@@ -43,7 +43,6 @@ def downloadDirectoryFroms3(bucketName,remoteDirectoryName):
         bucket.download_file(object.key,'tempS3Output/' + object.key)
 
 
-
 def scan_table(table_name): #runtime: about 15min
     #record time for scan the entire table
     print(dynamodb)
@@ -81,6 +80,7 @@ outputPath = 'temp/parsedOutput/'
 identities = scan_table('Identity')
 
 # Output verbose form of Identity table
+
 # print(identities)
 
 print("Count items from DynamoDB Identity table:", len(identities)) 
