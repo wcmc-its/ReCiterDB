@@ -18,8 +18,6 @@ def download_directory_from_s3(bucket_name, remote_directory_name, local_directo
     for object in bucket.objects.filter(Prefix=remote_directory_name):
         number = number + 1
         print(object)        
-#        if not os.path.exists(os.path.dirname(object.key)):
-#             os.makedirs(os.path.dirname("object.key"))
         local_path = f"{local_directory_name}/"
         file_name = local_path + "/" + object.key.removeprefix(remote_directory_name)
         bucket.download_file(object.key, file_name)
@@ -37,7 +35,6 @@ def downloadDirectoryFroms3(bucketName,remoteDirectoryName):
         print(object)
         txt = object.key 
         object.key = txt.replace(remoteDirectoryName, "")
-#       object.key = object.key.replace(remoteDirectoryName, "")
         if not os.path.exists('tempS3Output/' + object.key):
             os.makedirs('tempS3Output/' + object.key)
         bucket.download_file(object.key,'tempS3Output/' + object.key)
@@ -87,9 +84,8 @@ print("Count items from DynamoDB Identity table:", len(identities))
 
 
 # For testing purposes, comment this line out if you have the files and wish to re-run the script without downloading all the files
-# downloadDirectoryFroms3('reciter-dynamodb', 'AnalysisOutput')
 
-# download_directory_from_s3('reciter-dynamodb', 'AnalysisOutput','temp/s3Output')
+download_directory_from_s3('reciter-dynamodb', 'AnalysisOutput','temp/s3Output')
 
 
 person_list = []
