@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: reciter-report-configmap
+  namespace: reciter
+  labels:
+    app: reciter-report
+    environment: dev
+    tier: backend
+    owner: szd2013
+data:
+  AWS_DEFAULT_REGION: "us-east-1"
+  DB_HOST: "DB_HOST"
+  DB_NAME: "reciter"
