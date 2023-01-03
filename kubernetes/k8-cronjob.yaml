@@ -1,0 +1,73 @@
+apiVersion: batch/v1beta1
+kind: CronJob
+metadata:
+  name: reciter-report
+  namespace: reciter
+  labels:
+    app: reciter-report
+    tier: backend
+    owner: szd2013
+  
+spec:
+  schedule: "30 17 * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: reciter-report
+            image: CONTAINER_IMAGE
+            env:
+            - name: DB_USERNAME
+              valueFrom: 
+                secretKeyRef:
+                  name: reciter-report-secrets
+                  key: DB_USERNAME
+            - name: DB_PASSWORD
+              valueFrom: 
+                secretKeyRef:
+                  name: reciter-report-secrets
+                  key: DB_PASSWORD
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: 
+                secretKeyRef:
+                  name: reciter-report-secrets
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: 
+                secretKeyRef:
+                  name: reciter-report-secrets
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: reciter-report-configmap
+                  key: AWS_DEFAULT_REGION
+            - name: DB_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: reciter-report-configmap
+                  key: DB_HOST
+            - name: DB_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: reciter-report-configmap
+                  key: DB_NAME
+            resources:
+              requests:
+                memory: 4G
+                cpu: 1.5
+              limits:
+                memory: 4G
+                cpu: 1.6
+            readinessProbe:
+              exec:
+                command:
+                - cat
+                - /usr/src/app/Dynamodb_Analysis_upload.py
+              initialDelaySeconds: 10
+              periodSeconds: 5
+          nodeSelector:
+            lifecycle: Ec2Spot
+          restartPolicy: OnFailure
