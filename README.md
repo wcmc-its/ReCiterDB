@@ -6,7 +6,7 @@
   - [Installation](#installation)
   - [Components](#components)
   - [Configuration](#configuration)
-- [More on the ReCiter suite of applications](#x)
+- [More on the ReCiter suite of applications](#more-on-the-reciter-suite-of-applications)
 
 
 
@@ -73,5 +73,10 @@ As the figure describes, the ReCiter suite of applications can fully manage many
 
 
 The key tools and repositories used to perform these steps are:
-
-[table here]
+|Repository |Required? |Functionalities |
+| ---- | ------------- | ------------- |
+| [ReCiter](https://github.com/wcmc-its/ReCiter)	|yes|	 &bull; Store identity info (see #1 above)  <br> &bull; Coordinate retrieval of articles from PubMed and optionally Scopus  <br> &bull; Use machine learning to estimate the likelihood a scholar wrote each article (#3)  <br> &bull; Store a person's identity and articles  <br> &bull; Share data through web services (#4, #5)|
+| [ReCiter PubMed Retrieval Tool](https://github.com/wcmc-its/ReCiter-Scopus-Retrieval-Tool) | yes	|  &bull; Retrieve and normalize publication data from PubMed (#2) |
+| [ReCiter Scopus Retrieval Tool](https://github.com/wcmc-its/ReCiter-PubMed-Retrieval-Tool) | no	|  &bull; Retrieve and normalize publication data from Scopus (#2) |
+| [ReCiter Publication Manager](https://github.com/wcmc-its/ReCiter-Publication-Manager) | no	|  &bull; Collect feedback from librarians, department staff on most likely articles a given researcher has authored (#4) &bull; Provides a web interface for generating reports (#6)|
+| [ReCiterDB](https://github.com/wcmc-its/ReCiterDB) | optional but would be needed for Publication Manager | &bull; A set of scripts for retrieving data from ReCiter and populating the database (#5)  <br> &bull; A relational database for storing publication and bibliometric data (#6)|
