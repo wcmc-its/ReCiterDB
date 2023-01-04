@@ -70,7 +70,7 @@ export AWS_ACCESS_KEY_ID=[access key ID]
 export AWS_SECRET_ACCESS_KEY=[secret access key]
 export AWS_DEFAULT_REGION=[region]
 ```
-4b. If you haven't done so, run `python3 setupReciterDB.py`. This will set up the database and schema. This script should execute in seconds. 
+4b. If you haven't done so, run `python3 setupReciterDB.py`. This will set up the database and schema. This script should execute in seconds. <br />
 5. To update ReCiterDB on a daily basis, run `python3 retrieveUpdate.sh`. This script may take 45 minutes to execute.
 
 
