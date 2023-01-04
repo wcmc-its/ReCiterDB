@@ -96,6 +96,9 @@ for filename in os.listdir(originalDataPath):
 ## it's because you haven't removed the ".DS_Store" file
 
 person_list.remove('.DS_Store')
+
+person_list.remove('.gitkeep')
+
 person_list.sort()
 print(len(person_list))
 
