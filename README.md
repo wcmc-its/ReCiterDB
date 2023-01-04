@@ -60,7 +60,7 @@ In conjunction with data from [ReCiter](https://github.com/wcmc-its/reciter), Re
 chmod +x reciterDbImport.sh
 chmod +x retrieveUpdate.sh
 ```
-4. For each new window in Terminal, you need to assert the following environmental variables.
+4a. For each new window in Terminal, you need to assert the following environmental variables. Note that you would need to know the values for you database first before running these commands.
 ```
 export DB_HOST=[db host]
 export DB_USERNAME=[user]
@@ -70,8 +70,8 @@ export AWS_ACCESS_KEY_ID=[access key ID]
 export AWS_SECRET_ACCESS_KEY=[secret access key]
 export AWS_DEFAULT_REGION=[region]
 ```
-5. If you haven't done so, run `python3 setupReciterDB.py`. This will set up the database and schema. This script should execute in seconds.
-6. To update ReCiterDB on a daily basis, run `python3 retrieveUpdate.sh`. This script may take 45 minutes to execute.
+4b. If you haven't done so, run `python3 setupReciterDB.py`. This will set up the database and schema. This script should execute in seconds. Note that this script depends
+5. To update ReCiterDB on a daily basis, run `python3 retrieveUpdate.sh`. This script may take 45 minutes to execute.
 
 
 
