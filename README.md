@@ -60,7 +60,7 @@ In conjunction with data from [ReCiter](https://github.com/wcmc-its/reciter), Re
 chmod +x reciterDbImport.sh
 chmod +x retrieveUpdate.sh
 ```
-4. Create a database and a user with administrative privileges. Generally speaking, you need a user with broad privileges. This user will be creating and updating tables, views, and stored procedures. (That said, the `SUPER`, `FILE`, and `SHUTDOWN` privileges are not needed.)
+4. Create the ReCiterDB database and a user with administrative privileges. Generally speaking, you need a user with broad privileges. This user will be creating and updating tables, views, and stored procedures. (That said, the `SUPER`, `FILE`, and `SHUTDOWN` privileges are not needed.) From the MySQL prompt, run the following:
 ```
 CREATE DATABASE IF NOT EXISTS `reciterDB` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER 'admin' IDENTIFIED BY 'insert password';
