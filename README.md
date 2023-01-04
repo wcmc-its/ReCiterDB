@@ -16,7 +16,7 @@
 
 ## Summary
 
-ReCiterDB is an open source [MariaDB](https://mariadb.org/) database and set of tools that stores publication lists and computes bibliometric statistics for an academic institution's faculty and other people of interest. ReCiterDB is designed to be populated by person and publication data from [ReCiter](https://github.com/wcmc-its/reciter) (a machine learning-driven publication suggestion engine) and from third party sources such as NIH's iCite and Digital Science's Altmetric services. The data in the system can be viewed using the [ReCiter Publication Manager](https://github.com/wcmc-its/reciter-publication-manager) web application, or it can serve as a stand alone reporting tool. For more on the functionality in Publication Manager, see that repository.
+ReCiterDB is an open source [MariaDB](https://mariadb.org/) database and set of tools that stores publication lists and computes bibliometric statistics for an academic institution's faculty and other people of interest. ReCiterDB is designed to be populated by person and publication data from [ReCiter](https://github.com/wcmc-its/reciter) (a machine learning-driven publication suggestion engine) and from third party sources such as NIH's iCite and Digital Science's Altmetric services. The data in the system can be viewed using the [ReCiter Publication Manager](https://github.com/wcmc-its/reciter-publication-manager) web application, or it can serve as a stand alone reporting database. For more on the functionality in Publication Manager, see that repository.
 
 This repository contains:
 
