@@ -23,6 +23,10 @@ This repository contains:
 - Python and shell scripts for importing data into ReCiterDB
 - A Docker file that automates deployment of these components
 
+<img src="https://github.com/wcmc-its/ReCiterDB/blob/master/files/reCiterReportingModel.png" width=800 />
+
+
+
 ## Functionality
 In conjunction with data from [ReCiter](https://github.com/wcmc-its/reciter), ReCiterDB has been used to answer questions such as the following:
 
@@ -60,19 +64,8 @@ ReCiterDb consists of the following components:
 | ---- | ------------- | ------------- | ---------- |
 | **setupReciterDB.py**	| At initial setup	| Python script |Runs three below SQL files which create the database, inserts certain data, and events and procedures.|
 |createDatabaseTableReciterDb.sql |	At initial setup |	Database schema	 | Creates ReCiterDb database and the following tables: <br> &bull; `admin_*` - tracks users, their roles, and their feedback in Publication Manager <br> &bull; `analysis_altmetric_*` - bibliometric article-level data from Altmetric API <br> &bull; `analysis_override_author_position` - a table for manually overriding the inferred author position; there is no way to update these values through the web user interface <br> &bull; `analysis_nih_*` - bibliometric article-level data from NIH's iCite API <br> &bull; `analysis_summary_*` -  periodically updated, summary-level index tables for articles, authorships, and people; the people included in the analysis_summary_person table reflect the list contained in the `analysis_summary_person_scope` table, which is maintained by the system admin; these tables are widely used <br> &bull; `analysis_special_characters` -  includes special character to RTF lookups used for generating RTF files <br> &bull; `analysis_temp_*` - temporary tables used for staging data so that they can be used for outputting files <br> &bull; `journal_*` - metadata about journals from third-party sources <br> &bull; `person_*` - data imported directly from ReCiter's Feature Generator API|
-
-
-insertBaselineDataReciterDb.sql	At initial setup	Data to be imported	Imports following data into existing tables:
-roles for Publication Manager application
-special characters and their RTF equivalents 
-Scimago journal rankings 
-National Library of Medicine (NLM) journals in PubMed
-
-createEventsProceduresReciterDb.sql	At initial setup	Stored procedures & events	
-Creates stored procedures which are used to:
-populate the analysis_summary_*  tables, which function as a performant index, and is useful for querying
-generate RTF files 
-Create events that are used for executing certain stored procedures on a nightly basis.
+| insertBaselineDataReciterDb.sql	| At initial setup	| Data to be imported	| Imports following data into existing tables: &bull; roles for Publication Manager application <br /> &bull; special characters and their RTF equivalents <br /> &bull; Scimago journal rankings <br /> &bull; National Library of Medicine (NLM) journals in PubMed | 
+| createEventsProceduresReciterDb.sql	| At initial setup	| Stored procedures & events | 	Creates stored procedures which are used to: <br /> &bull;  populate the `analysis_summary_*`  tables, which function as a performant index, and is useful for querying<br /> &bull; generate RTF files Create events that are used for executing certain stored procedures on a nightly basis.|
 
 
 ### Update
@@ -97,8 +90,7 @@ Create events that are used for executing certain stored procedures on a nightly
 
 As the figure describes, the ReCiter suite of applications can fully manage many key steps in institutional publication management.
 
-![https://github.com/wcmc-its/ReCiterDB/blob/master/files/howReciterWorks.png](https://github.com/wcmc-its/ReCiterDB/blob/master/files/howReciterWorks.png)
-
+<img src="https://github.com/wcmc-its/ReCiterDB/blob/master/files/howReciterWorks.png" width=800 />
 
 
 The key tools and repositories used to perform these steps are:
