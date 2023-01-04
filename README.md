@@ -49,6 +49,32 @@ In conjunction with data from [ReCiter](https://github.com/wcmc-its/reciter), Re
 
 ### Installation
 
+#### Locally
+
+1. Download [repository](https://github.com/wcmc-its/ReCiterDB/archive/refs/heads/master.zip) to local directory.
+2. Unzip and move to desired directory.
+3. Ensure both the `reciterDbImport.sh` and `retrieveUpdate.sh` shell scripts are executable. You can do so in Terminal by navigating to the directory where these files are located and running the following commands:
+```
+chmod +x reciterDbImport.sh
+chmod +x retrieveUpdate.sh
+```
+4. For each new window in Terminal, you need to assert the following environmental variables.
+```
+export DB_HOST=[db host]
+export DB_USERNAME=[user]
+export DB_PASSWORD=[password]
+export DB_NAME=[db name]
+export AWS_ACCESS_KEY_ID=[access key ID]
+export AWS_SECRET_ACCESS_KEY=[secret access key]
+export AWS_DEFAULT_REGION=[region]
+```
+5. If you haven't done so, run `python3 setupReciterDB.py`. This will set up the database and schema. This script should execute in seconds.
+6. To update ReCiterDB on a daily basis, run `python3 retrieveUpdate.sh`. This script may take 45 minutes to execute.
+
+
+
+#### On AWS
+
 All of the above are packaged in a Docker file.
 
 ...to provide...
