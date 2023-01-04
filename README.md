@@ -16,7 +16,7 @@
 
 ## Summary
 
-ReCiterDB is an open source [MariaDB](https://mariadb.org/) database and set of tools that stores publication lists and computes bibliometric statistics for an academic institution's faculty and other people of interest. ReCiterDB is designed to be populated by person and publication data from [ReCiter](https://github.com/wcmc-its/reciter) (a machine learning-driven publication suggestion engine) and from third party sources such as NIH's iCite and Digital Science's Altmetric services. The data in the system can be viewed using the [ReCiter Publication Manager](https://github.com/wcmc-its/reciter-publication-manager) web application, or it can serve as a stand alone reporting tool. For more on the functionality in Publication Manager, see that repository.
+ReCiterDB is an open source [MariaDB](https://mariadb.org/) database and set of tools that stores publication lists and computes bibliometric statistics for an academic institution's faculty and other people of interest. ReCiterDB is designed to be populated by person and publication data from [ReCiter](https://github.com/wcmc-its/reciter) (a machine learning-driven publication suggestion engine) and from third party sources such as NIH's iCite and Digital Science's Altmetric services. The data in the system can be viewed using the [ReCiter Publication Manager](https://github.com/wcmc-its/reciter-publication-manager) web application, or it can serve as a stand alone reporting database. For more on the functionality in Publication Manager, see that repository.
 
 This repository contains:
 
@@ -60,7 +60,14 @@ In conjunction with data from [ReCiter](https://github.com/wcmc-its/reciter), Re
 chmod +x reciterDbImport.sh
 chmod +x retrieveUpdate.sh
 ```
-4a. For each new window in Terminal, you need to assert the following environmental variables. Note that you would need to know the values for you database first before running these commands.
+4. Create the ReCiterDB database and a user with administrative privileges. Generally speaking, you need a user with broad privileges. This user will be creating and updating tables, views, and stored procedures. (That said, the `SUPER`, `FILE`, and `SHUTDOWN` privileges are not needed.) From the MySQL prompt, run the following:
+```
+CREATE DATABASE IF NOT EXISTS `reciterDB` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER 'admin' IDENTIFIED BY 'insert password';
+GRANT ALL PRIVILEGES ON *.* TO `admin`;
+```
+
+5. Assert the following environmental variables in your Terminal window (Mac). The first four are from the prior step. The final three are from your existing installation of ReCiter.
 ```
 export DB_HOST=[db host]
 export DB_USERNAME=[user]
@@ -70,8 +77,8 @@ export AWS_ACCESS_KEY_ID=[access key ID]
 export AWS_SECRET_ACCESS_KEY=[secret access key]
 export AWS_DEFAULT_REGION=[region]
 ```
-4b. If you haven't done so, run `python3 setupReciterDB.py`. This will set up the database and schema. This script should execute in seconds. Note that this script depends
-5. To update ReCiterDB on a daily basis, run `python3 retrieveUpdate.sh`. This script may take 45 minutes to execute.
+6. Run `python3 setupReciterDB.py`. This will set up the database schema, the stored procedures, and events, and populate some baseline data. This script should execute in seconds.
+7. To update ReCiterDB on a daily basis, run `python3 retrieveUpdate.sh`. If you have 20,000 person records, this script may take ~45 minutes to execute.
 
 
 
