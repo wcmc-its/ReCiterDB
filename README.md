@@ -1,4 +1,14 @@
 # ReCiterDB
+- [Summary](#summary)
+- [Functionality](#functionality)
+- [Technical](#technical)
+  - [Prerequisites](#prerequisites)
+  - [Installation](#installation)
+  - [Components](#components)
+  - [Configuration](#configuration)
+- [More on the ReCiter suite of applications](#x)
+
+
 
 ## Summary
 
@@ -50,13 +60,17 @@ ReCiterDb consists of the following components:
 
 
 ## Configuration
-- **Define scope of bibliometrics.** As an administrator, you have control over the people for whom the system calculates person-level bibliometrics. This allows for download of a person's bibliometric analysis complete with comparisons to institutional peers. To do this, update the populateAnalysisSummaryPersonScopeTable stored procedure which populates the analysis_summary_person_scope table. Here at Weill Cornell Medicine, we consider only full-time employed faculty (i.e., person_person_type.personType = academic-faculty-weillfulltime).
+- **Define scope of bibliometrics.** As an administrator, you have control over the people for whom the system calculates person-level bibliometrics. This allows for download of a person's bibliometric analysis complete with comparisons to institutional peers. To do this, update the populateAnalysisSummaryPersonScopeTable stored procedure which populates the `analysis_summary_person_scope` table. Here at Weill Cornell Medicine, we consider only full-time employed faculty (i.e., `person_person_type.personType = academic-faculty-weillfulltime`). 
 - **Importing additional journal-level metrics (optional).** ReCiterDB ships with journal impact data from Scimago Journal Rank. If you have another journal level impact metric, which uses ISSN as a primary key, it can be imported into the journal_impact_alternative table.
 
 
 ## More on the ReCiter suite of applications
 
 As the figure describes, the ReCiter suite of applications can fully manage many key steps in institutional publication management.
+
+![https://github.com/wcmc-its/ReCiterDB/blob/master/files/howReciterWorks.png](https://github.com/wcmc-its/ReCiterDB/blob/master/files/howReciterWorks.png)
+
+
 
 The key tools and repositories used to perform these steps are:
 
