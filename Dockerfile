@@ -8,20 +8,20 @@ COPY init.py ./
 
 ## Database, tables, stored procedures, and events. 
 
-COPY /setup/setupReCiterDb.py
+COPY /setup/setupReCiterDb.py ./
 
-COPY /setup/createDatabaseTableReciterDb.sql
-COPY /setup/createEventsProceduresReciterDb.sql
-COPY /setup/insertBaselineDataReciterDb.sql
+COPY /setup/createDatabaseTableReciterDb.sql ./
+COPY /setup/createEventsProceduresReciterDb.sql ./
+COPY /setup/insertBaselineDataReciterDb.sql ./
 
 
 ## Retrieve data from ReCiter and import into ReCiterDB
 
-COPY /update/updateReciterDB.py
+COPY /update/updateReciterDB.py ./
 
-COPY /update/retrieveS3.py
-COPY /update/retrieveDynamoDb.py
-COPY /update/retrieveNIH.py
+COPY /update/retrieveS3.py ./
+COPY /update/retrieveDynamoDb.py ./
+COPY /update/retrieveNIH.py ./
 # COPY /update/retrieveAltmetric.py
 
 
