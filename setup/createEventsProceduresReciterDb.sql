@@ -1,4 +1,3 @@
-
 DELIMITER ////
 CREATE DEFINER=`admin`@`%` PROCEDURE `generateBibliometricReport`(IN personID VARCHAR(255))
 BEGIN
@@ -3753,4 +3752,3 @@ CREATE IF NOT EXISTS DEFINER=`admin`@`%` EVENT `runPopulateAnalysisSummaryTables
 
 
 CREATE IF NOT EXISTS DEFINER=`admin`@`%` EVENT `runUpdateCurateSelfRole` ON SCHEDULE EVERY 1 DAY STARTS '2022-01-01 01:00:00' ON COMPLETION PRESERVE ENABLE DO call `updateCurateSelfRole`();
-
