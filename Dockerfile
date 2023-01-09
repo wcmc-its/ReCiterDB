@@ -12,7 +12,7 @@ COPY setup/init.py ./
 COPY setup/createDatabaseTableReciterDb.sql ./
 COPY setup/createEventsProceduresReciterDb.sql ./
 COPY setup/insertBaselineDataReciterDb.sql ./
-COPY setup/setupReciterDb.py ./
+COPY setup/setupReciterDB.py ./
 
 
 ## Retrieve data from ReCiter and import into ReCiterDB
@@ -40,4 +40,4 @@ RUN mkdir -p update/temp/s3Output
 
 RUN chmod a+x update/retrieveUpdate.sh
 
-CMD [ "/bin/bash", "-c", "python3 ./setup/setupReCiterDb.py && python3 ./update/updateReciterDB.py" ]
+CMD [ "/bin/bash", "-c", "python3 ./setup/setupReciterDB.py && python3 ./update/updateReciterDB.py" ]
