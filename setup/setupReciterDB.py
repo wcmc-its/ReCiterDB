@@ -49,6 +49,9 @@ def main():
     DB_PASSWORD = os.getenv('DB_PASSWORD')
     DB_HOST = os.getenv('DB_HOST')
     DB_NAME = os.getenv('DB_NAME')
+    
+    print(DB_NAME)
+    print(DB_HOST)
 
     databaseConnection = connect_mysql_server(DB_USERNAME, DB_PASSWORD, DB_HOST, DB_NAME)  
     run_sql_file("createDatabaseTableReciterDb.sql", databaseConnection)     
