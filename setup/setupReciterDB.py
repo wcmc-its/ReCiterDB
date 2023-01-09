@@ -16,10 +16,10 @@ def run_sql_file(filename, connection):
     cursor = connection.cursor() 
     with open(filename, encoding="utf-8") as f:
         commands = f.read().rstrip(';').split(';')
-
+        print(commands)
     for command in commands:
-        print(command)
-        print("------------")
+        #print(command)
+        #print("------------")
         cursor.execute(command)
         connection.commit() 
      
