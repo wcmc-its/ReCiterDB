@@ -18,7 +18,7 @@ COPY setup/setupReCiterDb.py ./
 ## Retrieve data from ReCiter and import into ReCiterDB
 
 COPY update/init.py ./
-COPY update/retrieveAltmetric.py
+COPY update/retrieveAltmetric.py ./
 COPY update/retrieveDynamoDb.py ./
 COPY update/retrieveNIH.py ./
 COPY update/updateReciterDB.py ./
