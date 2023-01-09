@@ -20,8 +20,9 @@ def run_sql_file(filename, connection):
     for command in commands:
         print(command)
         print("------------")
-        cursor.execute(command)
-    connection.commit() 
+        if command !== ""
+         cursor.execute(command)
+         connection.commit() 
      
     end = time.time() 
     print("Time elapsed to run the query:") 
