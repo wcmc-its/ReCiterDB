@@ -19,6 +19,7 @@ def run_sql_file(filename, connection):
 
     for command in commands:
         print(command)
+        print("------------")
         cursor.execute(command)
     connection.commit() 
      
