@@ -16,12 +16,13 @@ def run_sql_file(filename, connection):
     cursor = connection.cursor() 
     with open(filename, encoding="utf-8") as f:
         commands = f.read().rstrip(';').split(';')
-        print(commands)
+        #print(commands)
     for command in commands:
-        #print(command)
+        print(command)
         #print("------------")
-        cursor.execute(command)
-        connection.commit() 
+        if command != '\n':
+         cursor.execute(command)
+         connection.commit() 
      
     end = time.time() 
     print("Time elapsed to run the query:") 
