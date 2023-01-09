@@ -38,6 +38,6 @@ RUN mkdir -p update/temp/s3Output
 
 ## Set permissions on shell script
 
-RUN chmod a+x update/retrieveUpdate.sh
+RUN chmod a+x retrieveUpdate.sh
 
 CMD [ "/bin/bash", "-c", "python3 ./setup/setupReciterDB.py && python3 ./update/updateReciterDB.py" ]
