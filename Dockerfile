@@ -12,7 +12,7 @@ COPY setup/init.py ./
 COPY setup/createDatabaseTableReciterDb.sql ./
 COPY setup/createEventsProceduresReciterDb.sql ./
 COPY setup/insertBaselineDataReciterDb.sql ./
-COPY setup/setupReCiterDb.py ./
+COPY setup/setupReciterDb.py ./
 
 
 ## Retrieve data from ReCiter and import into ReCiterDB
