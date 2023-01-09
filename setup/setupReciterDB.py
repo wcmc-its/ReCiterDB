@@ -15,9 +15,9 @@ def run_sql_file(filename, connection):
     print("Start executing: " + filename + " at " + str(datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))) 
     cursor = connection.cursor() 
     with open(filename, encoding="utf-8") as f:
-        commands = f.read().split(';')
+        commands = f.read().rstrip(';').split(';')
 
-    for command in filter(bool, commands):
+    for command in commands:
         print(command)
         print("------------")
         cursor.execute(command)
