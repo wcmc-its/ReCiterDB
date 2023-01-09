@@ -18,8 +18,8 @@ def run_sql_file(filename, connection):
         commands = f.read().split(';')
 
     for command in commands:
+        print(command)
         cursor.execute(command)
-        print(command)     
     connection.commit() 
      
     end = time.time() 
