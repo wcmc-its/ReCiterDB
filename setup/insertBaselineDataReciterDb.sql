@@ -1,3 +1,5 @@
+TRUNCATE `admin_roles`;
+
 LOCK TABLES `admin_roles` WRITE;
 INSERT INTO `admin_roles` (`roleID`, `roleLabel`) VALUES 
   (1,'Superuser'),
@@ -8,6 +10,8 @@ INSERT INTO `admin_roles` (`roleID`, `roleLabel`) VALUES
   (6,'Curator_Department_Delegate');
 UNLOCK TABLES;
 
+
+TRUNCATE `analysis_special_characters`;
 
 LOCK TABLES `analysis_special_characters` WRITE;
 TRUNCATE `analysis_special_characters`;
