@@ -40,4 +40,4 @@ RUN mkdir -p update/temp/s3Output
 
 RUN chmod a+x retrieveUpdate.sh
 
-CMD [ "/bin/bash", "-c", "python3 ./setupReciterDB.py && python3 ./retrieveDynamoDb.py" ]
+CMD [ "/bin/bash", "-c", "python3 ./setupReciterDB.py && python3 ./retrieveDynamoDb.py && python3 ./retrieveS3.py && python3 ./updateReciterDB.py && python3 ./retrieveNIH.py" ]
