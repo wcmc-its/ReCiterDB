@@ -1,3 +1,4 @@
+SET FOREIGN_KEY_CHECKS = 0;
 TRUNCATE `admin_roles`;
 
 LOCK TABLES `admin_roles` WRITE;
@@ -9,7 +10,6 @@ INSERT INTO `admin_roles` (`roleID`, `roleLabel`) VALUES
   (5,'Curator_Department'),
   (6,'Curator_Department_Delegate');
 UNLOCK TABLES;
-
 
 TRUNCATE `analysis_special_characters`;
 
