@@ -56,12 +56,7 @@ def main():
     print(DB_HOST)
 
     databaseConnection = connect_mysql_server(DB_USERNAME, DB_PASSWORD, DB_HOST, DB_NAME)  
-    run_sql_file("createDatabaseTableReciterDb.sql", databaseConnection)     
-'''  
-Commenting these out with the expectation that they would be imported manually.  
-    run_sql_file("insertBaselineDataReciterDb.sql", databaseConnection)     
-    run_sql_file("createEventsProceduresReciterDb.sql", databaseConnection) 
-'''
+    run_sql_file("createDatabaseTableReciterDb.sql", databaseConnection)
     databaseConnection.close() 
      
 if __name__ == "__main__": 
