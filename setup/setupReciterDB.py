@@ -55,9 +55,9 @@ def main():
     print(DB_NAME)
     print(DB_HOST)
 
-    databaseConnection = connect_mysql_server(DB_USERNAME, DB_PASSWORD, DB_HOST, DB_NAME)  
+    databaseConnection = connect_mysql_server(DB_USERNAME, DB_PASSWORD, DB_HOST, DB_NAME)
     run_sql_file("createDatabaseTableReciterDb.sql", databaseConnection)
-    databaseConnection.close() 
-     
+    databaseConnection.close()
+
 if __name__ == "__main__": 
     main() 
