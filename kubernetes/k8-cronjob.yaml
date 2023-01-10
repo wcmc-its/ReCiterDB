@@ -65,7 +65,7 @@ spec:
               exec:
                 command:
                 - cat
-                - /usr/src/app/update/retrieveDynamodb.py
+                - /usr/src/app/retrieveDynamoDb.py
               initialDelaySeconds: 10
               periodSeconds: 5
           nodeSelector:
