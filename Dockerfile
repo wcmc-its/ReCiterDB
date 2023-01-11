@@ -5,6 +5,8 @@ WORKDIR /usr/src/app
 COPY requirements.txt ./
 COPY init.py ./
 
+ENV PYTHON_PATH /usr/local/bin/python3
+
 
 ## Create necessary directories
 
@@ -43,6 +45,7 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 
 RUN chmod a+x update/retrieveUpdate.sh
 
-CMD [ "/bin/bash", "-c", " ./update/retrieveUpdate.sh" ]
+CMD [ "/bin/bash", "-c", "python3 $PYTHON_PATH /update/retrieveS3.py" ]
 
-RUN which python3
+
+# CMD [ "/bin/bash", "-c", " ./update/retrieveUpdate.sh" ]
