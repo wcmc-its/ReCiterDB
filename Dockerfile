@@ -45,7 +45,6 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 
 RUN chmod a+x update/retrieveUpdate.sh
 
-CMD [ "/bin/bash", "-c", "python3 ./update/retrieveS3.py" ]
-
-
 # CMD [ "/bin/bash", "-c", " ./update/retrieveUpdate.sh" ]
+
+CMD [ "/bin/bash", "-c", "python3 ./update/retrieveS3.py" ]
