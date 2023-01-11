@@ -41,6 +41,6 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 
 ## Set permissions on shell script
 
-RUN chmod a+x retrieveUpdate.sh
+RUN chmod a+x update/retrieveUpdate.sh
 
 CMD [ "/bin/bash", "-c", " ./update/retrieveUpdate.sh" ]
