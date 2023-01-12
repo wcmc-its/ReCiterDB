@@ -20,8 +20,7 @@ RUN mkdir -p temp/parsedOutput
 RUN mkdir -p temp/s3Output
 
 
-
-
 ## Update
 
 CMD [ "/bin/bash", "-c", "python3 ./retrieveDynamoDb.py && python3 ./retrieveNIH.py" ]
+
