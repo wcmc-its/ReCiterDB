@@ -8,9 +8,15 @@ COPY init.py ./
 
 ## Retrieve data from ReCiter and import into ReCiterDB
 
-COPY update/init.py ./
 COPY update/retrieveNIH.py ./
 COPY update/retrieveDynamoDb.py ./
+
+
+## Make directories
+
+RUN mkdir -p temp
+RUN mkdir -p temp/parsedOutput
+RUN mkdir -p temp/s3Output
 
 
 RUN pip3 install --no-cache-dir -r requirements.txt
