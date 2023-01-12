@@ -5,6 +5,7 @@ WORKDIR /usr/src/app
 COPY requirements.txt ./
 COPY init.py ./
 
+ENV PYTHONUNBUFFERED=1 
 
 ## Retrieve data from ReCiter and import into ReCiterDB
 
