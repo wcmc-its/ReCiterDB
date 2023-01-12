@@ -10,6 +10,7 @@ COPY init.py ./
 
 COPY update/init.py ./
 COPY update/retrieveNIH.py ./
+COPY update/retrieveDynamoDb.py ./
 
 
 RUN pip3 install --no-cache-dir -r requirements.txt
@@ -17,4 +18,4 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 
 ## Update
 
-CMD [ "/bin/bash", "-c", "python3 ./retrieveNIH.py" ]
+CMD [ "/bin/bash", "-c", "python3 ./retrieveDynamoDb.py && python3 ./retrieveNIH.py" ]
