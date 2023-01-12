@@ -18,4 +18,3 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 ## Update
 
 CMD [ "python3", "./retrieveNIH.py" ]
-CMD [ "python3", "./update/retrieveNIH.py" ]
