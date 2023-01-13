@@ -21,7 +21,7 @@ RUN mkdir -p temp/parsedOutput
 RUN mkdir -p temp/s3Output
 
 # RUN chown -R admin:admin temp
-RUN chmod 777 temp
+# RUN chmod 777 temp
 
 
 ## Update
