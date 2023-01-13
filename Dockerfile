@@ -26,8 +26,8 @@ RUN mkdir -p temp/s3Output
 # ARG GetMyUsername
 # RUN echo ${GetMyUsername}
 
-# RUN chown -R admin:admin /usr/src/app/temp
-# RUN chmod 777 temp
+# RUN chown -R root:root /usr/src/app/temp
+RUN chmod -R 777 temp
 
 
 ## Update
