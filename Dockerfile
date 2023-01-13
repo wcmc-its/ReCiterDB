@@ -21,10 +21,10 @@ RUN mkdir -p temp/parsedOutput
 RUN mkdir -p temp/s3Output
 
 
-RUN cut -d: -f1 /etc/passwd
+# RUN cut -d: -f1 /etc/passwd
 
-# ARG GetMyUsername
-# RUN echo ${GetMyUsername}
+ARG GetMyUsername
+RUN echo ${GetMyUsername}
 
 # RUN chown -R admin:admin /usr/src/app/temp
 # RUN chmod 777 temp
