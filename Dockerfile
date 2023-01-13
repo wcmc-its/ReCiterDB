@@ -10,8 +10,8 @@ ENV PYTHONUNBUFFERED=1
 ## Retrieve data from ReCiter and import into ReCiterDB
 
 COPY update/retrieveNIH.py ./
-COPY update/retrieveDynamoDb.py ./
-
+# COPY update/retrieveDynamoDb.py ./
+COPY update/retrieveS3.py ./
 
 ## Make directories
 
@@ -27,10 +27,10 @@ RUN mkdir -p temp/s3Output
 # RUN echo ${GetMyUsername}
 
 # RUN chown -R root:root /usr/src/app/temp
-RUN chmod -R 777 temp
+# RUN chmod -R 777 temp
 
 
 ## Update
 
-CMD [ "/bin/bash", "-c", "python3 ./retrieveDynamoDb.py && python3 ./retrieveNIH.py" ]
+CMD [ "/bin/bash", "-c", "python3 ./retrieveS3.py && python3 ./retrieveNIH.py" ]
 
