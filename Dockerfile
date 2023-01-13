@@ -20,7 +20,7 @@ RUN mkdir -p temp
 RUN mkdir -p temp/parsedOutput
 RUN mkdir -p temp/s3Output
 
-# RUN chown -R admin:admin temp
+RUN chown -R admin:admin /usr/src/app/temp
 # RUN chmod 777 temp
 
 
