@@ -12,6 +12,8 @@ ENV PYTHONUNBUFFERED=1
 
 COPY update/retrieveNIH.py ./
 COPY update/retrieveDynamoDb.py ./
+COPY update/retrieveS3.py ./
+COPY update/retrieveAltmetric.py ./
 
 
 ## Make directories
@@ -24,4 +26,4 @@ RUN mkdir -p temp/s3Output
 
 ## Update
 
-CMD [ "/bin/bash", "-c", "python3 ./retrieveDynamoDb.py && python3 ./retrieveNIH.py" ]
+CMD [ "/bin/bash", "-c", "python3 ./retrieveDynamoDb.py && python3 ./retrieveS3.py && python3 ./updateReciterDB.py && python3 ./retrieveNIH.py"  ]
