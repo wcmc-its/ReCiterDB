@@ -8,7 +8,7 @@ import MySQLdb
 
 import boto3
 import os
-
+ 
 dynamodb = boto3.resource('dynamodb')
 
 def download_directory_from_s3(bucket_name, remote_directory_name, local_directory_name):
