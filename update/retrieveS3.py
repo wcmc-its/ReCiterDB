@@ -95,9 +95,15 @@ for filename in os.listdir(originalDataPath):
 ## If you see this error "UnicodeDecodeError: 'utf-8' codec can't decode byte 0x80 in position 3131: invalid start byte",
 ## it's because you haven't removed the ".DS_Store" file
 
-person_list.remove('.DS_Store')
+try:
+    os.remove('.DS_Store')
+except OSError:
+    pass
 
-person_list.remove('.gitkeep')
+try:
+    os.remove('.gitkeep')
+except OSError:
+    pass
 
 person_list.sort()
 print(len(person_list))
