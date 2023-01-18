@@ -8,7 +8,7 @@ import MySQLdb
 
 import boto3
 import os
- 
+
 dynamodb = boto3.resource('dynamodb')
 
 def download_directory_from_s3(bucket_name, remote_directory_name, local_directory_name):
@@ -85,7 +85,7 @@ print("Count items from DynamoDB Identity table:", len(identities))
 
 # For testing purposes, comment this line out if you have the files and wish to re-run the script without downloading all the files
 
-download_directory_from_s3('reciter-dynamodb', 'AnalysisOutput','temp/s3Output')
+# download_directory_from_s3('reciter-dynamodb', 'AnalysisOutput','temp/s3Output')
 
 
 person_list = []
@@ -93,17 +93,17 @@ for filename in os.listdir(originalDataPath):
     person_list.append(filename)
 
 ## If you see this error "UnicodeDecodeError: 'utf-8' codec can't decode byte 0x80 in position 3131: invalid start byte",
-## it's because you haven't removed the ".DS_Store" file
+## it's because you haven't removed the ".DS_Store" file from the person_list index
 
 try:
-    os.remove('.DS_Store')
-except OSError:
-    pass
+    person_list.remove(".DS_Store")
+except ValueError:
+    print(".DS_Store not in list. Proceeding...")
 
 try:
-    os.remove('.gitkeep')
-except OSError:
-    pass
+    person_list.remove(".gitkeep")
+except ValueError:
+    print(".gitkeep not in list. Proceeding...")
 
 person_list.sort()
 print(len(person_list))
