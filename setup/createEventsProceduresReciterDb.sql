@@ -1,3 +1,4 @@
+
 DELIMITER ////
 CREATE DEFINER=`admin`@`%` PROCEDURE `generateBibliometricReport`(IN personID VARCHAR(255))
 BEGIN
@@ -1439,10 +1440,11 @@ distinct
 aa.personIdentifier,
 aa.pmid,
 rank,
-case 
-when targetAuthor = 1 then concat('((',authorLastName,' ',replace(cast(REGEXP_REPLACE(BINARY authorFirstName,'[a-z]','') as char),' ',''),'))')
-else concat(authorLastName,' ',replace(cast(REGEXP_REPLACE(BINARY authorFirstName,'[a-z]','') as char),' ',''))
-end as authorName
+convert(  
+case  
+when targetAuthor = 1 then concat('((',authorLastName,' ',replace(cast(REGEXP_REPLACE(BINARY authorFirstName,'[a-z]','') as char),' ',''),'))') 
+else concat(authorLastName,' ',replace(cast(REGEXP_REPLACE(BINARY authorFirstName,'[a-z]','') as char),' ','')) 
+end using utf8) as authorName
 from person_article_author aa
 join person_article a on a.pmid = aa.pmid and a.personIdentifier = aa.personIdentifier
 join analysis_temp_output_author a1 on a1.pmid = aa.pmid and a1.personIdentifier = aa.personIdentifier
@@ -1659,10 +1661,12 @@ distinct
 aa.personIdentifier,
 aa.pmid,
 rank,
-case 
-when targetAuthor = 1 then concat('((',authorLastName,' ',replace(cast(REGEXP_REPLACE(BINARY authorFirstName,'[a-z]','') as char),' ',''),'))')
-else concat(authorLastName,' ',replace(cast(REGEXP_REPLACE(BINARY authorFirstName,'[a-z]','') as char),' ',''))
-end as authorName
+convert(  
+case  
+when targetAuthor = 1 then concat('((',authorLastName,' ',replace(cast(REGEXP_REPLACE(BINARY authorFirstName,'[a-z]','') as char),' ',''),'))') 
+else concat(authorLastName,' ',replace(cast(REGEXP_REPLACE(BINARY authorFirstName,'[a-z]','') as char),' ','')) 
+end   
+using utf8) as authorName
 from person_article_author aa
 join person_article a on a.pmid = aa.pmid and a.personIdentifier = aa.personIdentifier
 join analysis_temp_output_author a1 on a1.pmid = aa.pmid and a1.personIdentifier = aa.personIdentifier
@@ -3752,3 +3756,4 @@ CREATE IF NOT EXISTS DEFINER=`admin`@`%` EVENT `runPopulateAnalysisSummaryTables
 
 
 CREATE IF NOT EXISTS DEFINER=`admin`@`%` EVENT `runUpdateCurateSelfRole` ON SCHEDULE EVERY 1 DAY STARTS '2022-01-01 01:00:00' ON COMPLETION PRESERVE ENABLE DO call `updateCurateSelfRole`();
+
