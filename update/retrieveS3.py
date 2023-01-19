@@ -85,7 +85,7 @@ print("Count items from DynamoDB Identity table:", len(identities))
 
 # For testing purposes, comment this line out if you have the files and wish to re-run the script without downloading all the files
 
-# download_directory_from_s3('reciter-dynamodb', 'AnalysisOutput','temp/s3Output')
+download_directory_from_s3('reciter-dynamodb', 'AnalysisOutput','temp/s3Output')
 
 
 person_list = []
