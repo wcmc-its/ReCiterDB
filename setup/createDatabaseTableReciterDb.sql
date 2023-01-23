@@ -318,6 +318,14 @@ CREATE TABLE IF NOT EXISTS `reciterDB`.`analysis_summary_person` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 
+CREATE TABLE IF NOT EXISTS `reciterDB`.`analysis_summary_person_scope` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `personIdentifier` varchar(20) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_personIdentifier` (`personIdentifier`) USING BTREE
+) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
 CREATE TABLE IF NOT EXISTS `reciterDB`.`analysis_temp_article` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `pmid` int(11) DEFAULT NULL,
