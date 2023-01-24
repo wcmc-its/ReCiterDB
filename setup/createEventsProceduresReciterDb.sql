@@ -1952,15 +1952,16 @@ select pmid, max(authorFirstName) as authorFirstName, max(authorLastName) as aut
 from 
 
 (select
-personIdentifier,
-pmid,
+aa.personIdentifier,
+aa.pmid,
 authorFirstName,
 authorLastName,
 rank,
 targetAuthor
-from person_article_author
-where
- targetAuthor = 1
+from person_article_author aa 
+join person_article a on a.pmid = aa.pmid and a.personIdentifier = aa.personIdentifier 
+where userAssertion = 'ACCEPTED'
+and targetAuthor = 1
 
 union 
 
