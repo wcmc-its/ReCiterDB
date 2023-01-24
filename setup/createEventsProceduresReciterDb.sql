@@ -3702,43 +3702,43 @@ BEGIN
 
 -- Update person info for "curate self" users from the "person" table
 
-update adminUsers a 
+update admin_users a 
 join person p on p.personIdentifier = a.personIdentifier
 set a.nameFirst = p.firstName
 where (a.nameFirst is null or a.nameFirst = '') and p.firstName is not null;
 
-update adminUsers a 
+update admin_users a 
 join person p on p.personIdentifier = a.personIdentifier
 set a.nameLast = p.lastName
 where (a.nameLast is null or a.nameLast = '') and p.lastName is not null;
 
-update adminUsers a 
+update admin_users a 
 join person p on p.personIdentifier = a.personIdentifier
 set a.nameMiddle = p.middleName
 where (a.nameMiddle is null or a.nameMiddle = '') and p.middleName is not null;
 
-update adminUsers a 
+update admin_users a 
 join person p on p.personIdentifier = a.personIdentifier
 set a.email = p.primaryEmail
 where (a.email is null or a.email = '') and p.primaryEmail is not null;
 
 -- Add new users from person table
 
-insert into adminUsers (personIdentifier, nameFirst, nameMiddle, nameLast, email)
+insert into admin_users (personIdentifier, nameFirst, nameMiddle, nameLast, email)
 select personIdentifier, firstName, middleName, lastName, primaryEmail
 from person p 
-where p.primaryEmail not in (select email from adminUsers where email is not null and email != '')
-and personIdentifier not in (select personIdentifier from adminUsers);
+where p.primaryEmail not in (select email from admin_users where email is not null and email != '')
+and personIdentifier not in (select personIdentifier from admin_users);
 
 -- Create roles for them
 
-insert into adminUsersRoles (userID, roleID)
+insert into admin_users_roles (userID, roleID)
 select a.userID, 4 
 from person p 
-join adminUsers a on a.personIdentifier = p.personIdentifier
+join admin_users a on a.personIdentifier = p.personIdentifier
 where a.userID  not in 
 (select userID
-from adminUsersRoles
+from admin_users_roles
 where roleID = 4);
 
 
