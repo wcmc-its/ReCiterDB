@@ -395,8 +395,8 @@ a.pmid,
 ".",
 "\\'a0{\\field{\\*\\fldinst{HYPERLINK \"",
 case 
-  when pmcid is not null then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
-  when a1.doi is not null then concat('https://dx.doi.org/',a1.doi)
+  when pmcid is not null and pmcid != '' then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
+  when a1.doi is not null and a1.doi != '' then concat('https://dx.doi.org/',a1.doi)
   when a.pmid is not null then concat('https://pubmed.ncbi.nlm.nih.gov/',a.pmid)
 end,
 "\"}}{\\fldrslt \\cf3 Full text}}
@@ -466,8 +466,8 @@ a.pmid,
 ".",
 "\\'a0{\\field{\\*\\fldinst{HYPERLINK \"",
 case 
-  when pmcid is not null then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
-  when a1.doi is not null then concat('https://dx.doi.org/',a1.doi)
+  when pmcid is not null and pmcid != '' then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
+  when a1.doi is not null and a1.doi != '' then concat('https://dx.doi.org/',a1.doi)
   when a.pmid is not null then concat('https://pubmed.ncbi.nlm.nih.gov/',a.pmid)
 end,
 "\"}}{\\fldrslt \\cf3 Full text}}
@@ -531,8 +531,8 @@ a.pmid,
 ".",
 "\\'a0{\\field{\\*\\fldinst{HYPERLINK \"",
 case 
-  when pmcid is not null then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
-  when a1.doi is not null then concat('https://dx.doi.org/',a1.doi)
+  when pmcid is not null and pmcid != '' then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
+  when a1.doi is not null and a1.doi != '' then concat('https://dx.doi.org/',a1.doi)
   when a.pmid is not null then concat('https://pubmed.ncbi.nlm.nih.gov/',a.pmid)
 end,
 "\"}}{\\fldrslt \\cf3 Full text}}
@@ -607,8 +607,8 @@ a.pmid,
 ".",
 "\\'a0{\\field{\\*\\fldinst{HYPERLINK \"",
 case 
-  when pmcid is not null then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
-  when a1.doi is not null then concat('https://dx.doi.org/',a1.doi)
+  when pmcid is not null and pmcid != '' then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
+  when a1.doi is not null and a1.doi != '' then concat('https://dx.doi.org/',a1.doi)
   when a.pmid is not null then concat('https://pubmed.ncbi.nlm.nih.gov/',a.pmid)
 end,
 "\"}}{\\fldrslt \\cf3 Full text}}
@@ -1335,8 +1335,8 @@ a.pmid,
 ".",
 "\\'a0{\\field{\\*\\fldinst{HYPERLINK \"",
 case 
-  when pmcid is not null then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
-  when a1.doi is not null then concat('https://dx.doi.org/',a1.doi)
+  when pmcid is not null and pmcid != '' then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
+  when a1.doi is not null and a1.doi != '' then concat('https://dx.doi.org/',a1.doi)
   when a.pmid is not null then concat('https://pubmed.ncbi.nlm.nih.gov/',a.pmid)
 end,
 "\"}}{\\fldrslt \\cf3 Full text}}
@@ -1552,8 +1552,8 @@ a.pmid,
 ".",
 "\\'a0{\\field{\\*\\fldinst{HYPERLINK \"",
 case 
-  when pmcid is not null then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
-  when a1.doi is not null then concat('https://dx.doi.org/',a1.doi)
+  when pmcid is not null and pmcid != '' then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
+  when a1.doi is not null and a1.doi != '' then concat('https://dx.doi.org/',a1.doi)
   when a.pmid is not null then concat('https://pubmed.ncbi.nlm.nih.gov/',a.pmid)
 end,
 "\"}}{\\fldrslt \\cf3 Full text}}
@@ -1795,8 +1795,8 @@ a.pmid,
 ".",
 "\\'a0{\\field{\\*\\fldinst{HYPERLINK \"",
 case 
-  when pmcid is not null then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
-  when a1.doi is not null then concat('https://dx.doi.org/',a1.doi)
+  when pmcid is not null and pmcid != '' then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
+  when a1.doi is not null and a1.doi != '' then concat('https://dx.doi.org/',a1.doi)
   when a.pmid is not null then concat('https://pubmed.ncbi.nlm.nih.gov/',a.pmid)
 end,
 "\"}}{\\fldrslt \\cf3 Full text}}
