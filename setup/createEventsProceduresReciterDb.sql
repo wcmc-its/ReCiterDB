@@ -2037,7 +2037,7 @@ set trendingPubsScore = round(readersMendeley / round((unix_timestamp() - UNIX_T
 ## Update NIH RCR stats
 
 update analysis_summary_article a
-join analysis_rcr r on r.pmid = a.pmid
+join analysis_nih r on r.pmid = a.pmid
 set a.citationCountNIH = r.citation_count, 
 a.percentileNIH = r.nih_percentile,
 a.relativeCitationRatioNIH = r.relative_citation_ratio,
@@ -2549,7 +2549,7 @@ set top10RankAll = personRank;
 
 ## We have two approaches for computing h-index and h5-index. 
 ##
-## Option 1. Use NIH iCite which takes data from the analysis_rcr table and outputs to 
+## Option 1. Use NIH iCite which takes data from the analysis_nih table and outputs to 
 ## h-index and h5-index in analysis_summary_person.
 ##
 ## Option 2. Use Scopus which is in the person_article table. This is only available if you 
