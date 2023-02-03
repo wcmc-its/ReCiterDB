@@ -1237,8 +1237,8 @@ aa.pmid,
 rank,
 cast(concat(authorLastName,' ', authorFirstName) as char)
 as authorName
-from personArticleAuthor aa
-join personArticle a on a.pmid = aa.pmid and a.personIdentifier = aa.personIdentifier
+from person_article_author aa
+join person_article a on a.pmid = aa.pmid and a.personIdentifier = aa.personIdentifier
 join analysis_temp_output_author a1 on a1.pmid = aa.pmid and a1.personIdentifier = aa.personIdentifier
 where userAssertion = 'ACCEPTED') m
 group by pmid, rank
