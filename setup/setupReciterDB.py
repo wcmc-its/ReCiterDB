@@ -15,12 +15,14 @@ def run_sql_file(filename, connection):
     print("Start executing: " + filename + " at " + str(datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))) 
     cursor = connection.cursor() 
     with open(filename, encoding="utf-8") as f:
-        commands = f.read().split(';')
-
+        commands = f.read().rstrip(';').split(';')
+        #print(commands)
     for command in commands:
-        cursor.execute(command)
-        print(command)     
-    connection.commit() 
+        print(command)
+        #print("------------")
+        if command != '\n':
+         cursor.execute(command)
+         connection.commit() 
      
     end = time.time() 
     print("Time elapsed to run the query:") 
@@ -49,12 +51,14 @@ def main():
     DB_PASSWORD = os.getenv('DB_PASSWORD')
     DB_HOST = os.getenv('DB_HOST')
     DB_NAME = os.getenv('DB_NAME')
+    
+    print(DB_NAME)
+    print(DB_HOST)
 
-    databaseConnection = connect_mysql_server(DB_USERNAME, DB_PASSWORD, DB_HOST, DB_NAME)  
-    run_sql_file("reciterDbCreateDatabaseTable.sql", databaseConnection)     
-    run_sql_file("reciterDbInsertData.sql", databaseConnection)     
-    run_sql_file("reciterDbCreateEventsProcedures.sql", databaseConnection)     
-    databaseConnection.close() 
-     
+    databaseConnection = connect_mysql_server(DB_USERNAME, DB_PASSWORD, DB_HOST, DB_NAME)
+    run_sql_file("createDatabaseTableReciterDb.sql", databaseConnection)
+    databaseConnection.close()
+
 if __name__ == "__main__": 
     main() 
+ 

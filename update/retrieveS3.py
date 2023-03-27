@@ -93,11 +93,17 @@ for filename in os.listdir(originalDataPath):
     person_list.append(filename)
 
 ## If you see this error "UnicodeDecodeError: 'utf-8' codec can't decode byte 0x80 in position 3131: invalid start byte",
-## it's because you haven't removed the ".DS_Store" file
+## it's because you haven't removed the ".DS_Store" file from the person_list index
 
-person_list.remove('.DS_Store')
+try:
+    person_list.remove(".DS_Store")
+except ValueError:
+    print(".DS_Store not in list. Proceeding...")
 
-person_list.remove('.gitkeep')
+try:
+    person_list.remove(".gitkeep")
+except ValueError:
+    print(".gitkeep not in list. Proceeding...")
 
 person_list.sort()
 print(len(person_list))

@@ -2,6 +2,23 @@
 CREATE DATABASE IF NOT EXISTS `reciterDB` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 
+CREATE TABLE IF NOT EXISTS `reciterDB`.`admin_users` (
+  `userID` int(11) NOT NULL AUTO_INCREMENT,
+  `personIdentifier` varchar(128) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `nameFirst` varchar(128) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `nameMiddle` varchar(128) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `nameLast` varchar(128) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `email` varchar(128) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `status` int(1) DEFAULT 1,
+  `createTimestamp` timestamp NOT NULL DEFAULT current_timestamp(),
+  `modifyTimestamp` timestamp NOT NULL ON UPDATE current_timestamp(),
+  PRIMARY KEY (`userID`),
+  KEY `idx_personIdentifier` (`personIdentifier`) USING BTREE,
+  KEY `idx_email` (`email`) USING BTREE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+
 CREATE TABLE IF NOT EXISTS `reciterDB`.`admin_departments` (
   `departmentID` int(11) NOT NULL AUTO_INCREMENT,
   `institutionalDepartmentCode` varchar(128) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
@@ -67,23 +84,6 @@ CREATE TABLE IF NOT EXISTS `reciterDB`.`admin_roles` (
   `roleID` int(11) NOT NULL AUTO_INCREMENT,
   `roleLabel` varchar(128) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
   PRIMARY KEY (`roleID`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-
-
-CREATE TABLE IF NOT EXISTS `reciterDB`.`admin_users` (
-  `userID` int(11) NOT NULL AUTO_INCREMENT,
-  `personIdentifier` varchar(128) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
-  `nameFirst` varchar(128) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
-  `nameMiddle` varchar(128) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
-  `nameLast` varchar(128) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
-  `email` varchar(128) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
-  `status` int(1) DEFAULT 1,
-  `createTimestamp` timestamp NOT NULL DEFAULT current_timestamp(),
-  `modifyTimestamp` timestamp NOT NULL ON UPDATE current_timestamp(),
-  PRIMARY KEY (`userID`),
-  KEY `idx_personIdentifier` (`personIdentifier`) USING BTREE,
-  KEY `idx_email` (`email`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 
@@ -316,6 +316,14 @@ CREATE TABLE IF NOT EXISTS `reciterDB`.`analysis_summary_person` (
   PRIMARY KEY (`id`),
   KEY `idx_personIdentifier` (`personIdentifier`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+CREATE TABLE IF NOT EXISTS `reciterDB`.`analysis_summary_person_scope` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `personIdentifier` varchar(20) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_personIdentifier` (`personIdentifier`) USING BTREE
+) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 
 CREATE TABLE IF NOT EXISTS `reciterDB`.`analysis_temp_article` (
@@ -704,4 +712,3 @@ CREATE TABLE IF NOT EXISTS `reciterDB`.`journal_science_metrix` (
   KEY `issn` (`issn`,`eissn`) USING BTREE,
   KEY `idx_subfield` (`subfield`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-

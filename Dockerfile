@@ -1,35 +1,32 @@
-FROM python:3.6-slim
+FROM python:3.11-slim
 
 WORKDIR /usr/src/app
 
 COPY requirements.txt ./
 COPY init.py ./
 
-
-## Database, tables, stored procedures, and events. 
-
-COPY /setup/setupReCiterDb.py
-
-COPY /setup/createDatabaseTableReciterDb.sql
-COPY /setup/createEventsProceduresReciterDb.sql
-COPY /setup/insertBaselineDataReciterDb.sql
+ENV PYTHONUNBUFFERED=1 
 
 
 ## Retrieve data from ReCiter and import into ReCiterDB
 
-COPY /update/updateReciterDB.py
+COPY update/retrieveNIH.py ./
+COPY update/retrieveDynamoDb.py ./
+COPY update/retrieveS3.py ./
+COPY update/retrieveAltmetric.py ./
+COPY update/updateReciterDB.py ./
 
-COPY /update/retrieveS3.py
-COPY /update/retrieveDynamoDb.py
-COPY /update/retrieveNIH.py
-# COPY /update/retrieveAltmetric.py
 
-
+## Make directories
 
 RUN pip3 install --no-cache-dir -r requirements.txt
-RUN mkdir -p ReCiter
-RUN mkdir -p AnalysisOutput
+RUN mkdir -p temp
+RUN mkdir -p temp/parsedOutput
+RUN mkdir -p temp/s3Output
 
-RUN chmod a+x /update/importIntoReCiterDB.sh
 
-CMD [ "/bin/bash", "-c", "python3 ./setup/setupReCiterDb.py && python3 /update/updateReciterDB.py" ]
+## Update
+
+# CMD [ "/bin/bash", "-c", "python3 ./retrieveDynamoDb.py && python3 ./retrieveS3.py && python3 ./updateReciterDB.py && python3 ./retrieveNIH.py"  ]
+
+CMD [ "/bin/bash", "-c", "python3 ./retrieveS3.py && python3 ./retrieveDynamoDb.py && python3 ./updateReciterDB.py && python3 ./retrieveNIH.py"  ]
