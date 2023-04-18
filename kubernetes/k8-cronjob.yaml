@@ -1,10 +1,10 @@
 apiVersion: batch/v1beta1
 kind: CronJob
 metadata:
-  name: reciter-report
+  name: reciterDB
   namespace: reciter
   labels:
-    app: reciter-report
+    app: reciterDB
     tier: backend
     owner: szd2013
   
@@ -16,43 +16,43 @@ spec:
       template:
         spec:
           containers:
-          - name: reciter-report
+          - name: reciterDB
             image: CONTAINER_IMAGE
             env:
             - name: DB_USERNAME
               valueFrom: 
                 secretKeyRef:
-                  name: reciter-report-secrets
+                  name: reciterDB-secrets
                   key: DB_USERNAME
             - name: DB_PASSWORD
               valueFrom: 
                 secretKeyRef:
-                  name: reciter-report-secrets
+                  name: reciterDB-secrets
                   key: DB_PASSWORD
             - name: AWS_ACCESS_KEY_ID
               valueFrom: 
                 secretKeyRef:
-                  name: reciter-report-secrets
+                  name: reciterDB-secrets
                   key: AWS_ACCESS_KEY_ID
             - name: AWS_SECRET_ACCESS_KEY
               valueFrom: 
                 secretKeyRef:
-                  name: reciter-report-secrets
+                  name: reciterDB-secrets
                   key: AWS_SECRET_ACCESS_KEY
             - name: AWS_DEFAULT_REGION
               valueFrom:
                 configMapKeyRef:
-                  name: reciter-report-configmap
+                  name: reciterDB-configmap
                   key: AWS_DEFAULT_REGION
             - name: DB_HOST
               valueFrom:
                 configMapKeyRef:
-                  name: reciter-report-configmap
+                  name: reciterDB-configmap
                   key: DB_HOST
             - name: DB_NAME
               valueFrom:
                 configMapKeyRef:
-                  name: reciter-report-configmap
+                  name: reciterDB-configmap
                   key: DB_NAME
             resources:
               requests:
