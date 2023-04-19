@@ -1,10 +1,10 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: reciterDB-configmap
+  name: reciterdb-configmap
   namespace: reciter
   labels:
-    app: reciter-report
+    app: reciterdb
     environment: dev
     tier: backend
     owner: szd2013

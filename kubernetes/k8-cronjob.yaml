@@ -1,10 +1,10 @@
 apiVersion: batch/v1beta1
 kind: CronJob
 metadata:
-  name: reciterDB
+  name: reciterdb
   namespace: reciter
   labels:
-    app: reciterDB
+    app: reciterdb
     tier: backend
     owner: szd2013
   
@@ -16,43 +16,43 @@ spec:
       template:
         spec:
           containers:
-          - name: reciterDB
+          - name: reciterdb
             image: CONTAINER_IMAGE
             env:
             - name: DB_USERNAME
               valueFrom: 
                 secretKeyRef:
-                  name: reciterDB-secrets
+                  name: reciterdb-secrets
                   key: DB_USERNAME
             - name: DB_PASSWORD
               valueFrom: 
                 secretKeyRef:
-                  name: reciterDB-secrets
+                  name: reciterdb-secrets
                   key: DB_PASSWORD
             - name: AWS_ACCESS_KEY_ID
               valueFrom: 
                 secretKeyRef:
-                  name: reciterDB-secrets
+                  name: reciterdb-secrets
                   key: AWS_ACCESS_KEY_ID
             - name: AWS_SECRET_ACCESS_KEY
               valueFrom: 
                 secretKeyRef:
-                  name: reciterDB-secrets
+                  name: reciterdb-secrets
                   key: AWS_SECRET_ACCESS_KEY
             - name: AWS_DEFAULT_REGION
               valueFrom:
                 configMapKeyRef:
-                  name: reciterDB-configmap
+                  name: reciterdb-configmap
                   key: AWS_DEFAULT_REGION
             - name: DB_HOST
               valueFrom:
                 configMapKeyRef:
-                  name: reciterDB-configmap
+                  name: reciterdb-configmap
                   key: DB_HOST
             - name: DB_NAME
               valueFrom:
                 configMapKeyRef:
-                  name: reciterDB-configmap
+                  name: reciterdb-configmap
                   key: DB_NAME
             resources:
               requests:
