@@ -2827,6 +2827,17 @@ where a.userID  not in
 from admin_users_roles
 where roleID = 4);
 
+-- Let's give self-curators the ability to generate reports for everyone
+
+insert into admin_users_roles (userID, roleID)
+select a.userID, 3 
+from person p 
+join admin_users a on a.personIdentifier = p.personIdentifier
+left join (select userID
+from admin_users_roles
+where roleID = 3) x on x.userID = a.userID
+where x.userID is null;
+
 
 END;
 //
