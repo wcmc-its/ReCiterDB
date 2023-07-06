@@ -13,7 +13,7 @@ echo "$now"
 echo "ReciterDB has been successfully updated"
 now=$(date +"%T")
 echo "$now"
-# /usr/bin/python3 retrieveNIH.py
+/usr/bin/python3 retrieveNIH.py
 echo "NIH RCR script complete"
 now=$(date +"%T")
 echo "$now"
