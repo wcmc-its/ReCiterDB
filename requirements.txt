@@ -1,3 +1,4 @@
 ###### Requirements without Version Specifiers ######
 PyMySQL
 boto3
+requests
