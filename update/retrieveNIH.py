@@ -1,11 +1,16 @@
 import json
 import os
 import time
+import requests
 import urllib.request
+import logging
+
+logging.basicConfig(filename='app.log', filemode='w', format='%(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 import pymysql.cursors
 import pymysql.err
-
+from http.client import responses
 
 def connect_mysql_server(username, db_password, db_hostname, database_name):
     """Establish a connection to MySQL or MariaDB server. This function is
@@ -205,51 +210,56 @@ def get_nih_records(nih_api_url):
         list: NIH RCR API record list of tuples.
     """
 
-    nih_record = get_json_data(nih_api_url)
+    response = requests.get(nih_api_url)
+    if response.status_code == 503:
+        return None
+    else:
 
-    if isinstance(nih_record, dict):
-        # We map dictionary value to each table column. This should
-        # allow for easy update if the database tables or API records
-        # change in the future.
-        #
-        # Because the API does not always return data for all keys,
-        # we have to check each one with the get_dict_value function
-        # and assign None (NULL) for the missing values.
-        process_records = get_dict_value(nih_record, "data")
-
-        records = []
-
-        for record in process_records:
-            new_record = (
-                get_dict_value(record, "pmid"),
-                get_dict_value(record, "year"),
-                get_dict_value(record, "is_research_article"),
-                get_dict_value(record, "is_clinical"),
-                get_dict_value(record, "relative_citation_ratio"),
-                get_dict_value(record, "nih_percentile"),
-                get_dict_value(record, "citation_count"),
-                get_dict_value(record, "citations_per_year"),
-                get_dict_value(record, "expected_citations_per_year"),
-                get_dict_value(record, "field_citation_rate"),
-                get_dict_value(record, "provisional"),
-                get_dict_value(record, "doi"),
-                get_dict_value(record, "human"),
-                get_dict_value(record, "animal"),
-                get_dict_value(record, "molecular_cellular"),
-                get_dict_value(record, "apt"),
-                get_dict_value(record, "x_coord"),
-                get_dict_value(record, "y_coord"),
-                get_dict_value(record, "cited_by_clin"),
-                get_dict_value(record, "cited_by"),
-                get_dict_value(record, "references")
-            )
-
-            records.append(new_record)
-
-        print(time.ctime() + "--" + "New records retrived--API URL: %s" % (nih_api_url))
-        return records
-
-    return "Invalid record obtained from API URL"
+        nih_record = get_json_data(nih_api_url)
+    
+        if isinstance(nih_record, dict):
+            # We map dictionary value to each table column. This should
+            # allow for easy update if the database tables or API records
+            # change in the future.
+            #
+            # Because the API does not always return data for all keys,
+            # we have to check each one with the get_dict_value function
+            # and assign None (NULL) for the missing values.
+            process_records = get_dict_value(nih_record, "data")
+    
+            records = []
+    
+            for record in process_records:
+                new_record = (
+                    get_dict_value(record, "pmid"),
+                    get_dict_value(record, "year"),
+                    get_dict_value(record, "is_research_article"),
+                    get_dict_value(record, "is_clinical"),
+                    get_dict_value(record, "relative_citation_ratio"),
+                    get_dict_value(record, "nih_percentile"),
+                    get_dict_value(record, "citation_count"),
+                    get_dict_value(record, "citations_per_year"),
+                    get_dict_value(record, "expected_citations_per_year"),
+                    get_dict_value(record, "field_citation_rate"),
+                    get_dict_value(record, "provisional"),
+                    get_dict_value(record, "doi"),
+                    get_dict_value(record, "human"),
+                    get_dict_value(record, "animal"),
+                    get_dict_value(record, "molecular_cellular"),
+                    get_dict_value(record, "apt"),
+                    get_dict_value(record, "x_coord"),
+                    get_dict_value(record, "y_coord"),
+                    get_dict_value(record, "cited_by_clin"),
+                    get_dict_value(record, "cited_by"),
+                    get_dict_value(record, "references")
+                )
+    
+                records.append(new_record)
+    
+            print(time.ctime() + "--" + "New records retrived--API URL: %s" % (nih_api_url))
+            return records
+    
+        return "Invalid record obtained from API URL"
 
 def insert_analysis_nih(mysql_db, mysql_cursor, db_records):
     """Inserts the API records in the MySQL analysis_nih database table.
@@ -364,6 +374,10 @@ def insert_analysis_nih_cites_clin(mysql_db, mysql_cursor, db_records):
         """
     )
 
+    # Log the records that are going to be inserted
+    for i, record in enumerate(db_records, start=1):
+        logging.debug("Record %d: %s", i, record)
+
     try:
         mysql_cursor.executemany(add_to_nih_table, db_records)
         mysql_db.commit()
@@ -372,7 +386,11 @@ def insert_analysis_nih_cites_clin(mysql_db, mysql_cursor, db_records):
             % (len(db_records)))
 
     except pymysql.err.MySQLError as err:
+        logging.error("An error occurred while inserting records: %s", err)
         print(time.ctime() + "--" + "Error writing the records to the database. %s" % (err))
+
+
+#########
 
 
 if __name__ == '__main__':
@@ -394,56 +412,97 @@ if __name__ == '__main__':
     # Get the PMIDs from the person_article table
     person_article_pmid = get_person_article_pmid(reciter_db_cursor)
 
-    # Take 900 PMIDs at a time, create an API URL with them,
-    # and get data for the records.
-    # This is an API limitation of 1000 records, but 900 is
-    # actually working without errors.
-    analysis_nih_rec = []
-    analysis_nih_cites_rec = []
-    analysis_nih_cites_clin = []
+    # Fibonacci sequence for retries
+    fibonacci_sequence = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144]
 
-    for i in range(0, len(person_article_pmid), 900):
-        # Create API URL
-        api_url = create_nih_API_url(person_article_pmid[i:i+900])
-        # Get records from API
-        nih_records = get_nih_records(api_url)
+    try:
+        for i in range(0, len(person_article_pmid), 900):
 
-        if nih_records is not None:
-            for item in nih_records:
-                # Get the records needed for
-                # the analysis_nih table
-                analysis_nih_rec.append(item[:18])
+            # Create API URL
+            api_url = create_nih_API_url(person_article_pmid[i:i+900])
+        
+            # Initialize counters for while loop
+            retries = 0
+            success = False
+            while retries < 10:  # try to get data up to 10 times
+                # Get records from API
+                nih_records = get_nih_records(api_url)
+                    
+                if nih_records is not None and not isinstance(nih_records, str):
+                    success = True  # API call successful, exit the loop
+                    
+                    # Initialize the record lists here
+                    analysis_nih_rec = []
+                    analysis_nih_cites_rec = []
+                    analysis_nih_cites_clin = []
+                    
+                    for item in nih_records:
+                        # Get the records needed for the analysis_nih table
+                        analysis_nih_rec.append(item[:18])
+    
+                        # Check if item has enough elements
+                        if len(item) == 21:
+                            # Process cited_by_clin
+                            if item[18] is not None:
+                                for cited_by_clin_item in item[18]:
+                                    cited_by_clin = (cited_by_clin_item, item[0])
+                                    analysis_nih_cites_clin.append(cited_by_clin)
+    
+                            # Process cited_by for the analysis_nih_cites table
+                            if item[19] is not None:
+                                for cited_by_item in item[19]:
+                                    cited_by = (cited_by_item, item[0])
+                                    analysis_nih_cites_rec.append(cited_by)
+    
+                            # Process references for the analysis_nih_cites table
+                            if item[20] is not None:
+                                for references_item in item[20]:
+                                    references = (references_item, item[0])
+                                    analysis_nih_cites_rec.append(references)
+        
+                    logger.info('Data queued for import: %s', analysis_nih_rec)
+    
+                    # Insert current records to the database
+                    insert_analysis_nih(reciter_db, reciter_db_cursor, analysis_nih_rec)
+                    insert_analysis_nih_cites(reciter_db, reciter_db_cursor, analysis_nih_cites_rec)
+                    insert_analysis_nih_cites_clin(reciter_db, reciter_db_cursor, analysis_nih_cites_clin)
+            
+                    # Clear the processed records from memory
+                    nih_records.clear()
+                    analysis_nih_rec.clear()
+                    analysis_nih_cites_rec.clear()
+                    analysis_nih_cites_clin.clear()
+                        
+                    # Pause for 1 second between API calls
+                    time.sleep(1)
+    
+                    # Exit the loop after successful call
+                    break
+    
+                else:
+                    retries += 1
+                    print(f'API call failed with status code 503: {responses[503]}. Retry attempt {retries}.')
+                    time.sleep(fibonacci_sequence[retries])  # wait for an increasing delay before next attempt
+        
+            # Ensure we haven't exceeded max retries
+            if retries == 10:
+                print('Max retry attempts exceeded. Please check the API service.')
+                # handle this event: e.g. break, continue, or sys.exit()
 
-                # Process cited_by_clin
-                if item[18] is not None:
-                    for cited_by_clin_item in item[18]:
-                        cited_by_clin = (cited_by_clin_item, item[0])
-                        analysis_nih_cites_clin.append(cited_by_clin)
+    except RuntimeError as e:
+        logger.error(f"Error occurred when fetching data: {str(e)}")
 
-                # Process cited_by for the analysis_nih_cites table
-                if item[19] is not None:
-                    for cited_by_item in item[19]:
-                        cited_by = (cited_by_item, item[0])
-                        analysis_nih_cites_rec.append(cited_by)
+    except pymysql.err.OperationalError as e:
+        if "MySQL server has gone away" in str(e):
+            logger.error("MySQL connection lost. Re-establishing connection.")
+            reciter_db = connect_mysql_server(DB_USERNAME, DB_PASSWORD, DB_HOST, DB_NAME)
+            reciter_db_cursor = reciter_db.cursor()
+            # Optionally, you might want to retry the operation that failed here
+        else:
+            raise e
 
-                # Process references for the analysis_nih_cites table
-                if item[20] is not None:
-                    for references_item in item[20]:
-                        references = (references_item, item[0])
-                        analysis_nih_cites_rec.append(references)
-
-        # Instert current records to the database
-        insert_analysis_nih(reciter_db, reciter_db_cursor, analysis_nih_rec)
-        insert_analysis_nih_cites(reciter_db, reciter_db_cursor, analysis_nih_cites_rec)
-        insert_analysis_nih_cites_clin(reciter_db, reciter_db_cursor, analysis_nih_cites_clin)
-
-        # Clear the processed records from memory
-        nih_records.clear()
-        analysis_nih_rec.clear()
-        analysis_nih_cites_rec.clear()
-        analysis_nih_cites_clin.clear()
-        # Pause for 1 second between API calls
-        time.sleep(1)
+    except Exception as e:
+        logger.error(f"An unexpected error occurred: {str(e)}")
 
     # Close DB connection
     reciter_db.close()
