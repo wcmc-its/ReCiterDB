@@ -1875,7 +1875,7 @@ BEGIN
 ## 2. analysis_summary_article - article-level data
 ## 3. analysis_summary_person - person-level data
 
-## In WCM's experience, this procedure takes ~11 minutes to complete while running on AWS 
+## In WCM's experience, this procedure takes ~17 minutes to complete while running on AWS RDS, MariaDB 10.6
 ## and with about 300,000 accepted articles. 
 
 ## The below is a hedge just to make sure this procedure doesn't start 
@@ -2042,7 +2042,7 @@ set a.citationCountNIH = r.citation_count,
 a.percentileNIH = r.nih_percentile,
 a.relativeCitationRatioNIH = r.relative_citation_ratio,
 publicationTypeNIH = 
-  case when is_research_article = 'yes' then 'Research Article'
+  case when is_research_article in ('Yes','yes') then 'Research Article'
   else null
   end;
 
