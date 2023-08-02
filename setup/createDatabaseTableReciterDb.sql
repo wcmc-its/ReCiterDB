@@ -712,3 +712,11 @@ CREATE TABLE IF NOT EXISTS `reciterDB`.`journal_science_metrix` (
   KEY `issn` (`issn`,`eissn`) USING BTREE,
   KEY `idx_subfield` (`subfield`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+CREATE TABLE `admin_settings` (
+  `viewName` varchar(200) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `viewAttributes` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL CHECK (json_valid(`viewAttributes`)),
+  `viewLabel` varchar(200) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  PRIMARY KEY (`viewName`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

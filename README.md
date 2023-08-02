@@ -55,7 +55,7 @@ In conjunction with data from [ReCiter](https://github.com/wcmc-its/reciter), Re
 
 1. Download [repository](https://github.com/wcmc-its/ReCiterDB/archive/refs/heads/master.zip) to local directory.
 2. Unzip and move to desired directory.
-3. Ensure both the `reciterDbImport.sh` and `retrieveUpdate.sh` shell scripts are executable. You can do so in Terminal by navigating to the directory where these files are located and running the following commands:
+3. Ensure both the `setupReciterDB.py` and `retrieveUpdate.sh` shell scripts are executable. You can do so in Terminal by navigating to the directory where these files are located and running the following commands:
 ```
 chmod +x reciterDbImport.sh
 chmod +x retrieveUpdate.sh
