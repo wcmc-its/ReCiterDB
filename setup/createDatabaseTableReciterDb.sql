@@ -590,6 +590,7 @@ CREATE TABLE IF NOT EXISTS `reciterDB`.`person_article_author` (
   `targetAuthor` varchar(128) COLLATE utf8mb4_unicode_ci DEFAULT '''NULL''',
   `rank` int(11) DEFAULT 0,
   `orcid` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `equalContrib` varchar(12) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `personIdentifier` (`personIdentifier`,`pmid`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
