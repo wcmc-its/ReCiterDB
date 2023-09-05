@@ -1937,12 +1937,410 @@ join person_article a on a.pmid = aa.pmid and a.personIdentifier = aa.personIden
 where userAssertion = 'ACCEPTED'  
 ) x 
 group by pmid, personIdentifier) y; 
+
 update analysis_summary_author a  
 join analysis_override_author_position o on a.pmid = o.pmid and a.personIdentifier = o.personIdentifier 
 set a.authorPosition = o.position;
 
 
-#### 2b.  Populate "analysis_summary_author_list" table with all authors and their ranks ####
+
+#### 2b. Update analysis_summary_author with cases where authors are marked as equalContrib relative to first/last authors
+## To receive credit for authorPosition = first or last, authors need to be contiguous with other authors who
+## also have the equalContrib designation.
+
+
+update analysis_summary_author y
+join (
+SELECT a.personIdentifier,
+       a.pmid,
+--     a.rank,
+--     maxRank,
+--     a.targetAuthor,
+--     equalContribAll,
+       CASE
+           -- Contiguous to 1
+           WHEN a.rank = 2 
+              AND FIND_IN_SET(1, equalContribAll) > 0  
+              AND FIND_IN_SET(2, equalContribAll) > 0
+           THEN 'first'
+
+           WHEN a.rank = 3
+              AND FIND_IN_SET(1, equalContribAll) > 0  
+              AND FIND_IN_SET(2, equalContribAll) > 0
+              AND FIND_IN_SET(3, equalContribAll) > 0
+           THEN 'first'
+
+           WHEN a.rank = 4
+              AND FIND_IN_SET(1, equalContribAll) > 0  
+              AND FIND_IN_SET(2, equalContribAll) > 0
+              AND FIND_IN_SET(3, equalContribAll) > 0
+              AND FIND_IN_SET(4, equalContribAll) > 0
+           THEN 'first'
+
+           WHEN a.rank = 5
+              AND FIND_IN_SET(1, equalContribAll) > 0  
+              AND FIND_IN_SET(2, equalContribAll) > 0
+              AND FIND_IN_SET(3, equalContribAll) > 0
+              AND FIND_IN_SET(4, equalContribAll) > 0
+              AND FIND_IN_SET(5, equalContribAll) > 0               
+           THEN 'first'
+
+           WHEN a.rank = 6
+              AND FIND_IN_SET(1, equalContribAll) > 0  
+              AND FIND_IN_SET(2, equalContribAll) > 0
+              AND FIND_IN_SET(3, equalContribAll) > 0
+              AND FIND_IN_SET(4, equalContribAll) > 0
+              AND FIND_IN_SET(5, equalContribAll) > 0    
+              AND FIND_IN_SET(6, equalContribAll) > 0                             
+           THEN 'first'
+
+           WHEN a.rank = 7
+              AND FIND_IN_SET(1, equalContribAll) > 0  
+              AND FIND_IN_SET(2, equalContribAll) > 0
+              AND FIND_IN_SET(3, equalContribAll) > 0
+              AND FIND_IN_SET(4, equalContribAll) > 0
+              AND FIND_IN_SET(5, equalContribAll) > 0    
+              AND FIND_IN_SET(6, equalContribAll) > 0   
+              AND FIND_IN_SET(7, equalContribAll) > 0                                           
+           THEN 'first'
+
+           WHEN a.rank = 8
+              AND FIND_IN_SET(1, equalContribAll) > 0  
+              AND FIND_IN_SET(2, equalContribAll) > 0
+              AND FIND_IN_SET(3, equalContribAll) > 0
+              AND FIND_IN_SET(4, equalContribAll) > 0
+              AND FIND_IN_SET(5, equalContribAll) > 0    
+              AND FIND_IN_SET(6, equalContribAll) > 0   
+              AND FIND_IN_SET(7, equalContribAll) > 0   
+              AND FIND_IN_SET(8, equalContribAll) > 0                                                         
+           THEN 'first'
+
+           WHEN a.rank = 9
+              AND FIND_IN_SET(1, equalContribAll) > 0  
+              AND FIND_IN_SET(2, equalContribAll) > 0
+              AND FIND_IN_SET(3, equalContribAll) > 0
+              AND FIND_IN_SET(4, equalContribAll) > 0
+              AND FIND_IN_SET(5, equalContribAll) > 0    
+              AND FIND_IN_SET(6, equalContribAll) > 0   
+              AND FIND_IN_SET(7, equalContribAll) > 0   
+              AND FIND_IN_SET(8, equalContribAll) > 0  
+              AND FIND_IN_SET(9, equalContribAll) > 0                                                                         
+           THEN 'first'
+
+           WHEN a.rank = 10
+              AND FIND_IN_SET(1, equalContribAll) > 0  
+              AND FIND_IN_SET(2, equalContribAll) > 0
+              AND FIND_IN_SET(3, equalContribAll) > 0
+              AND FIND_IN_SET(4, equalContribAll) > 0
+              AND FIND_IN_SET(5, equalContribAll) > 0    
+              AND FIND_IN_SET(6, equalContribAll) > 0   
+              AND FIND_IN_SET(7, equalContribAll) > 0   
+              AND FIND_IN_SET(8, equalContribAll) > 0  
+              AND FIND_IN_SET(9, equalContribAll) > 0                                                                         
+              AND FIND_IN_SET(10, equalContribAll) > 0    
+           THEN 'first'
+
+           WHEN a.rank = 11
+              AND FIND_IN_SET(1, equalContribAll) > 0  
+              AND FIND_IN_SET(2, equalContribAll) > 0
+              AND FIND_IN_SET(3, equalContribAll) > 0
+              AND FIND_IN_SET(4, equalContribAll) > 0
+              AND FIND_IN_SET(5, equalContribAll) > 0    
+              AND FIND_IN_SET(6, equalContribAll) > 0   
+              AND FIND_IN_SET(7, equalContribAll) > 0   
+              AND FIND_IN_SET(8, equalContribAll) > 0  
+              AND FIND_IN_SET(9, equalContribAll) > 0     
+              AND FIND_IN_SET(10, equalContribAll) > 0  
+              AND FIND_IN_SET(11, equalContribAll) > 0                                                                                                    
+           THEN 'first'
+
+           WHEN a.rank = 12
+              AND FIND_IN_SET(1, equalContribAll) > 0  
+              AND FIND_IN_SET(2, equalContribAll) > 0
+              AND FIND_IN_SET(3, equalContribAll) > 0
+              AND FIND_IN_SET(4, equalContribAll) > 0
+              AND FIND_IN_SET(5, equalContribAll) > 0    
+              AND FIND_IN_SET(6, equalContribAll) > 0   
+              AND FIND_IN_SET(7, equalContribAll) > 0   
+              AND FIND_IN_SET(8, equalContribAll) > 0  
+              AND FIND_IN_SET(9, equalContribAll) > 0     
+              AND FIND_IN_SET(10, equalContribAll) > 0  
+              AND FIND_IN_SET(11, equalContribAll) > 0                                                                                                    
+              AND FIND_IN_SET(12, equalContribAll) > 0   
+           THEN 'first'
+
+           WHEN a.rank = 13
+              AND FIND_IN_SET(1, equalContribAll) > 0  
+              AND FIND_IN_SET(2, equalContribAll) > 0
+              AND FIND_IN_SET(3, equalContribAll) > 0
+              AND FIND_IN_SET(4, equalContribAll) > 0
+              AND FIND_IN_SET(5, equalContribAll) > 0    
+              AND FIND_IN_SET(6, equalContribAll) > 0   
+              AND FIND_IN_SET(7, equalContribAll) > 0   
+              AND FIND_IN_SET(8, equalContribAll) > 0  
+              AND FIND_IN_SET(9, equalContribAll) > 0     
+              AND FIND_IN_SET(10, equalContribAll) > 0  
+              AND FIND_IN_SET(11, equalContribAll) > 0                                                                                                    
+              AND FIND_IN_SET(12, equalContribAll) > 0   
+              AND FIND_IN_SET(13, equalContribAll) > 0 
+           THEN 'first'
+
+           WHEN a.rank = 14
+              AND FIND_IN_SET(1, equalContribAll) > 0  
+              AND FIND_IN_SET(2, equalContribAll) > 0
+              AND FIND_IN_SET(3, equalContribAll) > 0
+              AND FIND_IN_SET(4, equalContribAll) > 0
+              AND FIND_IN_SET(5, equalContribAll) > 0    
+              AND FIND_IN_SET(6, equalContribAll) > 0   
+              AND FIND_IN_SET(7, equalContribAll) > 0   
+              AND FIND_IN_SET(8, equalContribAll) > 0  
+              AND FIND_IN_SET(9, equalContribAll) > 0     
+              AND FIND_IN_SET(10, equalContribAll) > 0  
+              AND FIND_IN_SET(11, equalContribAll) > 0                                                                                                    
+              AND FIND_IN_SET(12, equalContribAll) > 0   
+              AND FIND_IN_SET(13, equalContribAll) > 0 
+              AND FIND_IN_SET(14, equalContribAll) > 0                
+           THEN 'first'
+
+           WHEN a.rank = 15
+              AND FIND_IN_SET(1, equalContribAll) > 0  
+              AND FIND_IN_SET(2, equalContribAll) > 0
+              AND FIND_IN_SET(3, equalContribAll) > 0
+              AND FIND_IN_SET(4, equalContribAll) > 0
+              AND FIND_IN_SET(5, equalContribAll) > 0    
+              AND FIND_IN_SET(6, equalContribAll) > 0   
+              AND FIND_IN_SET(7, equalContribAll) > 0   
+              AND FIND_IN_SET(8, equalContribAll) > 0  
+              AND FIND_IN_SET(9, equalContribAll) > 0     
+              AND FIND_IN_SET(10, equalContribAll) > 0  
+              AND FIND_IN_SET(11, equalContribAll) > 0                                                                                                    
+              AND FIND_IN_SET(12, equalContribAll) > 0   
+              AND FIND_IN_SET(13, equalContribAll) > 0 
+              AND FIND_IN_SET(14, equalContribAll) > 0   
+              AND FIND_IN_SET(15, equalContribAll) > 0                              
+           THEN 'first'
+
+           WHEN a.rank = maxRank - 1
+              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
+           THEN 'last'
+
+           WHEN a.rank = maxRank - 2
+              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
+              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0               
+           THEN 'last'
+
+           WHEN a.rank = maxRank - 3
+              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
+              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0                             
+           THEN 'last'
+
+           WHEN a.rank = maxRank - 4
+              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
+              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
+           THEN 'last'
+
+           WHEN a.rank = maxRank - 5
+              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
+              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
+              AND FIND_IN_SET(maxRank - 5, equalContribAll) > 0   
+           THEN 'last'
+
+           WHEN a.rank = maxRank - 6
+              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
+              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
+              AND FIND_IN_SET(maxRank - 5, equalContribAll) > 0   
+              AND FIND_IN_SET(maxRank - 6, equalContribAll) > 0  
+           THEN 'last'
+
+           WHEN a.rank = maxRank - 7
+              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
+              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
+              AND FIND_IN_SET(maxRank - 5, equalContribAll) > 0   
+              AND FIND_IN_SET(maxRank - 6, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 7, equalContribAll) > 0 
+           THEN 'last'
+
+           WHEN a.rank = maxRank - 8
+              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
+              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
+              AND FIND_IN_SET(maxRank - 5, equalContribAll) > 0   
+              AND FIND_IN_SET(maxRank - 6, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 7, equalContribAll) > 0 
+              AND FIND_IN_SET(maxRank - 8, equalContribAll) > 0 
+           THEN 'last'
+
+           WHEN a.rank = maxRank - 9
+              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
+              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
+              AND FIND_IN_SET(maxRank - 5, equalContribAll) > 0   
+              AND FIND_IN_SET(maxRank - 6, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 7, equalContribAll) > 0 
+              AND FIND_IN_SET(maxRank - 8, equalContribAll) > 0 
+              AND FIND_IN_SET(maxRank - 9, equalContribAll) > 0               
+           THEN 'last'
+
+           WHEN a.rank = maxRank - 10
+              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
+              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
+              AND FIND_IN_SET(maxRank - 5, equalContribAll) > 0   
+              AND FIND_IN_SET(maxRank - 6, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 7, equalContribAll) > 0 
+              AND FIND_IN_SET(maxRank - 8, equalContribAll) > 0 
+              AND FIND_IN_SET(maxRank - 9, equalContribAll) > 0               
+              AND FIND_IN_SET(maxRank - 10, equalContribAll) > 0    
+           THEN 'last'
+
+           WHEN a.rank = maxRank - 11
+              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
+              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
+              AND FIND_IN_SET(maxRank - 5, equalContribAll) > 0   
+              AND FIND_IN_SET(maxRank - 6, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 7, equalContribAll) > 0 
+              AND FIND_IN_SET(maxRank - 8, equalContribAll) > 0 
+              AND FIND_IN_SET(maxRank - 9, equalContribAll) > 0               
+              AND FIND_IN_SET(maxRank - 10, equalContribAll) > 0    
+              AND FIND_IN_SET(maxRank - 11, equalContribAll) > 0             
+           THEN 'last'
+
+           WHEN a.rank = maxRank - 12
+              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
+              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
+              AND FIND_IN_SET(maxRank - 5, equalContribAll) > 0   
+              AND FIND_IN_SET(maxRank - 6, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 7, equalContribAll) > 0 
+              AND FIND_IN_SET(maxRank - 8, equalContribAll) > 0 
+              AND FIND_IN_SET(maxRank - 9, equalContribAll) > 0               
+              AND FIND_IN_SET(maxRank - 10, equalContribAll) > 0    
+              AND FIND_IN_SET(maxRank - 11, equalContribAll) > 0             
+              AND FIND_IN_SET(maxRank - 12, equalContribAll) > 0 
+           THEN 'last'
+
+           WHEN a.rank = maxRank - 13
+              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
+              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
+              AND FIND_IN_SET(maxRank - 5, equalContribAll) > 0   
+              AND FIND_IN_SET(maxRank - 6, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 7, equalContribAll) > 0 
+              AND FIND_IN_SET(maxRank - 8, equalContribAll) > 0 
+              AND FIND_IN_SET(maxRank - 9, equalContribAll) > 0               
+              AND FIND_IN_SET(maxRank - 10, equalContribAll) > 0    
+              AND FIND_IN_SET(maxRank - 11, equalContribAll) > 0             
+              AND FIND_IN_SET(maxRank - 12, equalContribAll) > 0 
+              AND FIND_IN_SET(maxRank - 13, equalContribAll) > 0                
+           THEN 'last'
+
+           WHEN a.rank = maxRank - 13
+              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
+              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
+              AND FIND_IN_SET(maxRank - 5, equalContribAll) > 0   
+              AND FIND_IN_SET(maxRank - 6, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 7, equalContribAll) > 0 
+              AND FIND_IN_SET(maxRank - 8, equalContribAll) > 0 
+              AND FIND_IN_SET(maxRank - 9, equalContribAll) > 0               
+              AND FIND_IN_SET(maxRank - 10, equalContribAll) > 0    
+              AND FIND_IN_SET(maxRank - 11, equalContribAll) > 0             
+              AND FIND_IN_SET(maxRank - 12, equalContribAll) > 0 
+              AND FIND_IN_SET(maxRank - 13, equalContribAll) > 0                
+           THEN 'last'
+
+           WHEN a.rank = maxRank - 14
+              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
+              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
+              AND FIND_IN_SET(maxRank - 5, equalContribAll) > 0   
+              AND FIND_IN_SET(maxRank - 6, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 7, equalContribAll) > 0 
+              AND FIND_IN_SET(maxRank - 8, equalContribAll) > 0 
+              AND FIND_IN_SET(maxRank - 9, equalContribAll) > 0               
+              AND FIND_IN_SET(maxRank - 10, equalContribAll) > 0    
+              AND FIND_IN_SET(maxRank - 11, equalContribAll) > 0             
+              AND FIND_IN_SET(maxRank - 12, equalContribAll) > 0 
+              AND FIND_IN_SET(maxRank - 13, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 14, equalContribAll) > 0                              
+           THEN 'last'
+
+           WHEN a.rank = maxRank - 15
+              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
+              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
+              AND FIND_IN_SET(maxRank - 5, equalContribAll) > 0   
+              AND FIND_IN_SET(maxRank - 6, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 7, equalContribAll) > 0 
+              AND FIND_IN_SET(maxRank - 8, equalContribAll) > 0 
+              AND FIND_IN_SET(maxRank - 9, equalContribAll) > 0               
+              AND FIND_IN_SET(maxRank - 10, equalContribAll) > 0    
+              AND FIND_IN_SET(maxRank - 11, equalContribAll) > 0             
+              AND FIND_IN_SET(maxRank - 12, equalContribAll) > 0 
+              AND FIND_IN_SET(maxRank - 13, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 14, equalContribAll) > 0  
+              AND FIND_IN_SET(maxRank - 15, equalContribAll) > 0                                            
+           THEN 'last'
+           
+           ELSE NULL
+       END AS PositionLabel
+FROM person_article_author a
+LEFT JOIN analysis_summary_author r ON r.pmid = a.pmid AND r.personIdentifier = a.personIdentifier
+JOIN (SELECT pmid, max(rank) AS maxRank
+      FROM person_article_author
+      GROUP BY pmid) m ON m.pmid = a.pmid
+JOIN (SELECT pmid, GROUP_CONCAT(DISTINCT rank ORDER BY rank ASC SEPARATOR ',') AS equalContribAll
+      FROM person_article_author
+      WHERE equalContrib = 'Y'
+      GROUP BY pmid) y ON y.pmid = a.pmid
+WHERE a.equalContrib = 'Y'
+  AND a.targetAuthor = 1
+  AND authorPosition IS NULL
+  ) x on x.pmid = y.pmid and x.personIdentifier = y.personIdentifier
+set y.authorPosition = x.PositionLabel
+where x.PositionLabel is not null and y.authorPosition is null;
+
+
+
+
+
+
+#### 2c.  Populate "analysis_summary_author_list" table with all authors and their ranks ####
 
 
 insert into analysis_summary_author_list (pmid, authorFirstName, authorLastName, rank, personIdentifier)
