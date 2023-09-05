@@ -198,13 +198,17 @@ f = open(outputPath + 'person_article2.csv','w', encoding='utf-8')
 
 #use count to record the number of person we have finished feature extraction
 count = 0
-#extract all required nested features 
+
+#extract all required nested features
 for i in range(len(items)):
-    article_temp = len(items[i]['reCiterArticleFeatures'])
+    try:
+        article_temp = len(items[i]['reCiterArticleFeatures'])
+    except KeyError:
+        print(f"Key 'reCiterArticleFeatures' not found for item {i}: {items[i]}")
+        article_temp = 0
     for j in range(article_temp):
         personIdentifier = items[i]['personIdentifier']
         pmid = items[i]['reCiterArticleFeatures'][j]['pmid']
-
         totalArticleScoreStandardized = items[i]['reCiterArticleFeatures'][j]['totalArticleScoreStandardized']
         totalArticleScoreNonStandardized = items[i]['reCiterArticleFeatures'][j]['totalArticleScoreNonStandardized']
         userAssertion = items[i]['reCiterArticleFeatures'][j]['userAssertion']
@@ -470,7 +474,11 @@ f = open(outputPath + 'person_article_grant2.csv','w', encoding='utf-8')
 
 count = 0
 for i in range(len(items)):
-    article_temp = len(items[i]['reCiterArticleFeatures'])
+    try:
+        article_temp = len(items[i]['reCiterArticleFeatures'])
+    except KeyError:
+        print(f"Key 'reCiterArticleFeatures' not found for item {i}: {items[i]}")
+        article_temp = 0
     for j in range(article_temp):
         if 'grantEvidence' in items[i]['reCiterArticleFeatures'][j]['evidence']:
             grants_temp = len(items[i]['reCiterArticleFeatures'][j]['evidence']['grantEvidence']['grants'])
@@ -495,7 +503,11 @@ f = open(outputPath + 'person_article_scopus_non_target_author_affiliation2.csv'
 
 count = 0
 for i in range(len(items)):
-    article_temp = len(items[i]['reCiterArticleFeatures'])
+    try:
+        article_temp = len(items[i]['reCiterArticleFeatures'])
+    except KeyError:
+        print(f"Key 'reCiterArticleFeatures' not found for item {i}: {items[i]}")
+        article_temp = 0
     for j in range(article_temp):
         if 'affiliationEvidence' in items[i]['reCiterArticleFeatures'][j]['evidence']:
             if 'scopusNonTargetAuthorAffiliation' in items[i]['reCiterArticleFeatures'][j]['evidence']['affiliationEvidence']:
@@ -522,7 +534,11 @@ f = open(outputPath + 'person_article_scopus_target_author_affiliation2.csv','w'
 
 count = 0
 for i in range(len(items)):
-    article_temp = len(items[i]['reCiterArticleFeatures'])
+    try:
+        article_temp = len(items[i]['reCiterArticleFeatures'])
+    except KeyError:
+        print(f"Key 'reCiterArticleFeatures' not found for item {i}: {items[i]}")
+        article_temp = 0
     for j in range(article_temp):
         if 'affiliationEvidence' in items[i]['reCiterArticleFeatures'][j]['evidence']:
             if 'scopusTargetAuthorAffiliation' in items[i]['reCiterArticleFeatures'][j]['evidence']['affiliationEvidence']:
@@ -558,7 +574,11 @@ f = open(outputPath + 'person_article_department2.csv','w', encoding='utf-8')
 
 count = 0
 for i in range(len(items)):
-    article_temp = len(items[i]['reCiterArticleFeatures'])
+    try:
+        article_temp = len(items[i]['reCiterArticleFeatures'])
+    except KeyError:
+        print(f"Key 'reCiterArticleFeatures' not found for item {i}: {items[i]}")
+        article_temp = 0
     for j in range(article_temp):
         if 'organizationalUnitEvidence' in items[i]['reCiterArticleFeatures'][j]['evidence']:
             organizationalUnit_temp = len(items[i]['reCiterArticleFeatures'][j]['evidence']['organizationalUnitEvidence'])
@@ -594,7 +614,11 @@ f = open(outputPath + 'person_article_relationship2.csv','w', encoding='utf-8')
 misspelling_list = []
 count = 0
 for i in range(len(items)):
-    article_temp = len(items[i]['reCiterArticleFeatures'])
+    try:
+        article_temp = len(items[i]['reCiterArticleFeatures'])
+    except KeyError:
+        print(f"Key 'reCiterArticleFeatures' not found for item {i}: {items[i]}")
+        article_temp = 0
     for j in range(article_temp):
         personIdentifier = items[i]['personIdentifier']
         pmid = items[i]['reCiterArticleFeatures'][j]['pmid']
@@ -674,7 +698,11 @@ f = open(outputPath + 'person_article_author2.csv','w', encoding='utf-8')
 no_reCiterArticleAuthorFeatures_list =[]
 count = 0
 for i in range(len(items)):
-    article_temp = len(items[i]['reCiterArticleFeatures'])
+    try:
+        article_temp = len(items[i]['reCiterArticleFeatures'])
+    except KeyError:
+        print(f"Key 'reCiterArticleFeatures' not found for item {i}: {items[i]}")
+        article_temp = 0
     for j in range(article_temp):
         personIdentifier = items[i]['personIdentifier']
         pmid = items[i]['reCiterArticleFeatures'][j]['pmid']
@@ -692,7 +720,11 @@ for i in range(len(items)):
                     orcid = items[i]['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'][k]['orcid']
                 else:
                     orcid = ""
-                f.write(str(personIdentifier) + "," + str(pmid) + "," + '"' + str(firstName) + '"' + "," + '"' + str(lastName) + '"' + "," + str(targetAuthor) + "," + str(rank) + "," + str(orcid) + "\n")
+                if 'equalContrib' in items[i]['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'][k]:
+                    equalContrib = items[i]['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'][k]['equalContrib']
+                else:
+                    equalContrib = ""                    
+                f.write(str(personIdentifier) + "," + str(pmid) + "," + '"' + str(firstName) + '"' + "," + '"' + str(lastName) + '"' + "," + str(targetAuthor) + "," + str(rank) + "," + str(orcid) + "," + str(equalContrib) + "\n")
         else:
             no_reCiterArticleAuthorFeatures_list.append((personIdentifier, pmid))
     count += 1
@@ -735,7 +767,11 @@ f = open(outputPath + 'person_article_keyword2.csv','w', encoding='utf-8')
 count = 0
 #extract all required nested features 
 for i in range(len(items)):
-    article_temp = len(items[i]['reCiterArticleFeatures'])
+    try:
+        article_temp = len(items[i]['reCiterArticleFeatures'])
+    except KeyError:
+        print(f"Key 'reCiterArticleFeatures' not found for item {i}: {items[i]}")
+        article_temp = 0
     for j in range(article_temp):
         personIdentifier = items[i]['personIdentifier']
         pmid = items[i]['reCiterArticleFeatures'][j]['pmid']
