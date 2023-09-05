@@ -557,7 +557,7 @@ for i in range(len(items)):
 print(len(count_authors_dict))
 
 f = open(outputPath + 'person_article_author1.csv','w', encoding='utf-8')
-f.write("personIdentifier," + "pmid," + "authorFirstName," + "authorLastName," + "targetAuthor," + "rank," + "orcid" + "\n")
+f.write("personIdentifier," + "pmid," + "authorFirstName," + "authorLastName," + "targetAuthor," + "rank," + "orcid" + "equalContrib" + "\n")
 
 count = 0
 for i in range(len(items)):
@@ -580,13 +580,18 @@ for i in range(len(items)):
                     orcid = items[i]['reCiterFeature']['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'][k]['orcid']
                 else:
                     orcid = ""
-                f.write(str(personIdentifier) + "," + str(pmid) + "," + '"' + str(firstName) + '"' + "," + '"' + str(lastName) + '"' + "," + str(targetAuthor) + "," + str(rank) + "," + str(orcid) + "\n")
+                if 'equalContrib' in items[i]['reCiterFeature']['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'][k]:
+                    equalContrib = items[i]['reCiterFeature']['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'][k]['equalContrib']
+                else:
+                    equalContrib = ""                    
+                f.write(str(personIdentifier) + "," + str(pmid) + "," + '"' + str(firstName) + '"' + "," + '"' + str(lastName) + '"' + "," + str(targetAuthor) + "," + str(rank) + "," + str(orcid) + "," + str(equalContrib) + "\n")
             except IndexError:
                 firstName = ""
                 lastName = ""
                 targetAuthor = ""
                 rank = 0
                 orcid = ""
+                equalContrib = ""
     count += 1
     print("here:", count)
 f.close()
