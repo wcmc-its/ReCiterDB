@@ -189,7 +189,7 @@ def load_person_article2(mysql_cursor):
 def load_person_article_author1(mysql_cursor):
     cwd = os.getcwd()
     load_person_article_author1_query = (
-        "LOAD DATA LOCAL INFILE '" + cwd + "/temp/parsedOutput/person_article_author1.csv' INTO TABLE person_article_author FIELDS TERMINATED BY ',' ENCLOSED BY '\"' IGNORE 1 LINES (personIdentifier,pmid,authorFirstName,authorLastName,targetAuthor,rank,orcid);"
+        "LOAD DATA LOCAL INFILE '" + cwd + "/temp/parsedOutput/person_article_author1.csv' INTO TABLE person_article_author FIELDS TERMINATED BY ',' ENCLOSED BY '\"' IGNORE 1 LINES (personIdentifier,pmid,authorFirstName,authorLastName,targetAuthor,rank,orcid,equalContrib);"
     )
     mysql_cursor.execute(load_person_article_author1_query)
     print(time.ctime() + "--" + "person_article_author1.csv file loaded")
@@ -199,7 +199,7 @@ def load_person_article_author1(mysql_cursor):
 def load_person_article_author2(mysql_cursor):
     cwd = os.getcwd()
     load_person_article_author2_query = (
-        "LOAD DATA LOCAL INFILE '" + cwd + "/temp/parsedOutput/person_article_author2.csv' INTO TABLE person_article_author FIELDS TERMINATED BY ',' ENCLOSED BY '\"' IGNORE 0 LINES (personIdentifier,pmid,authorFirstName,authorLastName,targetAuthor,rank,orcid);"
+        "LOAD DATA LOCAL INFILE '" + cwd + "/temp/parsedOutput/person_article_author2.csv' INTO TABLE person_article_author FIELDS TERMINATED BY ',' ENCLOSED BY '\"' IGNORE 0 LINES (personIdentifier,pmid,authorFirstName,authorLastName,targetAuthor,rank,orcid,equalContrib);"
     )
     mysql_cursor.execute(load_person_article_author2_query)
     print(time.ctime() + "--" + "person_article_author2.csv file loaded")
