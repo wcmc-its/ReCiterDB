@@ -1947,16 +1947,36 @@ set a.authorPosition = o.position;
 #### 2b. Update analysis_summary_author with cases where authors are marked as equalContrib relative to first/last authors
 ## To receive credit for authorPosition = first or last, authors need to be contiguous with other authors who
 ## also have the equalContrib designation.
+##
+## For some reason, this doesn't work without ta temporary table.
 
 
-update analysis_summary_author y
-join (
-SELECT a.personIdentifier,
-       a.pmid,
---     a.rank,
---     maxRank,
---     a.targetAuthor,
---     equalContribAll,
+
+CREATE TABLE if not exists `analysis_temp_equalcontrib` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `personIdentifier` varchar(30) DEFAULT NULL,
+  `pmid` int(11) DEFAULT NULL,
+  `rank` int(11) DEFAULT NULL,
+  `maxRank` int(11) DEFAULT NULL,  
+  `targetAuthor` int(11) DEFAULT NULL,    
+  `equalContribAll` varchar(500) DEFAULT NULL,      
+  `authorPositionEqualContrib` varchar(20) DEFAULT NULL,        
+  PRIMARY KEY (`id`),
+  KEY `personIdentifier` (`personIdentifier`) USING BTREE,
+  KEY `pmid` (`pmid`) USING BTREE  
+) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4
+  COLLATE utf8mb4_unicode_ci;
+
+
+
+INSERT INTO analysis_temp_equalcontrib (personIdentifier, pmid, rank, maxRank, targetAuthor, equalContribAll, authorPositionEqualContrib)
+
+SELECT a.personIdentifier as personIdentifier,
+     a.pmid as pmid,
+     a.rank,
+     maxRank,
+     a.targetAuthor,
+     equalContribAll,
        CASE
            -- Contiguous to 1
            WHEN a.rank = 2 
@@ -2316,10 +2336,10 @@ SELECT a.personIdentifier,
               AND FIND_IN_SET(maxRank - 14, equalContribAll) > 0  
               AND FIND_IN_SET(maxRank - 15, equalContribAll) > 0                                            
            THEN 'last'
-           
            ELSE NULL
-       END AS PositionLabel
+       END AS authorPositionEqualContrib
 FROM person_article_author a
+join person_article p on p.pmid = a.pmid and p.personIdentifier = a.personIdentifier
 LEFT JOIN analysis_summary_author r ON r.pmid = a.pmid AND r.personIdentifier = a.personIdentifier
 JOIN (SELECT pmid, max(rank) AS maxRank
       FROM person_article_author
@@ -2330,10 +2350,14 @@ JOIN (SELECT pmid, GROUP_CONCAT(DISTINCT rank ORDER BY rank ASC SEPARATOR ',') A
       GROUP BY pmid) y ON y.pmid = a.pmid
 WHERE a.equalContrib = 'Y'
   AND a.targetAuthor = 1
-  AND authorPosition IS NULL
-  ) x on x.pmid = y.pmid and x.personIdentifier = y.personIdentifier
-set y.authorPosition = x.PositionLabel
-where x.PositionLabel is not null and y.authorPosition is null;
+  and p.userAssertion = 'ACCEPTED';
+  
+  
+update analysis_summary_author y
+join analysis_temp_equalcontrib x on x.pmid = y.pmid and x.personIdentifier = y.personIdentifier
+set y.authorPosition = x.authorPositionEqualContrib
+where x.authorPositionEqualContrib is not null and y.authorPosition is null;
+
 
 
 
