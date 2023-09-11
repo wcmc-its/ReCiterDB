@@ -692,46 +692,64 @@ f.close()
 print(misspelling_list)
 
 
+
 #code for person_article_author_s3 table
 f = open(outputPath + 'person_article_author2.csv','w', encoding='utf-8')
-#some article is group authorship, so there is no record for authors in the file, here we use a list to record this
+
+#some article is group authorship, so there is no record for authors in the file, here we use a list to record this 
 no_reCiterArticleAuthorFeatures_list =[]
 count = 0
-for i in range(len(items)):
-    try:
-        article_temp = len(items[i]['reCiterArticleFeatures'])
-    except KeyError:
-        print(f"Key 'reCiterArticleFeatures' not found for item {i}: {items[i]}")
-        article_temp = 0
-    for j in range(article_temp):
-        personIdentifier = items[i]['personIdentifier']
-        pmid = items[i]['reCiterArticleFeatures'][j]['pmid']
-        if 'reCiterArticleAuthorFeatures' in items[i]['reCiterArticleFeatures'][j]:
-            author_temp = len(items[i]['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'])
-            for k in range(author_temp):
-                if 'firstName' in items[i]['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'][k]:
-                    firstName = items[i]['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'][k]['firstName']
-                else:
-                    firstName = ""
-                lastName = items[i]['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'][k]['lastName']                
-                targetAuthor = int(items[i]['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'][k]['targetAuthor'])                
-                rank = items[i]['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'][k]['rank']
-                if 'orcid' in items[i]['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'][k]:
-                    orcid = items[i]['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'][k]['orcid']
-                else:
-                    orcid = ""
-                if 'equalContrib' in items[i]['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'][k]:
-                    equalContrib = items[i]['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'][k]['equalContrib']
-                else:
-                    equalContrib = ""                    
-                f.write(str(personIdentifier) + "," + str(pmid) + "," + '"' + str(firstName) + '"' + "," + '"' + str(lastName) + '"' + "," + str(targetAuthor) + "," + str(rank) + "," + str(orcid) + "," + str(equalContrib) + "\n")
-        else:
-            no_reCiterArticleAuthorFeatures_list.append((personIdentifier, pmid))
-    count += 1
-    print("count person_article_author:", count)
-f.close()
-print(no_reCiterArticleAuthorFeatures_list) 
 
+for i in range(len(items)):
+  try:
+    article_temp = len(items[i]['reCiterArticleFeatures']) 
+  except KeyError as e:
+    print(f"Error getting article features: {e}")
+    continue
+  
+  for j in range(article_temp):
+    try:
+      personIdentifier = items[i]['personIdentifier']
+      pmid = items[i]['reCiterArticleFeatures'][j]['pmid']
+      
+      if 'reCiterArticleAuthorFeatures' in items[i]['reCiterArticleFeatures'][j]:
+        # process authors
+        author_temp = len(items[i]['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'])
+        
+        for k in range(author_temp):
+          if 'firstName' in items[i]['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'][k]:
+            firstName = items[i]['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'][k]['firstName']  
+          else:
+            firstName = ""
+            
+          lastName = items[i]['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'][k]['lastName']                
+          targetAuthor = int(items[i]['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'][k]['targetAuthor'])                
+          rank = items[i]['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'][k]['rank']
+          
+          if 'orcid' in items[i]['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'][k]:
+            orcid = items[i]['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'][k]['orcid']
+          else:
+            orcid = ""
+            
+          if 'equalContrib' in items[i]['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'][k]:
+            equalContrib = items[i]['reCiterArticleFeatures'][j]['reCiterArticleAuthorFeatures'][k]['equalContrib']
+          else:
+            equalContrib = ""
+            
+          f.write(str(personIdentifier) + "," + str(pmid) + "," + '"' + str(firstName) + '"' + "," + '"' + str(lastName) + '"' + "," + str(targetAuthor) + "," + str(rank) + "," + str(orcid) + "," + str(equalContrib) + "\n")
+      
+      else:
+        no_reCiterArticleAuthorFeatures_list.append((personIdentifier, pmid))
+        
+      count += 1  
+      print(f"Processed person {count}")
+    
+    except Exception as e:    
+      print(f"Error processing person {i}, PMID {pmid}: {e}")
+      continue
+      
+print("Finished processing authors")  
+f.close()
 
 
 #code for person table
