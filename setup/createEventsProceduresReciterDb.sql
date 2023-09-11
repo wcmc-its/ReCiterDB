@@ -1881,7 +1881,7 @@ BEGIN
 ## The below is a hedge just to make sure this procedure doesn't start 
 ## unless the person_article table is populated with at least some articles.
 
-IF ((select count(*) from person_article) > 10000) THEN
+IF ((select count(*) from person_article) > 5) THEN
 
 
 #### 1. Start from scratch ####
