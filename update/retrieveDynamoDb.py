@@ -557,7 +557,7 @@ for i in range(len(items)):
 print(len(count_authors_dict))
 
 f = open(outputPath + 'person_article_author1.csv','w', encoding='utf-8')
-f.write("personIdentifier," + "pmid," + "authorFirstName," + "authorLastName," + "targetAuthor," + "rank," + "orcid" + "equalContrib" + "\n")
+f.write("personIdentifier," + "pmid," + "authorFirstName," + "authorLastName," + "targetAuthor," + "rank," + "orcid," + "equalContrib" + "\n")
 
 count = 0
 for i in range(len(items)):
