@@ -2435,12 +2435,12 @@ where a.journalImpactScore1 is null and a.issn is not null;
 
 update analysis_summary_article a 
 join journal_impact_alternative i on i.issn = a.issn
-set journalImpactScore2 = i.impactScore1
+set journalImpactScore1 = i.impactScore1
 where a.journalImpactScore2 is null and a.issn is not null;
 
 update analysis_summary_article a 
 join journal_impact_alternative i on i.eissn = a.issn
-set journalImpactScore2 = i.impactScore2
+set journalImpactScore1 = i.impactScore2
 where a.journalImpactScore2 is null and a.issn is not null;
 
 
