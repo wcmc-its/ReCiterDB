@@ -15,6 +15,9 @@ COPY update/retrieveDynamoDb.py ./
 COPY update/retrieveS3.py ./
 COPY update/retrieveAltmetric.py ./
 COPY update/updateReciterDB.py ./
+COPY update/abstractImport.py ./
+COPY update/conflictsImport.py ./
+COPY update/executeFeatureGenerator.py ./
 
 
 ## Make directories
