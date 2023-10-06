@@ -64,7 +64,7 @@ def get_person_identifier(mysql_cursor):
 def make_curl_request(person_identifier):
     """Make curl request for each personIdentifier"""
     retrieval_flag = "ONLY_NEWLY_ADDED_PUBLICATIONS" if datetime.now().day != 1 else "ALL_PUBLICATIONS"
-    curl_url = f"{URL}={person_identifier}&useGoldStandard=AS_EVIDENCE&fields=reCiterArticleFeatures.pmid,personIdentifier,reCiterArticleFeatures.publicationDateStandardized&analysisRefreshFlag=true&retrievalRefreshFlag={retrieval_flag}"
+    curl_url = f"{URL}?uid={person_identifier}&useGoldStandard=AS_EVIDENCE&fields=reCiterArticleFeatures.pmid,personIdentifier,reCiterArticleFeatures.publicationDateStandardized&analysisRefreshFlag=true&retrievalRefreshFlag={retrieval_flag}"
     headers = {"accept": "application/json", "api-key": API_KEY}
     try:
         response = requests.get(curl_url, headers=headers)
