@@ -1,4 +1,3 @@
-import mysql.connector
 import boto3
 import csv
 import logging
@@ -20,14 +19,6 @@ DB_PASSWORD = os.getenv('DB_PASSWORD')
 DB_HOST = os.getenv('DB_HOST')
 DB_NAME = os.getenv('DB_NAME')
 
-# Connect to MySQL
-mysql_conn = mysql.connector.connect(
-  host=DB_HOST,
-  user=DB_USERNAME,
-  password=DB_PASSWORD,
-  database=DB_NAME
-)
-
 def connect_mysql_server(DB_USERNAME, DB_PASSWORD, DB_HOST, DB_NAME):
     """Function to connect to MySQL database"""
     try:
@@ -36,26 +27,30 @@ def connect_mysql_server(DB_USERNAME, DB_PASSWORD, DB_HOST, DB_NAME):
                                    database=DB_NAME,
                                    host=DB_HOST,
                                    autocommit=True,
-                                   local_infile=True)
+                                   local_infile=True,
+                                   cursorclass=pymysql.cursors.DictCursor)  # Use DictCursor to fetch results as dictionaries
         logging.info(f"Connected to database server: {DB_HOST}, database: {DB_NAME}, with user: {DB_USERNAME}")
         return mysql_db
     except pymysql.err.MySQLError as err:
         logging.error(f"{time.ctime()} -- Error connecting to the database: {err}")
 
+# Connect to MySQL
+mysql_conn = connect_mysql_server(DB_USERNAME, DB_PASSWORD, DB_HOST, DB_NAME)
 
 # Query for PMIDs
-mysql_cursor = mysql_conn.cursor()
-mysql_cursor.execute('''
+with mysql_conn.cursor() as mysql_cursor:
+    mysql_cursor.execute('''
         SELECT distinct p.pmid AS pmid
         FROM analysis_summary_article p
         LEFT JOIN reporting_conflicts a ON a.pmid = p.pmid
         WHERE a.pmid is null
         and articleYear >= 2017
-  LIMIT 90
-''')
+        LIMIT 90
+    ''')
+    results = mysql_cursor.fetchall()
+    pmids = [result['pmid'] for result in results]  # Use dictionary key to access pmid
 
-results = mysql_cursor.fetchall()
-pmids = [pmid[0] for pmid in results]
+
 
 # Connect to DynamoDB
 dynamodb = boto3.resource('dynamodb')
@@ -122,7 +117,7 @@ while True:
         logging.info('No more results, breaking out of loop')  # Log the end condition
         break
 
-    pmids = [pmid[0] for pmid in results]
+    pmids = [result['pmid'] for result in results]
 
     logging.info(f'Fetching data for {len(pmids)} PMIDs from DynamoDB')  # Log the number of PMIDs
 
@@ -155,19 +150,14 @@ def load_conflicts(mysql_cursor):
     print(time.ctime() + " reporting_conflicts table updated with varchar equivalent")  
 
 
-
-
-
 if __name__ == '__main__':
 
     # Create a MySQL connection to the Reciter database
     reciter_db = connect_mysql_server(DB_USERNAME, DB_PASSWORD, DB_HOST, DB_NAME)
-    reciter_db_cursor = reciter_db.cursor()
-
-    load_conflicts(reciter_db_cursor)
+    with reciter_db.cursor() as reciter_db_cursor:
+        load_conflicts(reciter_db_cursor)
 
     # Close DB connection
     reciter_db.close()
-    reciter_db_cursor.close()
 
 logging.info('Finished processing')  # Log the end of processing
