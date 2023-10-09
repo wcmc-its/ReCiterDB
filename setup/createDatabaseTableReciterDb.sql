@@ -2,7 +2,6 @@
 CREATE DATABASE IF NOT EXISTS `reciterdb` DEFAULT CHARACTER SET utf8mb4 DEFAULT COLLATE utf8mb4_unicode_ci;
 USE `reciterdb`;
 
-
 CREATE TABLE `admin_departments` (
   `departmentID` int(11) NOT NULL AUTO_INCREMENT,
   `institutionalDepartmentCode` varchar(128) DEFAULT NULL,
@@ -755,3 +754,67 @@ CREATE TABLE `person_person_type` (
   KEY `idx_personType` (`personType`) USING BTREE
 ) ENGINE=InnoDB AUTO_INCREMENT=131071 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE `reporting_abstracts` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `pmid` int(11) DEFAULT NULL,
+  `abstract` blob DEFAULT NULL,
+  `abstractVarchar` varchar(15000) DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_pmid` (`pmid`) USING BTREE
+) ENGINE=InnoDB AUTO_INCREMENT=262143 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE `reporting_ad_hoc_feature_generator_execution` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `personIdentifier` varchar(128) DEFAULT NULL,
+  `frequency` varchar(128) DEFAULT NULL,
+  `type` varchar(128) DEFAULT NULL,
+  `createdAt` timestamp NOT NULL DEFAULT current_timestamp(),
+  `updatedAt` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
+  PRIMARY KEY (`id`),
+  KEY `idx_personIdentifier` (`personIdentifier`) USING BTREE
+) ENGINE=InnoDB AUTO_INCREMENT=1971 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE `reporting_ad_hoc_identity_creation` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `personIdentifier` varchar(128) DEFAULT NULL,
+  `inPersonTable` varchar(128) DEFAULT NULL,
+  `type` varchar(128) DEFAULT NULL,
+  `firstName` varchar(128) DEFAULT NULL,
+  `middleName` varchar(128) DEFAULT NULL,
+  `lastName` varchar(128) DEFAULT NULL,
+  `title` varchar(128) DEFAULT NULL,
+  `primaryEmail` varchar(128) DEFAULT NULL,
+  `email1` varchar(128) DEFAULT NULL,
+  `email2` varchar(128) DEFAULT NULL,
+  `degreeYearTerminal` varchar(128) DEFAULT NULL,
+  `orgUnitLabel1` varchar(128) DEFAULT NULL,
+  `orgUnitType1` varchar(128) DEFAULT NULL,
+  `orgUnitLabel2` varchar(128) DEFAULT NULL,
+  `orgUnitType2` varchar(128) DEFAULT NULL,
+  `primaryOrganizationalUnit` varchar(128) DEFAULT NULL,
+  `primaryInstitution` varchar(128) DEFAULT NULL,
+  `institution1` varchar(128) DEFAULT NULL,
+  `institution2` varchar(128) DEFAULT NULL,
+  `institution3` varchar(128) DEFAULT NULL,
+  `institution4` varchar(128) DEFAULT NULL,
+  `institution5` varchar(128) DEFAULT NULL,
+  `relationshipFirstName1` varchar(128) DEFAULT NULL,
+  `relationshipLastName1` varchar(128) DEFAULT NULL,
+  `relationshipPersonID1` varchar(128) DEFAULT NULL,
+  `relationshipType1` varchar(128) DEFAULT NULL,
+  `relationshipFirstName2` varchar(128) DEFAULT NULL,
+  `relationshipLastName2` varchar(128) DEFAULT NULL,
+  `relationshipPersonID2` varchar(128) DEFAULT NULL,
+  `relationshipType2` varchar(128) DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_personIdentifier` (`personIdentifier`) USING BTREE
+) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE `reporting_conflicts` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `pmid` int(11) DEFAULT NULL,
+  `conflictStatement` blob DEFAULT NULL,
+  `conflictsVarchar` varchar(15000) DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_pmid` (`pmid`) USING BTREE
+) ENGINE=InnoDB AUTO_INCREMENT=65538 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
