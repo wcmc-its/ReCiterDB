@@ -58,7 +58,6 @@ def get_person_article_pmid(mysql_cursor):
         SELECT distinct
             CAST(pmid as char) as pmid
         FROM """ + DB_NAME + """.person_article
-        WHERE userAssertion = 'ACCEPTED'
         """
     )
 
