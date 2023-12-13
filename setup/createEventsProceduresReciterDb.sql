@@ -3267,7 +3267,7 @@ DELIMITER ;
 
 DELIMITER ////
 
-CREATE DEFINER=`admin`@`%` PROCEDURE `generateEmailNotifications`(
+CREATE DEFINER=`admin`@`%` PROCEDURE `reciterdb`.`generateEmailNotifications`(
 	IN personIdentifierArray mediumblob,
     IN recipientEmail mediumblob)
 BEGIN
@@ -3307,6 +3307,7 @@ BEGIN
     DECLARE l_admin_user varchar(250);
     DECLARE l_person_identifier_position INT;
     DECLARE l_notification_count INT;
+     DECLARE l_max_message_ID INT;
     
    
    DECLARE notification_pref_cursor CURSOR FOR SELECT DISTINCT PersonIdentifier,frequency,userID,minimumThreshold,accepted,suggested  FROM admin_notification_preferences WHERE status=1;
@@ -3322,7 +3323,7 @@ BEGIN
 		DROP TEMPORARY TABLE IF EXISTS email_notifications_temp;
 		
 		CREATE TEMPORARY TABLE email_notifications_temp(sender varchar(250),recipient varchar(250),subject text, salutation text, accepted_subject_headline text, accepted_publications longtext,accepted_pub_count INT,suggested_subject_headline text,suggested_publications longtext,suggested_pub_count INT,
-			signature text,max_accepted_publication_to_display INT,max_suggested_publication_to_display INT,personIdentifier varchar(250),accepted_publication_det longtext,suggested_publication_det longtext,admin_user_id varchar(250),notif_error_message varchar(250),pub_error_message varchar(250));
+			signature text,max_accepted_publication_to_display INT,max_suggested_publication_to_display INT,personIdentifier varchar(250),accepted_publication_det longtext,suggested_publication_det longtext,admin_user_id varchar(250),notif_error_message varchar(250),pub_error_message varchar(250),max_message_id INT);
 		truncate email_notifications_temp;
 	
 		SET SESSION group_concat_max_len = (4294967295);
@@ -3453,7 +3454,7 @@ BEGIN
 					and feedback = 'ACCEPTED'
 					and afl_personIdentifier != u_personIdentifier
 					and x.pmid is not null
-					and afl_createTimestamp > DATE_SUB(CURRENT_DATE() , INTERVAL 400 DAY)
+					and afl_createTimestamp > DATE_SUB(CURRENT_DATE() , INTERVAL frequency DAY)
 					group by x.pmid
 					order by afl_createTimestamp desc)x;
 		 	-- select concat('l_accepted_publications_count',l_accepted_publications_count);
@@ -3485,7 +3486,7 @@ BEGIN
 	   
 	   	 SELECT count(distinct pmid)  INTO l_pending_publications_count  
   			FROM person_article pa WHERE pa.userAssertion !='ACCEPTED' AND pa.userAssertion !='REJECTED'
-  											AND pa.datePublicationAddedToEntrez > DATE_SUB(CURRENT_DATE() , INTERVAL 400 DAY)
+  											AND pa.datePublicationAddedToEntrez > DATE_SUB(CURRENT_DATE() , INTERVAL frequency DAY)
   											AND pa.pmid not in(select afl.articleIdentifier  from admin_feedback_log afl 
   											WHERE afl.personIdentifier =l_person_Identifier )
   											AND pa.pmid NOT IN (SELECT anl.pmid  FROM admin_notification_log anl) 
@@ -3544,7 +3545,7 @@ BEGIN
 							and feedback = 'ACCEPTED'
 							and afl_personIdentifier != u_personIdentifier
 							and x.pmid is not null
-							and afl_createTimestamp > DATE_SUB(CURRENT_DATE() , INTERVAL 400 DAY)
+							and afl_createTimestamp > DATE_SUB(CURRENT_DATE() , INTERVAL frequency DAY)
 							group by x.pmid
 							order by afl_createTimestamp desc)x1;
 			-- select concat('l_accepted_pmids *************',l_accepted_pmids);			
@@ -3593,7 +3594,7 @@ BEGIN
 							   AND afl.personIdentifier = pa.personIdentifier
 							   AND afl.articleIdentifier = pa.pmid 
 							  AND afl.personIdentifier = l_person_Identifier
-							  AND afl.createTimestamp  > DATE_SUB(CURRENT_DATE() , INTERVAL 400 DAY)
+							  AND afl.createTimestamp  > DATE_SUB(CURRENT_DATE() , INTERVAL frequency DAY)
 							  ORDER BY afl.createTimestamp  DESC;	
 			
 							SELECT COALESCE(GROUP_CONCAT(q.authorLastName,
@@ -3648,7 +3649,7 @@ BEGIN
 		 SELECT COALESCE(group_concat(distinct pa.pmid),'') pmid  INTO l_pending_pmids
 		   						   FROM person_article pa
 		   						   WHERE pa.userAssertion !='ACCEPTED' AND pa.userAssertion !='REJECTED'
-  								   AND pa.datePublicationAddedToEntrez > DATE_SUB(CURRENT_DATE() , INTERVAL 400 DAY)
+  								   AND pa.datePublicationAddedToEntrez > DATE_SUB(CURRENT_DATE() , INTERVAL frequency DAY)
   								   AND pa.pmid not in(SELECT afl.articleIdentifier  
   								   					  FROM admin_feedback_log afl 
   								   					  WHERE afl.personIdentifier  = l_person_Identifier)
@@ -3681,7 +3682,7 @@ BEGIN
 							   WHERE FIND_IN_SET(pa.pmid, l_pending_pmids) 
 							   AND pa.totalArticleScoreStandardized >= l_minimum_threshold
 							   AND pa.personIdentifier = l_person_Identifier
-							   AND pa.datePublicationAddedToEntrez > DATE_SUB(CURRENT_DATE() , INTERVAL 400 DAY);	
+							   AND pa.datePublicationAddedToEntrez > DATE_SUB(CURRENT_DATE() , INTERVAL frequency DAY);	
 		  		
 							SELECT COALESCE(GROUP_CONCAT(DISTINCT firstAuthor,
 									CASE WHEN maxRank = 1 THEN '. '
@@ -3730,6 +3731,9 @@ BEGIN
 			    -- Admin Email
 			  SELECT  email, au.nameFirst,au.userID  INTO l_admin_email,l_name_first,l_admin_user 
 			  FROM admin_users au WHERE au.personIdentifier = l_person_Identifier; 
+			 
+			 SELECT COALESCE(MAX(messageID), 0) INTO l_max_message_ID  
+			 FROM admin_notification_log anl;
 			
 			 INSERT INTO email_notifications_temp(sender,
 			 									  recipient,
@@ -3747,7 +3751,8 @@ BEGIN
 			 									  personIdentifier,
 			 									  accepted_publication_det,
 			 									  suggested_publication_det,
-			 									  admin_user_id)
+			 									  admin_user_id,
+			 									  max_message_id)
 			 							VALUES(l_email_sender,
 			 									l_email_recipient,  -- COALESCE(l_email_receiver,l_admin_email)),
 			 									l_final_email_subject,
@@ -3764,7 +3769,8 @@ BEGIN
 			 								    l_person_Identifier,
 			 								    l_accepted_pmids_det,
     										    l_suggested_pmids_det,
-    										    l_admin_user);
+    										    l_admin_user,
+    										   l_max_message_ID);
     										   
     	ELSE  -- INSERT NO ELIGIGBLE PUBLICATIONS FOUND MESSAGE
     		
@@ -3784,14 +3790,10 @@ BEGIN
 		CLOSE notification_pref_cursor;
 		SELECT * FROM email_notifications_temp;
 	
-END;
+END
 //
 DELIMITER ;
 
-
-
-
-  
 
 CREATE DEFINER=`admin`@`%` EVENT `runPopulateAnalysisSummaryPersonScopeTable` ON SCHEDULE EVERY 1 DAY STARTS '2022-01-01 01:00:00' ON COMPLETION PRESERVE ENABLE DO call `populateAnalysisSummaryPersonScopeTable`();
 
