@@ -1,3 +1,4 @@
+
 FROM python:3.11-slim
 
 WORKDIR /usr/src/app
@@ -19,6 +20,11 @@ COPY update/abstractImport.py ./
 COPY update/conflictsImport.py ./
 COPY update/executeFeatureGenerator.py ./
 
+COPY update/feedbackScoreArticlesUpdateDatabase.py ./
+COPY update/feedbackScoringModel.keras ./
+COPY update/scaler.save ./
+COPY update/scoring.py ./
+
 
 ## Make directories
 
@@ -32,4 +38,4 @@ RUN mkdir -p temp/s3Output
 
 # CMD [ "/bin/bash", "-c", "python3 ./retrieveDynamoDb.py && python3 ./retrieveS3.py && python3 ./updateReciterDB.py && python3 ./retrieveNIH.py"  ]
 
-CMD [ "/bin/bash", "-c", "python3 executeFeatureGenerator.py && python3 ./retrieveS3.py && python3 ./retrieveDynamoDb.py && python3 ./updateReciterDB.py && python3 ./retrieveNIH.py && python3 ./conflictsImport.py && python3 ./abstractImport.py"  ]
+CMD [ "/bin/bash", "-c", "python3 executeFeatureGenerator.py && python3 ./retrieveS3.py && python3 ./retrieveDynamoDb.py && python3 ./updateReciterDB.py && python3 ./retrieveNIH.py && python3 ./scoring.py && python3 ./conflictsImport.py && python3 ./abstractImport.py"  ]
