@@ -1,4 +1,4 @@
-import mysql.connector
+import pymysql
 import subprocess
 import os
 from datetime import datetime
@@ -15,14 +15,15 @@ def run_sql_procedure(cursor, procedure_name):
         cursor.callproc(procedure_name)
         end_time = datetime.now()
         print(f"Procedure {procedure_name} executed successfully. Time taken: {end_time - start_time}")
-    except mysql.connector.Error as err:
+    except pymysql.Error as err:
         print(f"Error occurred: {err}")
 
 def main():
+    connection = None
     try:
         start_time = datetime.now()
         # Establishing connection to the MySQL database
-        connection = mysql.connector.connect(
+        connection = pymysql.connect(
             user=DB_USERNAME,
             password=DB_PASSWORD,
             host=DB_HOST,
@@ -43,10 +44,10 @@ def main():
         # Executing the final SQL procedure
         run_sql_procedure(cursor, 'scoringOverall')
 
-    except mysql.connector.Error as err:
+    except pymysql.Error as err:
         print(f"Database connection failed: {err}")
     finally:
-        if connection.is_connected():
+        if connection and connection.open:
             cursor.close()
             connection.close()
             print(f"MySQL connection is closed. Total time taken: {datetime.now() - start_time}")
