@@ -2,7 +2,7 @@
 PyMySQL
 boto3
 requests
-pandas
+pandas==2.0.3
 keras
 scikit-learn
 sqlalchemy
