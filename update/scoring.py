@@ -38,7 +38,7 @@ def main():
         cursor = connection.cursor()
         print(f"Connected to database. Time taken: {datetime.now() - start_time}")
         # Executing SQL procedures
-#       run_sql_procedure(cursor, 'scoringIdentity')
+        run_sql_procedure(cursor, 'scoringIdentity')
         run_sql_procedure(cursor, 'scoringFeedback')
         # Running the external Python script
         script_start_time = datetime.now()
