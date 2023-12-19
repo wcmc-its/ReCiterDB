@@ -26,15 +26,16 @@ COPY update/feedbackScoringModel.keras ./
 COPY update/scaler.save ./
 COPY update/scoring.py ./
 
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libpq-dev && rm -rf /var/lib/apt/lists/*
 
 ## Make directories
 
 RUN pip install --no-cache-dir -r requirements.txt
-RUN pip3 install pandas
-RUN pip3 install keras
-RUN pip3 install sklearn
-RUN pip3 install sqlalchemy
-RUN pip3 install joblib
+## RUN pip3 install pandas
+## RUN pip3 install keras
+## RUN pip3 install sklearn
+## RUN pip3 install sqlalchemy
+## RUN pip3 install joblib
 RUN mkdir -p temp
 RUN mkdir -p temp/parsedOutput
 RUN mkdir -p temp/s3Output
