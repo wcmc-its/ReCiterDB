@@ -3307,8 +3307,8 @@ BEGIN
     DECLARE l_admin_user varchar(250);
     DECLARE l_person_identifier_position INT;
     DECLARE l_notification_count INT;
-     DECLARE l_max_message_ID INT;
-    
+    DECLARE l_max_message_ID INT;
+    DECLARE l_notification_pref_cursor_with_cwid_cnt INT;
    
    DECLARE notification_pref_cursor CURSOR FOR SELECT DISTINCT PersonIdentifier,frequency,userID,minimumThreshold,accepted,suggested  FROM admin_notification_preferences WHERE status=1;
    DECLARE notification_pref_cursor_with_cwid CURSOR FOR SELECT DISTINCT PersonIdentifier,frequency,userID,minimumThreshold,accepted,suggested  FROM admin_notification_preferences WHERE status=1
@@ -3412,6 +3412,8 @@ BEGIN
 		
 	   OPEN notification_pref_cursor;
 	    OPEN notification_pref_cursor_with_cwid;
+	    -- select FOUND_ROWS() into l_notification_pref_cursor_with_cwid_cnt ;
+	   -- SELECT concat('notification_pref_cursor_with_cwid_cnt ',l_notification_pref_cursor_with_cwid_cnt );
 	   BEGIN
 		   	  DECLARE no_more_rows boolean default FALSE;
 			  DECLARE CONTINUE HANDLER FOR NOT FOUND SET no_more_rows = TRUE;	
@@ -3454,7 +3456,7 @@ BEGIN
 					and feedback = 'ACCEPTED'
 					and afl_personIdentifier != u_personIdentifier
 					and x.pmid is not null
-					and afl_createTimestamp > DATE_SUB(CURRENT_DATE() , INTERVAL frequency DAY)
+					and afl_createTimestamp > DATE_SUB(CURRENT_DATE() , INTERVAL l_frequency DAY)
 					group by x.pmid
 					order by afl_createTimestamp desc)x;
 		 	-- select concat('l_accepted_publications_count',l_accepted_publications_count);
@@ -3486,7 +3488,7 @@ BEGIN
 	   
 	   	 SELECT count(distinct pmid)  INTO l_pending_publications_count  
   			FROM person_article pa WHERE pa.userAssertion !='ACCEPTED' AND pa.userAssertion !='REJECTED'
-  											AND pa.datePublicationAddedToEntrez > DATE_SUB(CURRENT_DATE() , INTERVAL frequency DAY)
+  											AND pa.datePublicationAddedToEntrez > DATE_SUB(CURRENT_DATE() , INTERVAL l_frequency DAY)
   											AND pa.pmid not in(select afl.articleIdentifier  from admin_feedback_log afl 
   											WHERE afl.personIdentifier =l_person_Identifier )
   											AND pa.pmid NOT IN (SELECT anl.pmid  FROM admin_notification_log anl) 
@@ -3545,7 +3547,7 @@ BEGIN
 							and feedback = 'ACCEPTED'
 							and afl_personIdentifier != u_personIdentifier
 							and x.pmid is not null
-							and afl_createTimestamp > DATE_SUB(CURRENT_DATE() , INTERVAL frequency DAY)
+							and afl_createTimestamp > DATE_SUB(CURRENT_DATE() , INTERVAL l_frequency DAY)
 							group by x.pmid
 							order by afl_createTimestamp desc)x1;
 			-- select concat('l_accepted_pmids *************',l_accepted_pmids);			
@@ -3594,7 +3596,7 @@ BEGIN
 							   AND afl.personIdentifier = pa.personIdentifier
 							   AND afl.articleIdentifier = pa.pmid 
 							  AND afl.personIdentifier = l_person_Identifier
-							  AND afl.createTimestamp  > DATE_SUB(CURRENT_DATE() , INTERVAL frequency DAY)
+							  AND afl.createTimestamp  > DATE_SUB(CURRENT_DATE() , INTERVAL l_frequency DAY)
 							  ORDER BY afl.createTimestamp  DESC;	
 			
 							SELECT COALESCE(GROUP_CONCAT(q.authorLastName,
@@ -3649,7 +3651,7 @@ BEGIN
 		 SELECT COALESCE(group_concat(distinct pa.pmid),'') pmid  INTO l_pending_pmids
 		   						   FROM person_article pa
 		   						   WHERE pa.userAssertion !='ACCEPTED' AND pa.userAssertion !='REJECTED'
-  								   AND pa.datePublicationAddedToEntrez > DATE_SUB(CURRENT_DATE() , INTERVAL frequency DAY)
+  								   AND pa.datePublicationAddedToEntrez > DATE_SUB(CURRENT_DATE() , INTERVAL l_frequency DAY)
   								   AND pa.pmid not in(SELECT afl.articleIdentifier  
   								   					  FROM admin_feedback_log afl 
   								   					  WHERE afl.personIdentifier  = l_person_Identifier)
@@ -3682,7 +3684,7 @@ BEGIN
 							   WHERE FIND_IN_SET(pa.pmid, l_pending_pmids) 
 							   AND pa.totalArticleScoreStandardized >= l_minimum_threshold
 							   AND pa.personIdentifier = l_person_Identifier
-							   AND pa.datePublicationAddedToEntrez > DATE_SUB(CURRENT_DATE() , INTERVAL frequency DAY);	
+							   AND pa.datePublicationAddedToEntrez > DATE_SUB(CURRENT_DATE() , INTERVAL l_frequency DAY);	
 		  		
 							SELECT COALESCE(GROUP_CONCAT(DISTINCT firstAuthor,
 									CASE WHEN maxRank = 1 THEN '. '
@@ -3772,7 +3774,7 @@ BEGIN
     										    l_admin_user,
     										   l_max_message_ID);
     										   
-    	ELSE  -- INSERT NO ELIGIGBLE PUBLICATIONS FOUND MESSAGE
+    	ELSEIF l_notification_pref_cursor_with_cwid_cnt IS NOT NULL AND l_notification_pref_cursor_with_cwid_cnt > 0 THEN  -- INSERT NO ELIGIGBLE PUBLICATIONS FOUND MESSAGE
     		
     	   -- SELECT concat('No Eligible publications',l_person_Identifier);
     		INSERT INTO email_notifications_temp(
@@ -3787,7 +3789,9 @@ BEGIN
 			-- UNTIL done END REPEAT;
 		END LOOP notification_pref_loop;
 	    END;
+	    CLOSE notification_pref_cursor_with_cwid;
 		CLOSE notification_pref_cursor;
+	    
 		SELECT * FROM email_notifications_temp;
 	
 END
