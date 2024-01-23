@@ -3267,13 +3267,11 @@ DELIMITER ;
 
 DELIMITER ////
 
-CREATE DEFINER=`admin`@`%` PROCEDURE `reciterdb`.`generateEmailNotifications`(
+CREATE DEFINER=`admin`@`%` PROCEDURE `generateEmailNotifications`(
 	IN personIdentifierArray mediumblob,
     IN recipientEmail mediumblob)
 BEGIN
 	
-	-- DECLARE no_more_rows boolean default FALSE;
-   -- DECLARE no_more_person_rows boolean default FALSE;
     DECLARE l_person_identifier VARCHAR(250);
     DECLARE l_frequency INT;
     DECLARE l_minimum_threshold INT;
@@ -3316,10 +3314,6 @@ BEGIN
    DECLARE person_cursor CURSOR FOR SELECT DISTINCT personIdentifier FROM person WHERE FIND_IN_SET(personIdentifier, personIdentifierArray);  
    
   
-    
-		-- DECLARE CONTINUE HANDLER FOR NOT FOUND SET no_more_rows = TRUE; 
-	   -- DECLARE CONTINUE HANDLER FOR NOT FOUND SET no_more_person_rows = TRUE;
-		
 		DROP TEMPORARY TABLE IF EXISTS email_notifications_temp;
 		
 		CREATE TEMPORARY TABLE email_notifications_temp(sender varchar(250),recipient varchar(250),subject text, salutation text, accepted_subject_headline text, accepted_publications longtext,accepted_pub_count INT,suggested_subject_headline text,suggested_publications longtext,suggested_pub_count INT,
@@ -3342,10 +3336,9 @@ BEGIN
 	    
 	  IF recipientEmail IS NOT NULL AND recipientEmail !='' THEN 
 			 SET l_email_recipient = recipientEmail;	    
-	    ELSEIF JSON_UNQUOTE(JSON_EXTRACT(l_view_attributes,'$.emailOverride')) IS NOT NULL AND JSON_UNQUOTE(JSON_EXTRACT(l_view_attributes,'$.emailOverride')) !='' THEN
-	    	 SET l_email_recipient = JSON_UNQUOTE(JSON_EXTRACT(l_view_attributes,'$.emailOverride'));
-	    ELSE
-	    	 SET l_email_recipient = 'paa2013@med.cornell.edu';
+	    ELSEIF JSON_UNQUOTE(JSON_EXTRACT(l_view_attributes,'$.emailOverride')) IS NOT NULL AND JSON_UNQUOTE(JSON_EXTRACT(l_view_attributes,'$.emailOverride')) !='' 
+	          AND JSON_UNQUOTE(JSON_EXTRACT(l_view_attributes,'$.useEmailForScheduledJobs')) IS NOT NULL AND JSON_UNQUOTE(JSON_EXTRACT(l_view_attributes,'$.useEmailForScheduledJobs')) = 'true' THEN
+	          SET l_email_recipient = JSON_UNQUOTE(JSON_EXTRACT(l_view_attributes,'$.emailOverride'));
 	    END IF;
 	 	
 	  
@@ -3382,10 +3375,7 @@ BEGIN
 	 		SET l_salutation ='Hi';
 	 END IF;
 	
-	 
-	     -- select l_view_attributes;
 	
-		
 	    OPEN person_cursor;
 		BEGIN
 			  DECLARE no_more_rows boolean default FALSE;
@@ -3412,37 +3402,30 @@ BEGIN
 		
 	   OPEN notification_pref_cursor;
 	    OPEN notification_pref_cursor_with_cwid;
-	    -- select FOUND_ROWS() into l_notification_pref_cursor_with_cwid_cnt ;
-	   -- SELECT concat('notification_pref_cursor_with_cwid_cnt ',l_notification_pref_cursor_with_cwid_cnt );
+	
 	   BEGIN
 		   	  DECLARE no_more_rows boolean default FALSE;
 			  DECLARE CONTINUE HANDLER FOR NOT FOUND SET no_more_rows = TRUE;	
 		notification_pref_loop: loop
 			
 			
-			-- select 'coming here';
 			IF personIdentifierArray IS NOT NULL AND personIdentifierArray!='' AND recipientEmail IS NOT NULL AND recipientEmail !='' THEN
-			   -- SELECT 'COMING INTO FETCH IF CONDITION';
 				FETCH notification_pref_cursor_with_cwid INTO l_person_Identifier,l_frequency,l_userID,l_minimum_threshold,l_accepted,l_suggested;
 			ELSE
-				-- SELECT 'COMING INTO FETCH ELSE CONDITION';
 				FETCH notification_pref_cursor INTO l_person_Identifier,l_frequency,l_userID,l_minimum_threshold,l_accepted,l_suggested;
 			END IF;
-			-- select 'coming here12';
 		 	IF no_more_rows THEN               
                leave notification_pref_loop;                    
             END IF;
-          --  SELECT concat('No Eligible publications',personIdentifierArray);
-			-- SELECT l_person_Identifier;
+
 		    SET l_acceptedPublicationHeadLine ='';
 		    SET l_pendingPublicationHeadLine ='';
 		    SET l_accepted_publications_details = '';
     		SET l_pending_publications_details ='';
-		   -- select l_person_Identifier;
+
 		 -- ACCEPTED PUBLICATION COUNT
-    	 -- select concat('count',l_accepted);
     	 IF l_accepted IS NOT NULL AND l_accepted =1 THEN
-    	 -- select 'coming here1';
+
     	 select count(*)  INTO l_accepted_publications_count from (
 					select afl_personIdentifier as personIdentifier, x.pmid as pmid, feedback, afl_createTimestamp as createTimestamp,userID  from
 					(
@@ -3459,20 +3442,6 @@ BEGIN
 					and afl_createTimestamp > DATE_SUB(CURRENT_DATE() , INTERVAL l_frequency DAY)
 					group by x.pmid
 					order by afl_createTimestamp desc)x;
-		 	-- select concat('l_accepted_publications_count',l_accepted_publications_count);
-    	 /*	SELECT count(distinct afl.articleIdentifier) INTO l_accepted_publications_count 
-    	 	FROM admin_feedback_log afl where afl.feedback ='ACCEPTED' 
-    	 	and afl.createTimestamp > DATE_SUB(CURRENT_DATE() , INTERVAL 400 DAY)
-    	 	AND afl.articleIdentifier NOT IN (SELECT anl.articleIdentifier  FROM admin_notification_log anl)
-    	 	and afl.personIdentifier = l_person_identifier ORDER BY  afl.createTimestamp DESC;*/
-			/* SELECT count(distinct afl.articleIdentifier) INTO l_accepted_publications_count  
-		 FROM admin_feedback_log afl,person_article pa  WHERE afl.feedback ='ACCEPTED'
-		 									AND pa.personIdentifier = afl.personIdentifier and pa.userAssertion ='ACCEPTED'
-		 									-- AND pa.totalArticleScoreStandardized >= l_minimum_threshold
-											AND afl.articleIdentifier NOT IN (SELECT anl.articleIdentifier  FROM admin_notification_log anl) 
-											AND pa.datePublicationAddedToEntrez > DATE_SUB(CURRENT_DATE() , INTERVAL 400 DAY)
-											AND afl.personIdentifier  = l_person_Identifier 
-										    ORDER BY pa.datePublicationAddedToEntrez DESC;*/
 		
 	       IF l_accepted_publications_count > 1 THEN 
 	          SET l_accepted_publication_subject = concat('You have ', l_accepted_publications_count,' newly accepted publications');
@@ -3482,7 +3451,7 @@ BEGIN
 	       	   SET l_accepted_publication_subject='';	
 	       END IF; 
 	   END IF;   									 
-	     -- 	select l_accepted_publication_subject;						 
+
 	     -- pending publications count
 	   IF l_suggested IS NOT NULL AND l_suggested =1 THEN
 	   
@@ -3495,15 +3464,7 @@ BEGIN
   										    AND pa.personIdentifier  = l_person_Identifier 
   										    AND pa.totalArticleScoreStandardized >= l_minimum_threshold
   										    ORDER BY pa.datePublicationAddedToEntrez DESC;
-		/* SELECT count(distinct pmid) INTO l_pending_publications_count  FROM person_article pa WHERE pa.userAssertion !='ACCEPTED' AND pa.userAssertion !='REJECTED'
-  											AND pa.datePublicationAddedToEntrez > DATE_SUB(CURRENT_DATE() , INTERVAL 400 DAY)
-  											AND pa.pmid not in(select afl.articleIdentifier  from admin_feedback_log afl 
-  											WHERE afl.feedback ='ACCEPTED')
-  										    AND pa.personIdentifier  = l_person_Identifier 
-  										    AND pa.totalArticleScoreStandardized >= l_minimum_threshold
-  										    ORDER BY pa.datePublicationAddedToEntrez DESC; */
 			
-  		 		-- select concat('l_pending_publications_count',l_pending_publications_count);							   
 		   IF l_pending_publications_count > 1 THEN 
 		      SET l_pending_publication_subject = concat('You have ', l_pending_publications_count,'',' pending publications for review');
 	        ELSEIF l_pending_publications_count = 1 THEN  
@@ -3511,7 +3472,6 @@ BEGIN
 	        ELSE
 	            SET l_pending_publication_subject ='';
 	        END IF;
-  		 	-- select l_pending_publication_subject;
   		 END IF;
   		
 	  	   IF  (l_accepted_publications_count > 1 AND l_accepted=1) AND  (l_pending_publications_count > 1 AND l_suggested= 1) THEN 
@@ -3530,8 +3490,7 @@ BEGIN
 	  	       SET l_final_email_subject ='';
 	  	   END IF;
 	  	   
-	  	   --  SELECT l_final_email_subject;
-	      
+      
 	  	   IF  l_accepted_publications_count > 0 AND l_accepted =1 THEN
 	  	   
 	  	   select COALESCE(group_concat(distinct x1.pmid),'') pmid INTO l_accepted_pmids from (
@@ -3550,44 +3509,9 @@ BEGIN
 							and afl_createTimestamp > DATE_SUB(CURRENT_DATE() , INTERVAL l_frequency DAY)
 							group by x.pmid
 							order by afl_createTimestamp desc)x1;
-			-- select concat('l_accepted_pmids *************',l_accepted_pmids);			
-  		   /*SET @accepted_pmids := */
-	  	   /*SELECT COALESCE(group_concat(distinct afl.articleIdentifier),'') pmid 
-	  	                            INTO l_accepted_pmids
-									FROM admin_feedback_log afl
-									WHERE afl.feedback ='ACCEPTED' 
-			 						AND afl.personIdentifier = l_person_Identifier 
-			 						AND afl.articleIdentifier NOT IN (SELECT anl.articleIdentifier  
-																	  FROM admin_notification_log anl) 
-									AND afl.createTimestamp  > DATE_SUB(CURRENT_DATE() , INTERVAL 400 DAY)
-									ORDER BY afl.createTimestamp  DESC;*/
-	  	   /*SELECT COALESCE(group_concat(distinct pa.pmid),'') pmid 
-	  	                            INTO l_accepted_pmids
-									FROM admin_feedback_log afl,person_article pa 
-									WHERE afl.feedback ='ACCEPTED' 
-			 						AND pa.personIdentifier = afl.personIdentifier -- AND pa.userAssertion ='ACCEPTED'
-			 						-- AND pa.totalArticleScoreStandardized >= l_minimum_threshold
-			 						-- AND afl.articleIdentifier = pa.pmid 
-									AND afl.articleIdentifier NOT IN (SELECT anl.articleIdentifier  
-																	  FROM admin_notification_log anl) 
-									AND pa.datePublicationAddedToEntrez > DATE_SUB(CURRENT_DATE() , INTERVAL 400 DAY)
-									AND afl.personIdentifier  = l_person_Identifier
-									ORDER BY pa.datePublicationAddedToEntrez DESC;*/
-			
-			-- select concat('accepted PMIDS *************',l_accepted_pmids);					
-								
-			/*   SELECT JSON_ARRAYAGG(DISTINCT JSON_OBJECT('PMID',pa.pmid,'totalArticleScoreStandardized',pa.totalArticleScoreStandardized))
-			   INTO l_accepted_pmids_det
-			   FROM person_article pa 
-			   WHERE FIND_IN_SET(pa.pmid, l_accepted_pmids) 
-			  -- AND pa.totalArticleScoreStandardized >= l_minimum_threshold
-			  AND pa.personIdentifier = l_person_Identifier
-			  AND pa.datePublicationAddedToEntrez > DATE_SUB(CURRENT_DATE() , INTERVAL 400 DAY)
-			  ORDER BY pa.datePublicationAddedToEntrez DESC;*/	
-			  
-		 -- SELECT l_accepted_pmids;
+
 			IF l_accepted_pmids IS NOT NULL AND l_accepted_pmids !='' AND length(l_accepted_pmids) > 0 THEN	
-			  -- SELECT CONCAT('COMBINATION*************',l_person_Identifier , l_accepted_pmids);
+
 							-- ACCEPTED PUBLICATIONS AND TOTAL EVIDENCE SCORE
 							 SELECT JSON_ARRAYAGG(DISTINCT JSON_OBJECT('PMID',afl.articleIdentifier,'totalArticleScoreStandardized',pa.totalArticleScoreStandardized))
 							   INTO l_accepted_pmids_det
@@ -3622,9 +3546,6 @@ BEGIN
 													WHERE q.RANK = 1
 													AND (q1.RANK = 2 or q1.RANK IS NULL);	
 												
-							-- SELECT l_accepted_publications_details;
-							-- SET l_accepted_publications_details = COALESCE(l_accepted_publications_details,'');	
-						  -- SELECT concat('After acceptance',l_accepted_publications_details);
 				END IF;
 				
 				-- Accepted Publications Headerline
@@ -3646,7 +3567,6 @@ BEGIN
 		
 		 IF l_pending_publications_count > 0 AND l_suggested =1 THEN
 		
-		   /*SET @pending_pmids := */ 
 		 
 		 SELECT COALESCE(group_concat(distinct pa.pmid),'') pmid  INTO l_pending_pmids
 		   						   FROM person_article pa
@@ -3658,24 +3578,8 @@ BEGIN
   								   AND pa.personIdentifier  = l_person_Identifier
   								   AND pa.totalArticleScoreStandardized >= l_minimum_threshold
   								   ORDER BY pa.datePublicationAddedToEntrez DESC;
-		 /*SELECT COALESCE(group_concat(distinct pa.pmid),'') pmid  INTO l_pending_pmids
-		   						   FROM person_article pa
-		   						   WHERE pa.userAssertion !='ACCEPTED' AND pa.userAssertion !='REJECTED'
-  								   AND pa.datePublicationAddedToEntrez > DATE_SUB(CURRENT_DATE() , INTERVAL 400 DAY)
-  								   AND pa.pmid not in(SELECT afl.articleIdentifier  
-  								   					  FROM admin_feedback_log afl 
-  								   					  WHERE afl.feedback ='ACCEPTED')
-  								   AND pa.personIdentifier  = l_person_Identifier
-  								   AND pa.totalArticleScoreStandardized >= l_minimum_threshold
-  								   ORDER BY pa.datePublicationAddedToEntrez DESC;*/
-			
-				
-  			
-			  
-				 -- SELECT CONCAT('PENDING COMBINATION*************',l_person_Identifier , l_accepted_pmids);						
-			 -- SELECT l_pending_pmids;
-		  		IF l_pending_pmids IS NOT NULL AND l_pending_pmids!='' AND length(l_pending_pmids) > 0 THEN
-		  		-- SELECT CONCAT('COMBINATION*************',l_person_Identifier , l_pending_pmids);
+		 					
+		 		IF l_pending_pmids IS NOT NULL AND l_pending_pmids!='' AND length(l_pending_pmids) > 0 THEN
 		  					
 		  					-- suggested PUBLICATIONS AND TOTAL EVIDENCE SCORE
 				  		  	SELECT JSON_ARRAYAGG(DISTINCT JSON_OBJECT('PMID',pa.pmid,'totalArticleScoreStandardized',pa.totalArticleScoreStandardized))
@@ -3700,8 +3604,6 @@ BEGIN
 							JOIN (SELECT DISTINCT pmid, CONCAT(authorLastName, ' ', LEFT(authorFirstName, 1), ' ') AS firstAuthor FROM person_article_author WHERE rank = 1 AND FIND_IN_SET(pmid, l_pending_pmids)) m ON m.pmid = a.pmid
 							WHERE FIND_IN_SET(a.pmid, l_pending_pmids); 	
 						
-						-- SELECT concat('After suggested',l_pending_publications_details);
-							-- SET l_pending_publications_details = COALESCE(l_pending_publications_details,'');
 				END IF;	
 				-- Suggested Publications Headerline
 				  SET l_view_attributes = (SELECT JSON_EXTRACT(viewAttributes,'$[4]') FROM admin_settings as2  where viewName ='EmailNotifications');
@@ -3722,15 +3624,16 @@ BEGIN
 				END IF;
 		
 		END IF;	
-		-- select concat('publication count',l_accepted_publications_count,l_accepted ,l_pending_publications_count,l_suggested);
-	   IF  (l_accepted_publications_count > 0 AND l_accepted =1 
+	
+		IF  (l_accepted_publications_count > 0 AND l_accepted =1 
 	   			 AND l_accepted_pmids IS NOT NULL AND l_accepted_pmids !='' AND length(l_accepted_pmids) > 0 AND l_accepted_pmids_det IS NOT NULL AND l_accepted_pmids_det !='' AND length(l_accepted_pmids_det) > 0 
 	   					  && l_accepted_publications_details IS NOT NULL AND l_accepted_publications_details!='' AND length(l_accepted_publications_details) > 0) 
 	  		 OR  (l_pending_publications_count > 0 AND l_suggested =1 
 	  		   AND l_pending_pmids IS NOT NULL AND l_pending_pmids!='' AND length(l_pending_pmids) > 0 AND l_suggested_pmids_det IS NOT NULL AND l_suggested_pmids_det !='' AND length(l_suggested_pmids_det)> 0
 	  		 			 && l_pending_publications_details IS NOT NULL AND l_pending_publications_details !='' AND length(l_pending_publications_details) > 0
 	  		 			) THEN 
-			    -- Admin Email
+			
+			     -- Admin Email
 			  SELECT  email, au.nameFirst,au.userID  INTO l_admin_email,l_name_first,l_admin_user 
 			  FROM admin_users au WHERE au.personIdentifier = l_person_Identifier; 
 			 
@@ -3756,7 +3659,7 @@ BEGIN
 			 									  admin_user_id,
 			 									  max_message_id)
 			 							VALUES(l_email_sender,
-			 									l_email_recipient,  -- COALESCE(l_email_receiver,l_admin_email)),
+			 									COALESCE(l_email_recipient,l_admin_email),
 			 									l_final_email_subject,
 			 									concat(l_salutation,' ',l_name_first),
 			 									l_acceptedPublicationHeadLine,
@@ -3776,7 +3679,6 @@ BEGIN
     										   
     	ELSEIF l_notification_pref_cursor_with_cwid_cnt IS NOT NULL AND l_notification_pref_cursor_with_cwid_cnt > 0 THEN  -- INSERT NO ELIGIGBLE PUBLICATIONS FOUND MESSAGE
     		
-    	   -- SELECT concat('No Eligible publications',l_person_Identifier);
     		INSERT INTO email_notifications_temp(
 			 									  personIdentifier,pub_error_message
 			 									  )
