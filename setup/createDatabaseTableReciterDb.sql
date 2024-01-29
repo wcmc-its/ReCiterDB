@@ -32,16 +32,18 @@ CREATE TABLE `admin_feedback_log` (
 CREATE TABLE `admin_notification_log` (
   `notificationID` int(11) NOT NULL AUTO_INCREMENT,
   `userID` int(11) DEFAULT NULL,
-  `articleIdentifier` int(11) DEFAULT NULL,
+  `pmid` int(11) DEFAULT NULL,
   `articleScore` int(11) DEFAULT NULL,
   `email` varchar(128) DEFAULT NULL,
   `dateSent` datetime DEFAULT NULL,
   `createTimestamp` timestamp NOT NULL DEFAULT '0000-00-00 00:00:00',
   `modifyTimestamp` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
+  `messageID` int(11) DEFAULT NULL,
+  `notificationType` varchar(100) DEFAULT NULL,
   PRIMARY KEY (`notificationID`),
   KEY `admin_notification_log_ibfk_1` (`userID`),
   CONSTRAINT `admin_notification_log_ibfk_1` FOREIGN KEY (`userID`) REFERENCES `admin_users` (`userID`)
-) ENGINE=InnoDB AUTO_INCREMENT=2 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB AUTO_INCREMENT=948 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 
 CREATE TABLE `admin_notification_preferences` (
@@ -53,11 +55,12 @@ CREATE TABLE `admin_notification_preferences` (
   `status` int(1) DEFAULT 1,
   `createTimestamp` timestamp NOT NULL DEFAULT '0000-00-00 00:00:00',
   `modifyTimestamp` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
-  `PersonIdentifier` varchar(100) DEFAULT NULL,
+  `personIdentifier` varchar(100) DEFAULT NULL,
+  `suggested` int(1) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `admin_notification_preferences_ibfk_1` (`userID`),
   CONSTRAINT `admin_notification_preferences_ibfk_1` FOREIGN KEY (`userID`) REFERENCES `admin_users` (`userID`)
-) ENGINE=InnoDB AUTO_INCREMENT=18 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB AUTO_INCREMENT=175 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 
 CREATE TABLE `admin_roles` (
@@ -543,6 +546,8 @@ CREATE TABLE `journal_science_metrix` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 
+-- reciterdb.person definition
+
 CREATE TABLE `person` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(128) NOT NULL,
@@ -562,8 +567,10 @@ CREATE TABLE `person` (
   `overallAccuracy` float DEFAULT 0,
   `mode` varchar(128) DEFAULT NULL,
   PRIMARY KEY (`id`,`personIdentifier`),
-  KEY `id` (`id`)
-) ENGINE=InnoDB AUTO_INCREMENT=24575 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+  KEY `id` (`id`),
+  KEY `idx_primaryOrganizationalUnit` (`primaryOrganizationalUnit`) USING BTREE,
+  KEY `person_personIdentifier_IDX` (`personIdentifier`) USING BTREE
+) ENGINE=InnoDB AUTO_INCREMENT=32767 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 
 CREATE TABLE `person_article` (
