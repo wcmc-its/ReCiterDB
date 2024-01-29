@@ -546,6 +546,8 @@ CREATE TABLE `journal_science_metrix` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 
+-- reciterdb.person definition
+
 CREATE TABLE `person` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(128) NOT NULL,
@@ -565,8 +567,10 @@ CREATE TABLE `person` (
   `overallAccuracy` float DEFAULT 0,
   `mode` varchar(128) DEFAULT NULL,
   PRIMARY KEY (`id`,`personIdentifier`),
-  KEY `id` (`id`)
-) ENGINE=InnoDB AUTO_INCREMENT=24575 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+  KEY `id` (`id`),
+  KEY `idx_primaryOrganizationalUnit` (`primaryOrganizationalUnit`) USING BTREE,
+  KEY `person_personIdentifier_IDX` (`personIdentifier`) USING BTREE
+) ENGINE=InnoDB AUTO_INCREMENT=32767 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;;
 
 
 CREATE TABLE `person_article` (
