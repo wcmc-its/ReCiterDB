@@ -570,7 +570,7 @@ CREATE TABLE `person` (
   KEY `id` (`id`),
   KEY `idx_primaryOrganizationalUnit` (`primaryOrganizationalUnit`) USING BTREE,
   KEY `person_personIdentifier_IDX` (`personIdentifier`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=32767 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;;
+) ENGINE=InnoDB AUTO_INCREMENT=32767 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 
 CREATE TABLE `person_article` (
