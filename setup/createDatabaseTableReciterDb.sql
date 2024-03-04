@@ -827,10 +827,13 @@ CREATE TABLE `reporting_conflicts` (
 ) ENGINE=InnoDB AUTO_INCREMENT=65538 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 -- reciterdb.admin_orcid definition
 
+-- reciterdb.admin_orcid definition
+
 CREATE TABLE `admin_orcid` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(30) DEFAULT NULL,
   `orcid` varchar(128) DEFAULT NULL,
   PRIMARY KEY (`id`),
+  UNIQUE KEY `admin_orcid_unique` (`personIdentifier`),
   KEY `idx_personIdentifier` (`personIdentifier`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=21 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB AUTO_INCREMENT=4 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
