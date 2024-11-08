@@ -1,5 +1,4 @@
 import json
-from boto3.dynamodb.conditions import Key, Attr
 import time
 import os
 import csv
@@ -7,465 +6,529 @@ from init import pymysql
 import MySQLdb
 
 import boto3
-import os
+from boto3.dynamodb.conditions import Key, Attr
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Initialize the DynamoDB resource
 dynamodb = boto3.resource('dynamodb')
+
+def download_file(s3_client, bucket_name, object_key, local_file_path):
+    s3_client.download_file(bucket_name, object_key, local_file_path)
 
 def download_directory_from_s3(bucket_name, remote_directory_name, local_directory_name):
     s3_resource = boto3.resource('s3')
+    s3_client = boto3.client('s3')
     bucket = s3_resource.Bucket(bucket_name)
     number = 0
-    for object in bucket.objects.filter(Prefix=remote_directory_name):
-        number = number + 1
-        print(object)        
-        local_path = f"{local_directory_name}/"
-        file_name = local_path + "/" + object.key.removeprefix(remote_directory_name)
-        bucket.download_file(object.key, file_name)
+    objects = list(bucket.objects.filter(Prefix=remote_directory_name))
+    print(f"Total files to download: {len(objects)}")
 
+    if not os.path.exists(local_directory_name):
+        os.makedirs(local_directory_name)
 
+    max_workers = 20  # Adjust this number based on your system's capacity
 
-def downloadDirectoryFroms3(bucketName,remoteDirectoryName):
-    s3_resource = boto3.resource('s3')
-    bucket = s3_resource.Bucket(bucketName)
-    number = 0
-    for object in bucket.objects.filter(Prefix = ''):
-        number = number + 1
-#        if number == 100:
-#            break
-        print(object)
-        txt = object.key 
-        object.key = txt.replace(remoteDirectoryName, "")
-        if not os.path.exists('tempS3Output/' + object.key):
-            os.makedirs('tempS3Output/' + object.key)
-        bucket.download_file(object.key,'tempS3Output/' + object.key)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_object = {}
+        for obj in objects:
+            filename = os.path.basename(obj.key)
+            if not filename:
+                continue  # Skip directories
+            local_file_path = os.path.join(local_directory_name, filename)
+            future = executor.submit(download_file, s3_client, bucket_name, obj.key, local_file_path)
+            future_to_object[future] = obj.key
 
+        for future in as_completed(future_to_object):
+            obj_key = future_to_object[future]
+            try:
+                future.result()
+                number += 1
+                print(f"Downloaded: {obj_key}")
+            except Exception as e:
+                print(f"Error downloading {obj_key}: {e}")
 
-def scan_table(table_name): #runtime: about 15min
-    #record time for scan the entire table
+    print(f"Downloaded {number} files from S3.")
+
+def scan_table(table_name):
+    # Record time for scanning the entire table
     print(dynamodb)
     start = time.time()
     table = dynamodb.Table(table_name)
 
     response = table.scan()
-
     items = response['Items']
 
-    #continue to gat all records in the table, using ExclusiveStartKey
-    while True:
-        print(len(response['Items']))
-        if response.get('LastEvaluatedKey'):
-            response = table.scan(
-                ExclusiveStartKey = response['LastEvaluatedKey']
-                )
-            items += response['Items']
-        else:           
-            break
-    print('execution time:', time.time() - start)
-    
+    # Continue to get all records in the table, using ExclusiveStartKey
+    while 'LastEvaluatedKey' in response:
+        print(f"Retrieved {len(response['Items'])} items")
+        response = table.scan(
+            ExclusiveStartKey=response['LastEvaluatedKey']
+        )
+        items.extend(response['Items'])
+
+    print('Execution time:', time.time() - start)
     return items
 
-
-# This is where the raw JSON files downloaded from s3 go. Files have the format "[personIdentifier]".
-
-originalDataPath = 'temp/s3Output/' 
-
-# This is where the parsed CSV files go.
+# Paths for data
+originalDataPath = 'temp/s3Output/'
 outputPath = 'temp/parsedOutput/'
 
+# Ensure the output directories exist
+if not os.path.exists(originalDataPath):
+    os.makedirs(originalDataPath)
 
-# Call scan_table function for analysis
+if not os.path.exists(outputPath):
+    os.makedirs(outputPath)
+
+# Flag to control whether to download data from S3
+download_from_s3 = False  # Set to True to download data from S3, False to use existing data
+
+if download_from_s3:
+    # Download files from S3 using multithreading
+    download_directory_from_s3('reciter-dynamodb', 'AnalysisOutput/', originalDataPath)
+else:
+    print("Skipping download from S3. Using existing data in local directory.")
+
+# Call scan_table function for Identity table
 identities = scan_table('Identity')
+print("Count items from DynamoDB Identity table:", len(identities))
 
-# Output verbose form of Identity table
+# Prepare list of files to process
+person_list = os.listdir(originalDataPath)
 
-# print(identities)
-
-print("Count items from DynamoDB Identity table:", len(identities)) 
-
-
-# For testing purposes, comment this line out if you have the files and wish to re-run the script without downloading all the files
-
-download_directory_from_s3('reciter-dynamodb', 'AnalysisOutput','temp/s3Output')
-
-
-person_list = []
-for filename in os.listdir(originalDataPath):
-    person_list.append(filename)
-
-## If you see this error "UnicodeDecodeError: 'utf-8' codec can't decode byte 0x80 in position 3131: invalid start byte",
-## it's because you haven't removed the ".DS_Store" file from the person_list index
-
-try:
-    person_list.remove(".DS_Store")
-except ValueError:
-    print(".DS_Store not in list. Proceeding...")
-
-try:
-    person_list.remove(".gitkeep")
-except ValueError:
-    print(".gitkeep not in list. Proceeding...")
+# Remove any unwanted files, like ".DS_Store" or ".gitkeep"
+unwanted_files = [".DS_Store", ".gitkeep"]
+for unwanted_file in unwanted_files:
+    try:
+        person_list.remove(unwanted_file)
+    except ValueError:
+        pass  # File not in list; proceed
 
 person_list.sort()
-print(len(person_list))
+print(f"Processing {len(person_list)} files.")
 
-
-#use the directory to read files in 
+# Read the files
 items = []
-for item in person_list:
-    #record time
+for filename in person_list:
     start = time.time()
-    for line in open(originalDataPath + '{}'.format(item), 'r', encoding='utf-8'): 
-        items.append(json.loads(line))
-    print('execution time:', time.time() - start)
-print(len(items))
+    file_path = os.path.join(originalDataPath, filename)
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            items.append(json.loads(line))
+    print(f'Execution time for {filename}:', time.time() - start)
+print(f"Total items loaded: {len(items)}")
 
+# Prepare identity.csv
+with open(os.path.join(outputPath, 'identity.csv'), 'w', encoding='utf-8') as f:
+    count = 0
+    for identity in identities:
+        personIdentifier = identity.get('uid', '')
+        identity_data = identity.get('identity', {})
+        title = identity_data.get('title', '')
+        primaryName = identity_data.get('primaryName', {})
+        firstName = primaryName.get('firstName', '')
+        middleName = primaryName.get('middleName', '')
+        lastName = primaryName.get('lastName', '')
+        primaryEmail = identity_data.get('primaryEmail', '')
+        primaryOrganizationalUnit = identity_data.get('primaryOrganizationalUnit', '')
+        primaryInstitution = identity_data.get('primaryInstitution', '')
 
-
-# prepare query and data
-f = open(outputPath + 'identity.csv','w', encoding='utf-8')
-
-count = 0
-
-for i in range(len(identities)):
-    if 'uid' in identities[i]:
-        personIdentifier = identities[i]['uid']
-    if 'title' in identities[i]['identity']:
-        title = identities[i]['identity']['title']
-    else:
-        title = ''
-    if 'firstName' in identities[i]['identity']['primaryName']:
-        firstName = identities[i]['identity']['primaryName']['firstName']
-    else:
-        firstName = ''
-    if 'middleName' in identities[i]['identity']['primaryName']:
-        middleName = identities[i]['identity']['primaryName']['middleName']
-    else:
-        middleName = ''
-    if 'lastName' in identities[i]['identity']['primaryName']:
-        lastName = identities[i]['identity']['primaryName']['lastName']
-    else:
-        lastName = ''
-    if 'primaryEmail' in identities[i]['identity']:
-        primaryEmail = identities[i]['identity']['primaryEmail']
-    else:
-        primaryEmail = ''        
-    if 'primaryOrganizationalUnit' in identities[i]['identity']:
-        primaryOrganizationalUnit = identities[i]['identity']['primaryOrganizationalUnit']
-    else:
-        primaryOrganizationalUnit = ''
-    if 'primaryInstitution' in identities[i]['identity']:
-        primaryInstitution = identities[i]['identity']['primaryInstitution']
-    else:
-        primaryInstitution = ''
-
-    f.write("\"" + str(personIdentifier) + "\"" + "\t" + "\"" + 
-            str(title) + "\"" + "\t" + "\"" + 
-            str(firstName) + "\"" + "\t" + "\"" + 
-            str(middleName) + "\"" + "\t" + "\"" + 
-            str(lastName) + "\"" + "\t" + "\"" + 
-            str(primaryEmail) + "\"" + "\t" + "\"" + 
-            str(primaryOrganizationalUnit) + "\"" + "\t" + "\"" + 
-            str(primaryInstitution) + "\"" + 
-            "\n")
-    count += 1
-    print("Identities imported into temp table:", count)
+        f.write(
+            f"\"{personIdentifier}\"\t\"{title}\"\t\"{firstName}\"\t\"{middleName}\"\t\"{lastName}\"\t\"{primaryEmail}\"\t\"{primaryOrganizationalUnit}\"\t\"{primaryInstitution}\"\n"
+        )
+        count += 1
+        print("Identities imported into temp table:", count)
 
 f.close()
 
-
-f = open(outputPath + 'person_person_type.csv','w', encoding='utf-8')
-
-for i in range(len(identities)):
-    a = identities[i]['identity']
-    if 'uid' in a.keys():
-        personIdentifier = a['uid']
-    else:
-        print("uid key not found")
-    if 'personTypes' in a.keys():
-        personType = a['personTypes']
-        for each_person_type in personType:
-            f.write(str(personIdentifier) + "," + str(each_person_type) + "\n")
-    else:
-        print("Person type not found for", personIdentifier)
+# Prepare person_person_type.csv
+f = open(outputPath + 'person_person_type.csv', 'w', encoding='utf-8')
+for identity in identities:
+    a = identity.get('identity', {})
+    personIdentifier = a.get('uid', '')
+    personTypes = a.get('personTypes', [])
+    for each_person_type in personTypes:
+        f.write(str(personIdentifier) + "," + str(each_person_type) + "\n")
 f.close()
 
 
 
 
-#code for person_article_s3 table
-#open a csv file
-f = open(outputPath + 'person_article2.csv','w', encoding='utf-8')
+# Open the CSV file for writing
+with open(os.path.join(outputPath, 'person_article2.csv'), 'w', encoding='utf-8') as f:
+    # Write column names into the file
+    f.write(
+        "personIdentifier," + "pmid," + "authorshipLikelihoodScore," + "pmcid," + "totalArticleScoreStandardized," +
+        "totalArticleScoreNonStandardized," + "userAssertion," + "publicationDateDisplay," +
+        "publicationDateStandardized," + "publicationTypeCanonical," + "scopusDocID," + "journalTitleVerbose," +
+        "articleTitle," + "feedbackScoreAccepted," + "feedbackScoreRejected," + "feedbackScoreNull," +
+        "articleAuthorNameFirstName," + "articleAuthorNameLastName," + "institutionalAuthorNameFirstName," +
+        "institutionalAuthorNameMiddleName," + "institutionalAuthorNameLastName," + "nameMatchFirstScore," +
+        "nameMatchFirstType," + "nameMatchMiddleScore," + "nameMatchMiddleType," + "nameMatchLastScore," +
+        "nameMatchLastType," + "nameMatchModifierScore," + "nameScoreTotal," + "emailMatch," + "emailMatchScore," +
+        "journalSubfieldScienceMetrixLabel," + "journalSubfieldScienceMetrixID," + "journalSubfieldDepartment," +
+        "journalSubfieldScore," + "relationshipEvidenceTotalScore," + "relationshipMinimumTotalScore," +
+        "relationshipNonMatchCount," + "relationshipNonMatchScore," + "articleYear," + "identityBachelorYear," +
+        "discrepancyDegreeYearBachelor," + "discrepancyDegreeYearBachelorScore," + "identityDoctoralYear," +
+        "discrepancyDegreeYearDoctoral," + "discrepancyDegreeYearDoctoralScore," + "genderScoreArticle," +
+        "genderScoreIdentity," + "genderScoreIdentityArticleDiscrepancy," + "personType," + "personTypeScore," +
+        "countArticlesRetrieved," + "articleCountScore," + "targetAuthorInstitutionalAffiliationArticlePubmedLabel," +
+        "pubmedTargetAuthorInstitutionalAffiliationMatchTypeScore," + "scopusNonTargetAuthorInstitutionalAffiliationSource," +
+        "scopusNonTargetAuthorInstitutionalAffiliationScore," + "totalArticleScoreWithoutClustering," +
+        "clusterScoreAverage," + "clusterReliabilityScore," + "clusterScoreModificationOfTotalScore," +
+        "datePublicationAddedToEntrez," + "clusterIdentifier," + "doi," + "issn," + "issue," +
+        "journalTitleISOabbreviation," + "pages," + "timesCited," + "volume," + "feedbackScoreCites," +
+        "feedbackScoreCoAuthorName," + "feedbackScoreEmail," + "feedbackScoreInstitution," + "feedbackScoreJournal," +
+        "feedbackScoreJournalSubField," + "feedbackScoreKeyword," + "feedbackScoreOrcid," + "feedbackScoreOrcidCoAuthor," +
+        "feedbackScoreOrganization," + "feedbackScoreTargetAuthorName," + "feedbackScoreYear" + "\n"
+    )
 
-#use count to record the number of person we have finished feature extraction
-count = 0
+    count = 0
+    for item in items:
+        try:
+            article_features = item.get('reCiterArticleFeatures', [])
+            article_count = len(article_features)
+        except KeyError as e:
+            print(f"Error getting article features for person {item.get('personIdentifier', '')}: {e}")
+            continue
 
-#extract all required nested features
-for i in range(len(items)):
-    try:
-        article_temp = len(items[i]['reCiterArticleFeatures'])
-    except KeyError:
-        print(f"Key 'reCiterArticleFeatures' not found for item {i}: {items[i]}")
-        article_temp = 0
-    for j in range(article_temp):
-        personIdentifier = items[i]['personIdentifier']
-        pmid = items[i]['reCiterArticleFeatures'][j]['pmid']
-        totalArticleScoreStandardized = items[i]['reCiterArticleFeatures'][j]['totalArticleScoreStandardized']
-        totalArticleScoreNonStandardized = items[i]['reCiterArticleFeatures'][j]['totalArticleScoreNonStandardized']
-        userAssertion = items[i]['reCiterArticleFeatures'][j]['userAssertion']
-        publicationDateStandardized = items[i]['reCiterArticleFeatures'][j]['publicationDateStandardized']
-        if 'publicationTypeCanonical' in items[i]['reCiterArticleFeatures'][j]['publicationType']:
-            publicationTypeCanonical = items[i]['reCiterArticleFeatures'][j]['publicationType']['publicationTypeCanonical']
-        else:
-            publicationTypeCanonical = ""
-        # example1: when you get key error, check whether the key exists in dynamodb or not
-        if 'scopusDocID' in items[i]['reCiterArticleFeatures'][j]:
-            scopusDocID = items[i]['reCiterArticleFeatures'][j]['scopusDocID']
-        else:
-            scopusDocID = ""
+        personIdentifier = item.get('personIdentifier', '')
 
-        if 'pmcid' in items[i]['reCiterArticleFeatures'][j]:
-            pmcid = items[i]['reCiterArticleFeatures'][j]['pmcid']
-        else:
-            pmcid = ""
+        for article in article_features:
+            try:
+                pmid = article.get('pmid', '')
+                pmcid = article.get('pmcid', '')
 
-        journalTitleVerbose = items[i]['reCiterArticleFeatures'][j]['journalTitleVerbose']
-        journalTitleVerbose = journalTitleVerbose.replace('"', '""')
-        if 'articleTitle' in items[i]['reCiterArticleFeatures'][j]:
-            articleTitle = items[i]['reCiterArticleFeatures'][j]['articleTitle']
-            articleTitle = articleTitle.replace('"', '""')
-        else:
-            articleTitle = ""
+                # Determine if the record is in new or old format
+                is_new_format = 'authorshipLikelihoodScore' in article
 
-        if 'reCiterArticleAuthorFeatures' not in items[i]['reCiterArticleFeatures'][j]:
-            largeGroupAuthorship = True
-        else:
-            largeGroupAuthorship = False
-        if 'evidence' in items[i]['reCiterArticleFeatures'][j]:
-            if 'acceptedRejectedEvidence' in items[i]['reCiterArticleFeatures'][j]['evidence']:
-                if 'feedbackScoreAccepted' in items[i]['reCiterArticleFeatures'][j]['evidence']['acceptedRejectedEvidence']:
-                    feedbackScoreAccepted = items[i]['reCiterArticleFeatures'][j]['evidence']['acceptedRejectedEvidence']['feedbackScoreAccepted']
-                else: 
-                    feedbackScoreAccepted = 0
-                if 'feedbackScoreRejected' in items[i]['reCiterArticleFeatures'][j]['evidence']['acceptedRejectedEvidence']:
-                    feedbackScoreRejected = items[i]['reCiterArticleFeatures'][j]['evidence']['acceptedRejectedEvidence']['feedbackScoreRejected']
-                else: 
-                    feedbackScoreRejected = 0
-                if 'feedbackScoreNull' in items[i]['reCiterArticleFeatures'][j]['evidence']['acceptedRejectedEvidence']:
-                    feedbackScoreNull = items[i]['reCiterArticleFeatures'][j]['evidence']['acceptedRejectedEvidence']['feedbackScoreNull']
-                else: 
-                    feedbackScoreNull = 0
-            if 'authorNameEvidence' in items[i]['reCiterArticleFeatures'][j]['evidence']:
-                if 'articleAuthorName' in items[i]['reCiterArticleFeatures'][j]['evidence']['authorNameEvidence']:
-                    if 'firstName' in items[i]['reCiterArticleFeatures'][j]['evidence']['authorNameEvidence']['articleAuthorName']: 
-                        articleAuthorName_firstName = items[i]['reCiterArticleFeatures'][j]['evidence']['authorNameEvidence']['articleAuthorName']['firstName']
-                    else:
-                        articleAuthorName_firstName = ""
-                    articleAuthorName_lastName = items[i]['reCiterArticleFeatures'][j]['evidence']['authorNameEvidence']['articleAuthorName']['lastName']
-                else:
-                    articleAuthorName_firstName, articleAuthorName_lastName = "", ""
-                institutionalAuthorName_firstName = items[i]['reCiterArticleFeatures'][j]['evidence']['authorNameEvidence']['institutionalAuthorName']['firstName']
-                if 'middleName' in items[i]['reCiterArticleFeatures'][j]['evidence']['authorNameEvidence']['institutionalAuthorName']:
-                    institutionalAuthorName_middleName = items[i]['reCiterArticleFeatures'][j]['evidence']['authorNameEvidence']['institutionalAuthorName']['middleName']
-                else:
-                    institutionalAuthorName_middleName = ""
-                institutionalAuthorName_lastName = items[i]['reCiterArticleFeatures'][j]['evidence']['authorNameEvidence']['institutionalAuthorName']['lastName']
-                nameMatchFirstScore = items[i]['reCiterArticleFeatures'][j]['evidence']['authorNameEvidence']['nameMatchFirstScore']
-                if 'nameMatchFirstType' in items[i]['reCiterArticleFeatures'][j]['evidence']['authorNameEvidence']:
-                    nameMatchFirstType = items[i]['reCiterArticleFeatures'][j]['evidence']['authorNameEvidence']['nameMatchFirstType']
-                nameMatchMiddleScore = items[i]['reCiterArticleFeatures'][j]['evidence']['authorNameEvidence']['nameMatchMiddleScore']
-                if 'nameMatchMiddleType' in items[i]['reCiterArticleFeatures'][j]['evidence']['authorNameEvidence']:
-                    nameMatchMiddleType = items[i]['reCiterArticleFeatures'][j]['evidence']['authorNameEvidence']['nameMatchMiddleType']
-                nameMatchLastScore = items[i]['reCiterArticleFeatures'][j]['evidence']['authorNameEvidence']['nameMatchLastScore']
-                if 'nameMatchLastType' in items[i]['reCiterArticleFeatures'][j]['evidence']['authorNameEvidence']:
-                    nameMatchLastType = items[i]['reCiterArticleFeatures'][j]['evidence']['authorNameEvidence']['nameMatchLastType']
-                nameMatchModifierScore = items[i]['reCiterArticleFeatures'][j]['evidence']['authorNameEvidence']['nameMatchModifierScore']
-                nameScoreTotal = items[i]['reCiterArticleFeatures'][j]['evidence']['authorNameEvidence']['nameScoreTotal']
+                # Initialize variables to default values
+                authorshipLikelihoodScore = ''
+                totalArticleScoreStandardized = ''
+                totalArticleScoreNonStandardized = ''
+                userAssertion = ''
+                publicationDateStandardized = ''
+                publicationDateDisplay = ''
+                publicationTypeCanonical = ''
+                scopusDocID = ''
+                journalTitleVerbose = ''
+                articleTitle = ''
+                feedbackScoreAccepted = ''
+                feedbackScoreRejected = ''
+                feedbackScoreNull = ''
+                articleAuthorName_firstName = ''
+                articleAuthorName_lastName = ''
+                institutionalAuthorName_firstName = ''
+                institutionalAuthorName_middleName = ''
+                institutionalAuthorName_lastName = ''
+                nameMatchFirstScore = ''
+                nameMatchFirstType = ''
+                nameMatchMiddleScore = ''
+                nameMatchMiddleType = ''
+                nameMatchLastScore = ''
+                nameMatchLastType = ''
+                nameMatchModifierScore = ''
+                nameScoreTotal = ''
+                emailMatch = ''
+                emailMatchScore = ''
+                journalSubfieldScienceMetrixLabel = ''
+                journalSubfieldScienceMetrixID = ''
+                journalSubfieldDepartment = ''
+                journalSubfieldScore = ''
+                relationshipEvidenceTotalScore = ''
+                relationshipMinimumTotalScore = ''
+                relationshipNonMatchCount = ''
+                relationshipNonMatchScore = ''
+                articleYear = ''
+                identityBachelorYear = ''
+                discrepancyDegreeYearBachelor = ''
+                discrepancyDegreeYearBachelorScore = ''
+                identityDoctoralYear = ''
+                discrepancyDegreeYearDoctoral = ''
+                discrepancyDegreeYearDoctoralScore = ''
+                genderScoreArticle = ''
+                genderScoreIdentity = ''
+                genderScoreIdentityArticleDiscrepancy = ''
+                personType = ''
+                personTypeScore = ''
+                countArticlesRetrieved = ''
+                articleCountScore = ''
+                targetAuthorInstitutionalAffiliationArticlePubmedLabel = ''
+                pubmedTargetAuthorInstitutionalAffiliationMatchTypeScore = ''
+                scopusNonTargetAuthorInstitutionalAffiliationSource = ''
+                scopusNonTargetAuthorInstitutionalAffiliationScore = ''
+                totalArticleScoreWithoutClustering = ''
+                clusterScoreAverage = ''
+                clusterReliabilityScore = ''
+                clusterScoreModificationOfTotalScore = ''
+                datePublicationAddedToEntrez = ''
+                clusterIdentifier = ''
+                doi = ''
+                issn = ''
+                issue = ''
+                journalTitleISOabbreviation = ''
+                pages = ''
+                timesCited = ''
+                volume = ''
+                feedbackScoreCites = ''
+                feedbackScoreCoAuthorName = ''
+                feedbackScoreEmail = ''
+                feedbackScoreInstitution = ''
+                feedbackScoreJournal = ''
+                feedbackScoreJournalSubField = ''
+                feedbackScoreKeyword = ''
+                feedbackScoreOrcid = ''
+                feedbackScoreOrcidCoAuthor = ''
+                feedbackScoreOrganization = ''
+                feedbackScoreTargetAuthorName = ''
+                feedbackScoreYear = ''
 
-            if 'emailEvidence' in items[i]['reCiterArticleFeatures'][j]['evidence']:
-                emailMatch = items[i]['reCiterArticleFeatures'][j]['evidence']['emailEvidence']['emailMatch']
-                if 'false' in emailMatch:
-                    emailMatch = ""
-                emailMatchScore = items[i]['reCiterArticleFeatures'][j]['evidence']['emailEvidence']['emailMatchScore']
-            else:
-                emailMatch, emailMatchScore = "", 0
-            
-            if 'journalCategoryEvidence' in items[i]['reCiterArticleFeatures'][j]['evidence']:
-                journalSubfieldScienceMetrixLabel = items[i]['reCiterArticleFeatures'][j]['evidence']['journalCategoryEvidence']['journalSubfieldScienceMetrixLabel']
-                journalSubfieldScienceMetrixLabel = journalSubfieldScienceMetrixLabel.replace('"', '""')
-                journalSubfieldScienceMetrixID = items[i]['reCiterArticleFeatures'][j]['evidence']['journalCategoryEvidence']['journalSubfieldScienceMetrixID']
-                journalSubfieldDepartment = items[i]['reCiterArticleFeatures'][j]['evidence']['journalCategoryEvidence']['journalSubfieldDepartment']
-                journalSubfieldDepartment = journalSubfieldDepartment.replace('"', '""')
-                journalSubfieldScore = items[i]['reCiterArticleFeatures'][j]['evidence']['journalCategoryEvidence']['journalSubfieldScore']
-            else:
-                journalSubfieldScienceMetrixLabel, journalSubfieldScienceMetrixID, journalSubfieldDepartment, journalSubfieldScore = "", "", "", 0
-            
-            if 'relationshipEvidence' in items[i]['reCiterArticleFeatures'][j]['evidence']:
-                if 'relationshipEvidenceTotalScore' in items[i]['reCiterArticleFeatures'][j]['evidence']['relationshipEvidence']:
-                    relationshipEvidenceTotalScore = items[i]['reCiterArticleFeatures'][j]['evidence']['relationshipEvidence']['relationshipEvidenceTotalScore']
-                else:
-                    relationshipEvidenceTotalScore = 0
-                if 'relationshipNegativeMatch' in items[i]['reCiterArticleFeatures'][j]['evidence']['relationshipEvidence']:
-                    relationshipMinimumTotalScore = items[i]['reCiterArticleFeatures'][j]['evidence']['relationshipEvidence']['relationshipNegativeMatch']['relationshipMinimumTotalScore']
-                    relationshipNonMatchCount = items[i]['reCiterArticleFeatures'][j]['evidence']['relationshipEvidence']['relationshipNegativeMatch']['relationshipNonMatchCount']
-                    relationshipNonMatchScore = items[i]['reCiterArticleFeatures'][j]['evidence']['relationshipEvidence']['relationshipNegativeMatch']['relationshipNonMatchScore']
-                else:
-                    relationshipMinimumTotalScore, relationshipNonMatchCount, relationshipNonMatchScore = 0, 0, 0
-            else:
-                relationshipEvidenceTotalScore, relationshipMinimumTotalScore, relationshipNonMatchCount, relationshipNonMatchScore = 0, 0, 0, 0
-            
-            if 'educationYearEvidence' in items[i]['reCiterArticleFeatures'][j]['evidence']:
-                if 'articleYear' in items[i]['reCiterArticleFeatures'][j]['evidence']['educationYearEvidence']:
-                    articleYear = items[i]['reCiterArticleFeatures'][j]['evidence']['educationYearEvidence']['articleYear']
-                else:
-                    articleYear = 0
-                if 'identityBachelorYear' in items[i]['reCiterArticleFeatures'][j]['evidence']['educationYearEvidence']:
-                    identityBachelorYear = items[i]['reCiterArticleFeatures'][j]['evidence']['educationYearEvidence']['identityBachelorYear']
-                else:
-                    identityBachelorYear = ""
-                if 'discrepancyDegreeYearBachelor' in items[i]['reCiterArticleFeatures'][j]['evidence']['educationYearEvidence']:
-                    discrepancyDegreeYearBachelor = items[i]['reCiterArticleFeatures'][j]['evidence']['educationYearEvidence']['discrepancyDegreeYearBachelor']
-                else:
-                    discrepancyDegreeYearBachelor = 0
-                if 'discrepancyDegreeYearBachelorScore' in items[i]['reCiterArticleFeatures'][j]['evidence']['educationYearEvidence']:
-                    discrepancyDegreeYearBachelorScore = items[i]['reCiterArticleFeatures'][j]['evidence']['educationYearEvidence']['discrepancyDegreeYearBachelorScore']
-                else:
-                    discrepancyDegreeYearBachelorScore = 0
-                if 'identityDoctoralYear' in items[i]['reCiterArticleFeatures'][j]['evidence']['educationYearEvidence']:
-                    identityDoctoralYear = items[i]['reCiterArticleFeatures'][j]['evidence']['educationYearEvidence']['identityDoctoralYear']
-                else:
-                    identityDoctoralYear = ""
-                if 'discrepancyDegreeYearDoctoral' in items[i]['reCiterArticleFeatures'][j]['evidence']['educationYearEvidence']:
-                    discrepancyDegreeYearDoctoral = items[i]['reCiterArticleFeatures'][j]['evidence']['educationYearEvidence']['discrepancyDegreeYearDoctoral']
-                else:
-                    discrepancyDegreeYearDoctoral = 0
-                if 'discrepancyDegreeYearDoctoralScore' in items[i]['reCiterArticleFeatures'][j]['evidence']['educationYearEvidence']:
-                    discrepancyDegreeYearDoctoralScore = items[i]['reCiterArticleFeatures'][j]['evidence']['educationYearEvidence']['discrepancyDegreeYearDoctoralScore']
-                else:
-                    discrepancyDegreeYearDoctoralScore = 0
-            else:
-                articleYear, identityBachelorYear, discrepancyDegreeYearBachelor, discrepancyDegreeYearBachelorScore, identityDoctoralYear, discrepancyDegreeYearDoctoral, discrepancyDegreeYearDoctoralScore = 0, "", 0, 0, "", 0, 0
-            
-            if 'genderEvidence' in items[i]['reCiterArticleFeatures'][j]['evidence']:
-                genderScoreArticle = items[i]['reCiterArticleFeatures'][j]['evidence']['genderEvidence']['genderScoreArticle']
-                genderScoreIdentity = items[i]['reCiterArticleFeatures'][j]['evidence']['genderEvidence']['genderScoreIdentity']
-                genderScoreIdentityArticleDiscrepancy = items[i]['reCiterArticleFeatures'][j]['evidence']['genderEvidence']['genderScoreIdentityArticleDiscrepancy']
-            else:
-                genderScoreArticle, genderScoreIdentity, genderScoreIdentityArticleDiscrepancy = 0, 0, 0
-            
-            if 'personTypeEvidence' in items[i]['reCiterArticleFeatures'][j]['evidence']:
-                personType = items[i]['reCiterArticleFeatures'][j]['evidence']['personTypeEvidence']['personType']
-                personTypeScore = items[i]['reCiterArticleFeatures'][j]['evidence']['personTypeEvidence']['personTypeScore']
-            else:
-                personType, personTypeScore = "", 0
-            
-            if 'articleCountEvidence' in items[i]['reCiterArticleFeatures'][j]['evidence']:
-                countArticlesRetrieved = items[i]['reCiterArticleFeatures'][j]['evidence']['articleCountEvidence']['countArticlesRetrieved']
-                articleCountScore = items[i]['reCiterArticleFeatures'][j]['evidence']['articleCountEvidence']['articleCountScore']
-            else:
-                countArticlesRetrieved,  articleCountScore= 0,0
-            
-            if 'affiliationEvidence' in items[i]['reCiterArticleFeatures'][j]['evidence']:
-                if 'pubmedTargetAuthorAffiliation' in items[i]['reCiterArticleFeatures'][j]['evidence']['affiliationEvidence']:
-                    targetAuthorInstitutionalAffiliationArticlePubmedLabel = items[i]['reCiterArticleFeatures'][j]['evidence']['affiliationEvidence']['pubmedTargetAuthorAffiliation']['targetAuthorInstitutionalAffiliationArticlePubmedLabel']
-                    targetAuthorInstitutionalAffiliationArticlePubmedLabel = targetAuthorInstitutionalAffiliationArticlePubmedLabel.replace('"', '""')
-                    pubmedTargetAuthorInstitutionalAffiliationMatchTypeScore = items[i]['reCiterArticleFeatures'][j]['evidence']['affiliationEvidence']['pubmedTargetAuthorAffiliation']['targetAuthorInstitutionalAffiliationMatchTypeScore']
-                else:
-                    targetAuthorInstitutionalAffiliationArticlePubmedLabel, pubmedTargetAuthorInstitutionalAffiliationMatchTypeScore = "", 0
-            
-            if 'affiliationEvidence' in items[i]['reCiterArticleFeatures'][j]['evidence']:
-                if 'scopusNonTargetAuthorAffiliation' in items[i]['reCiterArticleFeatures'][j]['evidence']['affiliationEvidence']:
-                    scopusNonTargetAuthorInstitutionalAffiliationSource = items[i]['reCiterArticleFeatures'][j]['evidence']['affiliationEvidence']['scopusNonTargetAuthorAffiliation']['nonTargetAuthorInstitutionalAffiliationSource']
-                    scopusNonTargetAuthorInstitutionalAffiliationScore = items[i]['reCiterArticleFeatures'][j]['evidence']['affiliationEvidence']['scopusNonTargetAuthorAffiliation']['nonTargetAuthorInstitutionalAffiliationScore']
-                else:
-                    scopusNonTargetAuthorInstitutionalAffiliationSource, scopusNonTargetAuthorInstitutionalAffiliationScore= "", 0
+                # Common fields
+                pmcid = article.get('pmcid', '')
+                userAssertion = article.get('userAssertion', '')
+                publicationDateStandardized = article.get('publicationDateStandardized', '')
+                publicationDateDisplay = article.get('publicationDateDisplay', '')
+                publicationTypeCanonical = article.get('publicationType', {}).get('publicationTypeCanonical', '')
+                scopusDocID = article.get('scopusDocID', '')
+                journalTitleVerbose = article.get('journalTitleVerbose', '').replace('"', '""')
+                articleTitle = article.get('articleTitle', '').replace('"', '""')
 
-            if 'averageClusteringEvidence' in items[i]['reCiterArticleFeatures'][j]['evidence']:
-                totalArticleScoreWithoutClustering = items[i]['reCiterArticleFeatures'][j]['evidence']['averageClusteringEvidence']['totalArticleScoreWithoutClustering']
-                clusterScoreAverage = items[i]['reCiterArticleFeatures'][j]['evidence']['averageClusteringEvidence']['clusterScoreAverage']
-                clusterReliabilityScore = items[i]['reCiterArticleFeatures'][j]['evidence']['averageClusteringEvidence']['clusterReliabilityScore']
-                clusterScoreModificationOfTotalScore = items[i]['reCiterArticleFeatures'][j]['evidence']['averageClusteringEvidence']['clusterScoreModificationOfTotalScore']
-                if 'clusterIdentifier' in items[i]['reCiterArticleFeatures'][j]['evidence']['averageClusteringEvidence']:
-                    clusterIdentifier = items[i]['reCiterArticleFeatures'][j]['evidence']['averageClusteringEvidence']['clusterIdentifier']
-                else :
-                    clusterIdentifier = 0
+                # Evidence processing
+                evidence = article.get('evidence', {})              
 
-        if 'publicationDateDisplay' in items[i]['reCiterArticleFeatures'][j]:
-            publicationDateDisplay = items[i]['reCiterArticleFeatures'][j]['publicationDateDisplay']
-        else:
-            publicationDateDisplay = ""
+                # New fields (only in new format)
+                if is_new_format:
+                    authorshipLikelihoodScore = article.get('authorshipLikelihoodScore', '')
+                    # Feedback Evidence in new format
+                    feedbackEvidence = evidence.get('feedbackEvidence', {})  # Corrected line
+                    feedbackScoreCites = feedbackEvidence.get('feedbackScoreCites', '')
+                    feedbackScoreCoAuthorName = feedbackEvidence.get('feedbackScoreCoAuthorName', '')
+                    feedbackScoreEmail = feedbackEvidence.get('feedbackScoreEmail', '')
+                    feedbackScoreInstitution = feedbackEvidence.get('feedbackScoreInstitution', '')
+                    feedbackScoreJournal = feedbackEvidence.get('feedbackScoreJournal', '')
+                    feedbackScoreJournalSubField = feedbackEvidence.get('feedbackScoreJournalSubField', '')
+                    feedbackScoreKeyword = feedbackEvidence.get('feedbackScoreKeyword', '')
+                    feedbackScoreOrcid = feedbackEvidence.get('feedbackScoreOrcid', '')
+                    feedbackScoreOrcidCoAuthor = feedbackEvidence.get('feedbackScoreOrcidCoAuthor', '')
+                    feedbackScoreOrganization = feedbackEvidence.get('feedbackScoreOrganization', '')
+                    feedbackScoreTargetAuthorName = feedbackEvidence.get('feedbackScoreTargetAuthorName', '')
+                    feedbackScoreYear = feedbackEvidence.get('feedbackScoreYear', '')               
 
-        if 'datePublicationAddedToEntrez' in items[i]['reCiterArticleFeatures'][j]:
-            datePublicationAddedToEntrez = items[i]['reCiterArticleFeatures'][j]['datePublicationAddedToEntrez']
-        else:
-            datePublicationAddedToEntrez = ""
+                # Old fields (only in old format)
+                if not is_new_format:
+                    totalArticleScoreStandardized = article.get('totalArticleScoreStandardized', '')
+                    totalArticleScoreNonStandardized = article.get('totalArticleScoreNonStandardized', '')
+                    # Accepted/Rejected Evidence
+                    acceptedRejectedEvidence = evidence.get('acceptedRejectedEvidence', {})
+                    feedbackScoreAccepted = acceptedRejectedEvidence.get('feedbackScoreAccepted', '')
+                    feedbackScoreRejected = acceptedRejectedEvidence.get('feedbackScoreRejected', '')
+                    feedbackScoreNull = acceptedRejectedEvidence.get('feedbackScoreNull', '')
+                    # Clustering Evidence
+                    averageClusteringEvidence = evidence.get('averageClusteringEvidence', {})
+                    totalArticleScoreWithoutClustering = averageClusteringEvidence.get('totalArticleScoreWithoutClustering', '')
+                    clusterScoreAverage = averageClusteringEvidence.get('clusterScoreAverage', '')
+                    clusterReliabilityScore = averageClusteringEvidence.get('clusterReliabilityScore', '')
+                    clusterScoreModificationOfTotalScore = averageClusteringEvidence.get('clusterScoreModificationOfTotalScore', '')
+                    clusterIdentifier = averageClusteringEvidence.get('clusterIdentifier', '')
 
-        if 'doi' in items[i]['reCiterArticleFeatures'][j]:
-            doi = items[i]['reCiterArticleFeatures'][j]['doi']
-        else: 
-            doi = ""
-        #print(items[i]['reCiterArticleFeatures'][j])
-        if 'issn' in items[i]['reCiterArticleFeatures'][j]:
-            issn_temp = len(items[i]['reCiterArticleFeatures'][j]['issn'])
-            for k in range(issn_temp):
-                issntype = items[i]['reCiterArticleFeatures'][j]['issn'][k]['issntype']
-                if issntype == 'Linking':
-                    issn = items[i]['reCiterArticleFeatures'][j]['issn'][k]['issn']
-                    break
-                if issntype == 'Print':
-                    issn = items[i]['reCiterArticleFeatures'][j]['issn'][k]['issn']
-                    break
-                if issntype == 'Electronic':
-                    issn = items[i]['reCiterArticleFeatures'][j]['issn'][k]['issn']
-                    break
-        else:
-            issn = ""
 
-        if 'issue' in items[i]['reCiterArticleFeatures'][j]:
-            issue = items[i]['reCiterArticleFeatures'][j]['issue']
-        else: 
-            issue = ""
-        if 'journalTitleISOabbreviation' in items[i]['reCiterArticleFeatures'][j]:
-            journalTitleISOabbreviation = items[i]['reCiterArticleFeatures'][j]['journalTitleISOabbreviation']
-            journalTitleISOabbreviation = journalTitleISOabbreviation.replace('"', '""')
-        else:
-            journalTitleISOabbreviation = ""
-        if 'pages' in items[i]['reCiterArticleFeatures'][j]:
-            pages = items[i]['reCiterArticleFeatures'][j]['pages']
-        else:
-            pages = ""
-        if 'timesCited' in items[i]['reCiterArticleFeatures'][j]:
-            timesCited = items[i]['reCiterArticleFeatures'][j]['timesCited']
-        else: 
-            timesCited = 0
-        if 'volume' in items[i]['reCiterArticleFeatures'][j]:
-            volume = items[i]['reCiterArticleFeatures'][j]['volume']
-        else:
-            volume = ""
-        
-        #write all extracted features into csv file
-        #some string value may contain a comma, in this case, we need to double quote the output value, for example, '"' + str(journalSubfieldScienceMetrixLabel) + '"'
-        f.write('"' + str(personIdentifier) + '"' + "," + '"' + str(pmid) + '"' + "," + '"' + str(pmcid) + '"' + "," + '"' + str(totalArticleScoreStandardized) + '"' + "," 
-                + '"' + str(totalArticleScoreNonStandardized) + '"' + "," + '"' + str(userAssertion) + '"' + "," 
-                + '"' + str(publicationDateDisplay) + '"' + "," + '"' + str(publicationDateStandardized) + '"' + "," + '"' + str(publicationTypeCanonical) + '"' + ","
-                + '"' + str(scopusDocID) + '"' + ","  + '"' + str(journalTitleVerbose) + '"' + "," + '"' + str(articleTitle) + '"' + "," + '"' + str(feedbackScoreAccepted) + '"' + "," + '"' + str(feedbackScoreRejected) + '"' + "," + '"' + str(feedbackScoreNull) + '"' + "," 
-                + '"' + str(articleAuthorName_firstName) + '"' + "," + '"' + str(articleAuthorName_lastName) + '"' + "," + '"' + str(institutionalAuthorName_firstName) + '"' + "," + '"' + str(institutionalAuthorName_middleName) + '"' + "," + '"' + str(institutionalAuthorName_lastName) + '"' + ","
-                + '"' + str(nameMatchFirstScore) + '"' + "," + '"' + str(nameMatchFirstType) + '"' + "," + '"' + str(nameMatchMiddleScore) + '"' + "," + '"' + str(nameMatchMiddleType) + '"' + ","
-                + '"' + str(nameMatchLastScore) + '"' + "," + '"' + str(nameMatchLastType) + '"' + "," + '"' + str(nameMatchModifierScore) + '"' + "," + '"' + str(nameScoreTotal) + '"' + ","
-                + '"' + str(emailMatch) + '"' + "," + '"' + str(emailMatchScore) + '"' + "," 
-                + '"' + str(journalSubfieldScienceMetrixLabel) + '"' + "," + '"' + str(journalSubfieldScienceMetrixID) + '"' + "," + '"' + str(journalSubfieldDepartment) + '"' + "," + '"' + str(journalSubfieldScore) + '"' + "," 
-                + '"' + str(relationshipEvidenceTotalScore) + '"' + "," + '"' + str(relationshipMinimumTotalScore) + '"' + "," + '"' + str(relationshipNonMatchCount) + '"' + "," + '"' + str(relationshipNonMatchScore) + '"' + ","
-                + '"' + str(articleYear) + '"' + "," + '"' + str(identityBachelorYear) + '"' + "," + '"' + str(discrepancyDegreeYearBachelor) + '"' + "," + '"' + str(discrepancyDegreeYearBachelorScore) + '"' + ","
-                + '"' + str(identityDoctoralYear) + '"' + "," + '"' + str(discrepancyDegreeYearDoctoral) + '"' + "," + '"' + str(discrepancyDegreeYearDoctoralScore) + '"' + "," 
-                + '"' + str(genderScoreArticle) + '"' + "," + '"' + str(genderScoreIdentity) + '"' + "," + '"' + str(genderScoreIdentityArticleDiscrepancy) + '"' + "," 
-                + '"' + str(personType) + '"' + "," + '"' + str(personTypeScore) + '"' + ","
-                + '"' + str(countArticlesRetrieved) + '"' + "," + '"' + str(articleCountScore) + '"' + ","
-                + '"' + str(targetAuthorInstitutionalAffiliationArticlePubmedLabel) + '"' + "," + '"' + str(pubmedTargetAuthorInstitutionalAffiliationMatchTypeScore) + '"' + "," + '"' + str(scopusNonTargetAuthorInstitutionalAffiliationSource) + '"' + "," + '"' + str(scopusNonTargetAuthorInstitutionalAffiliationScore) + '"' + ","
-                + '"' + str(totalArticleScoreWithoutClustering) + '"' + "," + '"' + str(clusterScoreAverage) + '"' + "," + '"' + str(clusterReliabilityScore) + '"' + "," + '"' + str(clusterScoreModificationOfTotalScore) + '"' + ","
-                + '"' + str(datePublicationAddedToEntrez) + '"' + "," + '"' + str(clusterIdentifier) + '"' + "," + '"' + str(doi) + '"' + "," + '"' + str(issn) + '"' + "," + '"' + str(issue) + '"' + "," + '"' + str(journalTitleISOabbreviation) + '"'  + "," + '"' + str(pages) + '"' + "," + '"' + str(timesCited) + '"' + "," + '"' + str(volume) + '"'
-                + "\n")
-    count += 1
-    print("count person_article:", count)
+                # Author Name Evidence
+                authorNameEvidence = evidence.get('authorNameEvidence', {})
+                if authorNameEvidence:
+                    articleAuthorName = authorNameEvidence.get('articleAuthorName', {})
+                    articleAuthorName_firstName = articleAuthorName.get('firstName', '')
+                    articleAuthorName_lastName = articleAuthorName.get('lastName', '')
+                    institutionalAuthorName = authorNameEvidence.get('institutionalAuthorName', {})
+                    institutionalAuthorName_firstName = institutionalAuthorName.get('firstName', '')
+                    institutionalAuthorName_middleName = institutionalAuthorName.get('middleName', '')
+                    institutionalAuthorName_lastName = institutionalAuthorName.get('lastName', '')
+                    nameMatchFirstScore = authorNameEvidence.get('nameMatchFirstScore', '')
+                    nameMatchFirstType = authorNameEvidence.get('nameMatchFirstType', '')
+                    nameMatchMiddleScore = authorNameEvidence.get('nameMatchMiddleScore', '')
+                    nameMatchMiddleType = authorNameEvidence.get('nameMatchMiddleType', '')
+                    nameMatchLastScore = authorNameEvidence.get('nameMatchLastScore', '')
+                    nameMatchLastType = authorNameEvidence.get('nameMatchLastType', '')
+                    nameMatchModifierScore = authorNameEvidence.get('nameMatchModifierScore', '')
+                    nameScoreTotal = authorNameEvidence.get('nameScoreTotal', '')
+
+                # Email Evidence
+                emailEvidence = evidence.get('emailEvidence', {})
+                emailMatch = emailEvidence.get('emailMatch', '')
+                emailMatchScore = emailEvidence.get('emailMatchScore', '')
+
+                # Journal Category Evidence
+                journalCategoryEvidence = evidence.get('journalCategoryEvidence', {})
+                journalSubfieldScienceMetrixLabel = journalCategoryEvidence.get('journalSubfieldScienceMetrixLabel', '').replace('"', '""')
+                journalSubfieldScienceMetrixID = journalCategoryEvidence.get('journalSubfieldScienceMetrixID', '')
+                journalSubfieldDepartment = journalCategoryEvidence.get('journalSubfieldDepartment', '').replace('"', '""')
+                journalSubfieldScore = journalCategoryEvidence.get('journalSubfieldScore', '')
+
+                # Relationship Evidence
+                relationshipEvidence = evidence.get('relationshipEvidence', {})
+                relationshipEvidenceTotalScore = relationshipEvidence.get('relationshipEvidenceTotalScore', '')
+                relationshipNegativeMatch = relationshipEvidence.get('relationshipNegativeMatch', {})
+                relationshipMinimumTotalScore = relationshipNegativeMatch.get('relationshipMinimumTotalScore', '')
+                relationshipNonMatchCount = relationshipNegativeMatch.get('relationshipNonMatchCount', '')
+                relationshipNonMatchScore = relationshipNegativeMatch.get('relationshipNonMatchScore', '')
+
+                # Education Year Evidence
+                educationYearEvidence = evidence.get('educationYearEvidence', {})
+                articleYear = educationYearEvidence.get('articleYear', '')
+                identityBachelorYear = educationYearEvidence.get('identityBachelorYear', '')
+                discrepancyDegreeYearBachelor = educationYearEvidence.get('discrepancyDegreeYearBachelor', '')
+                discrepancyDegreeYearBachelorScore = educationYearEvidence.get('discrepancyDegreeYearBachelorScore', '')
+                identityDoctoralYear = educationYearEvidence.get('identityDoctoralYear', '')
+                discrepancyDegreeYearDoctoral = educationYearEvidence.get('discrepancyDegreeYearDoctoral', '')
+                discrepancyDegreeYearDoctoralScore = educationYearEvidence.get('discrepancyDegreeYearDoctoralScore', '')
+
+                # Gender Evidence
+                genderEvidence = evidence.get('genderEvidence', {})
+                genderScoreArticle = genderEvidence.get('genderScoreArticle', '')
+                genderScoreIdentity = genderEvidence.get('genderScoreIdentity', '')
+                genderScoreIdentityArticleDiscrepancy = genderEvidence.get('genderScoreIdentityArticleDiscrepancy', '')
+
+                # Person Type Evidence
+                personTypeEvidence = evidence.get('personTypeEvidence', {})
+                personType = personTypeEvidence.get('personType', '')
+                personTypeScore = personTypeEvidence.get('personTypeScore', '')
+
+                # Article Count Evidence
+                articleCountEvidence = evidence.get('articleCountEvidence', {})
+                countArticlesRetrieved = articleCountEvidence.get('countArticlesRetrieved', '')
+                articleCountScore = articleCountEvidence.get('articleCountScore', '')
+
+                # Affiliation Evidence
+                affiliationEvidence = evidence.get('affiliationEvidence', {})
+                pubmedAffiliation = affiliationEvidence.get('pubmedTargetAuthorAffiliation', {})
+                targetAuthorInstitutionalAffiliationArticlePubmedLabel = pubmedAffiliation.get('targetAuthorInstitutionalAffiliationArticlePubmedLabel', '').replace('"', '""')
+                pubmedTargetAuthorInstitutionalAffiliationMatchTypeScore = pubmedAffiliation.get('targetAuthorInstitutionalAffiliationMatchTypeScore', '')
+
+                scopusAffiliation = affiliationEvidence.get('scopusNonTargetAuthorAffiliation', {})
+                scopusNonTargetAuthorInstitutionalAffiliationSource = scopusAffiliation.get('nonTargetAuthorInstitutionalAffiliationSource', '')
+                scopusNonTargetAuthorInstitutionalAffiliationScore = scopusAffiliation.get('nonTargetAuthorInstitutionalAffiliationScore', '')
+
+
+                # Additional fields
+                datePublicationAddedToEntrez = article.get('datePublicationAddedToEntrez', '')
+                doi = article.get('doi', '')
+
+                # ISSN processing
+                issn_list = article.get('issn', [])
+                for issn_info in issn_list:
+                    issn_type = issn_info.get('issntype', '')
+                    if issn_type in ['Linking', 'Print', 'Electronic']:
+                        issn = issn_info.get('issn', '')
+                        break
+
+                issue = article.get('issue', '')
+                journalTitleISOabbreviation = article.get('journalTitleISOabbreviation', '').replace('"', '""')
+                pages = article.get('pages', '')
+                timesCited = article.get('timesCited', '')
+                volume = article.get('volume', '')
+
+                # Prepare fields for writing
+                fields = [
+                    '"' + str(personIdentifier) + '"',
+                    '"' + str(pmid) + '"',
+                    '"' + str(authorshipLikelihoodScore) + '"',
+                    '"' + str(pmcid) + '"',
+                    '"' + str(totalArticleScoreStandardized) + '"',
+                    '"' + str(totalArticleScoreNonStandardized) + '"',
+                    '"' + str(userAssertion) + '"',
+                    '"' + str(publicationDateDisplay) + '"',
+                    '"' + str(publicationDateStandardized) + '"',
+                    '"' + str(publicationTypeCanonical) + '"',
+                    '"' + str(scopusDocID) + '"',
+                    '"' + str(journalTitleVerbose) + '"',
+                    '"' + str(articleTitle) + '"',
+                    '"' + str(feedbackScoreAccepted) + '"',
+                    '"' + str(feedbackScoreRejected) + '"',
+                    '"' + str(feedbackScoreNull) + '"',
+                    '"' + str(articleAuthorName_firstName) + '"',
+                    '"' + str(articleAuthorName_lastName) + '"',
+                    '"' + str(institutionalAuthorName_firstName) + '"',
+                    '"' + str(institutionalAuthorName_middleName) + '"',
+                    '"' + str(institutionalAuthorName_lastName) + '"',
+                    '"' + str(nameMatchFirstScore) + '"',
+                    '"' + str(nameMatchFirstType) + '"',
+                    '"' + str(nameMatchMiddleScore) + '"',
+                    '"' + str(nameMatchMiddleType) + '"',
+                    '"' + str(nameMatchLastScore) + '"',
+                    '"' + str(nameMatchLastType) + '"',
+                    '"' + str(nameMatchModifierScore) + '"',
+                    '"' + str(nameScoreTotal) + '"',
+                    '"' + str(emailMatch) + '"',
+                    '"' + str(emailMatchScore) + '"',
+                    '"' + str(journalSubfieldScienceMetrixLabel) + '"',
+                    '"' + str(journalSubfieldScienceMetrixID) + '"',
+                    '"' + str(journalSubfieldDepartment) + '"',
+                    '"' + str(journalSubfieldScore) + '"',
+                    '"' + str(relationshipEvidenceTotalScore) + '"',
+                    '"' + str(relationshipMinimumTotalScore) + '"',
+                    '"' + str(relationshipNonMatchCount) + '"',
+                    '"' + str(relationshipNonMatchScore) + '"',
+                    '"' + str(articleYear) + '"',
+                    '"' + str(identityBachelorYear) + '"',
+                    '"' + str(discrepancyDegreeYearBachelor) + '"',
+                    '"' + str(discrepancyDegreeYearBachelorScore) + '"',
+                    '"' + str(identityDoctoralYear) + '"',
+                    '"' + str(discrepancyDegreeYearDoctoral) + '"',
+                    '"' + str(discrepancyDegreeYearDoctoralScore) + '"',
+                    '"' + str(genderScoreArticle) + '"',
+                    '"' + str(genderScoreIdentity) + '"',
+                    '"' + str(genderScoreIdentityArticleDiscrepancy) + '"',
+                    '"' + str(personType) + '"',
+                    '"' + str(personTypeScore) + '"',
+                    '"' + str(countArticlesRetrieved) + '"',
+                    '"' + str(articleCountScore) + '"',
+                    '"' + str(targetAuthorInstitutionalAffiliationArticlePubmedLabel) + '"',
+                    '"' + str(pubmedTargetAuthorInstitutionalAffiliationMatchTypeScore) + '"',
+                    '"' + str(scopusNonTargetAuthorInstitutionalAffiliationSource) + '"',
+                    '"' + str(scopusNonTargetAuthorInstitutionalAffiliationScore) + '"',
+                    '"' + str(totalArticleScoreWithoutClustering) + '"',
+                    '"' + str(clusterScoreAverage) + '"',
+                    '"' + str(clusterReliabilityScore) + '"',
+                    '"' + str(clusterScoreModificationOfTotalScore) + '"',
+                    '"' + str(datePublicationAddedToEntrez) + '"',
+                    '"' + str(clusterIdentifier) + '"',
+                    '"' + str(doi) + '"',
+                    '"' + str(issn) + '"',
+                    '"' + str(issue) + '"',
+                    '"' + str(journalTitleISOabbreviation) + '"',
+                    '"' + str(pages) + '"',
+                    '"' + str(timesCited) + '"',
+                    '"' + str(volume) + '"',
+                    '"' + str(feedbackScoreCites) + '"',
+                    '"' + str(feedbackScoreCoAuthorName) + '"',
+                    '"' + str(feedbackScoreEmail) + '"',
+                    '"' + str(feedbackScoreInstitution) + '"',
+                    '"' + str(feedbackScoreJournal) + '"',
+                    '"' + str(feedbackScoreJournalSubField) + '"',
+                    '"' + str(feedbackScoreKeyword) + '"',
+                    '"' + str(feedbackScoreOrcid) + '"',
+                    '"' + str(feedbackScoreOrcidCoAuthor) + '"',
+                    '"' + str(feedbackScoreOrganization) + '"',
+                    '"' + str(feedbackScoreTargetAuthorName) + '"',
+                    '"' + str(feedbackScoreYear) + '"',
+                ]
+                f.write(','.join(fields) + "\n")
+            except Exception as e:
+                print(f"Error processing article PMID {pmid} for person {personIdentifier}: {e}")
+                continue
+        count += 1
+        print(f"Processed person {personIdentifier}: {article_count} articles")
+
 f.close()
+
+
+
+
+
+
+
+
+
+
 
 
 #### The logic of all parts below is similar to the first part, please refer to the first part for explaination ####
@@ -690,8 +753,6 @@ for i in range(len(items)):
     print("count person_article_relationship:", count)
 f.close()
 print(misspelling_list)
-
-
 
 #code for person_article_author_s3 table
 f = open(outputPath + 'person_article_author2.csv','w', encoding='utf-8')
