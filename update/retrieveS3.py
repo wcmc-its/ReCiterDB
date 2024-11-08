@@ -81,7 +81,7 @@ if not os.path.exists(outputPath):
     os.makedirs(outputPath)
 
 # Flag to control whether to download data from S3
-download_from_s3 = False  # Set to True to download data from S3, False to use existing data
+download_from_s3 = True  # Set to True to download data from S3, False to use existing data
 
 if download_from_s3:
     # Download files from S3 using multithreading
