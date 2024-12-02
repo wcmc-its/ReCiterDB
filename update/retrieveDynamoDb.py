@@ -1,582 +1,172 @@
-import boto3
-from boto3.dynamodb.conditions import Key, Attr
-import time
-import json
-import csv
-import decimal
-from init import pymysql
-import MySQLdb
+# retrieveDynamoDB.py
+
 import os
+import sys
+import time
+import boto3
+from dynamodb_json import json_util as dynamodb_json
+import logging
+import pprint
+from botocore.exceptions import ClientError, EndpointConnectionError
+from data_transformer import (
+    process_person,
+    process_person_article,
+    process_person_article_author,
+    process_person_article_department,
+    process_person_article_grant,
+    process_person_article_keyword,
+    process_person_article_relationship,
+    process_person_article_scopus_target_author_affiliation,
+    process_person_article_scopus_non_target_author_affiliation,
+)
+import updateReCiterDB
 
-dynamodb = boto3.resource('dynamodb')
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def scan_table(table_name, is_filter_expression): #runtime: about 15min
-    #record time for scan the entire table
-    print(dynamodb)
-    start = time.time()
-    table = dynamodb.Table(table_name)
-
-    '''
-    # UIDs to filter
-    uids_to_retrieve = ['meb7002', 'ccole']
-
-    response = table.scan(
-        FilterExpression = Attr('usingS3').eq(0) & Attr('uid').is_in(uids_to_retrieve),
-    )
-    '''
-
-    response = table.scan(
-        FilterExpression = Attr('usingS3').eq(0),
-    )
-
-    items = response['Items']
-
-    #continue to get all records in the table, using ExclusiveStartKey
-    while True:
-        print(len(response['Items']))
-        if response.get('LastEvaluatedKey'):
-            if is_filter_expression: 
-                response = table.scan(
-                    ExclusiveStartKey = response['LastEvaluatedKey'],
-                    FilterExpression = Attr('usingS3').eq(0) # & Attr('uid').is_in(uids_to_retrieve)
-                )
-                items += response['Items']
-            else:
-                response = table.scan(
-                    ExclusiveStartKey = response['LastEvaluatedKey']
-                )
-                items += response['Items']
-        else:           
-            break
-    print('execution time:', time.time() - start)
-    
-    return items
-
-
+# Initialize paths and settings
 outputPath = 'temp/parsedOutput/'
-
-#call scan_table function for analysis
-items = scan_table('Analysis', True)
-print("Count Items from DynamoDB Analysis table:", len(items)) 
-
-#use a list to store (personIdentifier, number of articles for this person)
-count_articles = []
-#also check if there is anyone in the table with 0 article
-no_article_person_list = []
-for i in items:
-    count_articles.append((i['reCiterFeature']['personIdentifier'], len(i['reCiterFeature']['reCiterArticleFeatures'])))
-    if len(i['reCiterFeature']['reCiterArticleFeatures']) == 0:
-        no_article_person_list.append(i['reCiterFeature']['personIdentifier'])
-print("Count Items from count_articles list:", len(count_articles))
-print(len(no_article_person_list))
-
-
-
-# Open a CSV file in the directory you preferred
-with open(os.path.join(outputPath, 'person_article1.csv'), 'w', encoding='utf-8') as f:
-    # Write column names into the file
-    f.write(
-        "personIdentifier," + "pmid," + "authorshipLikelihoodScore," + "pmcid," + "totalArticleScoreStandardized," +
-        "totalArticleScoreNonStandardized," + "userAssertion," + "publicationDateDisplay," +
-        "publicationDateStandardized," + "publicationTypeCanonical," + "scopusDocID," + "journalTitleVerbose," +
-        "articleTitle," + "feedbackScoreAccepted," + "feedbackScoreRejected," + "feedbackScoreNull," +
-        "articleAuthorNameFirstName," + "articleAuthorNameLastName," + "institutionalAuthorNameFirstName," +
-        "institutionalAuthorNameMiddleName," + "institutionalAuthorNameLastName," + "nameMatchFirstScore," +
-        "nameMatchFirstType," + "nameMatchMiddleScore," + "nameMatchMiddleType," + "nameMatchLastScore," +
-        "nameMatchLastType," + "nameMatchModifierScore," + "nameScoreTotal," + "emailMatch," + "emailMatchScore," +
-        "journalSubfieldScienceMetrixLabel," + "journalSubfieldScienceMetrixID," + "journalSubfieldDepartment," +
-        "journalSubfieldScore," + "relationshipEvidenceTotalScore," + "relationshipMinimumTotalScore," +
-        "relationshipNonMatchCount," + "relationshipNonMatchScore," + "articleYear," + "identityBachelorYear," +
-        "discrepancyDegreeYearBachelor," + "discrepancyDegreeYearBachelorScore," + "identityDoctoralYear," +
-        "discrepancyDegreeYearDoctoral," + "discrepancyDegreeYearDoctoralScore," + "genderScoreArticle," +
-        "genderScoreIdentity," + "genderScoreIdentityArticleDiscrepancy," + "personType," + "personTypeScore," +
-        "countArticlesRetrieved," + "articleCountScore," + "targetAuthorInstitutionalAffiliationArticlePubmedLabel," +
-        "pubmedTargetAuthorInstitutionalAffiliationMatchTypeScore," + "scopusNonTargetAuthorInstitutionalAffiliationSource," +
-        "scopusNonTargetAuthorInstitutionalAffiliationScore," + "totalArticleScoreWithoutClustering," +
-        "clusterScoreAverage," + "clusterReliabilityScore," + "clusterScoreModificationOfTotalScore," +
-        "datePublicationAddedToEntrez," + "clusterIdentifier," + "doi," + "issn," + "issue," +
-        "journalTitleISOabbreviation," + "pages," + "timesCited," + "volume," + "feedbackScoreCites," +
-        "feedbackScoreCoAuthorName," + "feedbackScoreEmail," + "feedbackScoreInstitution," + "feedbackScoreJournal," +
-        "feedbackScoreJournalSubField," + "feedbackScoreKeyword," + "feedbackScoreOrcid," + "feedbackScoreOrcidCoAuthor," +
-        "feedbackScoreOrganization," + "feedbackScoreTargetAuthorName," + "feedbackScoreYear" + "\n"
-    )
-
-    count = 0
-
-    for item in items:
-        personIdentifier = item['reCiterFeature']['personIdentifier']
-        article_features = item['reCiterFeature'].get('reCiterArticleFeatures', [])
-        article_count = len(article_features)
-
-        for article in article_features:
-            pmid = article.get('pmid', "")
-            # Determine if the record is in new or old format
-            is_new_format = 'authorshipLikelihoodScore' in article
-
-            # Common fields
-            pmcid = article.get('pmcid', "")
-            totalArticleScoreStandardized = article.get('totalArticleScoreStandardized', "")
-            totalArticleScoreNonStandardized = article.get('totalArticleScoreNonStandardized', "")
-            userAssertion = article.get('userAssertion', "")
-            publicationDateDisplay = article.get('publicationDateDisplay', "")
-            publicationDateStandardized = article.get('publicationDateStandardized', "")
-            publicationTypeCanonical = article.get('publicationType', {}).get('publicationTypeCanonical', "")
-            scopusDocID = article.get('scopusDocID', "")
-            journalTitleVerbose = article.get('journalTitleVerbose', "").replace('"', '""')
-            articleTitle = article.get('articleTitle', "").replace('"', '""')
-
-            # New fields (only in new format)
-            if is_new_format:
-                authorshipLikelihoodScore = article.get('authorshipLikelihoodScore', "")
-            else:
-                authorshipLikelihoodScore = ""
-
-            # Initialize variables to default values before attempting to assign them
-            articleAuthorName_firstName = ""
-            articleAuthorName_lastName = ""
-            institutionalAuthorName_firstName = ""
-            institutionalAuthorName_middleName = ""
-            institutionalAuthorName_lastName = ""
-            nameMatchFirstScore = ""
-            nameMatchFirstType = ""
-            nameMatchMiddleScore = ""
-            nameMatchMiddleType = ""
-            nameMatchLastScore = ""
-            nameMatchLastType = ""
-            nameMatchModifierScore = ""
-            nameScoreTotal = ""
-            # Initialize other variables similarly...
-
-            # Accepted/Rejected Evidence
-            evidence = article.get('evidence', {})
-            acceptedRejectedEvidence = evidence.get('acceptedRejectedEvidence', {})
-            feedbackScoreAccepted = acceptedRejectedEvidence.get('feedbackScoreAccepted', "")
-            feedbackScoreRejected = acceptedRejectedEvidence.get('feedbackScoreRejected', "")
-            feedbackScoreNull = acceptedRejectedEvidence.get('feedbackScoreNull', "")
-
-            # Feedback Evidence (New attributes)
-            feedbackEvidence = evidence.get('feedbackEvidence', {})
-            feedbackScoreCites = feedbackEvidence.get('feedbackScoreCites', "")
-            feedbackScoreCoAuthorName = feedbackEvidence.get('feedbackScoreCoAuthorName', "")
-            feedbackScoreEmail = feedbackEvidence.get('feedbackScoreEmail', "")
-            feedbackScoreInstitution = feedbackEvidence.get('feedbackScoreInstitution', "")
-            feedbackScoreJournal = feedbackEvidence.get('feedbackScoreJournal', "")
-            feedbackScoreJournalSubField = feedbackEvidence.get('feedbackScoreJournalSubField', "")
-            feedbackScoreKeyword = feedbackEvidence.get('feedbackScoreKeyword', "")
-            feedbackScoreOrcid = feedbackEvidence.get('feedbackScoreOrcid', "")
-            feedbackScoreOrcidCoAuthor = feedbackEvidence.get('feedbackScoreOrcidCoAuthor', "")
-            feedbackScoreOrganization = feedbackEvidence.get('feedbackScoreOrganization', "")
-            feedbackScoreTargetAuthorName = feedbackEvidence.get('feedbackScoreTargetAuthorName', "")
-            feedbackScoreYear = feedbackEvidence.get('feedbackScoreYear', "")
-
-            # Author Name Evidence
-            authorNameEvidence = evidence.get('authorNameEvidence', {})
-            if authorNameEvidence:
-                articleAuthorName = authorNameEvidence.get('articleAuthorName', {})
-                articleAuthorName_firstName = articleAuthorName.get('firstName', "")
-                articleAuthorName_lastName = articleAuthorName.get('lastName', "")
-                institutionalAuthorName = authorNameEvidence.get('institutionalAuthorName', {})
-                institutionalAuthorName_firstName = institutionalAuthorName.get('firstName', "")
-                institutionalAuthorName_middleName = institutionalAuthorName.get('middleName', "")
-                institutionalAuthorName_lastName = institutionalAuthorName.get('lastName', "")
-                nameMatchFirstScore = authorNameEvidence.get('nameMatchFirstScore', "")
-                nameMatchFirstType = authorNameEvidence.get('nameMatchFirstType', "")
-                nameMatchMiddleScore = authorNameEvidence.get('nameMatchMiddleScore', "")
-                nameMatchMiddleType = authorNameEvidence.get('nameMatchMiddleType', "")
-                nameMatchLastScore = authorNameEvidence.get('nameMatchLastScore', "")
-                nameMatchLastType = authorNameEvidence.get('nameMatchLastType', "")
-                nameMatchModifierScore = authorNameEvidence.get('nameMatchModifierScore', "")
-                nameScoreTotal = authorNameEvidence.get('nameScoreTotal', "")
-            else:
-                # Variables have already been initialized to default empty strings
-                pass
-
-            # Email Evidence
-            emailEvidence = evidence.get('emailEvidence', {})
-            emailMatch = emailEvidence.get('emailMatch', "")
-            emailMatchScore = emailEvidence.get('emailMatchScore', "")
-
-            # Journal Category Evidence
-            journalCategoryEvidence = evidence.get('journalCategoryEvidence', {})
-            journalSubfieldScienceMetrixLabel = journalCategoryEvidence.get('journalSubfieldScienceMetrixLabel', "").replace('"', '""')
-            journalSubfieldScienceMetrixID = journalCategoryEvidence.get('journalSubfieldScienceMetrixID', "")
-            journalSubfieldDepartment = journalCategoryEvidence.get('journalSubfieldDepartment', "").replace('"', '""')
-            journalSubfieldScore = journalCategoryEvidence.get('journalSubfieldScore', "")
-
-            # Relationship Evidence
-            relationshipEvidence = evidence.get('relationshipEvidence', {})
-            relationshipEvidenceTotalScore = relationshipEvidence.get('relationshipEvidenceTotalScore', "")
-            relationshipNegativeMatch = relationshipEvidence.get('relationshipNegativeMatch', {})
-            relationshipMinimumTotalScore = relationshipNegativeMatch.get('relationshipMinimumTotalScore', "")
-            relationshipNonMatchCount = relationshipNegativeMatch.get('relationshipNonMatchCount', "")
-            relationshipNonMatchScore = relationshipNegativeMatch.get('relationshipNonMatchScore', "")
-
-            # Education Year Evidence
-            educationYearEvidence = evidence.get('educationYearEvidence', {})
-            articleYear = educationYearEvidence.get('articleYear', "")
-            identityBachelorYear = educationYearEvidence.get('identityBachelorYear', "")
-            discrepancyDegreeYearBachelor = educationYearEvidence.get('discrepancyDegreeYearBachelor', "")
-            discrepancyDegreeYearBachelorScore = educationYearEvidence.get('discrepancyDegreeYearBachelorScore', "")
-            identityDoctoralYear = educationYearEvidence.get('identityDoctoralYear', "")
-            discrepancyDegreeYearDoctoral = educationYearEvidence.get('discrepancyDegreeYearDoctoral', "")
-            discrepancyDegreeYearDoctoralScore = educationYearEvidence.get('discrepancyDegreeYearDoctoralScore', "")
-
-            # Gender Evidence
-            genderEvidence = evidence.get('genderEvidence', {})
-            genderScoreArticle = genderEvidence.get('genderScoreArticle', "")
-            genderScoreIdentity = genderEvidence.get('genderScoreIdentity', "")
-            genderScoreIdentityArticleDiscrepancy = genderEvidence.get('genderScoreIdentityArticleDiscrepancy', "")
-
-            # Person Type Evidence
-            personTypeEvidence = evidence.get('personTypeEvidence', {})
-            personType = personTypeEvidence.get('personType', "")
-            personTypeScore = personTypeEvidence.get('personTypeScore', "")
-
-            # Article Count Evidence
-            articleCountEvidence = evidence.get('articleCountEvidence', {})
-            countArticlesRetrieved = articleCountEvidence.get('countArticlesRetrieved', "")
-            articleCountScore = articleCountEvidence.get('articleCountScore', "")
-
-            # Affiliation Evidence
-            affiliationEvidence = evidence.get('affiliationEvidence', {})
-            pubmedTargetAuthorAffiliation = affiliationEvidence.get('pubmedTargetAuthorAffiliation', {})
-            targetAuthorInstitutionalAffiliationArticlePubmedLabel = pubmedTargetAuthorAffiliation.get('targetAuthorInstitutionalAffiliationArticlePubmedLabel', "").replace('"', '""')
-            pubmedTargetAuthorInstitutionalAffiliationMatchTypeScore = pubmedTargetAuthorAffiliation.get('targetAuthorInstitutionalAffiliationMatchTypeScore', "")
-            scopusNonTargetAuthorAffiliation = affiliationEvidence.get('scopusNonTargetAuthorAffiliation', {})
-            scopusNonTargetAuthorInstitutionalAffiliationSource = scopusNonTargetAuthorAffiliation.get('nonTargetAuthorInstitutionalAffiliationSource', "")
-            scopusNonTargetAuthorInstitutionalAffiliationScore = scopusNonTargetAuthorAffiliation.get('nonTargetAuthorInstitutionalAffiliationScore', "")
-
-            # Clustering Evidence
-            averageClusteringEvidence = evidence.get('averageClusteringEvidence', {})
-            totalArticleScoreWithoutClustering = averageClusteringEvidence.get('totalArticleScoreWithoutClustering', "")
-            clusterScoreAverage = averageClusteringEvidence.get('clusterScoreAverage', "")
-            clusterReliabilityScore = averageClusteringEvidence.get('clusterReliabilityScore', "")
-            clusterScoreModificationOfTotalScore = averageClusteringEvidence.get('clusterScoreModificationOfTotalScore', "")
-            clusterIdentifier = averageClusteringEvidence.get('clusterIdentifier', "")
-
-            # Additional fields
-            datePublicationAddedToEntrez = article.get('datePublicationAddedToEntrez', "")
-            doi = article.get('doi', "")
-            issn_list = article.get('issn', [])
-            issn = ""
-            for issn_item in issn_list:
-                issn_type = issn_item.get('issntype', "")
-                if issn_type in ['Linking', 'Print', 'Electronic']:
-                    issn = issn_item.get('issn', "")
-                    break
-            issue = article.get('issue', "")
-            journalTitleISOabbreviation = article.get('journalTitleISOabbreviation', "").replace('"', '""')
-            pages = article.get('pages', "")
-            timesCited = article.get('timesCited', "")
-            volume = article.get('volume', "")
-
-            # Prepare fields for writing
-            fields = [
-                '"' + str(personIdentifier) + '"',
-                '"' + str(pmid) + '"',
-                '"' + str(authorshipLikelihoodScore) + '"',
-                '"' + str(pmcid) + '"',
-                '"' + str(totalArticleScoreStandardized) + '"',
-                '"' + str(totalArticleScoreNonStandardized) + '"',
-                '"' + str(userAssertion) + '"',
-                '"' + str(publicationDateDisplay) + '"',
-                '"' + str(publicationDateStandardized) + '"',
-                '"' + str(publicationTypeCanonical) + '"',
-                '"' + str(scopusDocID) + '"',
-                '"' + str(journalTitleVerbose) + '"',
-                '"' + str(articleTitle) + '"',
-                '"' + str(feedbackScoreAccepted) + '"',
-                '"' + str(feedbackScoreRejected) + '"',
-                '"' + str(feedbackScoreNull) + '"',
-                '"' + str(articleAuthorName_firstName) + '"',
-                '"' + str(articleAuthorName_lastName) + '"',
-                '"' + str(institutionalAuthorName_firstName) + '"',
-                '"' + str(institutionalAuthorName_middleName) + '"',
-                '"' + str(institutionalAuthorName_lastName) + '"',
-                '"' + str(nameMatchFirstScore) + '"',
-                '"' + str(nameMatchFirstType) + '"',
-                '"' + str(nameMatchMiddleScore) + '"',
-                '"' + str(nameMatchMiddleType) + '"',
-                '"' + str(nameMatchLastScore) + '"',
-                '"' + str(nameMatchLastType) + '"',
-                '"' + str(nameMatchModifierScore) + '"',
-                '"' + str(nameScoreTotal) + '"',
-                '"' + str(emailMatch) + '"',
-                '"' + str(emailMatchScore) + '"',
-                '"' + str(journalSubfieldScienceMetrixLabel) + '"',
-                '"' + str(journalSubfieldScienceMetrixID) + '"',
-                '"' + str(journalSubfieldDepartment) + '"',
-                '"' + str(journalSubfieldScore) + '"',
-                '"' + str(relationshipEvidenceTotalScore) + '"',
-                '"' + str(relationshipMinimumTotalScore) + '"',
-                '"' + str(relationshipNonMatchCount) + '"',
-                '"' + str(relationshipNonMatchScore) + '"',
-                '"' + str(articleYear) + '"',
-                '"' + str(identityBachelorYear) + '"',
-                '"' + str(discrepancyDegreeYearBachelor) + '"',
-                '"' + str(discrepancyDegreeYearBachelorScore) + '"',
-                '"' + str(identityDoctoralYear) + '"',
-                '"' + str(discrepancyDegreeYearDoctoral) + '"',
-                '"' + str(discrepancyDegreeYearDoctoralScore) + '"',
-                '"' + str(genderScoreArticle) + '"',
-                '"' + str(genderScoreIdentity) + '"',
-                '"' + str(genderScoreIdentityArticleDiscrepancy) + '"',
-                '"' + str(personType) + '"',
-                '"' + str(personTypeScore) + '"',
-                '"' + str(countArticlesRetrieved) + '"',
-                '"' + str(articleCountScore) + '"',
-                '"' + str(targetAuthorInstitutionalAffiliationArticlePubmedLabel) + '"',
-                '"' + str(pubmedTargetAuthorInstitutionalAffiliationMatchTypeScore) + '"',
-                '"' + str(scopusNonTargetAuthorInstitutionalAffiliationSource) + '"',
-                '"' + str(scopusNonTargetAuthorInstitutionalAffiliationScore) + '"',
-                '"' + str(totalArticleScoreWithoutClustering) + '"',
-                '"' + str(clusterScoreAverage) + '"',
-                '"' + str(clusterReliabilityScore) + '"',
-                '"' + str(clusterScoreModificationOfTotalScore) + '"',
-                '"' + str(datePublicationAddedToEntrez) + '"',
-                '"' + str(clusterIdentifier) + '"',
-                '"' + str(doi) + '"',
-                '"' + str(issn) + '"',
-                '"' + str(issue) + '"',
-                '"' + str(journalTitleISOabbreviation) + '"',
-                '"' + str(pages) + '"',
-                '"' + str(timesCited) + '"',
-                '"' + str(volume) + '"',
-                '"' + str(feedbackScoreCites) + '"',
-                '"' + str(feedbackScoreCoAuthorName) + '"',
-                '"' + str(feedbackScoreEmail) + '"',
-                '"' + str(feedbackScoreInstitution) + '"',
-                '"' + str(feedbackScoreJournal) + '"',
-                '"' + str(feedbackScoreJournalSubField) + '"',
-                '"' + str(feedbackScoreKeyword) + '"',
-                '"' + str(feedbackScoreOrcid) + '"',
-                '"' + str(feedbackScoreOrcidCoAuthor) + '"',
-                '"' + str(feedbackScoreOrganization) + '"',
-                '"' + str(feedbackScoreTargetAuthorName) + '"',
-                '"' + str(feedbackScoreYear) + '"',
-            ]
-            f.write(','.join(fields) + "\n")
-
-        count += 1
-        print(f"Processed person {personIdentifier}: {article_count} articles")
-
-print("Finished generating person_article1.csv")
-
-
-
-
-#### The logic of all parts below is similar to the first part, please refer to the first part for explaination ####
-
-
-# Code for person_article_grant table
-f = open(outputPath + 'person_article_grant1.csv','w', encoding='utf-8')
-f.write("personIdentifier," + "pmid," + "articleGrant," + "grantMatchScore," + "institutionGrant" + "\n")
-
-count = 0
-for i in range(len(items)):
-    article_temp = len(items[i]['reCiterFeature']['reCiterArticleFeatures'])
-    for j in range(article_temp):
-        grants = items[i]['reCiterFeature']['reCiterArticleFeatures'][j].get('evidence', {}).get('grantEvidence', {}).get('grants', [])
-        for grant in grants:
-            personIdentifier = items[i]['reCiterFeature']['personIdentifier']
-            pmid = items[i]['reCiterFeature']['reCiterArticleFeatures'][j]['pmid']
-            articleGrant = grant.get('articleGrant', "")
-            grantMatchScore = grant.get('grantMatchScore', "")
-            institutionGrant = grant.get('institutionGrant', "")
-            f.write(f'{personIdentifier},{pmid},"{articleGrant}",{grantMatchScore},"{institutionGrant}"\n')
-    count += 1
-    print("Processed person:", count)
-f.close()
-
-
-
-# Code for person_article_scopus_non_target_author_affiliation table
-f = open(outputPath + 'person_article_scopus_non_target_author_affiliation1.csv','w', encoding='utf-8')
-f.write("personIdentifier," + "pmid," + "nonTargetAuthorInstitutionLabel," + "nonTargetAuthorInstitutionID," + "nonTargetAuthorInstitutionCount" + "\n")
-
-count = 0
-for i in range(len(items)):
-    article_temp = len(items[i]['reCiterFeature']['reCiterArticleFeatures'])
-    for j in range(article_temp):
-        non_target_affiliations = items[i]['reCiterFeature']['reCiterArticleFeatures'][j].get('evidence', {}).get('affiliationEvidence', {}).get('scopusNonTargetAuthorAffiliation', {}).get('nonTargetAuthorInstitutionalAffiliationMatchKnownInstitution', [])
-        for affiliation in non_target_affiliations:
-            personIdentifier = items[i]['reCiterFeature']['personIdentifier']
-            pmid = items[i]['reCiterFeature']['reCiterArticleFeatures'][j]['pmid']
-            # Assuming the affiliation string is in the format "Label, ID, Count"
-            f.write(f'{personIdentifier},{pmid},{affiliation}\n')
-    count += 1
-    print("Processed person:", count)
-f.close()
-
-
-
-
-# Code for person_article_scopus_target_author_affiliation table
-f = open(outputPath + 'person_article_scopus_target_author_affiliation1.csv','w', encoding='utf-8')
-f.write("personIdentifier," + "pmid," + "targetAuthorInstitutionalAffiliationSource," + "scopusTargetAuthorInstitutionalAffiliationIdentity," + "targetAuthorInstitutionalAffiliationArticleScopusLabel,"
-        + "targetAuthorInstitutionalAffiliationArticleScopusAffiliationId," + "targetAuthorInstitutionalAffiliationMatchType," + "targetAuthorInstitutionalAffiliationMatchTypeScore" + "\n")
-
-count = 0
-for i in range(len(items)):
-    article_temp = len(items[i]['reCiterFeature']['reCiterArticleFeatures'])
-    for j in range(article_temp):
-        scopus_affiliations = items[i]['reCiterFeature']['reCiterArticleFeatures'][j].get('evidence', {}).get('affiliationEvidence', {}).get('scopusTargetAuthorAffiliation', [])
-        for affiliation in scopus_affiliations:
-            personIdentifier = items[i]['reCiterFeature']['personIdentifier']
-            pmid = items[i]['reCiterFeature']['reCiterArticleFeatures'][j]['pmid']
-            targetAuthorInstitutionalAffiliationSource = affiliation.get('targetAuthorInstitutionalAffiliationSource', "")
-            scopusTargetAuthorInstitutionalAffiliationIdentity = affiliation.get('targetAuthorInstitutionalAffiliationIdentity', "")
-            targetAuthorInstitutionalAffiliationArticleScopusLabel = affiliation.get('targetAuthorInstitutionalAffiliationArticleScopusLabel', "")
-            targetAuthorInstitutionalAffiliationArticleScopusAffiliationId = affiliation.get('targetAuthorInstitutionalAffiliationArticleScopusAffiliationId', "")
-            targetAuthorInstitutionalAffiliationMatchType = affiliation.get('targetAuthorInstitutionalAffiliationMatchType', "")
-            targetAuthorInstitutionalAffiliationMatchTypeScore = affiliation.get('targetAuthorInstitutionalAffiliationMatchTypeScore', "")
-            f.write(f'{personIdentifier},{pmid},{targetAuthorInstitutionalAffiliationSource},"{scopusTargetAuthorInstitutionalAffiliationIdentity}","{targetAuthorInstitutionalAffiliationArticleScopusLabel}",{targetAuthorInstitutionalAffiliationArticleScopusAffiliationId},{targetAuthorInstitutionalAffiliationMatchType},{targetAuthorInstitutionalAffiliationMatchTypeScore}\n')
-    count += 1
-    print("Processed person:", count)
-f.close()
-
-
-
-# Code for person_article_department table
-f = open(outputPath + 'person_article_department1.csv','w', encoding='utf-8')
-f.write("personIdentifier," + "pmid," + "identityOrganizationalUnit," + "articleAffiliation," 
-        + "organizationalUnitType," + "organizationalUnitMatchingScore," + "organizationalUnitModifier," + "organizationalUnitModifierScore" + "\n")
-
-count = 0
-for i in range(len(items)):
-    article_temp = len(items[i]['reCiterFeature']['reCiterArticleFeatures'])
-    for j in range(article_temp):
-        # Determine if the record is in new or old format
-        is_new_format = 'authorshipLikelihoodScore' in items[i]['reCiterFeature']['reCiterArticleFeatures'][j]
-
-        organizationalUnitEvidence = items[i]['reCiterFeature']['reCiterArticleFeatures'][j].get('evidence', {}).get('organizationalUnitEvidence', [])
-
-        for org_unit in organizationalUnitEvidence:
-            personIdentifier = items[i]['reCiterFeature']['personIdentifier']
-            pmid = items[i]['reCiterFeature']['reCiterArticleFeatures'][j]['pmid']
-            identityOrganizationalUnit = org_unit.get('identityOrganizationalUnit', "").replace('"', '""')
-            articleAffiliation = org_unit.get('articleAffiliation', "").replace('"', '""')
-            organizationalUnitType = org_unit.get('organizationalUnitType', "")
-            organizationalUnitMatchingScore = org_unit.get('organizationalUnitMatchingScore', "")
-            organizationalUnitModifier = org_unit.get('organizationalUnitModifier', "")
-            organizationalUnitModifierScore = org_unit.get('organizationalUnitModifierScore', "")
-
-            f.write(f'"{personIdentifier}",{pmid},"{identityOrganizationalUnit}","{articleAffiliation}",{organizationalUnitType},{organizationalUnitMatchingScore},{organizationalUnitModifier},{organizationalUnitModifierScore}\n')
-    count += 1
-    print("Processed person:", count)
-f.close()
-
-
-
-# Code for person_article_relationship table
-f = open(outputPath + 'person_article_relationship1.csv','w', encoding='utf-8')
-f.write("personIdentifier," + "pmid," + "relationshipNameArticleFirstName," + "relationshipNameArticleLastName," 
-        + "relationshipNameIdentityFirstName," + "relationshipNameIdentityLastName," + "relationshipType," + "relationshipMatchType,"
-        + "relationshipMatchingScore," + "relationshipVerboseMatchModifierScore," + "relationshipMatchModifierMentor,"
-        + "relationshipMatchModifierMentorSeniorAuthor," + "relationshipMatchModifierManager," + "relationshipMatchModifierManagerSeniorAuthor" + "\n")
-
-count = 0
-for i in range(len(items)):
-    article_temp = len(items[i]['reCiterFeature']['reCiterArticleFeatures'])
-    for j in range(article_temp):
-        is_new_format = 'authorshipLikelihoodScore' in items[i]['reCiterFeature']['reCiterArticleFeatures'][j]
-
-        relationshipPositiveMatch = items[i]['reCiterFeature']['reCiterArticleFeatures'][j].get('evidence', {}).get('relationshipEvidence', {}).get('relationshipPositiveMatch', [])
-
-        for relation in relationshipPositiveMatch:
-            personIdentifier = items[i]['reCiterFeature']['personIdentifier']
-            pmid = items[i]['reCiterFeature']['reCiterArticleFeatures'][j]['pmid']
-            relationshipNameArticle_firstName = relation.get('relationshipNameArticle', {}).get('firstName', "")
-            relationshipNameArticle_lastName = relation.get('relationshipNameArticle', {}).get('lastName', "")
-            relationshipNameIdentity_firstName = relation.get('relationshipNameIdentity', {}).get('firstName', "")
-            relationshipNameIdentity_lastName = relation.get('relationshipNameIdentity', {}).get('lastName', "")
-            relationshipType = relation.get('relationshipType', "")
-            relationshipMatchType = relation.get('relationshipMatchType', "")
-            relationshipMatchingScore = relation.get('relationshipMatchingScore', "")
-            relationshipVerboseMatchModifierScore = relation.get('relationshipVerboseMatchModifierScore', "")
-            relationshipMatchModifierMentor = relation.get('relationshipMatchModifierMentor', "")
-            relationshipMatchModifierMentorSeniorAuthor = relation.get('relationshipMatchModifierMentorSeniorAuthor', "")
-            relationshipMatchModifierManager = relation.get('relationshipMatchModifierManager', "")
-            relationshipMatchModifierManagerSeniorAuthor = relation.get('relationshipMatchModifierManagerSeniorAuthor', "")
-
-            f.write(f'{personIdentifier},{pmid},"{relationshipNameArticle_firstName}","{relationshipNameArticle_lastName}","{relationshipNameIdentity_firstName}","{relationshipNameIdentity_lastName}","{relationshipType}",{relationshipMatchType},{relationshipMatchingScore},{relationshipVerboseMatchModifierScore},{relationshipMatchModifierMentor},{relationshipMatchModifierMentorSeniorAuthor},{relationshipMatchModifierManager},{relationshipMatchModifierManagerSeniorAuthor}\n')
-    count += 1
-    print("Processed person:", count)
-f.close()
-
-
-
-# Code for person table
-f = open(outputPath + 'person1.csv','w', encoding='utf-8')
-f.write("personIdentifier," + "dateAdded," + "dateUpdated," + "precision," + "recall," + "countSuggestedArticles," + "countPendingArticles," + "overallAccuracy," + "mode" + "\n")
-
-count = 0
-for i in range(len(items)):
-    personIdentifier = items[i]['reCiterFeature']['personIdentifier']
-    dateAdded = items[i]['reCiterFeature'].get('dateAdded', "")
-    dateUpdated = items[i]['reCiterFeature'].get('dateUpdated', "")
-    precision = items[i]['reCiterFeature'].get('precision', "")
-    recall = items[i]['reCiterFeature'].get('recall', "")
-    countSuggestedArticles = items[i]['reCiterFeature'].get('countSuggestedArticles', "")
-    countPendingArticles = items[i]['reCiterFeature'].get('countPendingArticles', "")
-    overallAccuracy = items[i]['reCiterFeature'].get('overallAccuracy', "")
-    mode = items[i]['reCiterFeature'].get('mode', "")
-
-    f.write(f'{personIdentifier},{dateAdded},{dateUpdated},{precision},{recall},{countSuggestedArticles},{countPendingArticles},{overallAccuracy},{mode}\n')
-    count += 1
-    print("Processed person:", count)
-f.close()
-
-
-
-# Code for person_article_author table
-
-# Record articles associated with the number of authors
-count_authors_dict = {}
-for i in range(len(items)):
-    article_temp = len(items[i]['reCiterFeature']['reCiterArticleFeatures'])
-    for j in range(article_temp):
-        pmid = items[i]['reCiterFeature']['reCiterArticleFeatures'][j]['pmid']
-        count_authors = len(items[i]['reCiterFeature']['reCiterArticleFeatures'][j].get('reCiterArticleAuthorFeatures', []))
-        count_authors_dict[str(pmid)] = count_authors
-
-f = open(outputPath + 'person_article_author1.csv','w', encoding='utf-8')
-f.write("personIdentifier," + "pmid," + "authorFirstName," + "authorLastName," + "targetAuthor," + "rank," + "orcid," + "equalContrib" + "\n")
-
-count = 0
-for i in range(len(items)):
-    article_temp = len(items[i]['reCiterFeature']['reCiterArticleFeatures'])
-    for j in range(article_temp):
-        pmid = items[i]['reCiterFeature']['reCiterArticleFeatures'][j]['pmid']
-        personIdentifier = items[i]['reCiterFeature']['personIdentifier']
-        author_features = items[i]['reCiterFeature']['reCiterArticleFeatures'][j].get('reCiterArticleAuthorFeatures', [])
-        for author in author_features:
-            firstName = author.get('firstName', "")
-            lastName = author.get('lastName', "")
-            targetAuthor = author.get('targetAuthor', "")
-            rank = author.get('rank', "")
-            orcid = author.get('orcid', "")
-            equalContrib = author.get('equalContrib', "")
-            f.write(f'{personIdentifier},{pmid},"{firstName}","{lastName}",{targetAuthor},{rank},"{orcid}","{equalContrib}"\n')
-    count += 1
-    print("Processed person:", count)
-f.close()
-
-
-# Code for person_article_keyword table
-f = open(outputPath + 'person_article_keyword1.csv','w', encoding='utf-8')
-f.write("personIdentifier," + "pmid," + "keyword" + "\n")
-
-count = 0
-for i in range(len(items)):
-    article_temp = len(items[i]['reCiterFeature']['reCiterArticleFeatures'])
-    for j in range(article_temp):
-        personIdentifier = items[i]['reCiterFeature']['personIdentifier']
-        pmid = items[i]['reCiterFeature']['reCiterArticleFeatures'][j]['pmid']
-        articleKeywords = items[i]['reCiterFeature']['reCiterArticleFeatures'][j].get('articleKeywords', [])
-        for keyword_entry in articleKeywords:
-            keyword = keyword_entry.get('keyword', "")
-            f.write(f'{personIdentifier},{pmid},"{keyword}"\n')
-    count += 1
-    print("Processed person:", count)
-f.close()
+max_objects_per_batch = 100  # Number of items to process per batch
+delete_csv_after_processing = True  # Set to True to delete CSV files after processing
+
+# Ensure directories exist
+os.makedirs(outputPath, exist_ok=True)
+
+def fetch_records_in_batches(table_name, batch_size=100, max_retries=5):
+    """
+    Generator function to fetch and transform records from a DynamoDB table in batches,
+    using the dynamodb-json library. Filters records where `usingS3 = 0`.
+
+    Args:
+        table_name (str): The name of the DynamoDB table.
+        batch_size (int): Number of items to fetch per scan operation.
+        max_retries (int): Maximum number of retry attempts for DynamoDB scan operations.
+
+    Yields:
+        list: A batch of transformed records.
+    """
+    dynamodb = boto3.client("dynamodb")
+    last_evaluated_key = None
+
+    while True:
+        attempt = 0
+        while attempt < max_retries:
+            try:
+                # Build the scan request with the filter expression
+                scan_kwargs = {
+                    "TableName": table_name,
+                    "Limit": batch_size,
+                    "FilterExpression": "usingS3 = :val",
+                    "ExpressionAttributeValues": {":val": {"N": "0"}},
+                }
+                if last_evaluated_key:
+                    scan_kwargs["ExclusiveStartKey"] = last_evaluated_key
+
+                # Perform the scan
+                response = dynamodb.scan(**scan_kwargs)
+
+                # Transform the items using dynamodb-json
+                raw_items = response.get("Items", [])
+                transformed_items = [dynamodb_json.loads(item) for item in raw_items]
+
+                if not transformed_items:
+                    logger.info("No more items to process.")
+                    return  # Exit if no items are returned
+
+                logger.info(f"Fetched and transformed {len(transformed_items)} records.")
+
+                # Yield the batch of transformed items
+                yield transformed_items
+
+                last_evaluated_key = response.get("LastEvaluatedKey", None)
+                if not last_evaluated_key:
+                    logger.info("All items have been processed.")
+                    break  # Exit the loop if there are no more items
+
+                break  # Exit retry loop if successful
+            except (ClientError, EndpointConnectionError) as e:
+                attempt += 1
+                logger.warning(f"Error fetching records: {e}. Attempt {attempt} of {max_retries}. Retrying...")
+                time.sleep(2 ** attempt)  # Exponential backoff
+            except Exception as e:
+                logger.error(f"Unexpected error: {e}")
+                return  # Exit function on unexpected errors
+
+def process_batch(batch, batch_number):
+    """
+    Processes a single batch of records.
+
+    Args:
+        batch (list): A batch of transformed records.
+        batch_number (int): The batch number for logging purposes.
+    """
+    logger.info(f"Processing batch {batch_number} with {len(batch)} records.")
+
+    # Extract 'reCiterFeature' from each record
+    extracted_records = []
+    for record in batch:
+        reCiterFeature = record.get('reCiterFeature')
+        if reCiterFeature:
+            extracted_records.append(reCiterFeature)
+        else:
+            logger.warning(f"No 'reCiterFeature' key in record: {record}")
+
+    if not extracted_records:
+        logger.warning(f"No valid 'reCiterFeature' records found in batch {batch_number}. Skipping.")
+        return
+
+    # Process the extracted records and generate CSV files
+    process_person(extracted_records, outputPath)
+    process_person_article(extracted_records, outputPath)
+    process_person_article_author(extracted_records, outputPath)
+    process_person_article_department(extracted_records, outputPath)
+    process_person_article_grant(extracted_records, outputPath)
+    process_person_article_keyword(extracted_records, outputPath)
+    process_person_article_relationship(extracted_records, outputPath)
+    process_person_article_scopus_target_author_affiliation(extracted_records, outputPath)
+    process_person_article_scopus_non_target_author_affiliation(extracted_records, outputPath)
+
+    logger.info(f"Batch {batch_number}: Updating the database...")
+    updateReCiterDB.main(truncate_tables=False, skip_identity_temp=True)
+
+    if delete_csv_after_processing:
+        logger.info(f"Batch {batch_number}: Deleting CSV files...")
+        for csv_file in os.listdir(outputPath):
+            if csv_file != "identity.csv":  # Retain `identity.csv`
+                csv_file_path = os.path.join(outputPath, csv_file)
+                if os.path.isfile(csv_file_path):
+                    os.remove(csv_file_path)
+        logger.info(f"Batch {batch_number}: CSV files deleted.")
+
+def main():
+    table_name = "Analysis"
+    total_items_processed = 0
+    batch_number = 0
+
+    logger.info("Fetching and processing records from DynamoDB in batches.")
+
+    for batch in fetch_records_in_batches(table_name, batch_size=max_objects_per_batch):
+        batch_number += 1
+        process_batch(batch, batch_number)
+        total_items_processed += len(batch)
+
+        # For testing purposes, you can break after processing the first batch
+        # Uncomment the following line if you want to process only one batch
+        # break
+
+    logger.info(f"Total items processed: {total_items_processed}")
+    logger.info("Script execution completed.")
+
+if __name__ == '__main__':
+    # Allow passing the max_objects_per_batch as a command-line argument
+    if len(sys.argv) > 1:
+        try:
+            max_objects_per_batch = int(sys.argv[1])
+        except ValueError:
+            logger.error("Please provide an integer value for max_objects_per_batch.")
+            sys.exit(1)
+    else:
+        max_objects_per_batch = 100  # Default value
+
+    main()
