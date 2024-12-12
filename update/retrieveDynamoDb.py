@@ -19,7 +19,7 @@ from data_transformer import (
     process_person_article_scopus_target_author_affiliation,
     process_person_article_scopus_non_target_author_affiliation,
 )
-import updateReCiterDB
+import updateReCiterDb
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
