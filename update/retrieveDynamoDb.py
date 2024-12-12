@@ -19,7 +19,7 @@ from data_transformer import (
     process_person_article_scopus_target_author_affiliation,
     process_person_article_scopus_non_target_author_affiliation,
 )
-import updateReCiterDB
+import updateReciterDB
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -128,7 +128,7 @@ def process_batch(batch, batch_number):
     process_person_article_scopus_non_target_author_affiliation(extracted_records, outputPath)
 
     logger.info(f"Batch {batch_number}: Updating the database...")
-    updateReCiterDB.main(truncate_tables=False, skip_identity_temp=True)
+    updateReciterDB.main(truncate_tables=False, skip_identity_temp=True)
 
     if delete_csv_after_processing:
         logger.info(f"Batch {batch_number}: Deleting CSV files...")
