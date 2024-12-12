@@ -1,4 +1,3 @@
-
 FROM python:3.11-slim
 
 WORKDIR /usr/src/app
@@ -12,19 +11,16 @@ ENV PYTHONUNBUFFERED=1
 
 ## Retrieve data from ReCiter and import into ReCiterDB
 
-COPY update/retrieveNIH.py ./
-COPY update/retrieveDynamoDb.py ./
-COPY update/retrieveS3.py ./
-COPY update/retrieveAltmetric.py ./
-COPY update/updateReciterDB.py ./
 COPY update/abstractImport.py ./
 COPY update/conflictsImport.py ./
+COPY update/dataTransformer.py ./
 COPY update/executeFeatureGenerator.py ./
+COPY update/retrieveAltmetric.py ./
+COPY update/retrieveDynamoDb.py ./
+COPY update/retrieveNIH.py ./
+COPY update/retrieveS3.py ./
+COPY update/updateReciterDB.py ./
 
-COPY update/feedbackScoreArticlesUpdateDatabase.py ./
-COPY update/feedbackScoringModel.keras ./
-COPY update/scaler.save ./
-COPY update/scoring.py ./
 
 RUN apt-get update && apt-get install -y --no-install-recommends gcc libpq-dev && rm -rf /var/lib/apt/lists/*
 
