@@ -1,6 +1,6 @@
 ###### Requirements without Version Specifiers ######
 PyMySQL
-boto3
+boto3==1.35.40
 requests
 pandas==2.0.3
 keras
