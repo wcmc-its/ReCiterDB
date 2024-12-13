@@ -8,7 +8,7 @@ from dynamodb_json import json_util as dynamodb_json
 import logging
 import pprint
 from botocore.exceptions import ClientError, EndpointConnectionError
-from data_transformer import (
+from dataTransformer import (
     process_person,
     process_person_article,
     process_person_article_author,
