@@ -23,7 +23,7 @@ from dataTransformer import (
 )
 import updateReciterDB
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 originalDataPath = 'temp/s3Output/'
@@ -72,10 +72,11 @@ def download_files_from_s3(bucket_name, keys, prefix, local_path, max_retries=5)
                 break
             except (ClientError, EndpointConnectionError, SSLError) as e:
                 attempt += 1
-                logger.warning(f"Error downloading {s3_key}: {e}. Attempt {attempt} of {max_retries}. Retrying...")
+                logger.warning(f"Error downloading {s3_key}: {type(e).__name__}: {e}. Attempt {attempt} of {max_retries}. Retrying...")
                 time.sleep(2 ** attempt)
             except Exception as e:
-                logger.error(f"Unexpected error downloading {s3_key}: {e}")
+                logger.error(f"Unexpected error downloading {s3_key}: {type(e).__name__}: {e}")
+                logger.debug("Full traceback:", exc_info=True)  # Logs full traceback
                 break
         else:
             logger.error(f"Failed to download {s3_key} after {max_retries} attempts.")
