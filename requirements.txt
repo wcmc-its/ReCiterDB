@@ -1,6 +1,7 @@
 ###### Requirements without Version Specifiers ######
 PyMySQL
 boto3==1.35.40
+dynamodb-json
 requests
 pandas==2.2.3
 keras
