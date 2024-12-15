@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 originalDataPath = 'temp/s3Output/'
 outputPath = 'temp/parsedOutput/'
-download_from_s3 = False
+download_from_s3 = True
 max_files_per_download_batch = 100
 max_objects_per_chunk = 100
 max_retry_attempts = 5
