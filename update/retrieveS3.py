@@ -189,7 +189,7 @@ def main():
             process_person_article_scopus_non_target_author_affiliation(items, outputPath)
 
             # Now that we have new CSVs for these items, load them without truncation or person_temp reload
-            updateReciterDB.main(truncate_tables=False, skip_person_temp=True)
+            updateReciterDB.main(truncate_tables=False, skip_person_temp=False)
 
         items.clear()
         current_index += max_files_per_download_batch
