@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 outputPath = 'temp/parsedOutput/'
 checkpoint_file = "checkpoint.json"
-max_objects_per_batch = 100
+max_objects_per_batch = 200
 delete_csv_after_processing = True
 
 os.makedirs(outputPath, exist_ok=True)
@@ -104,10 +104,14 @@ def process_batch(batch, batch_number):
     process_person_article_scopus_target_author_affiliation(extracted_records, outputPath)
     process_person_article_scopus_non_target_author_affiliation(extracted_records, outputPath)
 
+    # 1) Load the newly generated CSVs for person_article, etc. but skip loading person_temp
     retries = 0
     while retries < 5:
         try:
-            updateReciterDB.main(truncate_tables=False, skip_person_temp=False)
+            # skip_person_temp=True to skip re-loading person_temp.csv
+            updateReciterDB.main(truncate_tables=False, skip_person_temp=True)
+            # 2) Then call the separate function that only runs update_person
+            updateReciterDB.call_update_person_only()
             break
         except Exception as e:
             retries += 1

@@ -129,13 +129,12 @@ def load_table_once(cursor, csv_file_path, table_name, columns, already_loaded_t
     return cursor
 
 def main(truncate_tables=True, skip_person_temp=False):
-    # 1) Connect to the DB
     global connection
     connection = establish_connection()
     cursor = connection.cursor()
 
     try:
-        # 2) Possibly TRUNCATE all tables (if truncate_tables=True)
+        logger.info(f"Inside main(): truncate_tables={truncate_tables}, skip_person_temp={skip_person_temp}")
         if truncate_tables:
             tables_to_truncate = [
                 'person', 'person_article', 'person_article_author',
@@ -145,7 +144,6 @@ def main(truncate_tables=True, skip_person_temp=False):
                 'person_article_scopus_non_target_author_affiliation',
                 'person_person_type'
             ]
-            # Only add 'person_temp' if you genuinely want to re-load it
             if not skip_person_temp:
                 tables_to_truncate.append('person_temp')
 
@@ -153,9 +151,10 @@ def main(truncate_tables=True, skip_person_temp=False):
                 sql = f"TRUNCATE TABLE {table};"
                 cursor = execute_with_reconnect(cursor, sql)
             connection.commit()
-            logger.info("Tables truncated successfully.")
 
-        # 3) Load all your standard CSV files first
+        # ---------------------------------------------------------
+        # (A) Load *all the other CSVs except* person_temp/person_person_type
+        # ---------------------------------------------------------
         already_loaded_tables = set()
         csv_files = {
             'person2.csv': 'person',
@@ -167,7 +166,7 @@ def main(truncate_tables=True, skip_person_temp=False):
             'person_article_relationship2.csv': 'person_article_relationship',
             'person_article_scopus_target_author_affiliation2.csv': 'person_article_scopus_target_author_affiliation',
             'person_article_scopus_non_target_author_affiliation2.csv': 'person_article_scopus_non_target_author_affiliation',
-            'person_person_type.csv': 'person_person_type'
+            # 'person_person_type.csv': 'person_person_type'  <--- REMOVE THIS so it's not loaded multiple times
         }
         table_columns = {
             'person': ['personIdentifier', 'dateAdded', 'dateUpdated', 'precision', 'recall', 'countSuggestedArticles', 'countPendingArticles', 'overallAccuracy', 'mode'],
@@ -211,33 +210,60 @@ def main(truncate_tables=True, skip_person_temp=False):
 
         for csv_file, table_name in csv_files.items():
             csv_file_path = os.path.join('temp', 'parsedOutput', csv_file)
-            if table_name in table_columns:
-                columns = table_columns[table_name]
-                cursor = load_table_once(cursor, csv_file_path, table_name, columns, already_loaded_tables)
-            else:
+            if table_name not in table_columns:
                 logger.warning(f"No columns defined for {table_name}. Skipping load.")
+                continue
+            cursor = load_table_once(cursor, csv_file_path, table_name, table_columns[table_name], already_loaded_tables)
 
-        # 4) Now, do person_temp + update_person LAST
+        # ---------------------------------------------------------
+        # (B) Load person_temp and person_person_type *once*, if needed
+        # ---------------------------------------------------------
         if not skip_person_temp:
-            output_file = os.path.join('temp', 'parsedOutput', 'person_temp.csv')
-            if not os.path.exists(output_file):
-                raise FileNotFoundError(f"{output_file} not found. Ensure 'process_person_temp' has been run.")
+            # TRUNCATE person_temp, person_person_type once if needed
+            # Load person_temp.csv once
+            cursor = load_person_temp(cursor, "temp/parsedOutput/person_temp.csv")
 
-            logger.info("Loading person_temp and then updating person table.")
-            cursor = load_person_temp(cursor, output_file)
+            # Load person_person_type.csv once
+            # if not in the dictionary, you can manually do:
+            if os.path.exists("temp/parsedOutput/person_person_type.csv"):
+                columns = ["personIdentifier","personType"]  # adjust as needed
+                cursor = load_table_once(
+                    cursor,
+                    os.path.join("temp", "parsedOutput", "person_person_type.csv"),
+                    "person_person_type",
+                    columns,
+                    already_loaded_tables=set()
+                )
+
+            # Call update_person() last
             cursor = update_person(cursor)
 
         connection.commit()
-        logger.info("Database update completed successfully.")
-
     except Exception as e:
         logger.error(f"An error occurred: {e}")
-
     finally:
         cursor.close()
         connection.close()
-        logger.info("Database connection closed.")
 
+def call_update_person_only():
+    """
+    Connect to the DB, then call update_person().
+    This does NOT load person_temp or person_person_type.
+    """
+    global connection
+    connection = establish_connection()
+    cursor = connection.cursor()
+    try:
+        logger.info("Calling update_person ONLY, without loading person_temp...")
+        cursor = update_person(cursor)  # uses the existing person_temp table (whatever is currently in it)
+        connection.commit()
+    except Exception as e:
+        logger.error(f"Error in call_update_person_only: {e}")
+        raise
+    finally:
+        cursor.close()
+        connection.close()
+        logger.info("Finished update_person only.")
 
 if __name__ == '__main__':
     main(truncate_tables=True, skip_person_temp=False)

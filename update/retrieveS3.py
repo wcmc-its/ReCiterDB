@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 originalDataPath = 'temp/s3Output/'
 outputPath = 'temp/parsedOutput/'
-download_from_s3 = True
+download_from_s3 = False
 max_files_per_download_batch = 100
 max_objects_per_chunk = 100
 max_retry_attempts = 5
@@ -189,7 +189,7 @@ def main():
             process_person_article_scopus_non_target_author_affiliation(items, outputPath)
 
             # Now that we have new CSVs for these items, load them without truncation or person_temp reload
-            updateReciterDB.main(truncate_tables=False, skip_person_temp=False)
+            updateReciterDB.main(truncate_tables=False, skip_person_temp=True)
 
         items.clear()
         current_index += max_files_per_download_batch

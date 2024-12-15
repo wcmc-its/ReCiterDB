@@ -49,7 +49,7 @@ def get_person_identifier(mysql_cursor):
         """
         SELECT DISTINCT personIdentifier
         FROM """ + DB_NAME + """.reporting_ad_hoc_feature_generator_execution
-        WHERE (frequency = 'daily') OR (frequency = 'weekly' AND DAYOFWEEK(CURRENT_DATE) = 1) OR (frequency = 'monthly' AND DAY(CURRENT_DATE) = 1);
+        WHERE (frequency = 'daily') OR (frequency = 'weekly' AND DAYOFWEEK(CURRENT_DATE) = 7) OR (frequency = 'monthly' AND DAY(CURRENT_DATE) = 7);
         """
     )
     try:
