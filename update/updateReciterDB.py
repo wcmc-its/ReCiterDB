@@ -129,16 +129,13 @@ def load_table_once(cursor, csv_file_path, table_name, columns, already_loaded_t
     return cursor
 
 def main(truncate_tables=True, skip_person_temp=False):
-    db_vars = ["DB_HOST", "DB_USERNAME", "DB_PASSWORD", "DB_NAME"]
-    missing_vars = [var for var in db_vars if not os.getenv(var)]
-    if missing_vars:
-        raise EnvironmentError(f"Missing environment variables: {', '.join(missing_vars)}")
-
+    # 1) Connect to the DB
     global connection
     connection = establish_connection()
     cursor = connection.cursor()
 
     try:
+        # 2) Possibly TRUNCATE all tables (if truncate_tables=True)
         if truncate_tables:
             tables_to_truncate = [
                 'person', 'person_article', 'person_article_author',
@@ -148,27 +145,18 @@ def main(truncate_tables=True, skip_person_temp=False):
                 'person_article_scopus_non_target_author_affiliation',
                 'person_person_type'
             ]
+            # Only add 'person_temp' if you genuinely want to re-load it
             if not skip_person_temp:
                 tables_to_truncate.append('person_temp')
 
             for table in tables_to_truncate:
                 sql = f"TRUNCATE TABLE {table};"
-                logger.info(f"Executing: {sql}")
                 cursor = execute_with_reconnect(cursor, sql)
             connection.commit()
             logger.info("Tables truncated successfully.")
 
-        if not skip_person_temp:
-            # Load person_temp and then update_person only once at the start
-            output_file = os.path.join('temp', 'parsedOutput', 'person_temp.csv')
-            if not os.path.exists(output_file):
-                raise FileNotFoundError(f"{output_file} not found. Ensure 'process_person_temp' has been run.")
-
-            cursor = load_person_temp(cursor, output_file)
-            cursor = update_person(cursor)
-
+        # 3) Load all your standard CSV files first
         already_loaded_tables = set()
-
         csv_files = {
             'person2.csv': 'person',
             'person_article2.csv': 'person_article',
@@ -181,7 +169,6 @@ def main(truncate_tables=True, skip_person_temp=False):
             'person_article_scopus_non_target_author_affiliation2.csv': 'person_article_scopus_non_target_author_affiliation',
             'person_person_type.csv': 'person_person_type'
         }
-
         table_columns = {
             'person': ['personIdentifier', 'dateAdded', 'dateUpdated', 'precision', 'recall', 'countSuggestedArticles', 'countPendingArticles', 'overallAccuracy', 'mode'],
             'person_article': ["personIdentifier", "pmid", "authorshipLikelihoodScore", "pmcid",
@@ -223,27 +210,34 @@ def main(truncate_tables=True, skip_person_temp=False):
         }
 
         for csv_file, table_name in csv_files.items():
-            # If this is a subsequent run, skip re-loading person_temp and person_person_type
-            # because skip_person_temp=True means we don't re-run those initial loads
-            if skip_person_temp and table_name in ['person_temp', 'person_person_type']:
-                logger.info(f"Skipping {table_name} on subsequent runs.")
-                continue
-
             csv_file_path = os.path.join('temp', 'parsedOutput', csv_file)
-            columns = table_columns.get(table_name)
-            if not columns:
-                logger.warning(f"No column definitions for {table_name}. Skipping.")
-                continue
-            cursor = load_table_once(cursor, csv_file_path, table_name, columns, already_loaded_tables)
+            if table_name in table_columns:
+                columns = table_columns[table_name]
+                cursor = load_table_once(cursor, csv_file_path, table_name, columns, already_loaded_tables)
+            else:
+                logger.warning(f"No columns defined for {table_name}. Skipping load.")
+
+        # 4) Now, do person_temp + update_person LAST
+        if not skip_person_temp:
+            output_file = os.path.join('temp', 'parsedOutput', 'person_temp.csv')
+            if not os.path.exists(output_file):
+                raise FileNotFoundError(f"{output_file} not found. Ensure 'process_person_temp' has been run.")
+
+            logger.info("Loading person_temp and then updating person table.")
+            cursor = load_person_temp(cursor, output_file)
+            cursor = update_person(cursor)
 
         connection.commit()
         logger.info("Database update completed successfully.")
+
     except Exception as e:
         logger.error(f"An error occurred: {e}")
+
     finally:
         cursor.close()
         connection.close()
         logger.info("Database connection closed.")
+
 
 if __name__ == '__main__':
     main(truncate_tables=True, skip_person_temp=False)
