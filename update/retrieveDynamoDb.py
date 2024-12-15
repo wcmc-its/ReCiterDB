@@ -107,7 +107,7 @@ def process_batch(batch, batch_number):
     retries = 0
     while retries < 5:
         try:
-            updateReciterDB.main(truncate_tables=False, skip_person_temp=True)
+            updateReciterDB.main(truncate_tables=False, skip_person_temp=False)
             break
         except Exception as e:
             retries += 1
