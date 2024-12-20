@@ -4,43 +4,87 @@ import pymysql
 import os
 import time
 import logging
+import pymysql.err
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Retry parameters
 MAX_RETRIES = 10
-RETRY_WAIT_MAX = 300  # Maximum wait time in seconds for exponential backoff
+RETRY_WAIT_MAX = 300
+
+READ_TIMEOUT = 500     # seconds
+WRITE_TIMEOUT = 500    # seconds
+CONNECT_TIMEOUT = 10   # seconds
+
+connection = None
 
 def execute_with_reconnect(cursor, sql):
+    """
+    Execute SQL with automatic reconnection on certain errors.
+    Includes handling of various MySQL errors and generic Python exceptions.
+    """
     retries = 0
     while retries < MAX_RETRIES:
+        start_time = time.time()
         try:
+            logger.debug(f"Executing SQL: {sql[:500]}...")  # Log partial SQL to avoid huge logs
             cursor.execute(sql)
+            logger.debug(f"SQL executed successfully in {time.time() - start_time:.2f} seconds.")
             return cursor
-        except (pymysql.err.OperationalError, pymysql.err.InternalError, pymysql.err.InterfaceError, BrokenPipeError) as e:
-            if (isinstance(e, pymysql.err.OperationalError) and e.args[0] in (2006, 2013)) \
-               or isinstance(e, (pymysql.err.InterfaceError, BrokenPipeError)):
-                # Connection lost, attempt reconnect
+        except (pymysql.err.OperationalError,
+                pymysql.err.InternalError,
+                pymysql.err.InterfaceError,
+                pymysql.err.MySQLError,
+                BrokenPipeError,
+                TimeoutError) as e:
+            # Handle specific error codes for lost connection or server timeout
+            if isinstance(e, pymysql.err.OperationalError) and e.args[0] in (2006, 2013):
                 retries += 1
                 wait_time = min(2 ** retries, RETRY_WAIT_MAX)
-                logger.warning(f"Connection lost. Retrying ({retries}/{MAX_RETRIES}) in {wait_time} seconds...")
+                logger.warning(f"Connection lost during query (Error {e.args[0]}). "
+                               f"Retrying ({retries}/{MAX_RETRIES}) in {wait_time}s.")
                 time.sleep(wait_time)
+
+                # Attempt to reconnect
                 try:
                     connection.ping(reconnect=True)
                     cursor = connection.cursor()
+                    logger.info("Reconnected to the database successfully.")
                 except Exception as reconnect_error:
-                    logger.error(f"Error reconnecting: {reconnect_error}")
+                    logger.error(f"Error reconnecting after connection loss: {reconnect_error}")
                     continue
+            elif isinstance(e, pymysql.err.MySQLError) or isinstance(e, TimeoutError):
+                # Generic MySQL or timeout error
+                retries += 1
+                wait_time = min(2 ** retries, RETRY_WAIT_MAX)
+                logger.warning(f"MySQL error encountered: {e}. Retrying ({retries}/{MAX_RETRIES}) in {wait_time}s.")
+                time.sleep(wait_time)
             else:
+                # Reraise unexpected exceptions
                 raise
+        except Exception as e:
+            # Catch any other unexpected exceptions
+            retries += 1
+            wait_time = min(2 ** retries, RETRY_WAIT_MAX)
+            logger.error(f"Unexpected error executing SQL: {e}. Retrying ({retries}/{MAX_RETRIES}) in {wait_time}s.")
+            time.sleep(wait_time)
+            try:
+                connection.ping(reconnect=True)
+                cursor = connection.cursor()
+                logger.info("Reconnected to the database after unexpected error.")
+            except Exception as reconnect_error:
+                logger.error(f"Error reconnecting after unexpected exception: {reconnect_error}")
+                continue
+
     raise Exception("Failed to execute SQL after several retries.")
 
 def establish_connection():
+    global connection
     retries = 0
     while retries < MAX_RETRIES:
         try:
-            conn = pymysql.connect(
+            # Added read_timeout, write_timeout, and connect_timeout to avoid hangs
+            connection = pymysql.connect(
                 host=os.getenv("DB_HOST"),
                 user=os.getenv("DB_USERNAME"),
                 password=os.getenv("DB_PASSWORD"),
@@ -48,14 +92,17 @@ def establish_connection():
                 local_infile=True,
                 charset='utf8mb4',
                 cursorclass=pymysql.cursors.DictCursor,
-                connect_timeout=10
+                connect_timeout=CONNECT_TIMEOUT,
+                read_timeout=READ_TIMEOUT,
+                write_timeout=WRITE_TIMEOUT
             )
             logger.info("Database connection established successfully.")
-            return conn
+            return connection
         except pymysql.err.OperationalError as e:
             retries += 1
             wait_time = min(2 ** retries, RETRY_WAIT_MAX)
-            logger.warning(f"Database connection failed: {e}. Retrying ({retries}/{MAX_RETRIES}) in {wait_time} seconds...")
+            logger.warning(f"Database connection failed: {e}. "
+                           f"Retrying ({retries}/{MAX_RETRIES}) in {wait_time} seconds...")
             time.sleep(wait_time)
     raise Exception("Failed to establish database connection after several retries.")
 
@@ -71,7 +118,7 @@ def load_person_temp(cursor, csv_file_path):
     primaryOrganizationalUnit, primaryInstitution, personIdentifier, relationshipIdentityCount);
     """
     cursor = execute_with_reconnect(cursor, sql)
-    cursor.execute("SELECT COUNT(*) AS row_count FROM person_temp;")
+    cursor = execute_with_reconnect(cursor, "SELECT COUNT(*) AS row_count FROM person_temp;")
     row_count = cursor.fetchone()['row_count']
     logger.info(f"{time.ctime()} -- Loaded {row_count} rows into person_temp successfully.")
     return cursor
@@ -116,14 +163,10 @@ def load_table_once(cursor, csv_file_path, table_name, columns, already_loaded_t
         f"({columns_str});"
     )
 
-    try:
-        cursor = execute_with_reconnect(cursor, sql)
-        cursor.execute(f"SELECT COUNT(*) AS row_count FROM {table_name};")
-        row_count = cursor.fetchone()['row_count']
-        logger.info(f"Data successfully loaded into {table_name}. Row count: {row_count}")
-    except Exception as e:
-        logger.error(f"Error loading data into {table_name}: {e}")
-        raise
+    cursor = execute_with_reconnect(cursor, sql)
+    cursor = execute_with_reconnect(cursor, f"SELECT COUNT(*) AS row_count FROM {table_name};")
+    row_count = cursor.fetchone()['row_count']
+    logger.info(f"Data successfully loaded into {table_name}. Row count: {row_count}")
 
     already_loaded_tables.add(table_name)
     return cursor
@@ -135,27 +178,36 @@ def main(truncate_tables=True, skip_person_temp=False):
 
     try:
         logger.info(f"Inside main(): truncate_tables={truncate_tables}, skip_person_temp={skip_person_temp}")
-        if truncate_tables:
-            tables_to_truncate = [
-                'person', 'person_article', 'person_article_author',
-                'person_article_department', 'person_article_grant',
-                'person_article_keyword', 'person_article_relationship',
-                'person_article_scopus_target_author_affiliation',
-                'person_article_scopus_non_target_author_affiliation',
-                'person_person_type'
-            ]
-            if not skip_person_temp:
-                tables_to_truncate.append('person_temp')
 
-            for table in tables_to_truncate:
+        # Define all tables to be loaded for index disable/enable
+        all_tables = [
+            'person', 'person_article', 'person_article_author',
+            'person_article_department', 'person_article_grant',
+            'person_article_keyword', 'person_article_relationship',
+            'person_article_scopus_target_author_affiliation',
+            'person_article_scopus_non_target_author_affiliation',
+            'person_person_type', 'person_temp'
+        ]
+
+        if truncate_tables:
+            for table in all_tables:
                 sql = f"TRUNCATE TABLE {table};"
                 cursor = execute_with_reconnect(cursor, sql)
             connection.commit()
 
-        # ---------------------------------------------------------
-        # (A) Load *all the other CSVs except* person_temp/person_person_type
-        # ---------------------------------------------------------
+        # Disable keys before loading
+        for table in all_tables:
+            sql = f"ALTER TABLE `{table}` DISABLE KEYS;"
+            try:
+                cursor = execute_with_reconnect(cursor, sql)
+            except Exception as e:
+                logger.warning(f"Could not disable keys on {table}: {e}")
+
         already_loaded_tables = set()
+
+        # ---------------------------------------------------------
+        # (A) Load all other CSVs except person_temp/person_person_type
+        # ---------------------------------------------------------
         csv_files = {
             'person2.csv': 'person',
             'person_article2.csv': 'person_article',
@@ -166,7 +218,6 @@ def main(truncate_tables=True, skip_person_temp=False):
             'person_article_relationship2.csv': 'person_article_relationship',
             'person_article_scopus_target_author_affiliation2.csv': 'person_article_scopus_target_author_affiliation',
             'person_article_scopus_non_target_author_affiliation2.csv': 'person_article_scopus_non_target_author_affiliation',
-            # 'person_person_type.csv': 'person_person_type'  <--- REMOVE THIS so it's not loaded multiple times
         }
         table_columns = {
             'person': ['personIdentifier', 'dateAdded', 'dateUpdated', 'precision', 'recall', 'countSuggestedArticles', 'countPendingArticles', 'overallAccuracy', 'mode'],
@@ -205,9 +256,9 @@ def main(truncate_tables=True, skip_person_temp=False):
             'person_article_relationship': ['personIdentifier', 'pmid', 'relationshipNameArticleFirstName', 'relationshipNameArticleLastName', 'relationshipNameIdentityFirstName', 'relationshipNameIdentityLastName', 'relationshipType', 'relationshipMatchType', 'relationshipMatchingScore', 'relationshipVerboseMatchModifierScore', 'relationshipMatchModifierMentor', 'relationshipMatchModifierMentorSeniorAuthor', 'relationshipMatchModifierManager', 'relationshipMatchModifierManagerSeniorAuthor'],
             'person_article_scopus_target_author_affiliation': ['personIdentifier', 'pmid', 'targetAuthorInstitutionalAffiliationSource', 'scopusTargetAuthorInstitutionalAffiliationIdentity', 'targetAuthorInstitutionalAffiliationArticleScopusLabel', 'targetAuthorInstitutionalAffiliationArticleScopusAffiliationId', 'targetAuthorInstitutionalAffiliationMatchType', 'targetAuthorInstitutionalAffiliationMatchTypeScore'],
             'person_article_scopus_non_target_author_affiliation': ['personIdentifier', 'pmid', 'nonTargetAuthorInstitutionLabel', 'nonTargetAuthorInstitutionID', 'nonTargetAuthorInstitutionCount'],
-            'person_person_type': ['personIdentifier', 'personType']
         }
 
+        # Load all tables except person_temp and person_person_type
         for csv_file, table_name in csv_files.items():
             csv_file_path = os.path.join('temp', 'parsedOutput', csv_file)
             if table_name not in table_columns:
@@ -215,55 +266,59 @@ def main(truncate_tables=True, skip_person_temp=False):
                 continue
             cursor = load_table_once(cursor, csv_file_path, table_name, table_columns[table_name], already_loaded_tables)
 
-        # ---------------------------------------------------------
-        # (B) Load person_temp and person_person_type *once*, if needed
-        # ---------------------------------------------------------
+        # (B) Load person_temp and person_person_type if needed
+        # NOTE: We do NOT run update_person here anymore.
         if not skip_person_temp:
-            # TRUNCATE person_temp, person_person_type once if needed
-            # Load person_temp.csv once
             cursor = load_person_temp(cursor, "temp/parsedOutput/person_temp.csv")
-
-            # Load person_person_type.csv once
-            # if not in the dictionary, you can manually do:
-            if os.path.exists("temp/parsedOutput/person_person_type.csv"):
-                columns = ["personIdentifier","personType"]  # adjust as needed
+            person_person_type_path = os.path.join("temp", "parsedOutput", "person_person_type.csv")
+            if os.path.exists(person_person_type_path):
+                columns = ["personIdentifier","personType"]  
                 cursor = load_table_once(
                     cursor,
-                    os.path.join("temp", "parsedOutput", "person_person_type.csv"),
+                    person_person_type_path,
                     "person_person_type",
                     columns,
                     already_loaded_tables=set()
                 )
 
-            # Call update_person() last
+        # Enable keys after loading is completed
+        for table in all_tables:
+            sql = f"ALTER TABLE `{table}` ENABLE KEYS;"
+            try:
+                cursor = execute_with_reconnect(cursor, sql)
+            except Exception as e:
+                logger.warning(f"Could not enable keys on {table}: {e}")
+
+        # Now that all data is loaded, if we have person_temp, we can finally update_person
+        if not skip_person_temp:
             cursor = update_person(cursor)
 
         connection.commit()
+
     except Exception as e:
         logger.error(f"An error occurred: {e}")
     finally:
-        cursor.close()
-        connection.close()
+        if connection and connection.open:
+            cursor.close()
+            connection.close()
+            connection = None
+            logger.info("Database connection closed after main().")
+
 
 def call_update_person_only():
-    """
-    Connect to the DB, then call update_person().
-    This does NOT load person_temp or person_person_type.
-    """
     global connection
     connection = establish_connection()
     cursor = connection.cursor()
     try:
         logger.info("Calling update_person ONLY, without loading person_temp...")
-        cursor = update_person(cursor)  # uses the existing person_temp table (whatever is currently in it)
+        cursor = update_person(cursor)  # uses the existing person_temp table
         connection.commit()
     except Exception as e:
         logger.error(f"Error in call_update_person_only: {e}")
         raise
     finally:
-        cursor.close()
-        connection.close()
-        logger.info("Finished update_person only.")
-
-if __name__ == '__main__':
-    main(truncate_tables=True, skip_person_temp=False)
+        if connection and connection.open:
+            cursor.close()
+            connection.close()
+            connection = None
+            logger.info("Database connection closed after call_update_person_only().")
