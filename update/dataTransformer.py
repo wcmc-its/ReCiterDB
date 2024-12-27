@@ -197,7 +197,6 @@ def process_person_article(items, output_path):
     """
     output_file = os.path.join(output_path, 'person_article2.csv')
 
-    # Define headers dynamically
     headers = [
         "personIdentifier", "pmid", "authorshipLikelihoodScore", "pmcid",
 
@@ -211,13 +210,16 @@ def process_person_article(items, output_path):
         "emailMatchScore", "journalSubfieldScienceMetrixLabel",
         "journalSubfieldScienceMetrixID", "journalSubfieldDepartment",
         "journalSubfieldScore", "relationshipEvidenceTotalScore",
-        "relationshipMinimumTotalScore", "relationshipNonMatchCount",
-        "relationshipNonMatchScore", "articleYear",
-        
+        "relationshipPositiveMatchScore",
+        "relationshipNegativeMatchScore",
+        "relationshipIdentityCount",
+        "relationshipMinimumTotalScore", "relationshipNonMatchCount", "relationshipNonMatchScore",
+        "articleYear",
         "identityBachelorYear", "discrepancyDegreeYearBachelor", "discrepancyDegreeYearBachelorScore",
         "identityDoctoralYear", "discrepancyDegreeYearDoctoral", "discrepancyDegreeYearDoctoralScore",
         "genderScoreArticle", "genderScoreIdentity", "genderScoreIdentityArticleDiscrepancy",
         "personType", "personTypeScore", "countArticlesRetrieved", "articleCountScore",
+        "countAuthors", "authorCountScore",
         "targetAuthorInstitutionalAffiliationArticlePubmedLabel",
         "pubmedTargetAuthorInstitutionalAffiliationMatchTypeScore",
         "scopusNonTargetAuthorInstitutionalAffiliationSource",
@@ -299,6 +301,16 @@ def process_person_article(items, output_path):
                         relationship_evidence = evidence.get('relationshipEvidence', {})
                         relationship_total_score = sanitize_field(relationship_evidence.get('relationshipEvidenceTotalScore', ''))
 
+                        relationship_positive_match_score = sanitize_field(
+                            relationship_evidence.get('relationshipPositiveMatchScore', '')
+                        )
+                        relationship_negative_match_score = sanitize_field(
+                            relationship_evidence.get('relationshipNegativeMatchScore', '')
+                        )
+                        relationship_identity_count = sanitize_field(
+                            relationship_evidence.get('relationshipIdentityCount', '')
+                        )
+
                         # Relationship negative match
                         relationship_negative_match = relationship_evidence.get('relationshipNegativeMatch', {})
                         if isinstance(relationship_negative_match, dict):
@@ -334,39 +346,55 @@ def process_person_article(items, output_path):
                         # Article count evidence
                         article_count_evidence = evidence.get('articleCountEvidence', {})
                         count_articles_retrieved = sanitize_field(article_count_evidence.get('countArticlesRetrieved', ''))
-                        # print(f"Debug: Raw field value: {count_articles_retrieved}")
                         article_count_score = sanitize_field(article_count_evidence.get('articleCountScore', ''))
-                        # print(f"Debug: Raw field value: {article_count_score}")
+
+                        # Author count evidence
+                        author_count_evidence = evidence.get('authorCountEvidence', {})
+                        count_authors = sanitize_field(author_count_evidence.get('countAuthors', ''))
+                        author_count_score = sanitize_field(author_count_evidence.get('authorCountScore', ''))
 
                         # PubMed affiliation evidence
                         affiliation_evidence = evidence.get('affiliationEvidence', {})
-                        
                         pubmed_target_author_affiliation = affiliation_evidence.get('pubmedTargetAuthorAffiliation', {})
-                        # print(f"Debug: Raw field value: {pubmed_target_author_affiliation}")
                         if isinstance(pubmed_target_author_affiliation, dict):
-                            target_author_institutional_affiliation_article_pubmed_label = sanitize_field(pubmed_target_author_affiliation.get('targetAuthorInstitutionalAffiliationArticlePubmedLabel', ''))
-                            pubmed_target_author_institutional_affiliation_match_type_score = sanitize_field(pubmed_target_author_affiliation.get('targetAuthorInstitutionalAffiliationMatchTypeScore', ''))
+                            target_author_institutional_affiliation_article_pubmed_label = sanitize_field(
+                                pubmed_target_author_affiliation.get('targetAuthorInstitutionalAffiliationArticlePubmedLabel', '')
+                            )
+                            pubmed_target_author_institutional_affiliation_match_type_score = sanitize_field(
+                                pubmed_target_author_affiliation.get('targetAuthorInstitutionalAffiliationMatchTypeScore', '')
+                            )
                         else:
                             target_author_institutional_affiliation_article_pubmed_label = ''
                             pubmed_target_author_institutional_affiliation_match_type_score = ''
 
                         # Scopus affiliation evidence
                         scopus_affiliation = affiliation_evidence.get('scopusNonTargetAuthorAffiliation', {})
+                        scopus_non_target_author_institutional_affiliation_source = ''
+                        scopus_non_target_author_institutional_affiliation_score = ''
                         if isinstance(scopus_affiliation, dict):
                             # Handle dict case directly
-                            scopus_non_target_author_institutional_affiliation_source = sanitize_field(scopus_affiliation.get('nonTargetAuthorInstitutionalAffiliationSource', ''))
-                            scopus_non_target_author_institutional_affiliation_score = sanitize_field(scopus_affiliation.get('nonTargetAuthorInstitutionalAffiliationScore', 0))
+                            scopus_non_target_author_institutional_affiliation_source = sanitize_field(
+                                scopus_affiliation.get('nonTargetAuthorInstitutionalAffiliationSource', '')
+                            )
+                            scopus_non_target_author_institutional_affiliation_score = sanitize_field(
+                                scopus_affiliation.get('nonTargetAuthorInstitutionalAffiliationScore', 0)
+                            )
                         elif isinstance(scopus_affiliation, list) and scopus_affiliation:
                             # Handle list case by taking the first element
                             first_affiliation = scopus_affiliation[0]
                             if isinstance(first_affiliation, dict):
-                                scopus_non_target_author_institutional_affiliation_source = sanitize_field(first_affiliation.get('nonTargetAuthorInstitutionalAffiliationSource', ''))
-                                scopus_non_target_author_institutional_affiliation_score = sanitize_field(first_affiliation.get('nonTargetAuthorInstitutionalAffiliationScore', 0))
+                                scopus_non_target_author_institutional_affiliation_source = sanitize_field(
+                                    first_affiliation.get('nonTargetAuthorInstitutionalAffiliationSource', '')
+                                )
+                                scopus_non_target_author_institutional_affiliation_score = sanitize_field(
+                                    first_affiliation.get('nonTargetAuthorInstitutionalAffiliationScore', 0)
+                                )
 
                         # Additional fields
                         date_publication_added_to_entrez = sanitize_field(article.get('datePublicationAddedToEntrez', ''))
                         doi = sanitize_field(article.get('doi', ''))
                         issn_list = article.get('issn', [])
+                        issn = ''
                         if isinstance(issn_list, list):
                             for issn_item in issn_list:
                                 issntype = issn_item.get('issntype', '')
@@ -439,6 +467,11 @@ def process_person_article(items, output_path):
                             "journalSubfieldDepartment": journal_subfield_department,
                             "journalSubfieldScore": journal_subfield_score,
                             "relationshipEvidenceTotalScore": relationship_total_score,
+
+                            "relationshipPositiveMatchScore": relationship_positive_match_score,
+                            "relationshipNegativeMatchScore": relationship_negative_match_score,
+                            "relationshipIdentityCount": relationship_identity_count,
+
                             "relationshipMinimumTotalScore": relationship_min_score,
                             "relationshipNonMatchCount": relationship_non_match_count,
                             "relationshipNonMatchScore": relationship_non_match_score,
@@ -457,6 +490,8 @@ def process_person_article(items, output_path):
                             "personTypeScore": person_type_score,
                             "countArticlesRetrieved": count_articles_retrieved,
                             "articleCountScore": article_count_score,
+                            "countAuthors": count_authors,
+                            "authorCountScore": author_count_score,
                             "targetAuthorInstitutionalAffiliationArticlePubmedLabel": target_author_institutional_affiliation_article_pubmed_label,
                             "pubmedTargetAuthorInstitutionalAffiliationMatchTypeScore": pubmed_target_author_institutional_affiliation_match_type_score,
                             "scopusNonTargetAuthorInstitutionalAffiliationSource": scopus_non_target_author_institutional_affiliation_source,
@@ -491,12 +526,6 @@ def process_person_article(items, output_path):
 
                         # Build the row using the headers to ensure correct order
                         row = [row_data.get(header, '') for header in headers]
-
-                        # Debugging statements
-                        # print(f"Debug: Length of headers: {len(headers)}")
-                        # print(f"Debug: Length of row: {len(row)}")
-                        # print(f"Debug: Row data: {row}")
-
                         rows.append(row)
                         processed_articles += 1
                     except Exception as e:
@@ -512,7 +541,7 @@ def process_person_article(items, output_path):
 
     except Exception as e:
         log_error('N/A', f"Error writing to person_article2.csv: {e}")
-
+        
 
 def process_person_article_author(items, output_path):
     """
