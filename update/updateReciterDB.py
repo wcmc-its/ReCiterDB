@@ -297,6 +297,8 @@ def main(truncate_tables=True, skip_person_temp=False):
                 "personType", "personTypeScore", "countArticlesRetrieved", "articleCountScore",
                 "countAuthors",
                 "authorCountScore",
+                "targetAuthorCount",        
+                "targetAuthorCountPenalty",   
                 "targetAuthorInstitutionalAffiliationArticlePubmedLabel",
                 "pubmedTargetAuthorInstitutionalAffiliationMatchTypeScore",
                 "scopusNonTargetAuthorInstitutionalAffiliationSource",

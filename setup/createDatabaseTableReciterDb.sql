@@ -649,6 +649,8 @@ CREATE TABLE `person_article` (
   `feedbackScoreYear` float DEFAULT NULL,
   `totalArticleScoreStandardized` int(11) DEFAULT NULL,
   `totalArticleScoreNonStandardized` float DEFAULT NULL,
+  `targetAuthorCount` int(11) DEFAULT NULL,
+  `targetAuthorCountPenalty` float(7,4) DEFAULT NULL  
   PRIMARY KEY (`id`),
   KEY `idx_issn` (`issn`) USING BTREE,
   KEY `idx_scopusDocID` (`scopusDocID`) USING BTREE,

@@ -220,6 +220,8 @@ def process_person_article(items, output_path):
         "genderScoreArticle", "genderScoreIdentity", "genderScoreIdentityArticleDiscrepancy",
         "personType", "personTypeScore", "countArticlesRetrieved", "articleCountScore",
         "countAuthors", "authorCountScore",
+        "targetAuthorCount",          
+        "targetAuthorCountPenalty",   
         "targetAuthorInstitutionalAffiliationArticlePubmedLabel",
         "pubmedTargetAuthorInstitutionalAffiliationMatchTypeScore",
         "scopusNonTargetAuthorInstitutionalAffiliationSource",
@@ -263,6 +265,9 @@ def process_person_article(items, output_path):
                         scopus_doc_id = sanitize_field(article.get('scopusDocID', ''))
                         journal_title_verbose = sanitize_field(article.get('journalTitleVerbose', ''))
                         article_title = sanitize_field(article.get('articleTitle', ''))
+
+                        target_author_count = sanitize_field(article.get('targetAuthorCount', ''))
+                        target_author_count_penalty = sanitize_field(article.get('targetAuthorCountPenalty', ''))
 
                         # Evidence fields
                         evidence = article.get('evidence', {})
@@ -492,6 +497,10 @@ def process_person_article(items, output_path):
                             "articleCountScore": article_count_score,
                             "countAuthors": count_authors,
                             "authorCountScore": author_count_score,
+                            
+                            "targetAuthorCount": target_author_count,
+                            "targetAuthorCountPenalty": target_author_count_penalty,
+                            
                             "targetAuthorInstitutionalAffiliationArticlePubmedLabel": target_author_institutional_affiliation_article_pubmed_label,
                             "pubmedTargetAuthorInstitutionalAffiliationMatchTypeScore": pubmed_target_author_institutional_affiliation_match_type_score,
                             "scopusNonTargetAuthorInstitutionalAffiliationSource": scopus_non_target_author_institutional_affiliation_source,
