@@ -266,9 +266,6 @@ def process_person_article(items, output_path):
                         journal_title_verbose = sanitize_field(article.get('journalTitleVerbose', ''))
                         article_title = sanitize_field(article.get('articleTitle', ''))
 
-                        target_author_count = sanitize_field(article.get('targetAuthorCount', ''))
-                        target_author_count_penalty = sanitize_field(article.get('targetAuthorCountPenalty', ''))
-
                         # Evidence fields
                         evidence = article.get('evidence', {})
 
@@ -290,6 +287,10 @@ def process_person_article(items, output_path):
                         name_match_modifier_score = sanitize_field(author_name_evidence.get('nameMatchModifierScore', ''))
                         name_score_total = sanitize_field(author_name_evidence.get('nameScoreTotal', ''))
 
+                        # Target author count
+                        target_author_count = sanitize_field(evidence.get('targetAuthorCount', ''))
+                        target_author_count_penalty = sanitize_field(evidence.get('targetAuthorCountPenalty', ''))
+                        
                         # Email evidence
                         email_evidence = evidence.get('emailEvidence', {})
                         email_match = sanitize_field(email_evidence.get('emailMatch', ''))

@@ -17,9 +17,8 @@ COPY update/conflictsImport.py ./
 COPY update/dataTransformer.py ./
 COPY update/executeFeatureGenerator.py ./
 COPY update/retrieveAltmetric.py ./
-COPY update/retrieveDynamoDb.py ./
+COPY update/retrieveArticles.py ./
 COPY update/retrieveNIH.py ./
-COPY update/retrieveS3.py ./
 COPY update/updateReciterDB.py ./
 
 # Install Python dependencies
@@ -33,4 +32,4 @@ RUN mkdir -p temp/parsedOutput
 RUN mkdir -p temp/s3Output
 
 # Final command
-CMD [ "/bin/bash", "-c", "python3 executeFeatureGenerator.py && python3 ./retrieveS3.py && python3 ./retrieveDynamoDb.py && python3 ./retrieveNIH.py && python3 ./conflictsImport.py && python3 ./abstractImport.py" ]
+CMD [ "/bin/bash", "-c", "python3 executeFeatureGenerator.py && python3 ./retrieveArticles.py && python3 ./retrieveNIH.py && python3 ./conflictsImport.py && python3 ./abstractImport.py" ]
