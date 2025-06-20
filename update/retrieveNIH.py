@@ -270,10 +270,10 @@ if __name__ == '__main__':
     total_records_retrieved = 0
 
     # Process each batch
-    for i in range(0, len(person_article_pmid), 900):
+    for i in range(0, len(person_article_pmid), 250):
         # Get current batch of PMIDs
-        pmid_batch = person_article_pmid[i:i+900]
-        logger.info(f"Processing batch {i//900 +1}: PMIDs {i+1} to {i+len(pmid_batch)}")
+        pmid_batch = person_article_pmid[i:i+250]
+        logger.info(f"Processing batch {i//250 +1}: PMIDs {i+1} to {i+len(pmid_batch)}")
 
         # Make API call
         api_url = create_nih_API_url(pmid_batch)
