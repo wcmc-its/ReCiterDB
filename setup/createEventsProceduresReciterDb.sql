@@ -2464,7 +2464,7 @@ set a.citationCountNIH = r.citation_count,
 a.percentileNIH = r.nih_percentile,
 a.relativeCitationRatioNIH = r.relative_citation_ratio,
 publicationTypeNIH = 
-  case when is_research_article in ('Yes','yes') then 'Research Article'
+  case when is_research_article in ('Yes','yes','True') then 'Research Article'
   else null
   end;
 
