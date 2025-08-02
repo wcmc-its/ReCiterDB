@@ -1,7 +1,10 @@
 
 DELIMITER ////
+
 CREATE DEFINER=`admin`@`%` PROCEDURE `generateBibliometricReport`(IN personID VARCHAR(255))
 BEGIN
+
+SET collation_connection = 'utf8mb4_unicode_ci';
 
 set @personIdentifier = personID;
 
@@ -13,10 +16,11 @@ join analysis_summary_author a on a.personIdentifier = s.personIdentifier
 join analysis_summary_article a1 on a1.pmid = a.pmid
 where publicationTypeNIH = 'Research Article' and 
 a.personIdentifier = @personIdentifier and 
-percentileNIH is null and  
+(percentileNIH is null or percentileNIH = 0) and  
 round((unix_timestamp() - UNIX_TIMESTAMP(STR_TO_DATE(datePublicationAddedtoEntrez,'%Y-%m-%d')) ) / (60 * 60 * 24),0) < 730
 limit 10
 );
+
 
 
 
@@ -53,7 +57,7 @@ from analysis_summary_person s
 join analysis_summary_author a on a.personIdentifier = s.personIdentifier
 join analysis_summary_article a1 on a1.pmid = a.pmid
 where publicationTypeNIH = 'Research Article' 
-and percentileNIH is null 
+and (percentileNIH is null or percentileNIH = 0) 
 and a.personIdentifier = @personIdentifier
 and round((unix_timestamp() - UNIX_TIMESTAMP(STR_TO_DATE(datePublicationAddedtoEntrez,'%Y-%m-%d')) ) / (60 * 60 * 24),0) < 730
 order by a.pmid desc
@@ -395,8 +399,8 @@ a.pmid,
 ".",
 "\\'a0{\\field{\\*\\fldinst{HYPERLINK \"",
 case 
-  when pmcid is not null and pmcid != '' then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
-  when a1.doi is not null and a1.doi != '' then concat('https://dx.doi.org/',a1.doi)
+  when pmcid is not null then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
+  when a1.doi is not null then concat('https://dx.doi.org/',a1.doi)
   when a.pmid is not null then concat('https://pubmed.ncbi.nlm.nih.gov/',a.pmid)
 end,
 "\"}}{\\fldrslt \\cf3 Full text}}
@@ -466,8 +470,8 @@ a.pmid,
 ".",
 "\\'a0{\\field{\\*\\fldinst{HYPERLINK \"",
 case 
-  when pmcid is not null and pmcid != '' then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
-  when a1.doi is not null and a1.doi != '' then concat('https://dx.doi.org/',a1.doi)
+  when pmcid is not null then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
+  when a1.doi is not null then concat('https://dx.doi.org/',a1.doi)
   when a.pmid is not null then concat('https://pubmed.ncbi.nlm.nih.gov/',a.pmid)
 end,
 "\"}}{\\fldrslt \\cf3 Full text}}
@@ -531,8 +535,8 @@ a.pmid,
 ".",
 "\\'a0{\\field{\\*\\fldinst{HYPERLINK \"",
 case 
-  when pmcid is not null and pmcid != '' then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
-  when a1.doi is not null and a1.doi != '' then concat('https://dx.doi.org/',a1.doi)
+  when pmcid is not null then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
+  when a1.doi is not null then concat('https://dx.doi.org/',a1.doi)
   when a.pmid is not null then concat('https://pubmed.ncbi.nlm.nih.gov/',a.pmid)
 end,
 "\"}}{\\fldrslt \\cf3 Full text}}
@@ -563,7 +567,7 @@ join analysis_summary_article a1 on a1.pmid = a.pmid
 where 
 publicationTypeNIH = 'Research Article' and 
 a.personIdentifier = @personIdentifier and
-percentileNIH is null and  
+(percentileNIH is null or percentileNIH = 0) and      
 round((unix_timestamp() - UNIX_TIMESTAMP(STR_TO_DATE(datePublicationAddedtoEntrez,'%Y-%m-%d')) ) / (60 * 60 * 24),0) < 730
 order by authorPosition desc, readersMendeley desc
 limit 10) x);
@@ -607,8 +611,8 @@ a.pmid,
 ".",
 "\\'a0{\\field{\\*\\fldinst{HYPERLINK \"",
 case 
-  when pmcid is not null and pmcid != '' then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
-  when a1.doi is not null and a1.doi != '' then concat('https://dx.doi.org/',a1.doi)
+  when pmcid is not null then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
+  when a1.doi is not null then concat('https://dx.doi.org/',a1.doi)
   when a.pmid is not null then concat('https://pubmed.ncbi.nlm.nih.gov/',a.pmid)
 end,
 "\"}}{\\fldrslt \\cf3 Full text}}
@@ -1180,8 +1184,10 @@ end,
 
 
 END;
+
 ////
 DELIMITER ;
+
 
 
 DELIMITER ////
