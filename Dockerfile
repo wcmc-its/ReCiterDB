@@ -21,7 +21,7 @@ COPY update/executeFeatureGenerator.py ./
 
 
 ## Shell script for running the stored procedure
-COPY run_nightly_indexing.sh ./
+COPY update/run_nightly_indexing.sh ./
 RUN chmod +x run_nightly_indexing.sh
 
 
