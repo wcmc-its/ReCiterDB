@@ -1,7 +1,55 @@
+-- ============================================================================
+-- ReCiter Database Stored Procedures - Version 2 (Complete)
+-- ============================================================================
+--
+-- This is a complete, standalone file containing ALL stored procedures.
+-- 
+-- PROCEDURES INCLUDED:
+--   Report Generation:
+--     - generateBibliometricReport
+--     - generatePubsNoPeopleRTF
+--     - generatePubsPeopleOnlyRTF
+--     - generatePubsRTF
+--     - generateEmailNotifications
+--
+--   Nightly Indexing (v2 - improved):
+--     - populateAnalysisSummaryTables_v2  (replaces populateAnalysisSummaryTables)
+--     - setup_job_logging
+--     - log_progress
+--     - cleanup_staging_tables_v2
+--     - restore_from_backup_v2
+--     - check_analysis_summary_status
+--     - view_job_progress
+--     - get_latest_progress
+--
+--   Helper Procedures:
+--     - populateAnalysisSummaryPersonScopeTable
+--     - updateCurateSelfRole
+--
+-- KEY IMPROVEMENTS IN V2:
+--   1. Atomic table swap pattern - zero downtime during updates
+--   2. Set-based h-index computation - much faster than row-by-row loops
+--   3. Progress logging via analysis_job_log table
+--   4. Backup tables preserved for rollback capability
+--   5. RTF field population (articleTitleRTF, authorsRTF)
+--   6. Rank and Denominator columns populated for percentile metrics
+--   7. No MySQL EVENTs - EKS CronJob triggers populateAnalysisSummaryTables_v2()
+--      which internally calls populateAnalysisSummaryPersonScopeTable() and
+--      updateCurateSelfRole()
+--
+-- USAGE:
+--   Deploy to database, then have EKS CronJob call:
+--     CALL populateAnalysisSummaryTables_v2();
+--
+-- ============================================================================
+
 
 DELIMITER ////
+
 CREATE DEFINER=`admin`@`%` PROCEDURE `generateBibliometricReport`(IN personID VARCHAR(255))
 BEGIN
+
+SET collation_connection = 'utf8mb4_unicode_ci';
 
 set @personIdentifier = personID;
 
@@ -13,10 +61,11 @@ join analysis_summary_author a on a.personIdentifier = s.personIdentifier
 join analysis_summary_article a1 on a1.pmid = a.pmid
 where publicationTypeNIH = 'Research Article' and 
 a.personIdentifier = @personIdentifier and 
-percentileNIH is null and  
+(percentileNIH is null or percentileNIH = 0) and  
 round((unix_timestamp() - UNIX_TIMESTAMP(STR_TO_DATE(datePublicationAddedtoEntrez,'%Y-%m-%d')) ) / (60 * 60 * 24),0) < 730
 limit 10
 );
+
 
 
 
@@ -53,7 +102,7 @@ from analysis_summary_person s
 join analysis_summary_author a on a.personIdentifier = s.personIdentifier
 join analysis_summary_article a1 on a1.pmid = a.pmid
 where publicationTypeNIH = 'Research Article' 
-and percentileNIH is null 
+and (percentileNIH is null or percentileNIH = 0) 
 and a.personIdentifier = @personIdentifier
 and round((unix_timestamp() - UNIX_TIMESTAMP(STR_TO_DATE(datePublicationAddedtoEntrez,'%Y-%m-%d')) ) / (60 * 60 * 24),0) < 730
 order by a.pmid desc
@@ -395,8 +444,8 @@ a.pmid,
 ".",
 "\\'a0{\\field{\\*\\fldinst{HYPERLINK \"",
 case 
-  when pmcid is not null and pmcid != '' then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
-  when a1.doi is not null and a1.doi != '' then concat('https://dx.doi.org/',a1.doi)
+  when pmcid is not null then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
+  when a1.doi is not null then concat('https://dx.doi.org/',a1.doi)
   when a.pmid is not null then concat('https://pubmed.ncbi.nlm.nih.gov/',a.pmid)
 end,
 "\"}}{\\fldrslt \\cf3 Full text}}
@@ -466,8 +515,8 @@ a.pmid,
 ".",
 "\\'a0{\\field{\\*\\fldinst{HYPERLINK \"",
 case 
-  when pmcid is not null and pmcid != '' then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
-  when a1.doi is not null and a1.doi != '' then concat('https://dx.doi.org/',a1.doi)
+  when pmcid is not null then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
+  when a1.doi is not null then concat('https://dx.doi.org/',a1.doi)
   when a.pmid is not null then concat('https://pubmed.ncbi.nlm.nih.gov/',a.pmid)
 end,
 "\"}}{\\fldrslt \\cf3 Full text}}
@@ -531,8 +580,8 @@ a.pmid,
 ".",
 "\\'a0{\\field{\\*\\fldinst{HYPERLINK \"",
 case 
-  when pmcid is not null and pmcid != '' then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
-  when a1.doi is not null and a1.doi != '' then concat('https://dx.doi.org/',a1.doi)
+  when pmcid is not null then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
+  when a1.doi is not null then concat('https://dx.doi.org/',a1.doi)
   when a.pmid is not null then concat('https://pubmed.ncbi.nlm.nih.gov/',a.pmid)
 end,
 "\"}}{\\fldrslt \\cf3 Full text}}
@@ -563,7 +612,7 @@ join analysis_summary_article a1 on a1.pmid = a.pmid
 where 
 publicationTypeNIH = 'Research Article' and 
 a.personIdentifier = @personIdentifier and
-percentileNIH is null and  
+(percentileNIH is null or percentileNIH = 0) and      
 round((unix_timestamp() - UNIX_TIMESTAMP(STR_TO_DATE(datePublicationAddedtoEntrez,'%Y-%m-%d')) ) / (60 * 60 * 24),0) < 730
 order by authorPosition desc, readersMendeley desc
 limit 10) x);
@@ -607,8 +656,8 @@ a.pmid,
 ".",
 "\\'a0{\\field{\\*\\fldinst{HYPERLINK \"",
 case 
-  when pmcid is not null and pmcid != '' then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
-  when a1.doi is not null and a1.doi != '' then concat('https://dx.doi.org/',a1.doi)
+  when pmcid is not null then concat('https://www.ncbi.nlm.nih.gov/pmc/articles/',pmcid,'/')
+  when a1.doi is not null then concat('https://dx.doi.org/',a1.doi)
   when a.pmid is not null then concat('https://pubmed.ncbi.nlm.nih.gov/',a.pmid)
 end,
 "\"}}{\\fldrslt \\cf3 Full text}}
@@ -1180,8 +1229,10 @@ end,
 
 
 END;
+
 ////
 DELIMITER ;
+
 
 
 DELIMITER ////
@@ -1864,1345 +1915,963 @@ DELIMITER ;
 
 
 DELIMITER //
-CREATE DEFINER=`admin`@`%` PROCEDURE `populateAnalysisSummaryTables`()
+DELIMITER //
+
+-- ============================================================================
+-- Job Logging Setup
+-- ============================================================================
+
+DROP PROCEDURE IF EXISTS `setup_job_logging`//
+CREATE PROCEDURE `setup_job_logging`()
 BEGIN
+    CREATE TABLE IF NOT EXISTS `analysis_job_log` (
+        `id` INT AUTO_INCREMENT PRIMARY KEY,
+        `job_id` VARCHAR(50),
+        `step` VARCHAR(100),
+        `substep` VARCHAR(200),
+        `status` VARCHAR(20),
+        `rows_affected` INT,
+        `message` VARCHAR(500),
+        `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        KEY `idx_job_id` (`job_id`) USING BTREE,
+        KEY `idx_created_at` (`created_at`) USING BTREE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+END//
+
+DROP PROCEDURE IF EXISTS `log_progress`//
+CREATE PROCEDURE `log_progress`(
+    IN p_job_id VARCHAR(50),
+    IN p_step VARCHAR(100),
+    IN p_substep VARCHAR(200),
+    IN p_status VARCHAR(20),
+    IN p_rows INT,
+    IN p_message VARCHAR(500)
+)
+BEGIN
+    INSERT INTO analysis_job_log (job_id, step, substep, status, rows_affected, message)
+    VALUES (p_job_id, p_step, p_substep, p_status, p_rows, p_message);
+    -- Also output to console for real-time monitoring
+    SELECT CONCAT(NOW(), ' | ', p_step, ' | ', p_substep, ' | ', p_status,
+                  IFNULL(CONCAT(' | rows: ', p_rows), ''),
+                  IFNULL(CONCAT(' | ', p_message), '')) AS progress;
+END//
+
+-- ============================================================================
+-- Main Nightly Job Procedure (v2)
+-- ============================================================================
+
+DROP PROCEDURE IF EXISTS `populateAnalysisSummaryTables_v2`//
+
+CREATE PROCEDURE `populateAnalysisSummaryTables_v2`()
+proc_main: BEGIN
+
+    -- ========================================================================
+    -- DECLARATION SECTION
+    -- ========================================================================
+    DECLARE v_error_occurred INT DEFAULT 0;
+    DECLARE v_error_message VARCHAR(1000) DEFAULT '';
+    DECLARE v_start_time DATETIME;
+    DECLARE v_step VARCHAR(100);
+    DECLARE v_job_id VARCHAR(50);
+    DECLARE v_rows INT;
+
+    -- Error handler - captures any SQL exception
+    DECLARE CONTINUE HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1
+            v_error_message = MESSAGE_TEXT;
+        SET v_error_occurred = 1;
+    END;
+
+    SET v_start_time = NOW();
+    SET v_job_id = CONCAT('job_', DATE_FORMAT(NOW(), '%Y%m%d_%H%i%s'));
+
+    -- Setup logging
+    CALL setup_job_logging();
+
+    -- ========================================================================
+    -- PRE-FLIGHT CHECK
+    -- ========================================================================
+    SET v_step = 'Pre-flight check';
+    CALL log_progress(v_job_id, v_step, 'Starting job', 'RUNNING', NULL, CONCAT('Job ID: ', v_job_id));
+
+    -- Ensure person_article has data
+    SELECT COUNT(*) INTO v_rows FROM person_article;
+    CALL log_progress(v_job_id, v_step, 'Checking person_article', 'INFO', v_rows, NULL);
+
+    IF v_rows < 5 THEN
+        CALL log_progress(v_job_id, v_step, 'Validation failed', 'ERROR', v_rows, 'Insufficient data in person_article');
+        LEAVE proc_main;
+    END IF;
+
+    -- Populate the person scope table (replaces runPopulateAnalysisSummaryPersonScopeTable event)
+    CALL log_progress(v_job_id, v_step, 'Populating person scope table', 'RUNNING', NULL, NULL);
+    CALL populateAnalysisSummaryPersonScopeTable();
+    SELECT COUNT(*) INTO v_rows FROM analysis_summary_person_scope;
+    CALL log_progress(v_job_id, v_step, 'Populated person scope', 'INFO', v_rows, NULL);
+
+    -- ========================================================================
+    -- STEP 1: CREATE STAGING TABLES
+    -- ========================================================================
+    SET v_step = '1. Create staging tables';
+    CALL log_progress(v_job_id, v_step, 'Dropping old staging tables', 'RUNNING', NULL, NULL);
+
+    DROP TABLE IF EXISTS analysis_summary_author_new;
+    DROP TABLE IF EXISTS analysis_summary_article_new;
+    DROP TABLE IF EXISTS analysis_summary_person_new;
+    DROP TABLE IF EXISTS analysis_summary_author_list_new;
+
+    IF v_error_occurred THEN
+        CALL log_progress(v_job_id, v_step, 'Drop failed', 'ERROR', NULL, v_error_message);
+        LEAVE proc_main;
+    END IF;
+
+    CALL log_progress(v_job_id, v_step, 'Creating new staging tables', 'RUNNING', NULL, NULL);
+
+    CREATE TABLE analysis_summary_author_new LIKE analysis_summary_author;
+    CREATE TABLE analysis_summary_article_new LIKE analysis_summary_article;
+    CREATE TABLE analysis_summary_person_new LIKE analysis_summary_person;
+    CREATE TABLE analysis_summary_author_list_new LIKE analysis_summary_author_list;
+
+    IF v_error_occurred THEN
+        CALL log_progress(v_job_id, v_step, 'Create failed', 'ERROR', NULL, v_error_message);
+        CALL cleanup_staging_tables_v2();
+        LEAVE proc_main;
+    END IF;
+
+    CALL log_progress(v_job_id, v_step, 'Complete', 'DONE', NULL, CONCAT(TIMESTAMPDIFF(SECOND, v_start_time, NOW()), 's elapsed'));
+
+    -- ========================================================================
+    -- STEP 2: POPULATE analysis_summary_author_new
+    -- ========================================================================
+    SET v_step = '2. Populate analysis_summary_author';
+    CALL log_progress(v_job_id, v_step, 'Inserting author records', 'RUNNING', NULL, NULL);
+
+    INSERT INTO analysis_summary_author_new (pmid, personIdentifier, authorPosition, authors)
+    SELECT
+        y.pmid,
+        y.personIdentifier,
+        CASE
+            WHEN authors LIKE '((%' THEN 'first'
+            WHEN authors LIKE '%))' THEN 'last'
+        END AS authorPosition,
+        CASE
+            WHEN totalAuthorCount < 8 THEN authors
+            ELSE CONCAT(
+                SUBSTRING_INDEX(authors, ',', 6),
+                ' ...',
+                SUBSTRING_INDEX(authors, ',', -1)
+            )
+        END AS authors
+    FROM (
+        SELECT DISTINCT
+            personIdentifier,
+            pmid,
+            MAX(rank) AS totalAuthorCount,
+            GROUP_CONCAT(authorName ORDER BY rank ASC SEPARATOR ', ') AS authors
+        FROM (
+            SELECT DISTINCT
+                aa.personIdentifier,
+                aa.pmid,
+                rank,
+                CONVERT(
+                    CASE
+                        WHEN targetAuthor = 1 THEN CONCAT('((',authorLastName,' ',REPLACE(CAST(REGEXP_REPLACE(BINARY authorFirstName,'[a-z]','') AS CHAR),' ',''),'))')
+                        ELSE CONCAT(authorLastName,' ',REPLACE(CAST(REGEXP_REPLACE(BINARY authorFirstName,'[a-z]','') AS CHAR),' ',''))
+                    END
+                USING utf8) AS authorName
+            FROM person_article_author aa
+            JOIN person_article a ON a.pmid = aa.pmid AND a.personIdentifier = aa.personIdentifier
+            WHERE userAssertion = 'ACCEPTED'
+        ) x
+        GROUP BY pmid, personIdentifier
+    ) y;
+
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Inserted author records', 'INFO', v_rows, NULL);
+
+    -- Apply overrides (only if the override table exists)
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_schema = DATABASE()
+               AND table_name = 'analysis_override_author_position') THEN
+        CALL log_progress(v_job_id, v_step, 'Applying author position overrides', 'RUNNING', NULL, NULL);
+        UPDATE analysis_summary_author_new a
+        JOIN analysis_override_author_position o ON a.pmid = o.pmid AND a.personIdentifier = o.personIdentifier
+        SET a.authorPosition = o.position;
+        SET v_rows = ROW_COUNT();
+        CALL log_progress(v_job_id, v_step, 'Applied overrides', 'INFO', v_rows, NULL);
+    END IF;
+
+    -- Populate authorsRTF
+    CALL log_progress(v_job_id, v_step, 'Populating authorsRTF', 'RUNNING', NULL, NULL);
+    UPDATE analysis_summary_author_new SET authorsRTF = authors WHERE authors IS NOT NULL;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Copied authors to RTF', 'INFO', v_rows, NULL);
+
+    -- Apply RTF special character escapes for authors
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_schema = DATABASE() AND table_name = 'analysis_special_characters') THEN
+        CALL log_progress(v_job_id, v_step, 'Escaping special chars in authorsRTF', 'RUNNING', NULL, NULL);
+        BEGIN
+            DECLARE v_done INT DEFAULT FALSE;
+            DECLARE v_special_char VARCHAR(10);
+            DECLARE v_rtf_escape VARCHAR(50);
+            DECLARE cur_special CURSOR FOR SELECT specialCharacter, RTFescape FROM analysis_special_characters;
+            DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = TRUE;
+
+            OPEN cur_special;
+            read_loop: LOOP
+                FETCH cur_special INTO v_special_char, v_rtf_escape;
+                IF v_done THEN
+                    LEAVE read_loop;
+                END IF;
+                UPDATE analysis_summary_author_new
+                SET authorsRTF = REPLACE(authorsRTF, v_special_char, v_rtf_escape)
+                WHERE authorsRTF LIKE CONCAT('%', v_special_char, '%');
+            END LOOP;
+            CLOSE cur_special;
+        END;
+        CALL log_progress(v_job_id, v_step, 'Escaped special chars in authorsRTF', 'INFO', NULL, NULL);
+    END IF;
+
+    IF v_error_occurred THEN
+        CALL log_progress(v_job_id, v_step, 'Failed', 'ERROR', NULL, v_error_message);
+        CALL cleanup_staging_tables_v2();
+        LEAVE proc_main;
+    END IF;
+
+    CALL log_progress(v_job_id, v_step, 'Complete', 'DONE', NULL, CONCAT(TIMESTAMPDIFF(SECOND, v_start_time, NOW()), 's elapsed'));
+
+    -- ========================================================================
+    -- STEP 2b: Handle equal contribution authors
+    -- ========================================================================
+    SET v_step = '2b. Equal contribution authors';
+
+    CALL log_progress(v_job_id, v_step, 'Computing maxRank per article', 'RUNNING', NULL, NULL);
+    DROP TABLE IF EXISTS temp_maxrank;
+    CREATE TABLE temp_maxrank (
+        pmid INT PRIMARY KEY,
+        maxRank INT
+    ) ENGINE=InnoDB;
+    INSERT INTO temp_maxrank SELECT pmid, MAX(rank) FROM person_article_author GROUP BY pmid;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Computed maxRank', 'INFO', v_rows, NULL);
+
+    CALL log_progress(v_job_id, v_step, 'Computing equalContribAll per article', 'RUNNING', NULL, NULL);
+    DROP TABLE IF EXISTS temp_equalcontrib_all;
+    CREATE TABLE temp_equalcontrib_all (
+        pmid INT PRIMARY KEY,
+        equalContribAll VARCHAR(500)
+    ) ENGINE=InnoDB;
+    INSERT INTO temp_equalcontrib_all
+    SELECT pmid, GROUP_CONCAT(DISTINCT rank ORDER BY rank ASC SEPARATOR ',')
+    FROM person_article_author
+    WHERE equalContrib = 'Y'
+    GROUP BY pmid;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Computed equalContribAll', 'INFO', v_rows, NULL);
+
+    CALL log_progress(v_job_id, v_step, 'Building equal contrib positions', 'RUNNING', NULL, NULL);
+    DROP TABLE IF EXISTS analysis_temp_equalcontrib_v2;
+    CREATE TABLE analysis_temp_equalcontrib_v2 (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        personIdentifier VARCHAR(30),
+        pmid INT,
+        authorPositionEqualContrib VARCHAR(20),
+        KEY idx_person_pmid (personIdentifier, pmid)
+    ) ENGINE=InnoDB;
+
+    INSERT INTO analysis_temp_equalcontrib_v2 (personIdentifier, pmid, authorPositionEqualContrib)
+    SELECT a.personIdentifier, a.pmid,
+           CASE
+               WHEN a.rank = 2 AND FIND_IN_SET(1, ec.equalContribAll) > 0 AND FIND_IN_SET(2, ec.equalContribAll) > 0 THEN 'first'
+               WHEN a.rank = 3 AND FIND_IN_SET(1, ec.equalContribAll) > 0 AND FIND_IN_SET(2, ec.equalContribAll) > 0 AND FIND_IN_SET(3, ec.equalContribAll) > 0 THEN 'first'
+               WHEN a.rank = 4 AND FIND_IN_SET(1, ec.equalContribAll) > 0 AND FIND_IN_SET(2, ec.equalContribAll) > 0 AND FIND_IN_SET(3, ec.equalContribAll) > 0 AND FIND_IN_SET(4, ec.equalContribAll) > 0 THEN 'first'
+               WHEN a.rank = 5 AND FIND_IN_SET(1, ec.equalContribAll) > 0 AND FIND_IN_SET(2, ec.equalContribAll) > 0 AND FIND_IN_SET(3, ec.equalContribAll) > 0 AND FIND_IN_SET(4, ec.equalContribAll) > 0 AND FIND_IN_SET(5, ec.equalContribAll) > 0 THEN 'first'
+               WHEN a.rank = 6 AND FIND_IN_SET(1, ec.equalContribAll) > 0 AND FIND_IN_SET(2, ec.equalContribAll) > 0 AND FIND_IN_SET(3, ec.equalContribAll) > 0 AND FIND_IN_SET(4, ec.equalContribAll) > 0 AND FIND_IN_SET(5, ec.equalContribAll) > 0 AND FIND_IN_SET(6, ec.equalContribAll) > 0 THEN 'first'
+               WHEN a.rank = 7 AND FIND_IN_SET(1, ec.equalContribAll) > 0 AND FIND_IN_SET(2, ec.equalContribAll) > 0 AND FIND_IN_SET(3, ec.equalContribAll) > 0 AND FIND_IN_SET(4, ec.equalContribAll) > 0 AND FIND_IN_SET(5, ec.equalContribAll) > 0 AND FIND_IN_SET(6, ec.equalContribAll) > 0 AND FIND_IN_SET(7, ec.equalContribAll) > 0 THEN 'first'
+               WHEN a.rank = 8 AND FIND_IN_SET(1, ec.equalContribAll) > 0 AND FIND_IN_SET(2, ec.equalContribAll) > 0 AND FIND_IN_SET(3, ec.equalContribAll) > 0 AND FIND_IN_SET(4, ec.equalContribAll) > 0 AND FIND_IN_SET(5, ec.equalContribAll) > 0 AND FIND_IN_SET(6, ec.equalContribAll) > 0 AND FIND_IN_SET(7, ec.equalContribAll) > 0 AND FIND_IN_SET(8, ec.equalContribAll) > 0 THEN 'first'
+               WHEN a.rank = m.maxRank - 1 AND FIND_IN_SET(m.maxRank, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 1, ec.equalContribAll) > 0 THEN 'last'
+               WHEN a.rank = m.maxRank - 2 AND FIND_IN_SET(m.maxRank, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 1, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 2, ec.equalContribAll) > 0 THEN 'last'
+               WHEN a.rank = m.maxRank - 3 AND FIND_IN_SET(m.maxRank, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 1, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 2, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 3, ec.equalContribAll) > 0 THEN 'last'
+               WHEN a.rank = m.maxRank - 4 AND FIND_IN_SET(m.maxRank, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 1, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 2, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 3, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 4, ec.equalContribAll) > 0 THEN 'last'
+               WHEN a.rank = m.maxRank - 5 AND FIND_IN_SET(m.maxRank, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 1, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 2, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 3, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 4, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 5, ec.equalContribAll) > 0 THEN 'last'
+               WHEN a.rank = m.maxRank - 6 AND FIND_IN_SET(m.maxRank, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 1, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 2, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 3, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 4, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 5, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 6, ec.equalContribAll) > 0 THEN 'last'
+               WHEN a.rank = m.maxRank - 7 AND FIND_IN_SET(m.maxRank, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 1, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 2, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 3, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 4, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 5, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 6, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 7, ec.equalContribAll) > 0 THEN 'last'
+               WHEN a.rank = m.maxRank - 8 AND FIND_IN_SET(m.maxRank, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 1, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 2, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 3, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 4, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 5, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 6, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 7, ec.equalContribAll) > 0 AND FIND_IN_SET(m.maxRank - 8, ec.equalContribAll) > 0 THEN 'last'
+               ELSE NULL
+           END AS authorPositionEqualContrib
+    FROM person_article_author a
+    INNER JOIN person_article p ON p.pmid = a.pmid AND p.personIdentifier = a.personIdentifier
+    INNER JOIN temp_maxrank m ON m.pmid = a.pmid
+    INNER JOIN temp_equalcontrib_all ec ON ec.pmid = a.pmid
+    WHERE a.equalContrib = 'Y'
+      AND a.targetAuthor = 1
+      AND p.userAssertion = 'ACCEPTED';
+
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Built equal contrib positions', 'INFO', v_rows, NULL);
+
+    CALL log_progress(v_job_id, v_step, 'Applying equal contrib positions', 'RUNNING', NULL, NULL);
+    UPDATE analysis_summary_author_new y
+    JOIN analysis_temp_equalcontrib_v2 x ON x.pmid = y.pmid AND x.personIdentifier = y.personIdentifier
+    SET y.authorPosition = x.authorPositionEqualContrib
+    WHERE x.authorPositionEqualContrib IS NOT NULL AND y.authorPosition IS NULL;
+
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Applied equal contrib positions', 'INFO', v_rows, NULL);
+
+    DROP TABLE IF EXISTS temp_maxrank;
+    DROP TABLE IF EXISTS temp_equalcontrib_all;
+    DROP TABLE IF EXISTS analysis_temp_equalcontrib_v2;
+
+    IF v_error_occurred THEN
+        CALL log_progress(v_job_id, v_step, 'Failed', 'ERROR', NULL, v_error_message);
+        CALL cleanup_staging_tables_v2();
+        LEAVE proc_main;
+    END IF;
+
+    CALL log_progress(v_job_id, v_step, 'Complete', 'DONE', NULL, CONCAT(TIMESTAMPDIFF(SECOND, v_start_time, NOW()), 's elapsed'));
+
+    -- ========================================================================
+    -- STEP 2c: Populate analysis_summary_author_list_new
+    -- ========================================================================
+    SET v_step = '2c. Populate author_list';
+    CALL log_progress(v_job_id, v_step, 'Inserting author list records', 'RUNNING', NULL, NULL);
+
+    INSERT INTO analysis_summary_author_list_new (pmid, authorFirstName, authorLastName, rank, personIdentifier)
+    SELECT
+        pmid,
+        MAX(authorFirstName) AS authorFirstName,
+        MAX(authorLastName) AS authorLastName,
+        rank,
+        MAX(personIdentifier) AS personIdentifier
+    FROM (
+        SELECT
+            aa.personIdentifier,
+            aa.pmid,
+            authorFirstName,
+            authorLastName,
+            rank,
+            targetAuthor
+        FROM person_article_author aa
+        JOIN person_article a ON a.pmid = aa.pmid AND a.personIdentifier = aa.personIdentifier
+        WHERE userAssertion = 'ACCEPTED'
+          AND targetAuthor = 1
+        UNION
+        SELECT
+            '' AS personIdentifier,
+            pmid,
+            authorFirstName,
+            authorLastName,
+            rank,
+            targetAuthor
+        FROM person_article_author
+        WHERE targetAuthor = 0
+    ) x
+    GROUP BY pmid, rank
+    ORDER BY pmid DESC, rank ASC;
+
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Inserted author list records', 'INFO', v_rows, NULL);
+
+    IF v_error_occurred THEN
+        CALL log_progress(v_job_id, v_step, 'Failed', 'ERROR', NULL, v_error_message);
+        CALL cleanup_staging_tables_v2();
+        LEAVE proc_main;
+    END IF;
+
+    CALL log_progress(v_job_id, v_step, 'Complete', 'DONE', NULL, CONCAT(TIMESTAMPDIFF(SECOND, v_start_time, NOW()), 's elapsed'));
+
+    -- ========================================================================
+    -- STEP 3: Populate analysis_summary_article_new
+    -- ========================================================================
+    SET v_step = '3. Populate analysis_summary_article';
+    CALL log_progress(v_job_id, v_step, 'Inserting article records', 'RUNNING', NULL, NULL);
+
+    INSERT INTO analysis_summary_article_new (
+        pmid, pmcid, publicationTypeCanonical, articleYear,
+        publicationDateStandardized, publicationDateDisplay,
+        datePublicationAddedToEntrez, articleTitle, journalTitleVerbose,
+        issn, doi, issue, volume, pages, citationCountScopus
+    )
+    SELECT DISTINCT
+        pmid,
+        MAX(pmcid),
+        publicationTypeCanonical,
+        articleYear,
+        MIN(publicationDateStandardized),
+        publicationDateDisplay,
+        datePublicationAddedToEntrez,
+        articleTitle,
+        journalTitleVerbose,
+        issn,
+        doi,
+        issue,
+        volume,
+        pages,
+        MAX(timesCited)
+    FROM person_article
+    WHERE userAssertion = 'ACCEPTED'
+    GROUP BY pmid
+    ORDER BY datePublicationAddedToEntrez DESC;
+
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Inserted article records', 'INFO', v_rows, NULL);
+
+    -- Update with journal impact scores (Scimago)
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_schema = DATABASE() AND table_name = 'journal_impact_scimago') THEN
+        CALL log_progress(v_job_id, v_step, 'Updating journal impact scores (Scimago)', 'RUNNING', NULL, NULL);
+        UPDATE analysis_summary_article_new a
+        JOIN journal_impact_scimago i ON i.issn1 = a.issn
+        SET journalImpactScore1 = i.sjr
+        WHERE a.journalImpactScore1 IS NULL AND a.issn IS NOT NULL;
+
+        UPDATE analysis_summary_article_new a
+        JOIN journal_impact_scimago i ON i.issn2 = a.issn
+        SET journalImpactScore1 = i.sjr
+        WHERE a.journalImpactScore1 IS NULL AND a.issn IS NOT NULL;
+
+        UPDATE analysis_summary_article_new a
+        JOIN journal_impact_scimago i ON i.issn3 = a.issn
+        SET journalImpactScore1 = i.sjr
+        WHERE a.journalImpactScore1 IS NULL AND a.issn IS NOT NULL;
+    ELSE
+        CALL log_progress(v_job_id, v_step, 'Skipping Scimago (table not found)', 'INFO', 0, NULL);
+    END IF;
+
+    -- Update with alternative journal impact scores
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_schema = DATABASE() AND table_name = 'journal_impact_alternative') THEN
+        UPDATE analysis_summary_article_new a
+        JOIN journal_impact_alternative i ON i.issn = a.issn
+        SET journalImpactScore2 = i.impactScore1
+        WHERE a.journalImpactScore2 IS NULL AND a.issn IS NOT NULL;
+
+        UPDATE analysis_summary_article_new a
+        JOIN journal_impact_alternative i ON i.eissn = a.issn
+        SET journalImpactScore2 = i.impactScore1
+        WHERE a.journalImpactScore2 IS NULL AND a.issn IS NOT NULL;
+    END IF;
+
+    -- Update NIH citation data
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_schema = DATABASE() AND table_name = 'analysis_nih') THEN
+        CALL log_progress(v_job_id, v_step, 'Updating NIH citation data', 'RUNNING', NULL, NULL);
+        UPDATE analysis_summary_article_new a
+        JOIN analysis_nih n ON n.pmid = a.pmid
+        SET a.citationCountNIH = n.citation_count,
+            a.percentileNIH = n.nih_percentile,
+            a.relativeCitationRatioNIH = n.relative_citation_ratio,
+            a.publicationTypeNIH = CASE WHEN n.is_research_article = 'True' THEN 'Research Article' ELSE NULL END;
+        SET v_rows = ROW_COUNT();
+        CALL log_progress(v_job_id, v_step, 'Updated NIH citation data', 'INFO', v_rows, NULL);
+    ELSE
+        CALL log_progress(v_job_id, v_step, 'Skipping NIH data (table not found)', 'INFO', 0, NULL);
+    END IF;
+
+    -- Update Mendeley readers
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_schema = DATABASE() AND table_name = 'analysis_altmetric') THEN
+        CALL log_progress(v_job_id, v_step, 'Updating Mendeley readers', 'RUNNING', NULL, NULL);
+        UPDATE analysis_summary_article_new a
+        JOIN analysis_altmetric al ON al.doi = a.doi
+        SET a.readersMendeley = al.`readers-mendeley`
+        WHERE ROUND((UNIX_TIMESTAMP() - UNIX_TIMESTAMP(STR_TO_DATE(datePublicationAddedtoEntrez,'%Y-%m-%d')) ) / (60 * 60 * 24), 0) < 366;
+        SET v_rows = ROW_COUNT();
+        CALL log_progress(v_job_id, v_step, 'Updated Mendeley readers', 'INFO', v_rows, NULL);
+    ELSE
+        CALL log_progress(v_job_id, v_step, 'Skipping Mendeley (table not found)', 'INFO', 0, NULL);
+    END IF;
+
+    -- Populate articleTitleRTF
+    CALL log_progress(v_job_id, v_step, 'Populating articleTitleRTF', 'RUNNING', NULL, NULL);
+    UPDATE analysis_summary_article_new SET articleTitleRTF = articleTitle WHERE articleTitle IS NOT NULL;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Copied articleTitle to RTF', 'INFO', v_rows, NULL);
+
+    -- Apply RTF special character escapes for articleTitle
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_schema = DATABASE() AND table_name = 'analysis_special_characters') THEN
+        CALL log_progress(v_job_id, v_step, 'Escaping special chars in articleTitleRTF', 'RUNNING', NULL, NULL);
+        BEGIN
+            DECLARE v_done INT DEFAULT FALSE;
+            DECLARE v_special_char VARCHAR(10);
+            DECLARE v_rtf_escape VARCHAR(50);
+            DECLARE cur_special CURSOR FOR SELECT specialCharacter, RTFescape FROM analysis_special_characters;
+            DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = TRUE;
+
+            OPEN cur_special;
+            read_loop: LOOP
+                FETCH cur_special INTO v_special_char, v_rtf_escape;
+                IF v_done THEN
+                    LEAVE read_loop;
+                END IF;
+                UPDATE analysis_summary_article_new
+                SET articleTitleRTF = REPLACE(articleTitleRTF, v_special_char, v_rtf_escape)
+                WHERE articleTitleRTF LIKE CONCAT('%', v_special_char, '%');
+            END LOOP;
+            CLOSE cur_special;
+        END;
+        CALL log_progress(v_job_id, v_step, 'Escaped special chars in articleTitleRTF', 'INFO', NULL, NULL);
+    END IF;
+
+    IF v_error_occurred THEN
+        CALL log_progress(v_job_id, v_step, 'Failed', 'ERROR', NULL, v_error_message);
+        CALL cleanup_staging_tables_v2();
+        LEAVE proc_main;
+    END IF;
+
+    CALL log_progress(v_job_id, v_step, 'Complete', 'DONE', NULL, CONCAT(TIMESTAMPDIFF(SECOND, v_start_time, NOW()), 's elapsed'));
+
+    -- ========================================================================
+    -- STEP 4: Populate analysis_summary_person_new
+    -- ========================================================================
+    SET v_step = '4. Populate analysis_summary_person';
+    CALL log_progress(v_job_id, v_step, 'Inserting person records', 'RUNNING', NULL, NULL);
+
+    INSERT INTO analysis_summary_person_new (personIdentifier, nameFirst, nameMiddle, nameLast, facultyRank, department)
+    SELECT DISTINCT
+        p.personIdentifier,
+        p.firstName,
+        p.middleName,
+        p.lastName,
+        p.title,
+        p.primaryOrganizationalUnit
+    FROM person p
+    JOIN analysis_summary_person_scope s ON s.personIdentifier = p.personIdentifier;
+
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Inserted person records', 'INFO', v_rows, NULL);
+
+    -- Update article counts
+    CALL log_progress(v_job_id, v_step, 'Updating article counts', 'RUNNING', NULL, NULL);
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT personIdentifier, COUNT(DISTINCT pmid) AS cnt
+        FROM analysis_summary_author_new
+        GROUP BY personIdentifier
+    ) c ON c.personIdentifier = p.personIdentifier
+    SET p.countAll = c.cnt;
+
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT personIdentifier, COUNT(DISTINCT pmid) AS cnt
+        FROM analysis_summary_author_new
+        WHERE authorPosition = 'first'
+        GROUP BY personIdentifier
+    ) c ON c.personIdentifier = p.personIdentifier
+    SET p.countFirst = c.cnt;
+
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT personIdentifier, COUNT(DISTINCT pmid) AS cnt
+        FROM analysis_summary_author_new
+        WHERE authorPosition = 'last'
+        GROUP BY personIdentifier
+    ) c ON c.personIdentifier = p.personIdentifier
+    SET p.countSenior = c.cnt;
+
+    IF v_error_occurred THEN
+        CALL log_progress(v_job_id, v_step, 'Failed', 'ERROR', NULL, v_error_message);
+        CALL cleanup_staging_tables_v2();
+        LEAVE proc_main;
+    END IF;
+
+    CALL log_progress(v_job_id, v_step, 'Complete', 'DONE', NULL, CONCAT(TIMESTAMPDIFF(SECOND, v_start_time, NOW()), 's elapsed'));
+
+    -- ========================================================================
+    -- STEP 5: Compute percentile rankings (with rank and denominator)
+    -- ========================================================================
+    SET v_step = '5. Compute percentile rankings';
+    CALL log_progress(v_job_id, v_step, 'Computing percentiles (8 metrics)', 'RUNNING', NULL, NULL);
+
+    -- Top 5 percentile, first/last authored
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT a.personIdentifier,
+            ROUND(100 * SUM(CASE WHEN percentileNIH >= 95 THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct,
+            SUM(CASE WHEN percentileNIH >= 95 THEN 1 ELSE 0 END) AS rank_count,
+            COUNT(*) AS denominator
+        FROM analysis_summary_author_new a
+        JOIN analysis_summary_article_new a1 ON a1.pmid = a.pmid
+        WHERE percentileNIH IS NOT NULL AND authorPosition IN ('first', 'last')
+        GROUP BY a.personIdentifier
+    ) x ON x.personIdentifier = p.personIdentifier
+    SET p.top5PercentileFirstSenior = x.pct,
+        p.top5RankFirstSenior = x.rank_count,
+        p.top5DenominatorFirstSenior = x.denominator;
+
+    -- Top 10 percentile, first/last authored
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT a.personIdentifier,
+            ROUND(100 * SUM(CASE WHEN percentileNIH >= 90 THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct,
+            SUM(CASE WHEN percentileNIH >= 90 THEN 1 ELSE 0 END) AS rank_count,
+            COUNT(*) AS denominator
+        FROM analysis_summary_author_new a
+        JOIN analysis_summary_article_new a1 ON a1.pmid = a.pmid
+        WHERE percentileNIH IS NOT NULL AND authorPosition IN ('first', 'last')
+        GROUP BY a.personIdentifier
+    ) x ON x.personIdentifier = p.personIdentifier
+    SET p.top10PercentileFirstSenior = x.pct,
+        p.top10RankFirstSenior = x.rank_count,
+        p.top10DenominatorFirstSenior = x.denominator;
+
+    -- Top 5 percentile, first authored only
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT a.personIdentifier,
+            ROUND(100 * SUM(CASE WHEN percentileNIH >= 95 THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct,
+            SUM(CASE WHEN percentileNIH >= 95 THEN 1 ELSE 0 END) AS rank_count,
+            COUNT(*) AS denominator
+        FROM analysis_summary_author_new a
+        JOIN analysis_summary_article_new a1 ON a1.pmid = a.pmid
+        WHERE percentileNIH IS NOT NULL AND authorPosition = 'first'
+        GROUP BY a.personIdentifier
+    ) x ON x.personIdentifier = p.personIdentifier
+    SET p.top5PercentileFirst = x.pct,
+        p.top5RankFirst = x.rank_count,
+        p.top5DenominatorFirst = x.denominator;
+
+    -- Top 10 percentile, first authored only
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT a.personIdentifier,
+            ROUND(100 * SUM(CASE WHEN percentileNIH >= 90 THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct,
+            SUM(CASE WHEN percentileNIH >= 90 THEN 1 ELSE 0 END) AS rank_count,
+            COUNT(*) AS denominator
+        FROM analysis_summary_author_new a
+        JOIN analysis_summary_article_new a1 ON a1.pmid = a.pmid
+        WHERE percentileNIH IS NOT NULL AND authorPosition = 'first'
+        GROUP BY a.personIdentifier
+    ) x ON x.personIdentifier = p.personIdentifier
+    SET p.top10PercentileFirst = x.pct,
+        p.top10RankFirst = x.rank_count,
+        p.top10DenominatorFirst = x.denominator;
+
+    -- Top 5 percentile, last authored only
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT a.personIdentifier,
+            ROUND(100 * SUM(CASE WHEN percentileNIH >= 95 THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct,
+            SUM(CASE WHEN percentileNIH >= 95 THEN 1 ELSE 0 END) AS rank_count,
+            COUNT(*) AS denominator
+        FROM analysis_summary_author_new a
+        JOIN analysis_summary_article_new a1 ON a1.pmid = a.pmid
+        WHERE percentileNIH IS NOT NULL AND authorPosition = 'last'
+        GROUP BY a.personIdentifier
+    ) x ON x.personIdentifier = p.personIdentifier
+    SET p.top5PercentileSenior = x.pct,
+        p.top5RankSenior = x.rank_count,
+        p.top5DenominatorSenior = x.denominator;
+
+    -- Top 10 percentile, last authored only
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT a.personIdentifier,
+            ROUND(100 * SUM(CASE WHEN percentileNIH >= 90 THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct,
+            SUM(CASE WHEN percentileNIH >= 90 THEN 1 ELSE 0 END) AS rank_count,
+            COUNT(*) AS denominator
+        FROM analysis_summary_author_new a
+        JOIN analysis_summary_article_new a1 ON a1.pmid = a.pmid
+        WHERE percentileNIH IS NOT NULL AND authorPosition = 'last'
+        GROUP BY a.personIdentifier
+    ) x ON x.personIdentifier = p.personIdentifier
+    SET p.top10PercentileSenior = x.pct,
+        p.top10RankSenior = x.rank_count,
+        p.top10DenominatorSenior = x.denominator;
+
+    -- Top 5 percentile, all positions
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT a.personIdentifier,
+            ROUND(100 * SUM(CASE WHEN percentileNIH >= 95 THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct,
+            SUM(CASE WHEN percentileNIH >= 95 THEN 1 ELSE 0 END) AS rank_count,
+            COUNT(*) AS denominator
+        FROM analysis_summary_author_new a
+        JOIN analysis_summary_article_new a1 ON a1.pmid = a.pmid
+        WHERE percentileNIH IS NOT NULL
+        GROUP BY a.personIdentifier
+    ) x ON x.personIdentifier = p.personIdentifier
+    SET p.top5PercentileAll = x.pct,
+        p.top5RankAll = x.rank_count,
+        p.top5DenominatorAll = x.denominator;
+
+    -- Top 10 percentile, all positions
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT a.personIdentifier,
+            ROUND(100 * SUM(CASE WHEN percentileNIH >= 90 THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct,
+            SUM(CASE WHEN percentileNIH >= 90 THEN 1 ELSE 0 END) AS rank_count,
+            COUNT(*) AS denominator
+        FROM analysis_summary_author_new a
+        JOIN analysis_summary_article_new a1 ON a1.pmid = a.pmid
+        WHERE percentileNIH IS NOT NULL
+        GROUP BY a.personIdentifier
+    ) x ON x.personIdentifier = p.personIdentifier
+    SET p.top10PercentileAll = x.pct,
+        p.top10RankAll = x.rank_count,
+        p.top10DenominatorAll = x.denominator;
+
+    IF v_error_occurred THEN
+        CALL log_progress(v_job_id, v_step, 'Failed', 'ERROR', NULL, v_error_message);
+        CALL cleanup_staging_tables_v2();
+        LEAVE proc_main;
+    END IF;
+
+    CALL log_progress(v_job_id, v_step, 'Complete', 'DONE', NULL, CONCAT(TIMESTAMPDIFF(SECOND, v_start_time, NOW()), 's elapsed'));
+
+    -- ========================================================================
+    -- STEP 6: COMPUTE H-INDEX (Set-based, efficient)
+    -- ========================================================================
+    SET v_step = '6. Compute h-index';
+    CALL log_progress(v_job_id, v_step, 'Computing h-index NIH (all time)', 'RUNNING', NULL, NULL);
+
+    -- H-index using NIH citation data (all time)
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT personIdentifier, MAX(h_index) AS h_index
+        FROM (
+            SELECT personIdentifier, rn AS h_index
+            FROM (
+                SELECT a.personIdentifier, r.citationCountNIH,
+                    ROW_NUMBER() OVER (PARTITION BY a.personIdentifier ORDER BY r.citationCountNIH DESC) AS rn
+                FROM analysis_summary_author_new a
+                JOIN analysis_summary_article_new r ON r.pmid = a.pmid
+                WHERE r.citationCountNIH > 0
+            ) AS ranked
+            WHERE citationCountNIH >= rn
+        ) AS h_calc
+        GROUP BY personIdentifier
+    ) h ON h.personIdentifier = p.personIdentifier
+    SET p.hindexNIH = h.h_index;
+
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated h-index NIH', 'INFO', v_rows, NULL);
+
+    -- H5-index using NIH (last 5 years)
+    CALL log_progress(v_job_id, v_step, 'Computing h5-index NIH', 'RUNNING', NULL, NULL);
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT personIdentifier, MAX(h_index) AS h_index
+        FROM (
+            SELECT personIdentifier, rn AS h_index
+            FROM (
+                SELECT a.personIdentifier, r.citationCountNIH,
+                    ROW_NUMBER() OVER (PARTITION BY a.personIdentifier ORDER BY r.citationCountNIH DESC) AS rn
+                FROM analysis_summary_author_new a
+                JOIN analysis_summary_article_new r ON r.pmid = a.pmid
+                WHERE r.citationCountNIH > 0
+                  AND r.datePublicationAddedToEntrez > DATE_SUB(CURDATE(), INTERVAL 5 YEAR)
+            ) AS ranked
+            WHERE citationCountNIH >= rn
+        ) AS h_calc
+        GROUP BY personIdentifier
+    ) h ON h.personIdentifier = p.personIdentifier
+    SET p.h5indexNIH = h.h_index;
+
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated h5-index NIH', 'INFO', v_rows, NULL);
+
+    -- H-index using Scopus (all time)
+    CALL log_progress(v_job_id, v_step, 'Computing h-index Scopus', 'RUNNING', NULL, NULL);
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT personIdentifier, MAX(h_index) AS h_index
+        FROM (
+            SELECT personIdentifier, rn AS h_index
+            FROM (
+                SELECT a.personIdentifier, r.citationCountScopus,
+                    ROW_NUMBER() OVER (PARTITION BY a.personIdentifier ORDER BY r.citationCountScopus DESC) AS rn
+                FROM analysis_summary_author_new a
+                JOIN analysis_summary_article_new r ON r.pmid = a.pmid
+                WHERE r.citationCountScopus > 0
+            ) AS ranked
+            WHERE citationCountScopus >= rn
+        ) AS h_calc
+        GROUP BY personIdentifier
+    ) h ON h.personIdentifier = p.personIdentifier
+    SET p.hindexScopus = h.h_index;
+
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated h-index Scopus', 'INFO', v_rows, NULL);
+
+    -- H5-index using Scopus (last 5 years)
+    CALL log_progress(v_job_id, v_step, 'Computing h5-index Scopus', 'RUNNING', NULL, NULL);
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT personIdentifier, MAX(h_index) AS h_index
+        FROM (
+            SELECT personIdentifier, rn AS h_index
+            FROM (
+                SELECT a.personIdentifier, r.citationCountScopus,
+                    ROW_NUMBER() OVER (PARTITION BY a.personIdentifier ORDER BY r.citationCountScopus DESC) AS rn
+                FROM analysis_summary_author_new a
+                JOIN analysis_summary_article_new r ON r.pmid = a.pmid
+                WHERE r.citationCountScopus > 0
+                  AND r.datePublicationAddedToEntrez > DATE_SUB(CURDATE(), INTERVAL 5 YEAR)
+            ) AS ranked
+            WHERE citationCountScopus >= rn
+        ) AS h_calc
+        GROUP BY personIdentifier
+    ) h ON h.personIdentifier = p.personIdentifier
+    SET p.h5indexScopus = h.h_index;
+
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated h5-index Scopus', 'INFO', v_rows, NULL);
+
+    UPDATE analysis_summary_person_new SET hindexStatus = 1;
+
+    IF v_error_occurred THEN
+        CALL log_progress(v_job_id, v_step, 'Failed', 'ERROR', NULL, v_error_message);
+        CALL cleanup_staging_tables_v2();
+        LEAVE proc_main;
+    END IF;
+
+    CALL log_progress(v_job_id, v_step, 'Complete', 'DONE', NULL, CONCAT(TIMESTAMPDIFF(SECOND, v_start_time, NOW()), 's elapsed'));
+
+    -- ========================================================================
+    -- STEP 7: ATOMIC TABLE SWAP
+    -- ========================================================================
+    SET v_step = '7. Atomic table swap';
+    CALL log_progress(v_job_id, v_step, 'Dropping old backup tables', 'RUNNING', NULL, NULL);
+
+    DROP TABLE IF EXISTS analysis_summary_author_backup;
+    DROP TABLE IF EXISTS analysis_summary_article_backup;
+    DROP TABLE IF EXISTS analysis_summary_person_backup;
+    DROP TABLE IF EXISTS analysis_summary_author_list_backup;
+
+    CALL log_progress(v_job_id, v_step, 'Performing atomic RENAME', 'RUNNING', NULL, 'Swapping all 4 tables');
+
+    RENAME TABLE
+        analysis_summary_author TO analysis_summary_author_backup,
+        analysis_summary_author_new TO analysis_summary_author,
+        analysis_summary_article TO analysis_summary_article_backup,
+        analysis_summary_article_new TO analysis_summary_article,
+        analysis_summary_person TO analysis_summary_person_backup,
+        analysis_summary_person_new TO analysis_summary_person,
+        analysis_summary_author_list TO analysis_summary_author_list_backup,
+        analysis_summary_author_list_new TO analysis_summary_author_list;
+
+    IF v_error_occurred THEN
+        CALL log_progress(v_job_id, v_step, 'RENAME failed', 'ERROR', NULL, v_error_message);
+        CALL restore_from_backup_v2();
+        LEAVE proc_main;
+    END IF;
+
+    CALL log_progress(v_job_id, v_step, 'Complete', 'DONE', NULL, 'Tables swapped successfully');
+
+    -- ========================================================================
+    -- STEP 8: UPDATE CURATE SELF ROLES (replaces runUpdateCurateSelfRole event)
+    -- ========================================================================
+    SET v_step = '8. Update curate self roles';
+    CALL log_progress(v_job_id, v_step, 'Updating admin user roles', 'RUNNING', NULL, NULL);
+    CALL updateCurateSelfRole();
+    CALL log_progress(v_job_id, v_step, 'Complete', 'DONE', NULL, NULL);
+
+    -- ========================================================================
+    -- SUCCESS
+    -- ========================================================================
+    CALL log_progress(v_job_id, 'FINISHED', 'Job completed successfully', 'SUCCESS', NULL,
+                      CONCAT('Total time: ', TIMESTAMPDIFF(SECOND, v_start_time, NOW()), 's'));
+
+    SELECT CONCAT('SUCCESS: populateAnalysisSummaryTables_v2 completed in ',
+                  TIMESTAMPDIFF(SECOND, v_start_time, NOW()), ' seconds') AS status;
+
+END proc_main//
+
+-- ============================================================================
+-- Helper Procedures
+-- ============================================================================
+
+DROP PROCEDURE IF EXISTS `cleanup_staging_tables_v2`//
+CREATE PROCEDURE `cleanup_staging_tables_v2`()
+BEGIN
+    DROP TABLE IF EXISTS analysis_summary_author_new;
+    DROP TABLE IF EXISTS analysis_summary_article_new;
+    DROP TABLE IF EXISTS analysis_summary_person_new;
+    DROP TABLE IF EXISTS analysis_summary_author_list_new;
+    DROP TABLE IF EXISTS temp_maxrank;
+    DROP TABLE IF EXISTS temp_equalcontrib_all;
+    DROP TABLE IF EXISTS analysis_temp_equalcontrib_v2;
+    SELECT 'Staging tables cleaned up' AS status;
+END//
+
+DROP PROCEDURE IF EXISTS `restore_from_backup_v2`//
+CREATE PROCEDURE `restore_from_backup_v2`()
+BEGIN
+    DECLARE v_error INT DEFAULT 0;
+    DECLARE CONTINUE HANDLER FOR SQLEXCEPTION SET v_error = 1;
+
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_name = 'analysis_summary_author_backup' AND table_schema = DATABASE()) THEN
+        DROP TABLE IF EXISTS analysis_summary_author;
+        DROP TABLE IF EXISTS analysis_summary_article;
+        DROP TABLE IF EXISTS analysis_summary_person;
+        DROP TABLE IF EXISTS analysis_summary_author_list;
+
+        RENAME TABLE
+            analysis_summary_author_backup TO analysis_summary_author,
+            analysis_summary_article_backup TO analysis_summary_article,
+            analysis_summary_person_backup TO analysis_summary_person,
+            analysis_summary_author_list_backup TO analysis_summary_author_list;
+
+        IF v_error = 0 THEN
+            SELECT 'SUCCESS: Restored from backup tables' AS status;
+        ELSE
+            SELECT 'ERROR: Failed to restore from backup' AS status;
+        END IF;
+    ELSE
+        SELECT 'ERROR: Backup tables do not exist' AS status;
+    END IF;
+END//
+
+DROP PROCEDURE IF EXISTS `check_analysis_summary_status`//
+CREATE PROCEDURE `check_analysis_summary_status`()
+BEGIN
+    SELECT 'analysis_summary_author' AS table_name, COUNT(*) AS row_count,
+           (SELECT MAX(id) FROM analysis_summary_author) AS max_id
+    UNION ALL
+    SELECT 'analysis_summary_article', COUNT(*), (SELECT MAX(id) FROM analysis_summary_article)
+    FROM analysis_summary_article
+    UNION ALL
+    SELECT 'analysis_summary_person', COUNT(*), (SELECT MAX(id) FROM analysis_summary_person)
+    FROM analysis_summary_person
+    UNION ALL
+    SELECT 'analysis_summary_author_list', COUNT(*), (SELECT MAX(id) FROM analysis_summary_author_list)
+    FROM analysis_summary_author_list;
+
+    SELECT table_name,
+           CASE WHEN table_rows > 0 THEN 'EXISTS' ELSE 'EMPTY' END AS backup_status,
+           table_rows
+    FROM information_schema.tables
+    WHERE table_schema = DATABASE() AND table_name LIKE 'analysis_summary_%_backup';
+END//
+
+DROP PROCEDURE IF EXISTS `view_job_progress`//
+CREATE PROCEDURE `view_job_progress`(IN p_job_id VARCHAR(50))
+BEGIN
+    IF p_job_id IS NULL THEN
+        SELECT * FROM analysis_job_log
+        WHERE job_id = (SELECT MAX(job_id) FROM analysis_job_log)
+        ORDER BY id;
+    ELSE
+        SELECT * FROM analysis_job_log WHERE job_id = p_job_id ORDER BY id;
+    END IF;
+END//
+
+DROP PROCEDURE IF EXISTS `get_latest_progress`//
+CREATE PROCEDURE `get_latest_progress`()
+BEGIN
+    SELECT job_id, step, substep, status, rows_affected, message, created_at,
+           TIMESTAMPDIFF(SECOND, (SELECT MIN(created_at) FROM analysis_job_log WHERE job_id = l.job_id), created_at) AS elapsed_seconds
+    FROM analysis_job_log l
+    WHERE id = (SELECT MAX(id) FROM analysis_job_log);
+END//
 
-## With this stored procedure, we run a set of background jobs for summarizing all the publication
-## data used in the ReCiter Publication Manager web interface and the report generator.
-
-## Our goal here is to populate three tables:
-## 1. analysis_summary_author - authorship-level data
-## 2. analysis_summary_article - article-level data
-## 3. analysis_summary_person - person-level data
-
-## In WCM's experience, this procedure takes ~17 minutes to complete while running on AWS RDS, MariaDB 10.6
-## and with about 300,000 accepted articles. 
-
-## The below is a hedge just to make sure this procedure doesn't start 
-## unless the person_article table is populated with at least some articles.
-
-IF ((select count(*) from person_article) > 5) THEN
-
-
-#### 1. Start from scratch ####
-
-truncate analysis_summary_author;
-truncate analysis_summary_article;
-truncate analysis_summary_person;
-truncate analysis_summary_author_list;
-
-
-
-#### 2a. Populate "analysis_summary_author" table with known authors #### 
-
-insert into analysis_summary_author (pmid, personIdentifier, authorPosition, authors) 
-select  
-y.pmid, 
-y.personIdentifier, 
-case  
-when authors like '((%' then 'first'  
-when authors like '%))' then 'last' 
-end as authorPosition,  
-case  
-when totalAuthorCount < 8 then authors  
-else  
-concat( 
-SUBSTRING_INDEX(authors,',',6), 
-' ...', 
-SUBSTRING_INDEX(authors,',',-1)   
-) 
-end as authors  
-    
-from (select distinct 
-personIdentifier, 
-pmid,   
-max(rank) as totalAuthorCount,  
-group_concat(authorName order by rank asc SEPARATOR ', ') as authors  
-from  
-( 
-select  
-distinct  
-aa.personIdentifier,  
-aa.pmid,  
-rank, 
-convert(  
-case  
-when targetAuthor = 1 then concat('((',authorLastName,' ',replace(cast(REGEXP_REPLACE(BINARY authorFirstName,'[a-z]','') as char),' ',''),'))') 
-else concat(authorLastName,' ',replace(cast(REGEXP_REPLACE(BINARY authorFirstName,'[a-z]','') as char),' ','')) 
-end   
-using utf8) 
-as authorName 
-from person_article_author aa 
-join person_article a on a.pmid = aa.pmid and a.personIdentifier = aa.personIdentifier 
-where userAssertion = 'ACCEPTED'  
-) x 
-group by pmid, personIdentifier) y; 
-
-update analysis_summary_author a  
-join analysis_override_author_position o on a.pmid = o.pmid and a.personIdentifier = o.personIdentifier 
-set a.authorPosition = o.position;
-
-
-
-#### 2b. Update analysis_summary_author with cases where authors are marked as equalContrib relative to first/last authors
-## To receive credit for authorPosition = first or last, authors need to be contiguous with other authors who
-## also have the equalContrib designation.
-##
-## For some reason, this doesn't work without ta temporary table.
-
-
-
-CREATE TABLE if not exists `analysis_temp_equalcontrib` (
-  `id` int(11) NOT NULL AUTO_INCREMENT,
-  `personIdentifier` varchar(30) DEFAULT NULL,
-  `pmid` int(11) DEFAULT NULL,
-  `rank` int(11) DEFAULT NULL,
-  `maxRank` int(11) DEFAULT NULL,  
-  `targetAuthor` int(11) DEFAULT NULL,    
-  `equalContribAll` varchar(500) DEFAULT NULL,      
-  `authorPositionEqualContrib` varchar(20) DEFAULT NULL,        
-  PRIMARY KEY (`id`),
-  KEY `personIdentifier` (`personIdentifier`) USING BTREE,
-  KEY `pmid` (`pmid`) USING BTREE  
-) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4
-  COLLATE utf8mb4_unicode_ci;
-
-
-
-INSERT INTO analysis_temp_equalcontrib (personIdentifier, pmid, rank, maxRank, targetAuthor, equalContribAll, authorPositionEqualContrib)
-
-SELECT a.personIdentifier as personIdentifier,
-     a.pmid as pmid,
-     a.rank,
-     maxRank,
-     a.targetAuthor,
-     equalContribAll,
-       CASE
-           -- Contiguous to 1
-           WHEN a.rank = 2 
-              AND FIND_IN_SET(1, equalContribAll) > 0  
-              AND FIND_IN_SET(2, equalContribAll) > 0
-           THEN 'first'
-
-           WHEN a.rank = 3
-              AND FIND_IN_SET(1, equalContribAll) > 0  
-              AND FIND_IN_SET(2, equalContribAll) > 0
-              AND FIND_IN_SET(3, equalContribAll) > 0
-           THEN 'first'
-
-           WHEN a.rank = 4
-              AND FIND_IN_SET(1, equalContribAll) > 0  
-              AND FIND_IN_SET(2, equalContribAll) > 0
-              AND FIND_IN_SET(3, equalContribAll) > 0
-              AND FIND_IN_SET(4, equalContribAll) > 0
-           THEN 'first'
-
-           WHEN a.rank = 5
-              AND FIND_IN_SET(1, equalContribAll) > 0  
-              AND FIND_IN_SET(2, equalContribAll) > 0
-              AND FIND_IN_SET(3, equalContribAll) > 0
-              AND FIND_IN_SET(4, equalContribAll) > 0
-              AND FIND_IN_SET(5, equalContribAll) > 0               
-           THEN 'first'
-
-           WHEN a.rank = 6
-              AND FIND_IN_SET(1, equalContribAll) > 0  
-              AND FIND_IN_SET(2, equalContribAll) > 0
-              AND FIND_IN_SET(3, equalContribAll) > 0
-              AND FIND_IN_SET(4, equalContribAll) > 0
-              AND FIND_IN_SET(5, equalContribAll) > 0    
-              AND FIND_IN_SET(6, equalContribAll) > 0                             
-           THEN 'first'
-
-           WHEN a.rank = 7
-              AND FIND_IN_SET(1, equalContribAll) > 0  
-              AND FIND_IN_SET(2, equalContribAll) > 0
-              AND FIND_IN_SET(3, equalContribAll) > 0
-              AND FIND_IN_SET(4, equalContribAll) > 0
-              AND FIND_IN_SET(5, equalContribAll) > 0    
-              AND FIND_IN_SET(6, equalContribAll) > 0   
-              AND FIND_IN_SET(7, equalContribAll) > 0                                           
-           THEN 'first'
-
-           WHEN a.rank = 8
-              AND FIND_IN_SET(1, equalContribAll) > 0  
-              AND FIND_IN_SET(2, equalContribAll) > 0
-              AND FIND_IN_SET(3, equalContribAll) > 0
-              AND FIND_IN_SET(4, equalContribAll) > 0
-              AND FIND_IN_SET(5, equalContribAll) > 0    
-              AND FIND_IN_SET(6, equalContribAll) > 0   
-              AND FIND_IN_SET(7, equalContribAll) > 0   
-              AND FIND_IN_SET(8, equalContribAll) > 0                                                         
-           THEN 'first'
-
-           WHEN a.rank = 9
-              AND FIND_IN_SET(1, equalContribAll) > 0  
-              AND FIND_IN_SET(2, equalContribAll) > 0
-              AND FIND_IN_SET(3, equalContribAll) > 0
-              AND FIND_IN_SET(4, equalContribAll) > 0
-              AND FIND_IN_SET(5, equalContribAll) > 0    
-              AND FIND_IN_SET(6, equalContribAll) > 0   
-              AND FIND_IN_SET(7, equalContribAll) > 0   
-              AND FIND_IN_SET(8, equalContribAll) > 0  
-              AND FIND_IN_SET(9, equalContribAll) > 0                                                                         
-           THEN 'first'
-
-           WHEN a.rank = 10
-              AND FIND_IN_SET(1, equalContribAll) > 0  
-              AND FIND_IN_SET(2, equalContribAll) > 0
-              AND FIND_IN_SET(3, equalContribAll) > 0
-              AND FIND_IN_SET(4, equalContribAll) > 0
-              AND FIND_IN_SET(5, equalContribAll) > 0    
-              AND FIND_IN_SET(6, equalContribAll) > 0   
-              AND FIND_IN_SET(7, equalContribAll) > 0   
-              AND FIND_IN_SET(8, equalContribAll) > 0  
-              AND FIND_IN_SET(9, equalContribAll) > 0                                                                         
-              AND FIND_IN_SET(10, equalContribAll) > 0    
-           THEN 'first'
-
-           WHEN a.rank = 11
-              AND FIND_IN_SET(1, equalContribAll) > 0  
-              AND FIND_IN_SET(2, equalContribAll) > 0
-              AND FIND_IN_SET(3, equalContribAll) > 0
-              AND FIND_IN_SET(4, equalContribAll) > 0
-              AND FIND_IN_SET(5, equalContribAll) > 0    
-              AND FIND_IN_SET(6, equalContribAll) > 0   
-              AND FIND_IN_SET(7, equalContribAll) > 0   
-              AND FIND_IN_SET(8, equalContribAll) > 0  
-              AND FIND_IN_SET(9, equalContribAll) > 0     
-              AND FIND_IN_SET(10, equalContribAll) > 0  
-              AND FIND_IN_SET(11, equalContribAll) > 0                                                                                                    
-           THEN 'first'
-
-           WHEN a.rank = 12
-              AND FIND_IN_SET(1, equalContribAll) > 0  
-              AND FIND_IN_SET(2, equalContribAll) > 0
-              AND FIND_IN_SET(3, equalContribAll) > 0
-              AND FIND_IN_SET(4, equalContribAll) > 0
-              AND FIND_IN_SET(5, equalContribAll) > 0    
-              AND FIND_IN_SET(6, equalContribAll) > 0   
-              AND FIND_IN_SET(7, equalContribAll) > 0   
-              AND FIND_IN_SET(8, equalContribAll) > 0  
-              AND FIND_IN_SET(9, equalContribAll) > 0     
-              AND FIND_IN_SET(10, equalContribAll) > 0  
-              AND FIND_IN_SET(11, equalContribAll) > 0                                                                                                    
-              AND FIND_IN_SET(12, equalContribAll) > 0   
-           THEN 'first'
-
-           WHEN a.rank = 13
-              AND FIND_IN_SET(1, equalContribAll) > 0  
-              AND FIND_IN_SET(2, equalContribAll) > 0
-              AND FIND_IN_SET(3, equalContribAll) > 0
-              AND FIND_IN_SET(4, equalContribAll) > 0
-              AND FIND_IN_SET(5, equalContribAll) > 0    
-              AND FIND_IN_SET(6, equalContribAll) > 0   
-              AND FIND_IN_SET(7, equalContribAll) > 0   
-              AND FIND_IN_SET(8, equalContribAll) > 0  
-              AND FIND_IN_SET(9, equalContribAll) > 0     
-              AND FIND_IN_SET(10, equalContribAll) > 0  
-              AND FIND_IN_SET(11, equalContribAll) > 0                                                                                                    
-              AND FIND_IN_SET(12, equalContribAll) > 0   
-              AND FIND_IN_SET(13, equalContribAll) > 0 
-           THEN 'first'
-
-           WHEN a.rank = 14
-              AND FIND_IN_SET(1, equalContribAll) > 0  
-              AND FIND_IN_SET(2, equalContribAll) > 0
-              AND FIND_IN_SET(3, equalContribAll) > 0
-              AND FIND_IN_SET(4, equalContribAll) > 0
-              AND FIND_IN_SET(5, equalContribAll) > 0    
-              AND FIND_IN_SET(6, equalContribAll) > 0   
-              AND FIND_IN_SET(7, equalContribAll) > 0   
-              AND FIND_IN_SET(8, equalContribAll) > 0  
-              AND FIND_IN_SET(9, equalContribAll) > 0     
-              AND FIND_IN_SET(10, equalContribAll) > 0  
-              AND FIND_IN_SET(11, equalContribAll) > 0                                                                                                    
-              AND FIND_IN_SET(12, equalContribAll) > 0   
-              AND FIND_IN_SET(13, equalContribAll) > 0 
-              AND FIND_IN_SET(14, equalContribAll) > 0                
-           THEN 'first'
-
-           WHEN a.rank = 15
-              AND FIND_IN_SET(1, equalContribAll) > 0  
-              AND FIND_IN_SET(2, equalContribAll) > 0
-              AND FIND_IN_SET(3, equalContribAll) > 0
-              AND FIND_IN_SET(4, equalContribAll) > 0
-              AND FIND_IN_SET(5, equalContribAll) > 0    
-              AND FIND_IN_SET(6, equalContribAll) > 0   
-              AND FIND_IN_SET(7, equalContribAll) > 0   
-              AND FIND_IN_SET(8, equalContribAll) > 0  
-              AND FIND_IN_SET(9, equalContribAll) > 0     
-              AND FIND_IN_SET(10, equalContribAll) > 0  
-              AND FIND_IN_SET(11, equalContribAll) > 0                                                                                                    
-              AND FIND_IN_SET(12, equalContribAll) > 0   
-              AND FIND_IN_SET(13, equalContribAll) > 0 
-              AND FIND_IN_SET(14, equalContribAll) > 0   
-              AND FIND_IN_SET(15, equalContribAll) > 0                              
-           THEN 'first'
-
-           WHEN a.rank = maxRank - 1
-              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
-           THEN 'last'
-
-           WHEN a.rank = maxRank - 2
-              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
-              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0               
-           THEN 'last'
-
-           WHEN a.rank = maxRank - 3
-              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
-              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0                             
-           THEN 'last'
-
-           WHEN a.rank = maxRank - 4
-              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
-              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
-           THEN 'last'
-
-           WHEN a.rank = maxRank - 5
-              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
-              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
-              AND FIND_IN_SET(maxRank - 5, equalContribAll) > 0   
-           THEN 'last'
-
-           WHEN a.rank = maxRank - 6
-              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
-              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
-              AND FIND_IN_SET(maxRank - 5, equalContribAll) > 0   
-              AND FIND_IN_SET(maxRank - 6, equalContribAll) > 0  
-           THEN 'last'
-
-           WHEN a.rank = maxRank - 7
-              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
-              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
-              AND FIND_IN_SET(maxRank - 5, equalContribAll) > 0   
-              AND FIND_IN_SET(maxRank - 6, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 7, equalContribAll) > 0 
-           THEN 'last'
-
-           WHEN a.rank = maxRank - 8
-              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
-              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
-              AND FIND_IN_SET(maxRank - 5, equalContribAll) > 0   
-              AND FIND_IN_SET(maxRank - 6, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 7, equalContribAll) > 0 
-              AND FIND_IN_SET(maxRank - 8, equalContribAll) > 0 
-           THEN 'last'
-
-           WHEN a.rank = maxRank - 9
-              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
-              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
-              AND FIND_IN_SET(maxRank - 5, equalContribAll) > 0   
-              AND FIND_IN_SET(maxRank - 6, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 7, equalContribAll) > 0 
-              AND FIND_IN_SET(maxRank - 8, equalContribAll) > 0 
-              AND FIND_IN_SET(maxRank - 9, equalContribAll) > 0               
-           THEN 'last'
-
-           WHEN a.rank = maxRank - 10
-              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
-              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
-              AND FIND_IN_SET(maxRank - 5, equalContribAll) > 0   
-              AND FIND_IN_SET(maxRank - 6, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 7, equalContribAll) > 0 
-              AND FIND_IN_SET(maxRank - 8, equalContribAll) > 0 
-              AND FIND_IN_SET(maxRank - 9, equalContribAll) > 0               
-              AND FIND_IN_SET(maxRank - 10, equalContribAll) > 0    
-           THEN 'last'
-
-           WHEN a.rank = maxRank - 11
-              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
-              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
-              AND FIND_IN_SET(maxRank - 5, equalContribAll) > 0   
-              AND FIND_IN_SET(maxRank - 6, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 7, equalContribAll) > 0 
-              AND FIND_IN_SET(maxRank - 8, equalContribAll) > 0 
-              AND FIND_IN_SET(maxRank - 9, equalContribAll) > 0               
-              AND FIND_IN_SET(maxRank - 10, equalContribAll) > 0    
-              AND FIND_IN_SET(maxRank - 11, equalContribAll) > 0             
-           THEN 'last'
-
-           WHEN a.rank = maxRank - 12
-              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
-              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
-              AND FIND_IN_SET(maxRank - 5, equalContribAll) > 0   
-              AND FIND_IN_SET(maxRank - 6, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 7, equalContribAll) > 0 
-              AND FIND_IN_SET(maxRank - 8, equalContribAll) > 0 
-              AND FIND_IN_SET(maxRank - 9, equalContribAll) > 0               
-              AND FIND_IN_SET(maxRank - 10, equalContribAll) > 0    
-              AND FIND_IN_SET(maxRank - 11, equalContribAll) > 0             
-              AND FIND_IN_SET(maxRank - 12, equalContribAll) > 0 
-           THEN 'last'
-
-           WHEN a.rank = maxRank - 13
-              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
-              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
-              AND FIND_IN_SET(maxRank - 5, equalContribAll) > 0   
-              AND FIND_IN_SET(maxRank - 6, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 7, equalContribAll) > 0 
-              AND FIND_IN_SET(maxRank - 8, equalContribAll) > 0 
-              AND FIND_IN_SET(maxRank - 9, equalContribAll) > 0               
-              AND FIND_IN_SET(maxRank - 10, equalContribAll) > 0    
-              AND FIND_IN_SET(maxRank - 11, equalContribAll) > 0             
-              AND FIND_IN_SET(maxRank - 12, equalContribAll) > 0 
-              AND FIND_IN_SET(maxRank - 13, equalContribAll) > 0                
-           THEN 'last'
-
-           WHEN a.rank = maxRank - 13
-              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
-              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
-              AND FIND_IN_SET(maxRank - 5, equalContribAll) > 0   
-              AND FIND_IN_SET(maxRank - 6, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 7, equalContribAll) > 0 
-              AND FIND_IN_SET(maxRank - 8, equalContribAll) > 0 
-              AND FIND_IN_SET(maxRank - 9, equalContribAll) > 0               
-              AND FIND_IN_SET(maxRank - 10, equalContribAll) > 0    
-              AND FIND_IN_SET(maxRank - 11, equalContribAll) > 0             
-              AND FIND_IN_SET(maxRank - 12, equalContribAll) > 0 
-              AND FIND_IN_SET(maxRank - 13, equalContribAll) > 0                
-           THEN 'last'
-
-           WHEN a.rank = maxRank - 14
-              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
-              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
-              AND FIND_IN_SET(maxRank - 5, equalContribAll) > 0   
-              AND FIND_IN_SET(maxRank - 6, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 7, equalContribAll) > 0 
-              AND FIND_IN_SET(maxRank - 8, equalContribAll) > 0 
-              AND FIND_IN_SET(maxRank - 9, equalContribAll) > 0               
-              AND FIND_IN_SET(maxRank - 10, equalContribAll) > 0    
-              AND FIND_IN_SET(maxRank - 11, equalContribAll) > 0             
-              AND FIND_IN_SET(maxRank - 12, equalContribAll) > 0 
-              AND FIND_IN_SET(maxRank - 13, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 14, equalContribAll) > 0                              
-           THEN 'last'
-
-           WHEN a.rank = maxRank - 15
-              AND FIND_IN_SET(maxRank, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 1, equalContribAll) > 0
-              AND FIND_IN_SET(maxRank - 2, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 3, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 4, equalContribAll) > 0                                           
-              AND FIND_IN_SET(maxRank - 5, equalContribAll) > 0   
-              AND FIND_IN_SET(maxRank - 6, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 7, equalContribAll) > 0 
-              AND FIND_IN_SET(maxRank - 8, equalContribAll) > 0 
-              AND FIND_IN_SET(maxRank - 9, equalContribAll) > 0               
-              AND FIND_IN_SET(maxRank - 10, equalContribAll) > 0    
-              AND FIND_IN_SET(maxRank - 11, equalContribAll) > 0             
-              AND FIND_IN_SET(maxRank - 12, equalContribAll) > 0 
-              AND FIND_IN_SET(maxRank - 13, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 14, equalContribAll) > 0  
-              AND FIND_IN_SET(maxRank - 15, equalContribAll) > 0                                            
-           THEN 'last'
-           ELSE NULL
-       END AS authorPositionEqualContrib
-FROM person_article_author a
-join person_article p on p.pmid = a.pmid and p.personIdentifier = a.personIdentifier
-LEFT JOIN analysis_summary_author r ON r.pmid = a.pmid AND r.personIdentifier = a.personIdentifier
-JOIN (SELECT pmid, max(rank) AS maxRank
-      FROM person_article_author
-      GROUP BY pmid) m ON m.pmid = a.pmid
-JOIN (SELECT pmid, GROUP_CONCAT(DISTINCT rank ORDER BY rank ASC SEPARATOR ',') AS equalContribAll
-      FROM person_article_author
-      WHERE equalContrib = 'Y'
-      GROUP BY pmid) y ON y.pmid = a.pmid
-WHERE a.equalContrib = 'Y'
-  AND a.targetAuthor = 1
-  and p.userAssertion = 'ACCEPTED';
-  
-  
-update analysis_summary_author y
-join analysis_temp_equalcontrib x on x.pmid = y.pmid and x.personIdentifier = y.personIdentifier
-set y.authorPosition = x.authorPositionEqualContrib
-where x.authorPositionEqualContrib is not null and y.authorPosition is null;
-
-
-
-
-
-
-
-#### 2c.  Populate "analysis_summary_author_list" table with all authors and their ranks ####
-
-
-insert into analysis_summary_author_list (pmid, authorFirstName, authorLastName, rank, personIdentifier)
-
-select pmid, max(authorFirstName) as authorFirstName, max(authorLastName) as authorLastName, rank, max(personIdentifier) as personIdentifier
-
-from 
-
-(select
-aa.personIdentifier,
-aa.pmid,
-authorFirstName,
-authorLastName,
-rank,
-targetAuthor
-from person_article_author aa 
-join person_article a on a.pmid = aa.pmid and a.personIdentifier = aa.personIdentifier 
-where userAssertion = 'ACCEPTED'
-and targetAuthor = 1
-
-union 
-
-select
-'' as personIdentifier,
-pmid,
-authorFirstName,
-authorLastName,
-rank,
-targetAuthor
-from person_article_author
-where
-targetAuthor = 0) x 
-group by pmid, rank
-order by pmid desc, rank asc;
-
-
-
-#### 3. Populate "analysis_summary_article" table with articles ####
-
-insert into analysis_summary_article (pmid, pmcid, publicationTypeCanonical, articleYear, publicationDateStandardized, publicationDateDisplay, datePublicationAddedToEntrez, articleTitle, journalTitleVerbose, issn, doi, issue, volume, pages, citationCountScopus)
-select distinct 
-pmid, max(pmcid), publicationTypeCanonical, articleYear, min(publicationDateStandardized), publicationDateDisplay, datePublicationAddedToEntrez, articleTitle, journalTitleVerbose, issn, doi, issue, volume, pages, max(timesCited)
-from person_article 
-where userAssertion = 'ACCEPTED'
-group by pmid
-order by datePublicationAddedToEntrez desc;
-
-
-## Update analysis_summary_article with Scimago Journal Rank (SJR)
-
-update analysis_summary_article a 
-join journal_impact_scimago i on i.issn1 = a.issn
-set journalImpactScore1 = i.sjr
-where a.journalImpactScore1 is null and a.issn is not null;
-
-update analysis_summary_article a 
-join journal_impact_scimago i on i.issn2 = a.issn
-set journalImpactScore1 = i.sjr
-where a.journalImpactScore1 is null and a.issn is not null;
-
-update analysis_summary_article a 
-join journal_impact_scimago i on i.issn3 = a.issn
-set journalImpactScore1 = i.sjr
-where a.journalImpactScore1 is null and a.issn is not null;
-
-
-## Update analysis_summary_article with an alternate journal ranking scheme in journal_impact_alternative
-
-update analysis_summary_article a 
-join journal_impact_alternative i on i.issn = a.issn
-set journalImpactScore2 = i.impactScore1
-where a.journalImpactScore2 is null and a.issn is not null;
-
-update analysis_summary_article a 
-join journal_impact_alternative i on i.eissn = a.issn
-set journalImpactScore2 = i.impactScore1
-where a.journalImpactScore2 is null and a.issn is not null;
-
-
-## Update Mendeley readers and TrendingPubs score
-
-update analysis_summary_article a
-join analysis_altmetric al on al.doi = a.doi
-set a.readersMendeley = al.`readers-mendeley`
-where round((unix_timestamp() - UNIX_TIMESTAMP(STR_TO_DATE(datePublicationAddedtoEntrez,'%Y-%m-%d')) ) / (60 * 60 * 24),0) < 366;
-
-update analysis_summary_article 
-set trendingPubsScore = round(readersMendeley / round((unix_timestamp() - UNIX_TIMESTAMP(STR_TO_DATE(publicationDateStandardized,'%Y-%m-%d')) ) 
-  / (60 * 60 * 24),0),2);
-
-
-## Update NIH RCR stats
-
-update analysis_summary_article a
-join analysis_nih r on r.pmid = a.pmid
-set a.citationCountNIH = r.citation_count, 
-a.percentileNIH = r.nih_percentile,
-a.relativeCitationRatioNIH = r.relative_citation_ratio,
-publicationTypeNIH = 
-  case when is_research_article in ('Yes','yes') then 'Research Article'
-  else null
-  end;
-
-
-
-## Update article year in cases where year is 0. This is due to a quirk in PubMed that hasn't been
-## fixed as yet in ReCiter.
-
-update analysis_summary_article a
-set articleYear = left(publicationDateStandardized,4)
-where articleYear = 0 or articleYear is null;
-
-
-## Update datePublicationAddedToEntrez where that value is blank.
-
-update analysis_summary_article a
-set datePublicationAddedToEntrez = publicationDateStandardized
-where datePublicationAddedToEntrez = '' and publicationDateStandardized != '' and publicationDateStandardized is not null;
-
-
-#### 4. Manage special characters #### 
-
-## Update a field that has an RTF-friendly equivalent of articleTitle
-
-update analysis_summary_article
-set articleTitleRTF = articleTitle;
-
-SET @id = 0;
-
-REPEAT 
-
-   SET @id = @id + 1; 
-
-     select specialCharacter, RTFescape 
-     into @specialCharacter, @RTFescape
-     from analysis_special_characters 
-     where id = @id;
-
-     update analysis_summary_article
-     set articleTitleRTF = REPLACE(articleTitleRTF, @specialCharacter, @RTFescape)
-     where articleTitleRTF like(concat('%',@specialCharacter,'%'));
-     
-   UNTIL @id = (select max(id) from analysis_special_characters)
-END REPEAT;
-
-
-## Update a field that has an RTF-friendly equivalent of authors
-
-update analysis_summary_author
-set authorsRTF = authors;
-
-SET @id = 0;
-
-REPEAT 
-
-   SET @id = @id + 1; 
-
-     select specialCharacter, RTFescape 
-     into @specialCharacter, @RTFescape
-     from analysis_special_characters 
-     where id = @id;
-
-     update analysis_summary_author
-     set authorsRTF = REPLACE(authorsRTF, @specialCharacter, @RTFescape)
-     where authorsRTF like(concat('%',@specialCharacter,'%'));
-
-   UNTIL @id = (select max(id) from analysis_special_characters)
-END REPEAT;
-
-
-
-
-#### 5. Populate the "analysis_summary_person" table with person-level statistics ####
-
-## This function is site-specific, populating all in scope personIdentifiers in the analysis_summary_person_scope
-## table.
-
-call populateAnalysisSummaryPersonScopeTable();
-
-
-## Populate the analysis_summary_person table
-
-insert into analysis_summary_person (personIdentifier, nameFirst, nameMiddle, nameLast, department, facultyRank)
-
-select * from (
-select distinct
-p.personIdentifier,
-firstName as nameFirst,
-middleName as nameMiddle,
-lastName as nameLast,
-primaryOrganizationalUnit as department,
-
-coalesce(a.facultyRank, b.facultyRank, c.facultyRank, d.facultyRank) as facultyRank
-from person p 
-
-left join (select personIdentifier, 'Full Professor' as facultyRank 
-from person_person_type
-where personType = 'academic-faculty-fullprofessor') a 
-on a.personIdentifier = p.personIdentifier
-
-left join (select personIdentifier, 'Associate Professor' as facultyRank 
-from person_person_type
-where personType = 'academic-faculty-associate') b
-on b.personIdentifier = p.personIdentifier
-
-left join (select personIdentifier, 'Assistant Professor' as facultyRank 
-from person_person_type
-where personType = 'academic-faculty-assistant') c
-on c.personIdentifier = p.personIdentifier
-
-left join (select personIdentifier, 'Instructor or Lecturer' as facultyRank 
-from person_person_type
-where personType in ('academic-faculty-instructor','academic-faculty-lecturer')) d
-on d.personIdentifier = p.personIdentifier
-
-
-inner join (select personIdentifier 
-from analysis_summary_person_scope) e
-on e.personIdentifier = p.personIdentifier
-
-) x where facultyRank is not null; 
-
-
-
-## Count, all
-
-update analysis_summary_person p
-join (select s.personIdentifier,
-count(a1.pmid) as count
-from analysis_summary_person s 
-join analysis_summary_author a on a.personIdentifier = s.personIdentifier
-join analysis_summary_article a1 on a1.pmid = a.pmid
-where publicationTypeNIH = 'Research Article' 
-and percentileNIH is not null
-group by s.personIdentifier) x on x.personIdentifier = p.personIdentifier
-set countAll = count;
-
-
-
-## Count, first only
-
-update analysis_summary_person p
-join (select s.personIdentifier,
-count(a1.pmid) as count
-from analysis_summary_person s 
-join analysis_summary_author a on a.personIdentifier = s.personIdentifier
-join analysis_summary_article a1 on a1.pmid = a.pmid
-where percentileNIH is not null
-and authorPosition in ('first')
-group by s.personIdentifier) x on x.personIdentifier = p.personIdentifier
-set countFirst = count;
-
-
-## Count, senior only
-
-update analysis_summary_person p
-join (select s.personIdentifier,
-count(a1.pmid) as count
-from analysis_summary_person s 
-join analysis_summary_author a on a.personIdentifier = s.personIdentifier
-join analysis_summary_article a1 on a1.pmid = a.pmid
-where percentileNIH is not null
-and authorPosition in ('last')
-group by s.personIdentifier) x on x.personIdentifier = p.personIdentifier
-set countSenior = count;
-
-
-## Average, Top 10, all
-
-update analysis_summary_person p
-join (
-select personIdentifier,
-round(avg(percentileNIH),3) as percentileNIH,
-count(*) as count
-from
-(select s.personIdentifier,
-a.pmid,
-percentileNIH,
-rank() over (partition by personIdentifier order by percentileNIH desc) as article_rank
-from analysis_summary_person s 
-join analysis_summary_author a on a.personIdentifier = s.personIdentifier
-join analysis_summary_article a1 on a1.pmid = a.pmid
-where percentileNIH is not null
-and countAll > 9) y 
-where article_rank < 11
-group by personIdentifier) x on x.personIdentifier = p.personIdentifier
-set top10PercentileAll = percentileNIH;
-
-
-
-
-## Average, Top 5, all
-
-update analysis_summary_person p
-join (
-select personIdentifier,
-round(avg(percentileNIH),3) as percentileNIH,
-count(*) as count
-from
-(select s.personIdentifier,
-a.pmid,
-percentileNIH,
-rank() over (partition by personIdentifier order by percentileNIH desc) as article_rank
-from analysis_summary_person s 
-join analysis_summary_author a on a.personIdentifier = s.personIdentifier
-join analysis_summary_article a1 on a1.pmid = a.pmid
-where percentileNIH is not null
-and countAll > 4) y 
-where article_rank < 6
-group by personIdentifier) x on x.personIdentifier = p.personIdentifier
-set top5PercentileAll = percentileNIH;
-
-
-## Average, Top 10, senior only
-
-update analysis_summary_person p
-join (
-select personIdentifier,
-round(avg(percentileNIH),3) as percentileNIH,
-count(*) as count
-from
-(select s.personIdentifier,
-a.pmid,
-percentileNIH,
-rank() over (partition by personIdentifier order by percentileNIH desc) as article_rank
-from analysis_summary_person s 
-join analysis_summary_author a on a.personIdentifier = s.personIdentifier
-join analysis_summary_article a1 on a1.pmid = a.pmid
-where percentileNIH is not null
-and authorPosition in ('last')
-and countAll > 9) y 
-where article_rank < 11
-group by personIdentifier) x on x.personIdentifier = p.personIdentifier
-set top10PercentileSenior = percentileNIH;
-
-
-## Average, Top 5, senior only
-
-update analysis_summary_person p
-join (
-select personIdentifier,
-round(avg(percentileNIH),3) as percentileNIH,
-count(*) as count
-from
-(select s.personIdentifier,
-a.pmid,
-percentileNIH,
-rank() over (partition by personIdentifier order by percentileNIH desc) as article_rank
-from analysis_summary_person s 
-join analysis_summary_author a on a.personIdentifier = s.personIdentifier
-join analysis_summary_article a1 on a1.pmid = a.pmid
-where percentileNIH is not null
-and authorPosition in ('last')
-and countAll > 9) y 
-where article_rank < 6
-group by personIdentifier) x on x.personIdentifier = p.personIdentifier
-set top5PercentileSenior = percentileNIH;
-
-
-## Average, Top 10, first only
-
-update analysis_summary_person p
-join (
-select personIdentifier,
-round(avg(percentileNIH),3) as percentileNIH,
-count(*) as count
-from
-(select s.personIdentifier,
-a.pmid,
-percentileNIH,
-rank() over (partition by personIdentifier order by percentileNIH desc) as article_rank
-from analysis_summary_person s 
-join analysis_summary_author a on a.personIdentifier = s.personIdentifier
-join analysis_summary_article a1 on a1.pmid = a.pmid
-where percentileNIH is not null
-and authorPosition in ('first')
-and countAll > 9) y 
-where article_rank < 11
-group by personIdentifier) x on x.personIdentifier = p.personIdentifier
-set top10PercentileFirst = percentileNIH;
-
-
-## Average, Top 5, first 
-
-update analysis_summary_person p
-join (
-select personIdentifier,
-round(avg(percentileNIH),3) as percentileNIH,
-count(*) as count
-from
-(select s.personIdentifier,
-a.pmid,
-percentileNIH,
-rank() over (partition by personIdentifier order by percentileNIH desc) as article_rank
-from analysis_summary_person s 
-join analysis_summary_author a on a.personIdentifier = s.personIdentifier
-join analysis_summary_article a1 on a1.pmid = a.pmid
-where percentileNIH is not null
-and authorPosition in ('first')
-and countAll > 4) y 
-where article_rank < 6
-group by personIdentifier) x on x.personIdentifier = p.personIdentifier
-set top5PercentileFirst = percentileNIH;
-
-
-## Average, Top 10, first or last
-
-update analysis_summary_person p
-join (
-select personIdentifier,
-round(avg(percentileNIH),3) as percentileNIH,
-count(*) as count
-from
-(select s.personIdentifier,
-a.pmid,
-percentileNIH,
-rank() over (partition by personIdentifier order by percentileNIH desc) as article_rank
-from analysis_summary_person s 
-join analysis_summary_author a on a.personIdentifier = s.personIdentifier
-join analysis_summary_article a1 on a1.pmid = a.pmid
-where percentileNIH is not null
-and authorPosition in ('first','last')
-and countAll > 9) y 
-where article_rank < 11
-group by personIdentifier) x on x.personIdentifier = p.personIdentifier
-set top10PercentileFirstSenior = percentileNIH;
-
-
-## Average, Top 5, first or last
-
-update analysis_summary_person p
-join (
-select personIdentifier,
-round(avg(percentileNIH),3) as percentileNIH,
-count(*) as count
-from
-(select s.personIdentifier,
-a.pmid,
-percentileNIH,
-rank() over (partition by personIdentifier order by percentileNIH desc) as article_rank
-from analysis_summary_person s 
-join analysis_summary_author a on a.personIdentifier = s.personIdentifier
-join analysis_summary_article a1 on a1.pmid = a.pmid
-where percentileNIH is not null
-and authorPosition in ('first','last')
-and countAll > 4) y 
-where article_rank < 6
-group by personIdentifier) x on x.personIdentifier = p.personIdentifier
-set top5PercentileFirstSenior = percentileNIH;
-
-
-## Denominator, top 5, senior only
-
-update analysis_summary_person p
-join (select count(*) as count, facultyRank from analysis_summary_person where top5PercentileSenior is not null and countSenior > 4 group by facultyRank) x on x.facultyRank = p.facultyRank
-set top5DenominatorSenior = count;
-
-
-## Denominator, Top 10, senior only
-
-update analysis_summary_person p
-join (select count(*) as count, facultyRank from analysis_summary_person where top10PercentileSenior is not null and countSenior > 9 group by facultyRank) x on x.facultyRank = p.facultyRank
-set top10DenominatorSenior = count;
-
-
-## Denominator, Top 5, first only
-
-update analysis_summary_person p
-join (select count(personIdentifier) as count, facultyRank from analysis_summary_person where top5PercentileFirst is not null and countFirst > 4 group by facultyRank) x on x.facultyRank = p.facultyRank
-set top5DenominatorFirst = count;
-
-
-## Denominator, Top 10, first only
-
-update analysis_summary_person p
-join (select count(*) as count, facultyRank from analysis_summary_person where top10PercentileFirst is not null and countFirst > 9 group by facultyRank) x on x.facultyRank = p.facultyRank
-set top10DenominatorFirst = count;
-
-
-
-
-## Denominator, Top 5, first or senior 
-
-update analysis_summary_person p
-join (select count(*) as count, facultyRank from analysis_summary_person where top5PercentileFirstSenior is not null and (countFirst + countSenior) > 4 group by facultyRank) x on x.facultyRank = p.facultyRank
-set top5DenominatorFirstSenior = count;
-
-
-
-
-## Denominator, Top 10, first or senior
-
-update analysis_summary_person p
-join (select count(*) as count, facultyRank from analysis_summary_person where top10PercentileFirstSenior is not null and (countFirst + countSenior) > 9 group by facultyRank) x on x.facultyRank = p.facultyRank
-set top10DenominatorFirstSenior = count;
-
-
-
-
-## Denominator, Top 5, all 
-
-update analysis_summary_person p
-join (select count(*) as count, facultyRank from analysis_summary_person where top5PercentileAll is not null and countAll > 4 group by facultyRank) x on x.facultyRank = p.facultyRank
-set top5DenominatorAll = count;
-
-
-## Denominator, Top 10, all
-
-update analysis_summary_person p
-join (select count(*) as count, facultyRank from analysis_summary_person where top10PercentileAll is not null and countAll > 9 group by facultyRank) x on x.facultyRank = p.facultyRank
-set top10DenominatorAll = count;
-
-
-## Rank, top 5, senior only
-
-update analysis_summary_person p
-join (select 
-personIdentifier, 
-rank() over (partition by facultyRank order by top5PercentileSenior desc) as personRank
-from analysis_summary_person
-where countSenior > 4) x on x.personIdentifier = p.personIdentifier
-set top5RankSenior = personRank;
-
-
-## Rank, Top 10, senior only
-
-update analysis_summary_person p
-join (select 
-personIdentifier, 
-rank() over (partition by facultyRank order by top10PercentileSenior desc) as personRank
-from analysis_summary_person
-where countSenior > 9) x on x.personIdentifier = p.personIdentifier
-set top10RankSenior = personRank;
-
-
-## Rank, Top 5, first only
-
-update analysis_summary_person p
-join (select 
-personIdentifier, 
-rank() over (partition by facultyRank order by top5PercentileFirst desc) as personRank
-from analysis_summary_person
-where countFirst > 4) x on x.personIdentifier = p.personIdentifier
-set top5RankFirst = personRank;
-
-
-## Rank, Top 10, first only
-
-update analysis_summary_person p
-join (select 
-personIdentifier, 
-rank() over (partition by facultyRank order by top10PercentileFirst desc) as personRank
-from analysis_summary_person
-where countFirst > 9) x on x.personIdentifier = p.personIdentifier
-set top10RankFirst = personRank;
-
-
-## Rank, Top 5, first or senior 
-
-update analysis_summary_person p
-join (select 
-personIdentifier, 
-rank() over (partition by facultyRank order by top5PercentileFirstSenior desc) as personRank
-from analysis_summary_person
-where (countSenior + countFirst) > 4) x on x.personIdentifier = p.personIdentifier
-set top5RankFirstSenior = personRank;
-
-
-## Rank, Top 10, first or senior
-
-update analysis_summary_person p
-join (select 
-personIdentifier, 
-rank() over (partition by facultyRank order by top10PercentileFirstSenior desc) as personRank
-from analysis_summary_person
-where (countSenior + countFirst) > 4) x on x.personIdentifier = p.personIdentifier
-set top10RankFirstSenior = personRank;
-
-
-## Rank, Top 5, all 
-
-update analysis_summary_person p
-join (select 
-personIdentifier, 
-rank() over (partition by facultyRank order by top5PercentileAll desc) as personRank
-from analysis_summary_person
-where countAll > 4) x on x.personIdentifier = p.personIdentifier
-set top5RankAll = personRank;
-
-
-## Rank, Top 10, all
-
-update analysis_summary_person p
-join (select 
-personIdentifier, 
-rank() over (partition by facultyRank order by top10PercentileAll desc) as personRank
-from analysis_summary_person
-where countAll > 9) x on x.personIdentifier = p.personIdentifier
-set top10RankAll = personRank;
-
-
-
-#### 6. Compute h-index and h5-index
-
-## We have two approaches for computing h-index and h5-index. 
-##
-## Option 1. Use NIH iCite which takes data from the analysis_nih table and outputs to 
-## h-index and h5-index in analysis_summary_person.
-##
-## Option 2. Use Scopus which is in the person_article table. This is only available if you 
-## have an integration with Scopus.
-##
-## You can comment out the Scopus option (6c and 6d) if you're not using it, or just let it run. 
-## This process will complete really quickly if citation count is 0 for all articles.
-
-
-## 6a. Compute h-index using NIH iCite data 
-
-update analysis_summary_person h  
-set hindexStatus = 0;
-
-update analysis_summary_person h  
-set hindexStatus = 1
-where personIdentifier not in 
-(select distinct p.personIdentifier 
-from analysis_summary_person p 
-join analysis_summary_author a on p.personIdentifier = a.personIdentifier
-join analysis_summary_article a1 on a1.pmid = a.pmid
-where citationCountNIH > 0);  
-
-SET @person_identifier = (select personIdentifier from analysis_summary_person WHERE hindexStatus = 0 limit 1);
-
-proc1: REPEAT   
-
-    select personIdentifier into @personIdentifier from analysis_summary_person WHERE hindexStatus = 0 limit 1;
-                
-    TRUNCATE analysis_temp_hindex;
-            
-    INSERT INTO analysis_temp_hindex (personIdentifier, citation_count) 
-    SELECT s.personIdentifier, citationCountNIH 
-    from analysis_summary_author a 
-    join analysis_summary_person s on s.personIdentifier = a.personIdentifier
-    join analysis_summary_article a1 on a1.pmid = a.pmid
-    where s.personIdentifier = @person_identifier and citationCountNIH > 0 
-    ORDER BY citationCountNIH desc;
-
-
-    SET @article_count := (SELECT count(*) from analysis_temp_hindex);
-    SET @max_times_cited := (SELECT max(citation_count) from analysis_temp_hindex);
-    SET @temp_hindex := (select least(@article_count, @max_times_cited)) + 1;   
-
-    REPEAT SET @temp_hindex = @temp_hindex - 1; 
-      UNTIL 
-        (@temp_hindex <= (select count(*) from analysis_temp_hindex WHERE citation_count >= @temp_hindex)) OR 
-        (@temp_hindex is null) OR
-        (@temp_hindex = 0)
-    END REPEAT;
-    
-    UPDATE analysis_summary_person
-    SET hindexStatus = 1, hindexNIH = @temp_hindex
-    WHERE personIdentifier = @person_identifier;
-
-    SET @person_identifier = (select personIdentifier from analysis_summary_person WHERE hindexStatus = 0 limit 1);
-                        
-    UNTIL ((select count(*) from analysis_summary_person WHERE hindexStatus = 0) = 0)  
-         
-  END REPEAT proc1;
-  
-  
-
-
-## 6b. Compute h5-index using NIH iCite data 
-
-update analysis_summary_person h  
-set hindexStatus = 0;
-
-update analysis_summary_person h  
-set hindexStatus = 1
-where personIdentifier not in
-(select distinct p.personIdentifier 
-from analysis_summary_person p 
-join analysis_summary_author a on p.personIdentifier = a.personIdentifier
-join analysis_summary_article a1 on a1.pmid = a.pmid
-where citationCountNIH > 0 
-and datePublicationAddedToEntrez > CURDATE() - INTERVAL 5 YEAR);  
-
-proc1: REPEAT   
-
-    select personIdentifier into @personIdentifier from analysis_summary_person WHERE hindexStatus = 0 limit 1;
-                
-    TRUNCATE analysis_temp_hindex;
-            
-    INSERT INTO analysis_temp_hindex (personIdentifier, citation_count) 
-    SELECT s.personIdentifier, citationCountNIH 
-    from analysis_summary_author a 
-    join analysis_summary_person s on s.personIdentifier = a.personIdentifier
-    join analysis_summary_article a1 on a1.pmid = a.pmid
-    where s.personIdentifier = @person_identifier 
-    and citationCountNIH > 0 
-    and datePublicationAddedToEntrez > CURDATE() - INTERVAL 5 YEAR 
-    ORDER BY citationCountNIH desc;
-
-    SET @article_count := (SELECT count(*) from analysis_temp_hindex);
-    SET @max_times_cited := (SELECT max(citation_count) from analysis_temp_hindex);
-    SET @temp_hindex := (select least(@article_count, @max_times_cited)) + 1;   
-
-    REPEAT SET @temp_hindex = @temp_hindex - 1; 
-      UNTIL 
-        (@temp_hindex <= (select count(*) from analysis_temp_hindex WHERE citation_count >= @temp_hindex)) OR 
-        (@temp_hindex is null) OR
-        (@temp_hindex = 0)
-    END REPEAT;
-    
-    UPDATE analysis_summary_person
-    SET hindexStatus = 1, h5indexNIH = @temp_hindex
-    WHERE personIdentifier = @person_identifier;
-
-    SET @person_identifier = (select personIdentifier from analysis_summary_person WHERE hindexStatus = 0 limit 1);
-                        
-    UNTIL ((select count(*) from analysis_summary_person WHERE hindexStatus = 0) = 0)  
-         
-  END REPEAT proc1;
-
-
-
-
-## 6c. Compute h-index using Scopus data 
-
-update analysis_summary_person h  
-set hindexStatus = 0;
-
-update analysis_summary_person h  
-set hindexStatus = 1
-where personIdentifier not in 
-(select distinct p.personIdentifier 
-from analysis_summary_person p 
-join analysis_summary_author a on p.personIdentifier = a.personIdentifier
-join analysis_summary_article a1 on a1.pmid = a.pmid
-where citationCountScopus > 0);  
-
-SET @person_identifier = (select personIdentifier from analysis_summary_person WHERE hindexStatus = 0 limit 1);
-
-proc1: REPEAT   
-
-    select personIdentifier into @personIdentifier from analysis_summary_person WHERE hindexStatus = 0 limit 1;
-                
-    TRUNCATE analysis_temp_hindex;
-            
-    INSERT INTO analysis_temp_hindex (personIdentifier, citation_count) 
-    SELECT s.personIdentifier, citationCountScopus 
-    from analysis_summary_author a 
-    join analysis_summary_person s on s.personIdentifier = a.personIdentifier
-    join analysis_summary_article a1 on a1.pmid = a.pmid
-    where s.personIdentifier = @person_identifier and citationCountScopus > 0 
-    ORDER BY citationCountScopus desc;
-
-    SET @article_count := (SELECT count(*) from analysis_temp_hindex);
-    SET @max_times_cited := (SELECT max(citation_count) from analysis_temp_hindex);
-    SET @temp_hindex := (select least(@article_count, @max_times_cited)) + 1;   
-
-    REPEAT SET @temp_hindex = @temp_hindex - 1; 
-      UNTIL 
-        (@temp_hindex <= (select count(*) from analysis_temp_hindex WHERE citation_count >= @temp_hindex)) OR 
-        (@temp_hindex is null) OR
-        (@temp_hindex = 0)
-    END REPEAT;
-    
-    UPDATE analysis_summary_person
-    SET hindexStatus = 1, hindexScopus = @temp_hindex
-    WHERE personIdentifier = @person_identifier;
-
-    SET @person_identifier = (select personIdentifier from analysis_summary_person WHERE hindexStatus = 0 limit 1);
-                        
-    UNTIL ((select count(*) from analysis_summary_person WHERE hindexStatus = 0) = 0)  
-         
-  END REPEAT proc1;
-  
-  
-
-
-## 6d. Compute h5-index using Scopus data 
-
-update analysis_summary_person h  
-set hindexStatus = 0;
-
-update analysis_summary_person h  
-set hindexStatus = 1
-where personIdentifier not in 
-(select distinct p.personIdentifier 
-from analysis_summary_person p 
-join analysis_summary_author a on p.personIdentifier = a.personIdentifier
-join analysis_summary_article a1 on a1.pmid = a.pmid
-where citationCountScopus > 0 
-and datePublicationAddedToEntrez > CURDATE() - INTERVAL 5 YEAR);  
-
-proc1: REPEAT   
-
-    select personIdentifier into @personIdentifier from analysis_summary_person WHERE hindexStatus = 0 limit 1;
-                
-    TRUNCATE analysis_temp_hindex;
-            
-    INSERT INTO analysis_temp_hindex (personIdentifier, citation_count) 
-    SELECT s.personIdentifier, citationCountScopus 
-    from analysis_summary_author a 
-    join analysis_summary_person s on s.personIdentifier = a.personIdentifier
-    join analysis_summary_article a1 on a1.pmid = a.pmid
-    where s.personIdentifier = @person_identifier and citationCountScopus > 0 
-    and datePublicationAddedToEntrez > CURDATE() - INTERVAL 5 YEAR 
-    ORDER BY citationCountScopus desc;
-
-    SET @article_count := (SELECT count(*) from analysis_temp_hindex);
-    SET @max_times_cited := (SELECT max(citation_count) from analysis_temp_hindex);
-    SET @temp_hindex := (select least(@article_count, @max_times_cited)) + 1;   
-
-    REPEAT SET @temp_hindex = @temp_hindex - 1; 
-      UNTIL 
-        (@temp_hindex <= (select count(*) from analysis_temp_hindex WHERE citation_count >= @temp_hindex)) OR 
-        (@temp_hindex is null) OR
-        (@temp_hindex = 0)
-    END REPEAT;
-    
-    UPDATE analysis_summary_person
-    SET hindexStatus = 1, h5indexScopus = @temp_hindex
-    WHERE personIdentifier = @person_identifier;
-
-    SET @person_identifier = (select personIdentifier from analysis_summary_person WHERE hindexStatus = 0 limit 1);
-                        
-    UNTIL ((select count(*) from analysis_summary_person WHERE hindexStatus = 0) = 0)  
-         
-  END REPEAT proc1;
-
-END IF;
-END;
-//
 DELIMITER ;
-
-
-
 
 DELIMITER //
 CREATE DEFINER=`admin`@`%` PROCEDURE `updateCurateSelfRole`()
@@ -3701,8 +3370,3 @@ END
 DELIMITER ;
 
 
-CREATE DEFINER=`admin`@`%` EVENT `runPopulateAnalysisSummaryPersonScopeTable` ON SCHEDULE EVERY 1 DAY STARTS '2022-01-01 01:00:00' ON COMPLETION PRESERVE ENABLE DO call `populateAnalysisSummaryPersonScopeTable`();
-
-CREATE DEFINER=`admin`@`%` EVENT `runPopulateAnalysisSummaryTables` ON SCHEDULE EVERY 1 DAY STARTS '2022-01-01 01:00:00' ON COMPLETION PRESERVE ENABLE DO call `populateAnalysisSummaryTables`();
-
-CREATE DEFINER=`admin`@`%` EVENT `runUpdateCurateSelfRole` ON SCHEDULE EVERY 1 DAY STARTS '2022-01-01 01:00:00' ON COMPLETION PRESERVE ENABLE DO call `updateCurateSelfRole`();
