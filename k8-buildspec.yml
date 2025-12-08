@@ -3,7 +3,7 @@ version: 0.2
 phases:
   install:
     commands:
-      - kubectl version --client 
+      - kubectl version --client # removed --short flag 
   pre_build:
       commands:
         # Fetch Docker credentials from AWS Secrets Manager
