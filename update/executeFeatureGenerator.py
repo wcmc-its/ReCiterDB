@@ -68,8 +68,8 @@ logger = logging.getLogger(__name__)
 # ------------------------------
 # Upload Logs to S3
 # ------------------------------
-def upload_log_to_s3():
-    """Upload log file to S3."""
+""" def upload_log_to_s3():
+    #Upload log file to S3.
     if not os.path.exists(LOCAL_LOG_FILE):
         logger.warning("Local log file does not exist; skipping S3 upload.")
         return
@@ -81,7 +81,7 @@ def upload_log_to_s3():
         s3_client.upload_file(LOCAL_LOG_FILE, S3_BUCKET, s3_key)
         logger.info(f"Uploaded logs to s3://{S3_BUCKET}/{s3_key}")
     except Exception as e:
-        logger.error(f"Failed to upload logs to S3: {e}")
+        logger.error(f"Failed to upload logs to S3: {e}") """
 
 
 # ------------------------------
@@ -260,7 +260,7 @@ def main():
         logger.exception(f"Unexpected error in main(): {e}")
 
     finally:
-        upload_log_to_s3()
+        #upload_log_to_s3()
         logger.info("Uploaded logs to S3.")
 
 
