@@ -55,8 +55,8 @@ URL = os.environ['URL']
 API_KEY = os.environ['API_KEY']
 
 # Configure logging to output to command line
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
+#logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+#logger = logging.getLogger(__name__)
 
 # ------------------------------
 # Logging Setup (writes to file)
@@ -72,17 +72,36 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ------------------------------
+# Upload Logs to S3
+# ------------------------------
+def upload_log_to_s3():
+    """Upload log file to S3."""
+    if not os.path.exists(LOCAL_LOG_FILE):
+        logger.warning("Local log file does not exist; skipping S3 upload.")
+        return
+
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
+    s3_key = f"{S3_LOG_PREFIX}{timestamp}.log"
+
+    try:
+        s3_client.upload_file(LOCAL_LOG_FILE, S3_BUCKET, s3_key)
+        logger.info(f"Uploaded logs to s3://{S3_BUCKET}/{s3_key}")
+    except Exception as e:
+        logger.error(f"Failed to upload logs to S3: {e}")
+
+
+# ------------------------------
 # CPU & Memory Metrics Thread
 # ------------------------------
-def collect_system_metrics():
+def metrics_loop():
     """Runs in background, logs CPU & memory every METRIC_INTERVAL seconds."""
     while True:
-        cpu_percent = psutil.cpu_percent(interval=1)
-        mem_info = psutil.virtual_memory()
+        cpu = psutil.cpu_percent(interval=1)
+        mem = psutil.virtual_memory()
 
         logger.info(
-            f"[METRICS] CPU={cpu_percent}% | "
-            f"Memory Used={mem_info.percent}% ({mem_info.used/1024/1024:.1f} MB)"
+            f"[METRICS] CPU={cpu}% | Memory={mem.percent}% "
+            f"({mem.used/1024/1024:.1f} MB used)"
         )
 
         time.sleep(METRIC_INTERVAL)
@@ -92,12 +111,7 @@ def collect_system_metrics():
 # ------------------------------
 
 def start_metrics_collector():
-    def loop():
-        while True:
-            collect_system_metrics()   # collects CPU, RAM, etc.
-            time.sleep(30)            # every 30 seconds (adjust as needed)
-    
-    t = threading.Thread(target=loop, daemon=True)
+    t = Thread(target=metrics_loop, daemon=True)
     t.start()
 
 
@@ -124,11 +138,11 @@ def rate_limited():
 def connect_mysql_server(username, db_password, db_hostname, database_name):
     """Function to connect to MySQL database"""
     try:
-        mysql_db = pymysql.connect(user=DB_USERNAME,
-                                   password=DB_PASSWORD,
-                                   database=DB_NAME,
-                                   host=DB_HOST)
-        logger.info(f"Connected to database server: {DB_HOST}, database: {DB_NAME}, with user: {DB_USERNAME}")
+        mysql_db = pymysql.connect(user=username,
+                                   password=db_password,
+                                   database=database_name,
+                                   host=db_hostname)
+        logger.info(f"Connected to database server: {db_hostname}, database: {database_name}, with user: {username}")
         return mysql_db
     except pymysql.err.MySQLError as err:
         logger.error(f"{time.ctime()} -- Error connecting to the database: {err}")
@@ -206,9 +220,10 @@ def make_curl_request(person_identifier):
 # Main Execution
 # ------------------------------
 def main():
+    logger.info("Starting Feature Generator Script.")
+    start_metrics_collector()  # start CPU/memory monitoring
+
     try:
-		logger.info("Starting of the Feature Generator Script.")
-		start_metrics_collector()  # <-- starts continuous monitoring
         mysql_db = connect_mysql_server(DB_USERNAME, DB_PASSWORD, DB_HOST, DB_NAME)
         mysql_cursor = mysql_db.cursor()
         person_identifiers = get_person_identifier(mysql_cursor)
@@ -216,7 +231,6 @@ def main():
         logger.info(f"Total person identifiers: {len(person_identifiers)}")
         logger.info(f"Using {MAX_WORKERS} workers, rate limit {REQUESTS_PER_SECOND} req/sec")
 
-        # Thread pool to control concurrency
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             executor.map(make_curl_request, person_identifiers)
 
@@ -225,12 +239,10 @@ def main():
     except Exception as e:
         logger.exception(f"Unexpected error in main(): {e}")
 
+    finally:
+        upload_log_to_s3()
+        logger.info("Uploaded logs to S3.")
+
+
 if __name__ == "__main__":
     main()
-
-# ------------------------------
-# Upload Logs to S3
-# ------------------------------
-def upload_log_to_s3():
-    """Upload the local log file to S3 after script completes."""
-    timestamp = date
