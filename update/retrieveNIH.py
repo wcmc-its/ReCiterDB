@@ -7,13 +7,14 @@ import requests
 import logging
 import random
 import csv
+import sys;
 
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('app.log', mode='w'),
-        logging.StreamHandler()
+        logging.FileHandler('retrieveNIH.log', mode='w'),
+        logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
@@ -301,6 +302,7 @@ def validate_data(mysql_cursor, staging_table, production_table, min_rows=100, m
 #########
 
 if __name__ == '__main__':
+	
     DB_USERNAME = os.getenv('DB_USERNAME')
     DB_PASSWORD = os.getenv('DB_PASSWORD')
     DB_HOST = os.getenv('DB_HOST')

@@ -2,10 +2,13 @@ import json
 import os
 import time
 import urllib.request
-
+import logging
 import pymysql.cursors
 import pymysql.err
 
+
+# Configure logging to output to stdout
+logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(asctime)s - %(message)s')
 
 def connect_mysql_server(username, db_password, db_hostname, database_name):
     """Establish a connection to MySQL or MariaDB server. This function is
@@ -312,6 +315,7 @@ def insert_altmetric_records(mysql_db, mysql_cursor, db_records):
 
 
 if __name__ == '__main__':
+	
     DB_USERNAME = os.getenv('DB_USERNAME')
     DB_PASSWORD = os.getenv('DB_PASSWORD')
     DB_HOST = os.getenv('DB_HOST')

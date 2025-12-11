@@ -18,7 +18,7 @@ COPY update/updateReciterDB.py ./
 COPY update/abstractImport.py ./
 COPY update/conflictsImport.py ./
 COPY update/executeFeatureGenerator.py ./
-
+COPY run_all.py ./
 
 ## Shell script for running the stored procedure
 COPY update/run_nightly_indexing.sh ./
@@ -34,5 +34,4 @@ RUN mkdir -p temp/s3Output
 
 
 ## Run imports then the indexing SP
-#CMD [ "/bin/bash", "-c", "python3 executeFeatureGenerator.py && python3 ./retrieveS3.py && python3 ./retrieveDynamoDb.py && python3 ./updateReciterDB.py && #python3 ./retrieveNIH.py && python3   ./conflictsImport.py && python3 ./abstractImport.py && ./run_nightly_indexing.sh" ]  
-CMD [ "/bin/bash", "-c", "python3 executeFeatureGenerator.py"] 
+CMD [ "/bin/bash", "-c", "python3 run_all.py"] 
