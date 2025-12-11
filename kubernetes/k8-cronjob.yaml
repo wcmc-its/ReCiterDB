@@ -53,7 +53,22 @@ spec:
               valueFrom:
                 configMapKeyRef:
                   name: reciterdb-configmap
-                  key: DB_NAME
+                  key: DB_NAME      
+            - name: LOG_FILE
+              valueFrom:
+                configMapKeyRef:
+                  name: reciterdb-configmap
+                  key: LOG_FILE
+            - name: S3_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: reciterdb-configmap
+                  key: S3_BUCKET
+            - name: S3_KEY_PREFIX
+              valueFrom:
+                configMapKeyRef:
+                  name: reciterdb-configmap
+                  key: S3_KEY_PREFIX
             resources:
               requests:
                 memory: 4G

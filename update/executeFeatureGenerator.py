@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Lock, Thread
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import sys
 
 
 ## This script is a lightweight way for using person ID's from ReCiterDB to run Feature Generator (which suggests new 
@@ -30,11 +31,6 @@ from urllib3.util.retry import Retry
 # ------------------------------
 MAX_WORKERS = 10                 # Safe level of concurrency per pod
 REQUESTS_PER_SECOND = 3          # Global rate limit
-
-# S3 logging configuration
-S3_BUCKET = "reciterdbcrondevlogs"
-S3_LOG_PREFIX = "logs/featuregeneratorapi-job/"       # Folder path in bucket
-LOCAL_LOG_FILE = "/tmp/featuregeneratorapi.log"  # Local log file path
 
 # Metrics settings
 METRIC_INTERVAL = 10  # seconds between CPU/mem reports
@@ -56,9 +52,6 @@ DB_NAME = os.environ['DB_NAME']
 URL = os.environ['URL']
 API_KEY = os.environ['API_KEY']
 
-# Configure logging to output to command line
-#logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-#logger = logging.getLogger(__name__)
 
 # ------------------------------
 # Logging Setup (writes to file)
@@ -67,8 +60,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler(LOCAL_LOG_FILE),  # Write logs to file
-        logging.StreamHandler()               # Also print to console
+        logging.StreamHandler(sys.stdout)               # Also print to console
     ]
 )
 logger = logging.getLogger(__name__)
@@ -136,7 +128,7 @@ def rate_limited():
 # ------------------------------
 # Connect to MySQL
 # ------------------------------
-		
+
 def connect_mysql_server(username, db_password, db_hostname, database_name):
     """Function to connect to MySQL database"""
     try:
@@ -171,6 +163,9 @@ def get_person_identifier(mysql_cursor):
     except Exception as e:
         logger.exception(f"An error occurred while fetching person identifiers: {e}")
 		
+# ------------------------------
+# create session with retries
+# ------------------------------
 
 def create_session_with_retries(
     total_retries=3, 
@@ -191,9 +186,11 @@ def create_session_with_retries(
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
+	
 # ------------------------------
 # API Request Function
 # ------------------------------
+
 session = create_session_with_retries()
 def make_curl_request(person_identifier):
     """Make a safe API request for each person_identifier."""
@@ -241,6 +238,7 @@ def make_curl_request(person_identifier):
 # ------------------------------
 # Main Execution
 # ------------------------------
+
 def main():
     logger.info("Starting Feature Generator Script.")
     start_metrics_collector()  # start CPU/memory monitoring

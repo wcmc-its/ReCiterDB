@@ -6,10 +6,6 @@ import os
 import sys
 import psutil   # for memory logging (pip install psutil)
 
-#LOG_FILE = "/tmp/cronjob.log"
-#S3_BUCKET = "reciterdbcronjobs"
-#S3_KEY_PREFIX = "dev-cronjob-logs/"
-
 LOG_FILE = os.environ['LOG_FILE']
 S3_BUCKET = os.environ['S3_BUCKET']
 S3_KEY_PREFIX = os.environ['S3_KEY_PREFIX']
@@ -92,7 +88,7 @@ def upload_log_to_s3():
 # ------------- Main Flow -------------
 def main():
     scripts = [
-        #("executeFeatureGenerator", "python3 executeFeatureGenerator.py"), # Optional
+        ("executeFeatureGenerator", "python3 executeFeatureGenerator.py"),
         ("retrieveS3", "python3 retrieveS3.py"),
         ("retrieveDynamoDb", "python3 retrieveDynamoDb.py"),
         ("updateReciterDB", "python3 updateReciterDB.py"),
