@@ -9,6 +9,8 @@ import boto3
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock, Thread
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 ## This script is a lightweight way for using person ID's from ReCiterDB to run Feature Generator (which suggests new 
@@ -170,9 +172,29 @@ def get_person_identifier(mysql_cursor):
         logger.exception(f"An error occurred while fetching person identifiers: {e}")
 		
 
+def create_session_with_retries(
+    total_retries=3, 
+    backoff_factor=2, 
+    status_forcelist=(500, 502, 503, 504)
+):
+    """Returns a requests.Session configured with retries and backoff."""
+    session = requests.Session()
+    retry = Retry(
+        total=total_retries,
+        read=total_retries,
+        connect=total_retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=status_forcelist,
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 # ------------------------------
 # API Request Function
 # ------------------------------
+session = create_session_with_retries()
 def make_curl_request(person_identifier):
     """Make a safe API request for each person_identifier."""
     rate_limited()
@@ -198,7 +220,7 @@ def make_curl_request(person_identifier):
     }
 
     try:
-        response = requests.get(curl_url, headers=headers, timeout=60)
+        response = session.get(curl_url, headers=headers, timeout=(10,180))
 
         if response.status_code == 200:
             logger.info(
@@ -209,9 +231,9 @@ def make_curl_request(person_identifier):
                 f"[{person_identifier}] Failed with status {response.status_code}: {response.text}"
             )
 
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
         logger.exception(
-            f"[{person_identifier}] Exception occurred: {e}"
+            f"[{person_identifier}]  Exception occurred after retries: {e}"
         )
 
     return True
