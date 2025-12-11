@@ -198,7 +198,7 @@ def make_curl_request(person_identifier):
     }
 
     try:
-        response = requests.get(curl_url, headers=headers, timeout=20)
+        response = requests.get(curl_url, headers=headers, timeout=60)
 
         if response.status_code == 200:
             logger.info(
