@@ -4,7 +4,12 @@ import time
 import requests
 import logging
 import pymysql
+import psutil
+import boto3			 
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock, Thread
+
 
 ## This script is a lightweight way for using person ID's from ReCiterDB to run Feature Generator (which suggests new 
 ## publications). This way you don't have to bother your developer if you want to add some new people.
@@ -17,6 +22,28 @@ from datetime import datetime
 ## aren't used by other scripts: URL and API_KEY. 
 ## The URL attribute has the form: https://myDomain.edu/reciter/feature-generator/by/uid?uid
 ## The API_KEY attribute is what you would use in ReCiter Swagger to run Feature Generator.
+
+# ------------------------------
+# Configuration
+# ------------------------------
+MAX_WORKERS = 10                 # Safe level of concurrency per pod
+REQUESTS_PER_SECOND = 3          # Global rate limit
+
+# S3 logging configuration
+S3_BUCKET = "reciterdbcrondevlogs"
+S3_LOG_PREFIX = "logs/featuregeneratorapi-job/"       # Folder path in bucket
+LOCAL_LOG_FILE = "/tmp/featuregeneratorapi.log"  # Local log file path
+
+# Metrics settings
+METRIC_INTERVAL = 10  # seconds between CPU/mem reports
+
+# AWS clients
+s3_client = boto3.client("s3")
+
+
+# Rate limiter state
+_last_request_time = 0
+_rate_lock = Lock()
 
 
 # Database and API credentials from environment variables
@@ -31,6 +58,69 @@ API_KEY = os.environ['API_KEY']
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ------------------------------
+# Logging Setup (writes to file)
+# ------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(LOCAL_LOG_FILE),  # Write logs to file
+        logging.StreamHandler()               # Also print to console
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ------------------------------
+# CPU & Memory Metrics Thread
+# ------------------------------
+def collect_system_metrics():
+    """Runs in background, logs CPU & memory every METRIC_INTERVAL seconds."""
+    while True:
+        cpu_percent = psutil.cpu_percent(interval=1)
+        mem_info = psutil.virtual_memory()
+
+        logger.info(
+            f"[METRICS] CPU={cpu_percent}% | "
+            f"Memory Used={mem_info.percent}% ({mem_info.used/1024/1024:.1f} MB)"
+        )
+
+        time.sleep(METRIC_INTERVAL)
+
+# ------------------------------
+# start_metrics_collector function
+# ------------------------------
+
+def start_metrics_collector():
+    def loop():
+        while True:
+            collect_system_metrics()   # collects CPU, RAM, etc.
+            time.sleep(30)            # every 30 seconds (adjust as needed)
+    
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+
+
+# ------------------------------
+# Rate Limiter
+# ------------------------------
+def rate_limited():
+    """Ensures only REQUESTS_PER_SECOND outbound API calls."""
+    global _last_request_time
+    with _rate_lock:
+        gap = 1 / REQUESTS_PER_SECOND
+        now = time.time()
+        elapsed = now - _last_request_time
+
+        if elapsed < gap:
+            time.sleep(gap - elapsed)
+
+        _last_request_time = time.time()
+		
+# ------------------------------
+# Connect to MySQL
+# ------------------------------
+		
 def connect_mysql_server(username, db_password, db_hostname, database_name):
     """Function to connect to MySQL database"""
     try:
@@ -43,13 +133,17 @@ def connect_mysql_server(username, db_password, db_hostname, database_name):
     except pymysql.err.MySQLError as err:
         logger.error(f"{time.ctime()} -- Error connecting to the database: {err}")
 
+# ------------------------------
+# Fecthing PersonIdentifier
+# ------------------------------
+
 def get_person_identifier(mysql_cursor):
     """Get personIdentifiers from MySQL database"""
     get_metadata_query = (
         """
         SELECT DISTINCT personIdentifier
-        FROM """ + DB_NAME + """.reporting_ad_hoc_feature_generator_execution
-        WHERE (frequency = 'daily') OR (frequency = 'weekly' AND DAYOFWEEK(CURRENT_DATE) = 1) OR (frequency = 'monthly' AND DAY(CURRENT_DATE) = 1);
+        FROM """ + DB_NAME + """.reporting_ad_hoc_feature_generator_execution limit 2000;
+        #WHERE (frequency = 'daily') OR (frequency = 'weekly' AND DAYOFWEEK(CURRENT_DATE) = 1) OR (frequency = 'monthly' AND DAY(CURRENT_DATE) = 1);
         """
     )
     try:
@@ -60,29 +154,83 @@ def get_person_identifier(mysql_cursor):
         return person_identifier
     except Exception as e:
         logger.exception(f"An error occurred while fetching person identifiers: {e}")
+		
 
+# ------------------------------
+# API Request Function
+# ------------------------------
 def make_curl_request(person_identifier):
-    """Make curl request for each personIdentifier"""
-    retrieval_flag = "ONLY_NEWLY_ADDED_PUBLICATIONS" if datetime.now().day != 1 else "ALL_PUBLICATIONS"
-    curl_url = f"{URL}?uid={person_identifier}&useGoldStandard=AS_EVIDENCE&fields=reCiterArticleFeatures.pmid,personIdentifier,reCiterArticleFeatures.publicationDateStandardized&analysisRefreshFlag=true&retrievalRefreshFlag={retrieval_flag}"
-    headers = {"accept": "application/json", "api-key": API_KEY}
-    try:
-        response = requests.get(curl_url, headers=headers)
-        if response.status_code == 200:
-            logger.info(f"Response for person identifier {person_identifier}: {response.text}")
-        else:
-            logger.error(f"Failed to retrieve data for person identifier {person_identifier}. HTTP Status Code: {response.status_code}. Response: {response.text}")
-    except Exception as e:
-        logger.exception(f"An error occurred while making the curl request for person identifier {person_identifier}: {e}")
-    logger.info('')  # Output an empty line to the log
+    """Make a safe API request for each person_identifier."""
+    rate_limited()
 
-if __name__ == "__main__":
+    retrieval_flag = (
+        "ONLY_NEWLY_ADDED_PUBLICATIONS"
+        if datetime.now().day != 1
+        else "ALL_PUBLICATIONS"
+    )
+
+    curl_url = (
+        f"{URL}?uid={person_identifier}"
+        f"&useGoldStandard=AS_EVIDENCE"
+        f"&fields=reCiterArticleFeatures.pmid,personIdentifier,"
+        f"reCiterArticleFeatures.publicationDateStandardized"
+        f"&analysisRefreshFlag=true"
+        f"&retrievalRefreshFlag={retrieval_flag}"
+    )
+
+    headers = {
+        "accept": "application/json",
+        "api-key": API_KEY
+    }
+
     try:
+        response = requests.get(curl_url, headers=headers, timeout=20)
+
+        if response.status_code == 200:
+            logger.info(
+                f"[{person_identifier}] Success: {len(response.text)} bytes received"
+            )
+        else:
+            logger.error(
+                f"[{person_identifier}] Failed with status {response.status_code}: {response.text}"
+            )
+
+    except Exception as e:
+        logger.exception(
+            f"[{person_identifier}] Exception occurred: {e}"
+        )
+
+    return True
+
+# ------------------------------
+# Main Execution
+# ------------------------------
+def main():
+    try:
+		logger.info("Starting of the Feature Generator Script.")
+		start_metrics_collector()  # <-- starts continuous monitoring
         mysql_db = connect_mysql_server(DB_USERNAME, DB_PASSWORD, DB_HOST, DB_NAME)
         mysql_cursor = mysql_db.cursor()
         person_identifiers = get_person_identifier(mysql_cursor)
-        for person_identifier in person_identifiers:
-            make_curl_request(person_identifier)
-            time.sleep(2)
+
+        logger.info(f"Total person identifiers: {len(person_identifiers)}")
+        logger.info(f"Using {MAX_WORKERS} workers, rate limit {REQUESTS_PER_SECOND} req/sec")
+
+        # Thread pool to control concurrency
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            executor.map(make_curl_request, person_identifiers)
+
+        logger.info("Processing complete for Feature Generator.")
+
     except Exception as e:
-        logger.exception(f"An unexpected error occurred: {e}")
+        logger.exception(f"Unexpected error in main(): {e}")
+
+if __name__ == "__main__":
+    main()
+
+# ------------------------------
+# Upload Logs to S3
+# ------------------------------
+def upload_log_to_s3():
+    """Upload the local log file to S3 after script completes."""
+    timestamp = date

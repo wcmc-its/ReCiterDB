@@ -34,4 +34,5 @@ RUN mkdir -p temp/s3Output
 
 
 ## Run imports then the indexing SP
-CMD [ "/bin/bash", "-c", "python3 executeFeatureGenerator.py && python3 ./retrieveS3.py && python3 ./retrieveDynamoDb.py && python3 ./updateReciterDB.py && python3 ./retrieveNIH.py && python3   ./conflictsImport.py && python3 ./abstractImport.py && ./run_nightly_indexing.sh" ]  
+#CMD [ "/bin/bash", "-c", "python3 executeFeatureGenerator.py && python3 ./retrieveS3.py && python3 ./retrieveDynamoDb.py && python3 ./updateReciterDB.py && #python3 ./retrieveNIH.py && python3   ./conflictsImport.py && python3 ./abstractImport.py && ./run_nightly_indexing.sh" ]  
+CMD [ "/bin/bash", "-c", "python3 executeFeatureGenerator.py"] 

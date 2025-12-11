@@ -2,3 +2,4 @@
 PyMySQL
 boto3
 requests
+psutil
