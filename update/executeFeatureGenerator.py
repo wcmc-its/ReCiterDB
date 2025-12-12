@@ -157,8 +157,8 @@ def get_person_identifier(mysql_cursor):
         FROM {DB_NAME}.reporting_ad_hoc_feature_generator_execution
         WHERE 
             (frequency = 'daily')
-            OR (frequency = 'weekly' AND DAYOFWEEK(CURRENT_DATE) = 7)
-            OR (frequency = 'monthly' AND DAY(CURRENT_DATE) = 7);
+            OR (frequency = 'weekly' AND DAYOFWEEK(CURRENT_DATE()) = 7)
+            OR (frequency = 'monthly' AND DAY(CURRENT_DATE()) = 7);
     """
     try:
         mysql_cursor.execute(get_metadata_query)

@@ -33,6 +33,7 @@ def log_memory_usage(label=""):
 
 # ------------- Script Runner -------------
 def run_script(name, cmd):
+    start_ts = time.time()
     logger.info("")
     logger.info("======================================")
     logger.info(f"STARTING SCRIPT: {name}")
@@ -46,23 +47,34 @@ def run_script(name, cmd):
             cmd,
             shell=True,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+
         )
 
         # Stream logs live
-        for line in process.stdout:
-            logger.info(f"{name}: {line.strip()}")
-        for line in process.stderr:
-            logger.error(f"{name} [ERR]: {line.strip()}")
+       # for line in process.stdout:
+       #     logger.info(f"{name}: {line.strip()}")
+       # for line in process.stderr:
+       #     logger.error(f"{name} [ERR]: {line.strip()}")
+        assert process.stdout is not None
+        for line in iter(process.stdout.readline, ""):
+            line = line.rstrip("\n")
+            if line:
+                logger.info(f"{name}: {line}")
+        process.stdout.close()
 
         exit_code = process.wait()
+        elapsed = time.time() - start_ts
 
         if exit_code != 0:
-            logger.error(f"❌ SCRIPT FAILED: {name} (exit code {exit_code})")
+            #logger.error(f"❌ SCRIPT FAILED: {name} (exit code {exit_code})")
+            logger.error(f"❌ SCRIPT FAILED: {name} (exit code {exit_code}) after {elapsed:.1f}s")
             return False
 
         logger.info(f"✅ SCRIPT COMPLETED: {name}")
+        logger.info(f"✅ SCRIPT COMPLETED: {name} in {elapsed:.1f}s")
         log_memory_usage(f"After running {name}")
         return True
 
@@ -95,8 +107,8 @@ def main():
         ("retrieveArticles", "python3 retrieveArticles.py"),
         ("retrieveNIH", "python3 retrieveNIH.py"),  
         ("conflictsImport", "python3 conflictsImport.py"),
-        ("abstractImport", "python3 abstractImport.py"),
-        ("nightlyIndexing", "bash run_nightly_indexing.sh"),
+        ("abstractImport", "python3 abstractImport.py")
+        #("nightlyIndexing", "bash run_nightly_indexing.sh"),
     ]
 
     overall_success = True
