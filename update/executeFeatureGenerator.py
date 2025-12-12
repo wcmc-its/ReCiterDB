@@ -146,26 +146,27 @@ def connect_mysql_server(username, db_password, db_hostname, database_name):
 # ------------------------------
 
 def get_person_identifier(mysql_cursor):
-    """Get personIdentifiers from MySQL database"""
-    get_metadata_query = (
-        """
+    """
+    Get personIdentifiers from MySQL database based on frequency rules:
+      - daily
+      - weekly (only on Sunday)
+      - monthly (only on day 7)
+    """
+    get_metadata_query = f"""
         SELECT DISTINCT personIdentifier
-        FROM """ + DB_NAME + """.reporting_ad_hoc_feature_generator_execution limit 2000;
-        #WHERE (frequency = 'daily') OR (frequency = 'weekly' AND DAYOFWEEK(CURRENT_DATE) = 1) OR (frequency = 'monthly' AND DAY(CURRENT_DATE) = 1);
-        """
-    )
+        FROM {DB_NAME}.reporting_ad_hoc_feature_generator_execution
+        WHERE 
+            (frequency = 'daily')
+            OR (frequency = 'weekly' AND DAYOFWEEK(CURRENT_DATE) = 7)
+            OR (frequency = 'monthly' AND DAY(CURRENT_DATE) = 7);
+    """
     try:
         mysql_cursor.execute(get_metadata_query)
-        person_identifier = list()
-        for rec in mysql_cursor:
-            person_identifier.append(rec[0])
-        return person_identifier
+        person_identifiers = [rec[0] for rec in mysql_cursor]
+        return person_identifiers
     except Exception as e:
         logger.exception(f"An error occurred while fetching person identifiers: {e}")
-		
-# ------------------------------
-# create session with retries
-# ------------------------------
+        return []
 
 def create_session_with_retries(
     total_retries=3, 
@@ -193,7 +194,12 @@ def create_session_with_retries(
 
 session = create_session_with_retries()
 def make_curl_request(person_identifier):
-    """Make a safe API request for each person_identifier."""
+    """
+    Make a GET request to ReCiter's Feature Generator service for a given personIdentifier.
+    
+    - On the 1st day of the month, we request ALL_PUBLICATIONS.
+    - On other days, ONLY_NEWLY_ADDED_PUBLICATIONS are requested.
+    """
     rate_limited()
 
     retrieval_flag = (
@@ -232,6 +238,8 @@ def make_curl_request(person_identifier):
         logger.exception(
             f"[{person_identifier}]  Exception occurred after retries: {e}"
         )
+    finally:
+        logger.info("")  # Blank line in logs for readability
 
     return True
 

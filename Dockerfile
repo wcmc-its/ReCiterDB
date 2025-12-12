@@ -1,33 +1,38 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 WORKDIR /usr/src/app
 
+# Install required system packages
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libpq-dev && rm -rf /var/lib/apt/lists/*
+
+# Copy application files and requirements
 COPY requirements.txt ./
 COPY init.py ./
 
 ENV PYTHONUNBUFFERED=1 
 
-
-## Retrieve data from ReCiter and import into ReCiterDB
-
+# Copy additional Python scripts
 COPY update/retrieveNIH.py ./
-COPY update/retrieveDynamoDb.py ./
-COPY update/retrieveS3.py ./
 COPY update/retrieveAltmetric.py ./
+COPY update/retrieveArticles.py ./
 COPY update/updateReciterDB.py ./
 COPY update/abstractImport.py ./
 COPY update/conflictsImport.py ./
+COPY update/dataTransformer.py ./
 COPY update/executeFeatureGenerator.py ./
 COPY run_all.py ./
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+# Or, if not using requirements.txt:
+# RUN pip install requests boto3 dynamodb-json
+
 
 ## Shell script for running the stored procedure
 COPY update/run_nightly_indexing.sh ./
 RUN chmod +x run_nightly_indexing.sh
 
-
-## Make directories
-
-RUN pip3 install --no-cache-dir -r requirements.txt
+# Create required directories
 RUN mkdir -p temp
 RUN mkdir -p temp/parsedOutput
 RUN mkdir -p temp/s3Output

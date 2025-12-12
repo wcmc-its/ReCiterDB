@@ -1,5 +1,12 @@
 ###### Requirements without Version Specifiers ######
 PyMySQL
-boto3
+boto3==1.35.40
+dynamodb-json
 requests
 psutil
+pandas==2.2.3
+keras
+scikit-learn
+sqlalchemy
+joblib
+tensorflow
