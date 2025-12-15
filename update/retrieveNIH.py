@@ -8,6 +8,9 @@ import logging
 import random
 import csv
 import sys;
+import faulthandler, signal
+import pymysql.cursors
+import pymysql.err
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -19,8 +22,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-import pymysql.cursors
-import pymysql.err
+faulthandler.enable(file=sys.stderr, all_threads=True)
+faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
 
 def connect_mysql_server(username, db_password, db_hostname, database_name, max_retries=5, backoff_factor=1):
     """Establish a connection to MySQL or MariaDB server with retry logic."""
@@ -75,7 +78,7 @@ def get_nih_records(nih_api_url, max_retries=5, backoff_factor=1):
     """Fetch NIH records with retry logic."""
     for retry in range(max_retries):
         try:
-            response = requests.get(nih_api_url, timeout=30)
+            response = requests.get(nih_api_url, timeout=(5, 60))
             response.raise_for_status()
             nih_record = response.json()
 

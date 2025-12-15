@@ -36,7 +36,7 @@ REQUESTS_PER_SECOND = 3          # Global rate limit
 METRIC_INTERVAL = 10  # seconds between CPU/mem reports
 
 # AWS clients
-s3_client = boto3.client("s3")
+#s3_client = boto3.client("s3")
 
 
 # Rate limiter state

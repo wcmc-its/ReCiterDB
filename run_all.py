@@ -5,6 +5,7 @@ import boto3
 import os
 import sys
 import psutil   # for memory logging (pip install psutil)
+from botocore.config import Config        
 
 LOG_FILE = os.environ['LOG_FILE']
 S3_BUCKET = os.environ['S3_BUCKET']
@@ -32,7 +33,7 @@ def log_memory_usage(label=""):
     logger.info(f"[MEMORY] {label} - RSS: {mem_mb:.2f} MB")
 
 # ------------- Script Runner -------------
-def run_script(name, cmd):
+def run_script(name, cmd, timeout_seconds=None):
     start_ts = time.time()
     logger.info("")
     logger.info("======================================")
@@ -58,13 +59,20 @@ def run_script(name, cmd):
        #     logger.info(f"{name}: {line.strip()}")
        # for line in process.stderr:
        #     logger.error(f"{name} [ERR]: {line.strip()}")
+        start = time.time()
         assert process.stdout is not None
         for line in iter(process.stdout.readline, ""):
-            line = line.rstrip("\n")
-            if line:
-                logger.info(f"{name}: {line}")
+            logger.info(f"{name}: {line.rstrip()}")
+            if timeout_seconds and (time.time() - start) > timeout_seconds:
+                logger.error(f"⏱️ TIMEOUT: {name} exceeded {timeout_seconds}s; terminating.")
+                process.terminate()
+                try:
+                    process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    logger.error(f"Escalating to kill for {name}.")
+                    process.kill()
+                return False
         process.stdout.close()
-
         exit_code = process.wait()
         elapsed = time.time() - start_ts
 
@@ -85,6 +93,8 @@ def run_script(name, cmd):
 # ------------- S3 Upload -------------
 def upload_log_to_s3():
     try:
+        cfg = Config(connect_timeout=5, read_timeout=60, retries={"max_attempts": 10, "mode": "standard"})
+        s3 = boto3.client("s3", config=cfg)
         s3 = boto3.client("s3")
         filename = f"{int(time.time())}-cronjob.log"
         s3_key = f"{S3_KEY_PREFIX}{filename}"
@@ -104,7 +114,7 @@ def main():
         #("retrieveS3", "python3 retrieveS3.py"),
         #("retrieveDynamoDb", "python3 retrieveDynamoDb.py"),
         #("updateReciterDB", "python3 updateReciterDB.py"),
-        ("retrieveArticles", "python3 retrieveArticles.py"),
+       ("retrieveArticles", "python3 retrieveArticles.py"),
         ("retrieveNIH", "python3 retrieveNIH.py"),  
         ("conflictsImport", "python3 conflictsImport.py"),
         ("abstractImport", "python3 abstractImport.py")
@@ -114,7 +124,8 @@ def main():
     overall_success = True
 
     for name, cmd in scripts:
-        ok = run_script(name, cmd)
+        #ok = run_script(name, cmd)
+        ok = run_script(name, cmd, timeout_seconds=int(os.getenv("SCRIPT_TIMEOUT_SECONDS", "15000")))
         if not ok:
             overall_success = False
             logger.error("Stopping pipeline due to script failure.")
