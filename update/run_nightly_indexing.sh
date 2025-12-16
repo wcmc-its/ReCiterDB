@@ -27,10 +27,10 @@ UPSTREAM_CHECK_INTERVAL=300  # 5 minutes
 UPSTREAM_TIMEOUT=7200        # 2 hours
 
 # Database connection using environment variables
-DB_HOST="${URL:?Variable URL is not set}"
-DB_USER="${DB_USERNAME:?Variable DB_USERNAME is not set}"
-DB_PASS="${DB_PASSWORD:?Variable DB_PASSWORD is not set}"
-DB_NAME="${DB_NAME:?Variable DB_NAME is not set}"
+DB_HOST="${URL}"
+DB_USER="${DB_USERNAME}"
+DB_PASS="${DB_PASSWORD}"
+DB_NAME="${DB_NAME}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -54,7 +54,6 @@ log_info() { log "INFO" "$*"; }
 log_warn() { log "${YELLOW}WARN${NC}" "$*"; }
 log_error() { log "${RED}ERROR${NC}" "$*"; }
 log_success() { log "${GREEN}SUCCESS${NC}" "$*"; }
-
 
 # Check required environment variables
 check_env() {
