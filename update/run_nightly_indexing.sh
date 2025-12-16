@@ -32,6 +32,11 @@ DB_USER="${DB_USERNAME}"
 DB_PASS="${DB_PASSWORD}"
 DB_NAME="${DB_NAME}"
 
+echo "DB_HOST=$DB_HOST"
+echo "DB_USERNAME=$DB_USERNAME"
+echo "DB_PASSWORD=$DB_PASSWORD"
+echo "DB_NAME=$DB_NAME"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -70,8 +75,7 @@ check_env() {
 # Test database connectivity
 test_db_connection() {
     log_info "Testing database connection..."
-    #if mysql -h "${DB_HOST}" -u "${DB_USERNAME}" -p"${DB_PASSWORD}" -e "SELECT 1" "${DB_NAME}" > /dev/null 2>&1; then
-    if mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "SELECT 1"; then
+    if mysql -h "${DB_HOST}" -u "${DB_USERNAME}" -p"${DB_PASSWORD}" -e "SELECT 1" "${DB_NAME}" > /dev/null 2>&1; then
         log_success "Database connection successful"
         return 0
     else
