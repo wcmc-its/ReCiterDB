@@ -55,10 +55,11 @@ log_warn() { log "${YELLOW}WARN${NC}" "$*"; }
 log_error() { log "${RED}ERROR${NC}" "$*"; }
 log_success() { log "${GREEN}SUCCESS${NC}" "$*"; }
 
+
 # Check required environment variables
 check_env() {
     local missing=0
-    for var in DB_HOST_DEV DB_USERNAME_DEV DB_PASSWORD_DEV DB_NAME_DEV; do
+    for var in DB_HOST DB_USER DB_PASS DB_NAME; do
         if [ -z "${!var}" ]; then
             log_error "Missing required environment variable: $var"
             missing=1
