@@ -73,6 +73,9 @@ check_env() {
 # Test database connectivity
 test_db_connection() {
     log_info "Testing database connection..."
+    echo "mysqlversion" 
+    which mysql
+    mysql --version
     if mysql -h "${DB_HOST}" -u "${DB_USERNAME}" -p"${DB_PASSWORD}" -e "SELECT 1" "${DB_NAME}" > /dev/null 2>&1; then
         log_success "Database connection successful"
         return 0
