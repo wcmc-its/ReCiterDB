@@ -20,7 +20,7 @@ COPY update/abstractImport.py ./
 COPY update/conflictsImport.py ./
 COPY update/dataTransformer.py ./
 COPY update/executeFeatureGenerator.py ./
-COPY run_all.py ./
+COPY update/run_all.py ./
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
