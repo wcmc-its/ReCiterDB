@@ -32,8 +32,6 @@ DB_USER="${DB_USERNAME}"
 DB_PASS="${DB_PASSWORD}"
 DB_NAME="${DB_NAME}"
 
-echo "DB_HOST=$DB_HOST"
-echo "DB_NAME=$DB_NAME"
 
 # Colors for output
 RED='\033[0;31m'
