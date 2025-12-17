@@ -160,4 +160,3 @@ if __name__ == '__main__':
     # Close DB connection
     reciter_db.close()
 
-logging.info('Finished processing')  # Log the end of processing

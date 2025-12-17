@@ -1,8 +1,22 @@
+-- ============================================================================
+-- ReCiter Database Tables - Version 2
+-- ============================================================================
+--
+-- Changes from v1:
+--   1. Added analysis_job_log table for progress tracking
+--   2. Updated analysis_summary_person.facultyRank to VARCHAR(150) to accommodate longer titles
+--   3. Added comments for clarity
+--
+-- ============================================================================
 
 CREATE DATABASE IF NOT EXISTS `reciterdb` DEFAULT CHARACTER SET utf8mb4 DEFAULT COLLATE utf8mb4_unicode_ci;
 USE `reciterdb`;
 
-CREATE TABLE `admin_departments` (
+-- ============================================================================
+-- Admin Tables
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS `admin_departments` (
   `departmentID` int(11) NOT NULL AUTO_INCREMENT,
   `institutionalDepartmentCode` varchar(128) DEFAULT NULL,
   `departmentLabel` varchar(128) DEFAULT NULL,
@@ -11,10 +25,24 @@ CREATE TABLE `admin_departments` (
   `createTimestamp` timestamp NOT NULL DEFAULT '0000-00-00 00:00:00',
   `modifyTimestamp` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
   PRIMARY KEY (`departmentID`)
-) ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS `admin_users` (
+  `userID` int(11) NOT NULL AUTO_INCREMENT,
+  `personIdentifier` varchar(128) DEFAULT NULL,
+  `nameFirst` varchar(128) DEFAULT NULL,
+  `nameMiddle` varchar(128) DEFAULT NULL,
+  `nameLast` varchar(128) DEFAULT NULL,
+  `email` varchar(128) DEFAULT NULL,
+  `status` int(1) DEFAULT 1,
+  `createTimestamp` timestamp NOT NULL DEFAULT '0000-00-00 00:00:00',
+  `modifyTimestamp` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
+  PRIMARY KEY (`userID`),
+  KEY `idx_personIdentifier` (`personIdentifier`) USING BTREE,
+  KEY `idx_email` (`email`) USING BTREE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-CREATE TABLE `admin_feedback_log` (
+CREATE TABLE IF NOT EXISTS `admin_feedback_log` (
   `feedbackID` int(11) NOT NULL AUTO_INCREMENT,
   `userID` int(11) DEFAULT NULL,
   `personIdentifier` varchar(20) DEFAULT NULL,
@@ -26,10 +54,9 @@ CREATE TABLE `admin_feedback_log` (
   KEY `idx_userID` (`userID`) USING BTREE,
   KEY `idx_personIdentifier` (`personIdentifier`,`articleIdentifier`) USING BTREE,
   CONSTRAINT `admin_feedback_log_ibfk_1` FOREIGN KEY (`userID`) REFERENCES `admin_users` (`userID`)
-) ENGINE=InnoDB AUTO_INCREMENT=65273 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `admin_notification_log` (
+CREATE TABLE IF NOT EXISTS `admin_notification_log` (
   `notificationID` int(11) NOT NULL AUTO_INCREMENT,
   `userID` int(11) DEFAULT NULL,
   `pmid` int(11) DEFAULT NULL,
@@ -43,10 +70,9 @@ CREATE TABLE `admin_notification_log` (
   PRIMARY KEY (`notificationID`),
   KEY `admin_notification_log_ibfk_1` (`userID`),
   CONSTRAINT `admin_notification_log_ibfk_1` FOREIGN KEY (`userID`) REFERENCES `admin_users` (`userID`)
-) ENGINE=InnoDB AUTO_INCREMENT=948 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `admin_notification_preferences` (
+CREATE TABLE IF NOT EXISTS `admin_notification_preferences` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `userID` int(11) DEFAULT NULL,
   `minimumThreshold` int(11) DEFAULT NULL,
@@ -60,43 +86,24 @@ CREATE TABLE `admin_notification_preferences` (
   PRIMARY KEY (`id`),
   KEY `admin_notification_preferences_ibfk_1` (`userID`),
   CONSTRAINT `admin_notification_preferences_ibfk_1` FOREIGN KEY (`userID`) REFERENCES `admin_users` (`userID`)
-) ENGINE=InnoDB AUTO_INCREMENT=175 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `admin_roles` (
+CREATE TABLE IF NOT EXISTS `admin_roles` (
   `roleID` int(11) NOT NULL AUTO_INCREMENT,
   `roleLabel` varchar(128) DEFAULT NULL,
   `createTimestamp` timestamp NOT NULL DEFAULT '0000-00-00 00:00:00',
   `modifyTimestamp` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
   PRIMARY KEY (`roleID`)
-) ENGINE=InnoDB AUTO_INCREMENT=7 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `admin_settings` (
+CREATE TABLE IF NOT EXISTS `admin_settings` (
   `viewName` varchar(200) NOT NULL,
   `viewAttributes` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL CHECK (json_valid(`viewAttributes`)),
   `viewLabel` varchar(200) DEFAULT NULL,
   PRIMARY KEY (`viewName`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `admin_users` (
-  `userID` int(11) NOT NULL AUTO_INCREMENT,
-  `personIdentifier` varchar(128) DEFAULT NULL,
-  `nameFirst` varchar(128) DEFAULT NULL,
-  `nameMiddle` varchar(128) DEFAULT NULL,
-  `nameLast` varchar(128) DEFAULT NULL,
-  `email` varchar(128) DEFAULT NULL,
-  `status` int(1) DEFAULT 1,
-  `createTimestamp` timestamp NOT NULL DEFAULT '0000-00-00 00:00:00',
-  `modifyTimestamp` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
-  PRIMARY KEY (`userID`),
-  KEY `idx_personIdentifier` (`personIdentifier`) USING BTREE,
-  KEY `idx_email` (`email`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=37566 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-
-CREATE TABLE `admin_users_departments` (
+CREATE TABLE IF NOT EXISTS `admin_users_departments` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `userID` int(11) DEFAULT NULL,
   `departmentID` int(11) DEFAULT NULL,
@@ -107,10 +114,9 @@ CREATE TABLE `admin_users_departments` (
   KEY `idx_userID` (`userID`) USING BTREE,
   CONSTRAINT `admin_users_departments_ibfk_1` FOREIGN KEY (`departmentID`) REFERENCES `admin_departments` (`departmentID`),
   CONSTRAINT `admin_users_departments_ibfk_2` FOREIGN KEY (`userID`) REFERENCES `admin_users` (`userID`)
-) ENGINE=InnoDB AUTO_INCREMENT=50 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `admin_users_roles` (
+CREATE TABLE IF NOT EXISTS `admin_users_roles` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `userID` int(11) DEFAULT NULL,
   `roleID` int(11) DEFAULT NULL,
@@ -121,10 +127,9 @@ CREATE TABLE `admin_users_roles` (
   KEY `admin_users_roles_ibfk_2` (`roleID`),
   CONSTRAINT `admin_users_roles_ibfk_1` FOREIGN KEY (`userID`) REFERENCES `admin_users` (`userID`),
   CONSTRAINT `admin_users_roles_ibfk_2` FOREIGN KEY (`roleID`) REFERENCES `admin_roles` (`roleID`)
-) ENGINE=InnoDB AUTO_INCREMENT=74683 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `admin_users_temp` (
+CREATE TABLE IF NOT EXISTS `admin_users_temp` (
   `userID` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(128) DEFAULT NULL,
   `nameFirst` varchar(128) DEFAULT NULL,
@@ -137,10 +142,22 @@ CREATE TABLE `admin_users_temp` (
   PRIMARY KEY (`userID`),
   KEY `idx_personIdentifier` (`personIdentifier`) USING BTREE,
   KEY `idx_email` (`email`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=75460 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS `admin_orcid` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `personIdentifier` varchar(30) DEFAULT NULL,
+  `orcid` varchar(128) DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `admin_orcid_unique` (`personIdentifier`),
+  KEY `idx_personIdentifier` (`personIdentifier`) USING BTREE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-CREATE TABLE `altmetric` (
+-- ============================================================================
+-- Analysis Tables
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS `altmetric` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `doi` varchar(128) DEFAULT NULL,
   `pmid` int(11) DEFAULT NULL,
@@ -181,8 +198,7 @@ CREATE TABLE `altmetric` (
   KEY `x` (`pmid`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `analysis_altmetric` (
+CREATE TABLE IF NOT EXISTS `analysis_altmetric` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `doi` varchar(128) DEFAULT NULL,
   `pmid` int(11) DEFAULT NULL,
@@ -223,8 +239,7 @@ CREATE TABLE `analysis_altmetric` (
   KEY `x` (`pmid`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `analysis_nih` (
+CREATE TABLE IF NOT EXISTS `analysis_nih` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `pmid` int(11) DEFAULT 0,
   `year` int(11) DEFAULT NULL,
@@ -245,31 +260,28 @@ CREATE TABLE `analysis_nih` (
   `x_coord` float(5,4) DEFAULT NULL,
   `y_coord` float(5,4) DEFAULT NULL,
   PRIMARY KEY (`id`),
-  KEY `sdfsdfsdf` (`pmid`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=196200 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+  KEY `idx_pmid` (`pmid`) USING BTREE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `analysis_nih_cites` (
+CREATE TABLE IF NOT EXISTS `analysis_nih_cites` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `citing_pmid` int(11) DEFAULT 0,
   `cited_pmid` int(11) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `y` (`cited_pmid`) USING BTREE,
   KEY `x` (`citing_pmid`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=17881642 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `analysis_nih_cites_clin` (
+CREATE TABLE IF NOT EXISTS `analysis_nih_cites_clin` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `citing_pmid` int(11) DEFAULT 0,
   `cited_pmid` int(11) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `y` (`cited_pmid`) USING BTREE,
   KEY `x` (`citing_pmid`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=559279 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `analysis_override_author_position` (
+CREATE TABLE IF NOT EXISTS `analysis_override_author_position` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(128) DEFAULT NULL,
   `pmid` int(11) DEFAULT NULL,
@@ -279,18 +291,20 @@ CREATE TABLE `analysis_override_author_position` (
   KEY `idx_personIdentifier` (`personIdentifier`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `analysis_special_characters` (
+CREATE TABLE IF NOT EXISTS `analysis_special_characters` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `specialCharacter` varchar(3) DEFAULT NULL,
   `RTFescape` varchar(10) DEFAULT NULL,
   `characterName` varchar(128) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_character` (`specialCharacter`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=295 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- ============================================================================
+-- Analysis Summary Tables (populated by nightly job)
+-- ============================================================================
 
-CREATE TABLE `analysis_summary_article` (
+CREATE TABLE IF NOT EXISTS `analysis_summary_article` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `pmid` int(11) DEFAULT 0,
   `pmcid` varchar(128) DEFAULT NULL,
@@ -320,10 +334,9 @@ CREATE TABLE `analysis_summary_article` (
   KEY `x` (`doi`) USING BTREE,
   KEY `z` (`pmid`) USING BTREE,
   KEY `w` (`issn`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=262141 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `analysis_summary_author` (
+CREATE TABLE IF NOT EXISTS `analysis_summary_author` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(128) DEFAULT NULL,
   `pmid` int(11) DEFAULT 0,
@@ -333,10 +346,9 @@ CREATE TABLE `analysis_summary_author` (
   PRIMARY KEY (`id`),
   KEY `z` (`pmid`) USING BTREE,
   KEY `y` (`personIdentifier`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=393211 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `analysis_summary_author_list` (
+CREATE TABLE IF NOT EXISTS `analysis_summary_author_list` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `pmid` int(11) DEFAULT 0,
   `authorLastName` varchar(200) DEFAULT NULL,
@@ -346,16 +358,16 @@ CREATE TABLE `analysis_summary_author_list` (
   PRIMARY KEY (`id`),
   KEY `z` (`pmid`) USING BTREE,
   KEY `y` (`personIdentifier`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=3604426 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `analysis_summary_person` (
+-- NOTE: facultyRank increased from VARCHAR(25) to VARCHAR(150) to accommodate longer titles
+CREATE TABLE IF NOT EXISTS `analysis_summary_person` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(20) DEFAULT NULL,
   `nameFirst` varchar(128) DEFAULT NULL,
   `nameMiddle` varchar(128) DEFAULT NULL,
   `nameLast` varchar(128) DEFAULT NULL,
-  `facultyRank` varchar(25) DEFAULT NULL,
+  `facultyRank` varchar(150) DEFAULT NULL,
   `department` varchar(128) DEFAULT NULL,
   `hindexNIH` int(11) DEFAULT NULL,
   `h5indexNIH` int(11) DEFAULT NULL,
@@ -391,27 +403,45 @@ CREATE TABLE `analysis_summary_person` (
   `hindexStatus` int(11) DEFAULT 0,
   PRIMARY KEY (`id`),
   KEY `idx_personIdentifier` (`personIdentifier`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=4096 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `analysis_summary_person_scope` (
+CREATE TABLE IF NOT EXISTS `analysis_summary_person_scope` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(20) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_personIdentifier` (`personIdentifier`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=4096 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- ============================================================================
+-- NEW: Job Logging Table for progress tracking
+-- ============================================================================
 
-CREATE TABLE `analysis_temp_article` (
+CREATE TABLE IF NOT EXISTS `analysis_job_log` (
+  `id` INT AUTO_INCREMENT PRIMARY KEY,
+  `job_id` VARCHAR(50),
+  `step` VARCHAR(100),
+  `substep` VARCHAR(200),
+  `status` VARCHAR(20),
+  `rows_affected` INT,
+  `message` VARCHAR(500),
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  KEY `idx_job_id` (`job_id`) USING BTREE,
+  KEY `idx_created_at` (`created_at`) USING BTREE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ============================================================================
+-- Analysis Temp Tables (used during processing)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS `analysis_temp_article` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `pmid` int(11) DEFAULT NULL,
   `position` varchar(20) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `personIdentifier` (`pmid`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=256 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `analysis_temp_equalcontrib` (
+CREATE TABLE IF NOT EXISTS `analysis_temp_equalcontrib` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(30) DEFAULT NULL,
   `pmid` int(11) DEFAULT NULL,
@@ -425,17 +455,15 @@ CREATE TABLE `analysis_temp_equalcontrib` (
   KEY `pmid` (`pmid`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `analysis_temp_hindex` (
+CREATE TABLE IF NOT EXISTS `analysis_temp_hindex` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(128) DEFAULT NULL,
   `citation_count` int(11) DEFAULT 0,
   PRIMARY KEY (`id`),
   KEY `personIdentifier` (`personIdentifier`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=128 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `analysis_temp_output_article` (
+CREATE TABLE IF NOT EXISTS `analysis_temp_output_article` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `pmid` int(11) DEFAULT NULL,
   `authors` varchar(500) DEFAULT NULL,
@@ -443,20 +471,18 @@ CREATE TABLE `analysis_temp_output_article` (
   `specialCharacterFixNeeded` int(11) DEFAULT 0,
   PRIMARY KEY (`id`),
   KEY `pmid` (`pmid`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=1024 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `analysis_temp_output_author` (
+CREATE TABLE IF NOT EXISTS `analysis_temp_output_author` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(50) DEFAULT '0',
   `pmid` int(11) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `pmid` (`pmid`) USING BTREE,
   KEY `personIdentifier` (`personIdentifier`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=2048 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `analysis_temp_output_table_cell` (
+CREATE TABLE IF NOT EXISTS `analysis_temp_output_table_cell` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(50) DEFAULT '0',
   `tableCell` longblob DEFAULT NULL,
@@ -465,8 +491,11 @@ CREATE TABLE `analysis_temp_output_table_cell` (
   KEY `personIdentifier` (`personIdentifier`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- ============================================================================
+-- Journal Tables
+-- ============================================================================
 
-CREATE TABLE `journal_impact_alternative` (
+CREATE TABLE IF NOT EXISTS `journal_impact_alternative` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `journalTitle` varchar(200) DEFAULT NULL,
   `issn` varchar(12) DEFAULT NULL,
@@ -479,10 +508,9 @@ CREATE TABLE `journal_impact_alternative` (
   KEY `idx_EISSN` (`eissn`) USING BTREE,
   KEY `idx_FullJournalTitle` (`journalTitle`) USING BTREE,
   KEY `idx_issn` (`issn`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=12312 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `journal_impact_scimago` (
+CREATE TABLE IF NOT EXISTS `journal_impact_scimago` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `sourceID` varchar(128) DEFAULT NULL,
   `rank` int(11) DEFAULT NULL,
@@ -510,10 +538,9 @@ CREATE TABLE `journal_impact_scimago` (
   PRIMARY KEY (`id`),
   KEY `index1` (`issn1`),
   KEY `index2` (`issn2`)
-) ENGINE=InnoDB AUTO_INCREMENT=95336 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `journal_nlm` (
+CREATE TABLE IF NOT EXISTS `journal_nlm` (
   `nlmabbreviation` varchar(200) DEFAULT NULL,
   `nlmfulltitle` varchar(300) DEFAULT NULL,
   `nlmissn` varchar(9) DEFAULT NULL,
@@ -527,8 +554,7 @@ CREATE TABLE `journal_nlm` (
   KEY `idx_nlmabbreviation` (`nlmabbreviation`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `journal_science_metrix` (
+CREATE TABLE IF NOT EXISTS `journal_science_metrix` (
   `smsid` int(11) NOT NULL DEFAULT 0,
   `publication_name` varchar(500) DEFAULT NULL,
   `issn` varchar(25) DEFAULT NULL,
@@ -545,10 +571,11 @@ CREATE TABLE `journal_science_metrix` (
   KEY `sdhfkjsdjfh` (`subfield`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- ============================================================================
+-- Person Tables
+-- ============================================================================
 
--- reciterdb.person definition
-
-CREATE TABLE `person` (
+CREATE TABLE IF NOT EXISTS `person` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(128) NOT NULL,
   `firstName` varchar(128) DEFAULT NULL,
@@ -570,10 +597,9 @@ CREATE TABLE `person` (
   KEY `id` (`id`),
   KEY `idx_primaryOrganizationalUnit` (`primaryOrganizationalUnit`) USING BTREE,
   KEY `person_personIdentifier_IDX` (`personIdentifier`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=32767 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `person_article` (
+CREATE TABLE IF NOT EXISTS `person_article` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(128) DEFAULT NULL,
   `pmid` int(11) DEFAULT 0,
@@ -650,7 +676,7 @@ CREATE TABLE `person_article` (
   `totalArticleScoreStandardized` int(11) DEFAULT NULL,
   `totalArticleScoreNonStandardized` float DEFAULT NULL,
   `targetAuthorCount` int(11) DEFAULT NULL,
-  `targetAuthorCountPenalty` float(7,4) DEFAULT NULL  
+  `targetAuthorCountPenalty` float(7,4) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_issn` (`issn`) USING BTREE,
   KEY `idx_scopusDocID` (`scopusDocID`) USING BTREE,
@@ -659,7 +685,7 @@ CREATE TABLE `person_article` (
   KEY `personIdentifier` (`personIdentifier`,`pmid`) USING BTREE
 ) ENGINE=InnoDB AUTO_INCREMENT=1852332 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 
-CREATE TABLE `person_article_author` (
+CREATE TABLE IF NOT EXISTS `person_article_author` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(128) DEFAULT NULL,
   `pmid` int(11) DEFAULT 0,
@@ -671,10 +697,9 @@ CREATE TABLE `person_article_author` (
   `equalContrib` varchar(12) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `personIdentifier` (`personIdentifier`,`pmid`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=6356896 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `person_article_department` (
+CREATE TABLE IF NOT EXISTS `person_article_department` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(128) DEFAULT NULL,
   `pmid` int(11) DEFAULT 0,
@@ -686,10 +711,9 @@ CREATE TABLE `person_article_department` (
   `organizationalUnitModifierScore` float DEFAULT 0,
   PRIMARY KEY (`id`),
   KEY `personIdentifier` (`personIdentifier`,`pmid`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=196606 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `person_article_grant` (
+CREATE TABLE IF NOT EXISTS `person_article_grant` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(128) DEFAULT NULL,
   `pmid` int(11) DEFAULT 0,
@@ -697,20 +721,18 @@ CREATE TABLE `person_article_grant` (
   `grantMatchScore` float DEFAULT 0,
   `institutionGrant` varchar(128) DEFAULT NULL,
   PRIMARY KEY (`id`)
-) ENGINE=InnoDB AUTO_INCREMENT=40959 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `person_article_keyword` (
+CREATE TABLE IF NOT EXISTS `person_article_keyword` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(128) DEFAULT NULL,
   `pmid` int(11) DEFAULT 0,
   `keyword` varchar(128) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `sdfsdfsdf` (`personIdentifier`,`pmid`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=2162656 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `person_article_relationship` (
+CREATE TABLE IF NOT EXISTS `person_article_relationship` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(128) DEFAULT NULL,
   `pmid` int(11) DEFAULT 0,
@@ -728,10 +750,9 @@ CREATE TABLE `person_article_relationship` (
   `relationshipMatchModifierManagerSeniorAuthor` float DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `personIdentifier` (`personIdentifier`,`pmid`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=262141 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `person_article_scopus_non_target_author_affiliation` (
+CREATE TABLE IF NOT EXISTS `person_article_scopus_non_target_author_affiliation` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(128) DEFAULT NULL,
   `pmid` int(11) DEFAULT NULL,
@@ -740,10 +761,9 @@ CREATE TABLE `person_article_scopus_non_target_author_affiliation` (
   `nonTargetAuthorInstitutionCount` int(11) DEFAULT 0,
   PRIMARY KEY (`id`),
   KEY `personIdentifier` (`personIdentifier`,`pmid`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=393211 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `person_article_scopus_target_author_affiliation` (
+CREATE TABLE IF NOT EXISTS `person_article_scopus_target_author_affiliation` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(128) DEFAULT NULL,
   `pmid` int(11) DEFAULT 0,
@@ -755,28 +775,31 @@ CREATE TABLE `person_article_scopus_target_author_affiliation` (
   `targetAuthorInstitutionalAffiliationMatchTypeScore` float DEFAULT 0,
   PRIMARY KEY (`id`),
   KEY `personIdentifier` (`personIdentifier`,`pmid`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=655351 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-CREATE TABLE `person_person_type` (
+CREATE TABLE IF NOT EXISTS `person_person_type` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(128) DEFAULT NULL,
   `personType` varchar(128) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_personIdentifier` (`personIdentifier`) USING BTREE,
   KEY `idx_personType` (`personType`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=131071 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-CREATE TABLE `reporting_abstracts` (
+-- ============================================================================
+-- Reporting Tables
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS `reporting_abstracts` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `pmid` int(11) DEFAULT NULL,
   `abstract` blob DEFAULT NULL,
   `abstractVarchar` varchar(15000) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_pmid` (`pmid`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=262143 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-CREATE TABLE `reporting_ad_hoc_feature_generator_execution` (
+CREATE TABLE IF NOT EXISTS `reporting_ad_hoc_feature_generator_execution` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(128) DEFAULT NULL,
   `frequency` varchar(128) DEFAULT NULL,
@@ -785,9 +808,9 @@ CREATE TABLE `reporting_ad_hoc_feature_generator_execution` (
   `updatedAt` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
   PRIMARY KEY (`id`),
   KEY `idx_personIdentifier` (`personIdentifier`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=1971 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-CREATE TABLE `reporting_ad_hoc_identity_creation` (
+CREATE TABLE IF NOT EXISTS `reporting_ad_hoc_identity_creation` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(128) DEFAULT NULL,
   `inPersonTable` varchar(128) DEFAULT NULL,
@@ -821,25 +844,13 @@ CREATE TABLE `reporting_ad_hoc_identity_creation` (
   `relationshipType2` varchar(128) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_personIdentifier` (`personIdentifier`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-CREATE TABLE `reporting_conflicts` (
+CREATE TABLE IF NOT EXISTS `reporting_conflicts` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `pmid` int(11) DEFAULT NULL,
   `conflictStatement` blob DEFAULT NULL,
   `conflictsVarchar` varchar(15000) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_pmid` (`pmid`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=65538 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
--- reciterdb.admin_orcid definition
-
--- reciterdb.admin_orcid definition
-
-CREATE TABLE `admin_orcid` (
-  `id` int(11) NOT NULL AUTO_INCREMENT,
-  `personIdentifier` varchar(30) DEFAULT NULL,
-  `orcid` varchar(128) DEFAULT NULL,
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `admin_orcid_unique` (`personIdentifier`),
-  KEY `idx_personIdentifier` (`personIdentifier`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=4 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

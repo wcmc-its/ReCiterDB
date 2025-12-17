@@ -3,7 +3,7 @@ version: 0.2
 phases:
   install:
     commands:
-      - kubectl version --short --client
+      - kubectl version --client # removed --short flag 
   pre_build:
       commands:
         # Fetch Docker credentials from AWS Secrets Manager
@@ -26,7 +26,10 @@ phases:
         - echo "${CODEBUILD_WEBHOOK_HEAD_REF}"
         - echo "${BRANCH}"
         - echo $REPOSITORY_URI
-        - $(aws ecr get-login --no-include-email)
+        - echo "${AWS_REGION}"
+        
+        # - $(aws ecr get-login --no-include-email)
+        - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $REPOSITORY_URI
   build:
     commands:
       - |

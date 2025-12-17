@@ -7,19 +7,23 @@ import requests
 import logging
 import random
 import csv
+import sys;
+import faulthandler, signal
+import pymysql.cursors
+import pymysql.err
 
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('app.log', mode='w'),
-        logging.StreamHandler()
+        logging.FileHandler('retrieveNIH.log', mode='w'),
+        logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
 
-import pymysql.cursors
-import pymysql.err
+faulthandler.enable(file=sys.stderr, all_threads=True)
+faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
 
 def connect_mysql_server(username, db_password, db_hostname, database_name, max_retries=5, backoff_factor=1):
     """Establish a connection to MySQL or MariaDB server with retry logic."""
@@ -74,7 +78,7 @@ def get_nih_records(nih_api_url, max_retries=5, backoff_factor=1):
     """Fetch NIH records with retry logic."""
     for retry in range(max_retries):
         try:
-            response = requests.get(nih_api_url, timeout=30)
+            response = requests.get(nih_api_url, timeout=(5, 60))
             response.raise_for_status()
             nih_record = response.json()
 
@@ -193,9 +197,115 @@ def truncate_table(mysql_cursor, table_name):
     mysql_cursor.execute(truncate_query)
     logger.info(f"Existing {table_name} table truncated.")
 
+def create_staging_tables(mysql_cursor, tables):
+    """Create staging tables (table_new) with same structure as production tables."""
+    for table_name in tables:
+        staging_table = f"{table_name}_new"
+        # Drop if exists from failed prior run
+        mysql_cursor.execute(f"DROP TABLE IF EXISTS {staging_table}")
+        # Create staging table with same structure
+        mysql_cursor.execute(f"CREATE TABLE {staging_table} LIKE {table_name}")
+        logger.info(f"Created staging table: {staging_table}")
+
+def atomic_table_swap(mysql_db, mysql_cursor, tables):
+    """
+    Atomically swap staging tables with production tables.
+    Production tables become backup, staging becomes production.
+    """
+    # Build the RENAME statement for all tables at once (atomic operation)
+    rename_parts = []
+    for table_name in tables:
+        staging_table = f"{table_name}_new"
+        backup_table = f"{table_name}_backup"
+        # Drop old backup tables first
+        mysql_cursor.execute(f"DROP TABLE IF EXISTS {backup_table}")
+        rename_parts.append(f"{table_name} TO {backup_table}")
+        rename_parts.append(f"{staging_table} TO {table_name}")
+
+    rename_sql = "RENAME TABLE " + ", ".join(rename_parts)
+    logger.info(f"Executing atomic table swap: {rename_sql}")
+
+    try:
+        mysql_cursor.execute(rename_sql)
+        mysql_db.commit()
+        logger.info("Atomic table swap completed successfully")
+        return True
+    except Exception as e:
+        logger.error(f"Atomic table swap failed: {e}")
+        return False
+
+def restore_from_backup(mysql_db, mysql_cursor, tables):
+    """Restore production tables from backup tables."""
+    logger.warning("Attempting to restore from backup tables...")
+    try:
+        rename_parts = []
+        for table_name in tables:
+            backup_table = f"{table_name}_backup"
+            # Check if backup exists
+            mysql_cursor.execute(f"SHOW TABLES LIKE '{backup_table}'")
+            if mysql_cursor.fetchone():
+                # Drop current table if it exists
+                mysql_cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+                rename_parts.append(f"{backup_table} TO {table_name}")
+
+        if rename_parts:
+            rename_sql = "RENAME TABLE " + ", ".join(rename_parts)
+            mysql_cursor.execute(rename_sql)
+            mysql_db.commit()
+            logger.info("Restored from backup tables successfully")
+            return True
+        else:
+            logger.error("No backup tables found to restore from")
+            return False
+    except Exception as e:
+        logger.error(f"Failed to restore from backup: {e}")
+        return False
+
+def cleanup_staging_tables(mysql_cursor, tables):
+    """Clean up staging tables after a failed run."""
+    for table_name in tables:
+        staging_table = f"{table_name}_new"
+        mysql_cursor.execute(f"DROP TABLE IF EXISTS {staging_table}")
+        logger.info(f"Cleaned up staging table: {staging_table}")
+
+def validate_data(mysql_cursor, staging_table, production_table, min_rows=100, min_percentage=80):
+    """
+    Validate staging table has sufficient data before swap.
+    - Must have at least min_rows
+    - Must have at least min_percentage of production table's row count
+    """
+    mysql_cursor.execute(f"SELECT COUNT(*) as cnt FROM {staging_table}")
+    staging_count = mysql_cursor.fetchone()['cnt']
+
+    mysql_cursor.execute(f"SELECT COUNT(*) as cnt FROM {production_table}")
+    production_count = mysql_cursor.fetchone()['cnt']
+
+    logger.info(f"Validation: {staging_table} has {staging_count} rows, "
+                f"{production_table} has {production_count} rows")
+
+    # Check minimum rows
+    if staging_count < min_rows:
+        logger.error(f"Validation FAILED: {staging_table} has {staging_count} rows "
+                     f"(minimum required: {min_rows})")
+        return False
+
+    # Check percentage of production (only if production has data)
+    if production_count > 0:
+        percentage = (staging_count / production_count) * 100
+        logger.info(f"Staging data is {percentage:.1f}% of production data")
+        if percentage < min_percentage:
+            logger.error(f"Validation FAILED: staging data ({staging_count} rows) is only "
+                         f"{percentage:.1f}% of production ({production_count} rows). "
+                         f"Minimum required: {min_percentage}%")
+            return False
+
+    logger.info(f"Validation PASSED for {staging_table}")
+    return True
+
 #########
 
 if __name__ == '__main__':
+	
     DB_USERNAME = os.getenv('DB_USERNAME')
     DB_PASSWORD = os.getenv('DB_PASSWORD')
     DB_HOST = os.getenv('DB_HOST')
@@ -208,16 +318,21 @@ if __name__ == '__main__':
     reciter_db = connect_mysql_server(DB_USERNAME, DB_PASSWORD, DB_HOST, DB_NAME)
     reciter_db_cursor = reciter_db.cursor(pymysql.cursors.DictCursor)
 
-    # Truncate tables
-    truncate_table(reciter_db_cursor, "analysis_nih")
-    truncate_table(reciter_db_cursor, "analysis_nih_cites")
-    truncate_table(reciter_db_cursor, "analysis_nih_cites_clin")
+    # Define tables to manage
+    NIH_TABLES = ["analysis_nih", "analysis_nih_cites", "analysis_nih_cites_clin"]
+
+    # Create staging tables (instead of truncating production tables)
+    logger.info("Creating staging tables for zero-downtime update...")
+    create_staging_tables(reciter_db_cursor, NIH_TABLES)
+    reciter_db.commit()
 
     # Get PMIDs
     person_article_pmid = get_person_article_pmid(reciter_db_cursor)
 
     if not person_article_pmid:
-        logger.error("No PMIDs retrieved from the database. Exiting script.")
+        logger.error("No PMIDs retrieved from the database. Cleaning up and exiting.")
+        cleanup_staging_tables(reciter_db_cursor, NIH_TABLES)
+        reciter_db.commit()
         reciter_db_cursor.close()
         reciter_db.close()
         exit(1)
@@ -310,22 +425,51 @@ if __name__ == '__main__':
     cites_csv.close()
     cites_clin_csv.close()
 
-    # Check if CSV files are not empty before loading
+    # Track if data load was successful
+    load_success = True
+
+    # Check if CSV files are not empty before loading into STAGING tables
     if os.path.getsize(nih_csv_path) > 0:
-        # Load data into the database
-        load_data_into_db(reciter_db, reciter_db_cursor, "analysis_nih", nih_csv_path, analysis_nih_columns)
+        # Load data into the STAGING table (not production)
+        load_data_into_db(reciter_db, reciter_db_cursor, "analysis_nih_new", nih_csv_path, analysis_nih_columns)
     else:
         logger.error(f"No data in {nih_csv_path}. Skipping data load for analysis_nih.")
+        load_success = False
 
     if os.path.getsize(cites_csv_path) > 0:
-        load_data_into_db(reciter_db, reciter_db_cursor, "analysis_nih_cites", cites_csv_path, ["cited_pmid", "citing_pmid"])
+        load_data_into_db(reciter_db, reciter_db_cursor, "analysis_nih_cites_new", cites_csv_path, ["cited_pmid", "citing_pmid"])
     else:
         logger.error(f"No data in {cites_csv_path}. Skipping data load for analysis_nih_cites.")
+        load_success = False
 
     if os.path.getsize(cites_clin_csv_path) > 0:
-        load_data_into_db(reciter_db, reciter_db_cursor, "analysis_nih_cites_clin", cites_clin_csv_path, ["cited_pmid", "citing_pmid"])
+        load_data_into_db(reciter_db, reciter_db_cursor, "analysis_nih_cites_clin_new", cites_clin_csv_path, ["cited_pmid", "citing_pmid"])
     else:
         logger.error(f"No data in {cites_clin_csv_path}. Skipping data load for analysis_nih_cites_clin.")
+        load_success = False
+
+    # Validate staging data before swap
+    if load_success:
+        logger.info("Validating staging table data...")
+        # Check that staging has at least 80% of production data and minimum 100 rows
+        if not validate_data(reciter_db_cursor, "analysis_nih_new", "analysis_nih",
+                             min_rows=100, min_percentage=80):
+            logger.error("Validation failed: aborting table swap to protect production data")
+            load_success = False
+
+    # Perform atomic table swap if data load was successful
+    if load_success:
+        logger.info("Data load successful. Performing atomic table swap...")
+        if atomic_table_swap(reciter_db, reciter_db_cursor, NIH_TABLES):
+            logger.info("SUCCESS: NIH data updated with zero downtime")
+        else:
+            logger.error("Atomic table swap failed. Attempting to restore from backup...")
+            restore_from_backup(reciter_db, reciter_db_cursor, NIH_TABLES)
+    else:
+        logger.error("Data load failed. Cleaning up staging tables...")
+        cleanup_staging_tables(reciter_db_cursor, NIH_TABLES)
+        reciter_db.commit()
+        logger.error("Production tables remain unchanged.")
 
     # Do not delete temporary files to allow inspection
     # os.remove(nih_csv_path)
