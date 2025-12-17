@@ -27,14 +27,12 @@ UPSTREAM_CHECK_INTERVAL=300  # 5 minutes
 UPSTREAM_TIMEOUT=7200        # 2 hours
 
 # Database connection using environment variables
-DB_HOST="${URL}"
+DB_HOST="${DB_HOST}"
 DB_USER="${DB_USERNAME}"
 DB_PASS="${DB_PASSWORD}"
 DB_NAME="${DB_NAME}"
 
 echo "DB_HOST=$DB_HOST"
-echo "DB_USERNAME=$DB_USERNAME"
-echo "DB_PASSWORD=$DB_PASSWORD"
 echo "DB_NAME=$DB_NAME"
 
 # Colors for output
