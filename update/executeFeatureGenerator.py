@@ -1,3 +1,5 @@
+# executeFeatureGenerator.py
+
 import json
 import os
 import time
@@ -45,6 +47,11 @@ _rate_lock = Lock()
 
 
 # Database and API credentials from environment variables
+import concurrent.futures  # <--- for concurrency
+
+# ------------------------------------------------------------------------------
+#  ENVIRONMENT VARIABLES
+# ------------------------------------------------------------------------------
 DB_USERNAME = os.environ['DB_USERNAME']
 DB_PASSWORD = os.environ['DB_PASSWORD']
 DB_HOST = os.environ['DB_HOST']
@@ -130,7 +137,9 @@ def rate_limited():
 # ------------------------------
 
 def connect_mysql_server(username, db_password, db_hostname, database_name):
-    """Function to connect to MySQL database"""
+    """
+    Function to connect to MySQL database
+    """
     try:
         mysql_db = pymysql.connect(user=username,
                                    password=db_password,
@@ -141,10 +150,9 @@ def connect_mysql_server(username, db_password, db_hostname, database_name):
     except pymysql.err.MySQLError as err:
         logger.error(f"{time.ctime()} -- Error connecting to the database: {err}")
 
-# ------------------------------
-# Fecthing PersonIdentifier
-# ------------------------------
-
+# ------------------------------------------------------------------------------
+#  FETCH PERSON IDENTIFIERS
+# ------------------------------------------------------------------------------
 def get_person_identifier(mysql_cursor):
     """
     Get personIdentifiers from MySQL database based on frequency rules:
@@ -193,6 +201,9 @@ def create_session_with_retries(
 # ------------------------------
 
 session = create_session_with_retries()
+# ------------------------------------------------------------------------------
+#  MAKE FEATURE-GENERATOR REQUEST
+# ------------------------------------------------------------------------------
 def make_curl_request(person_identifier):
     """
     Make a GET request to ReCiter's Feature Generator service for a given personIdentifier.
@@ -252,8 +263,11 @@ def main():
     start_metrics_collector()  # start CPU/memory monitoring
 
     try:
+        # Connect to the database
         mysql_db = connect_mysql_server(DB_USERNAME, DB_PASSWORD, DB_HOST, DB_NAME)
         mysql_cursor = mysql_db.cursor()
+
+        # Fetch all relevant personIdentifiers
         person_identifiers = get_person_identifier(mysql_cursor)
 
         logger.info(f"Total person identifiers: {len(person_identifiers)}")
