@@ -110,11 +110,11 @@ def upload_log_to_s3():
 # ------------- Main Flow -------------
 def main():
     scripts = [
-        #("executeFeatureGenerator", "python3 executeFeatureGenerator.py"),
-        #("retrieveArticles", "python3 retrieveArticles.py"),
-        #("retrieveNIH", "python3 retrieveNIH.py"),  
-        #("conflictsImport", "python3 conflictsImport.py"),
-        #("abstractImport", "python3 abstractImport.py")
+        ("executeFeatureGenerator", "python3 executeFeatureGenerator.py"),
+        ("retrieveArticles", "python3 retrieveArticles.py"),
+        ("retrieveNIH", "python3 retrieveNIH.py"),  
+        ("conflictsImport", "python3 conflictsImport.py"),
+        ("abstractImport", "python3 abstractImport.py")
         ("nightlyIndexing", "bash run_nightly_indexing.sh"),
     ]
 
