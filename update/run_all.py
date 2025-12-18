@@ -114,7 +114,7 @@ def main():
         ("retrieveArticles", "python3 retrieveArticles.py"),
         ("retrieveNIH", "python3 retrieveNIH.py"),  
         ("nightlyIndexing", "bash run_nightly_indexing.sh"),
-        ("abstractImport", "python3 abstractImport.py")
+        ("abstractImport", "python3 abstractImport.py"),
         ("conflictsImport", "python3 conflictsImport.py")
     ]
 
