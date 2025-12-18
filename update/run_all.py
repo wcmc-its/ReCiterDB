@@ -113,9 +113,9 @@ def main():
         ("executeFeatureGenerator", "python3 executeFeatureGenerator.py"),
         ("retrieveArticles", "python3 retrieveArticles.py"),
         ("retrieveNIH", "python3 retrieveNIH.py"),  
-        ("conflictsImport", "python3 conflictsImport.py"),
-        ("abstractImport", "python3 abstractImport.py"),
         ("nightlyIndexing", "bash run_nightly_indexing.sh"),
+        ("abstractImport", "python3 abstractImport.py")
+        ("conflictsImport", "python3 conflictsImport.py")
     ]
 
     overall_success = True

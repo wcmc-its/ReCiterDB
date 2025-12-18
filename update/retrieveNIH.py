@@ -205,6 +205,7 @@ def create_staging_tables(mysql_cursor, tables):
         mysql_cursor.execute(f"DROP TABLE IF EXISTS {staging_table}")
         # Create staging table with same structure
         mysql_cursor.execute(f"CREATE TABLE {staging_table} LIKE {table_name}")
+        mysql_cursor.execute(f"ALTER TABLE {staging_table} MODIFY COLUMN id int(11) NOT NULL AUTO_INCREMENT")
         logger.info(f"Created staging table: {staging_table}")
 
 def atomic_table_swap(mysql_db, mysql_cursor, tables):
