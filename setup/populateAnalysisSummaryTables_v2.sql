@@ -714,7 +714,9 @@ proc_main: BEGIN
                 FROM analysis_summary_author_new a
                 JOIN analysis_summary_article_new r ON r.pmid = a.pmid
                 WHERE r.citationCountNIH > 0
-            ) AS ranked
+                AND r.datePublicationAddedToEntrez <> ''
+		        AND r.datePublicationAddedToEntrez is not null
+		) AS ranked
             WHERE citationCountNIH >= rn
         ) AS h_calc
         GROUP BY personIdentifier
@@ -748,6 +750,8 @@ proc_main: BEGIN
                 JOIN analysis_summary_article_new r ON r.pmid = a.pmid
                 WHERE r.citationCountNIH > 0
                   AND r.datePublicationAddedToEntrez > DATE_SUB(CURDATE(), INTERVAL 5 YEAR)
+		          AND r.datePublicationAddedToEntrez <> ''
+		          AND r.datePublicationAddedToEntrez is not null
             ) AS ranked
             WHERE citationCountNIH >= rn
         ) AS h_calc
