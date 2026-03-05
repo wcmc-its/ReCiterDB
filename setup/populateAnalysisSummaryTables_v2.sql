@@ -1,4 +1,66 @@
-CREATE DEFINER=`admin`@`%` PROCEDURE `reciterdb`.`populateAnalysisSummaryTables_v2`()
+-- ============================================================================
+-- ReCiter Analysis Summary Tables - Improved Nightly Job
+-- Version 2.1
+--
+-- Key improvements:
+-- 1. Atomic table swap pattern - no downtime during updates
+-- 2. Set-based h-index computation - much faster than row-by-row
+-- 3. Transaction control with rollback capability
+-- 4. Backup tables preserved for recovery
+-- 5. Granular progress logging via analysis_job_log table
+-- ============================================================================
+
+DELIMITER //
+
+-- Create job logging table if it doesn't exist
+DROP PROCEDURE IF EXISTS `setup_job_logging`//
+CREATE PROCEDURE `setup_job_logging`()
+BEGIN
+    CREATE TABLE IF NOT EXISTS `analysis_job_log` (
+        `id` INT AUTO_INCREMENT PRIMARY KEY,
+        `job_id` VARCHAR(50),
+        `step` VARCHAR(100),
+        `substep` VARCHAR(200),
+        `status` VARCHAR(20),
+        `rows_affected` INT,
+        `message` VARCHAR(500),
+        `created_at` TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP(6)
+    ) ENGINE=InnoDB;
+
+    -- Upgrade existing table to microsecond precision if needed
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE()
+        AND table_name = 'analysis_job_log'
+        AND column_name = 'created_at'
+        AND datetime_precision = 0
+    ) THEN
+        ALTER TABLE analysis_job_log
+        MODIFY COLUMN created_at TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP(6);
+    END IF;
+END//
+
+DROP PROCEDURE IF EXISTS `log_progress`//
+CREATE PROCEDURE `log_progress`(
+    IN p_job_id VARCHAR(50),
+    IN p_step VARCHAR(100),
+    IN p_substep VARCHAR(200),
+    IN p_status VARCHAR(20),
+    IN p_rows INT,
+    IN p_message VARCHAR(500)
+)
+BEGIN
+    INSERT INTO analysis_job_log (job_id, step, substep, status, rows_affected, message)
+    VALUES (p_job_id, p_step, p_substep, p_status, p_rows, p_message);
+    -- Also output to console
+    SELECT CONCAT(NOW(), ' | ', p_step, ' | ', p_substep, ' | ', p_status,
+                  IFNULL(CONCAT(' | rows: ', p_rows), ''),
+                  IFNULL(CONCAT(' | ', p_message), '')) AS progress;
+END//
+
+DROP PROCEDURE IF EXISTS `populateAnalysisSummaryTables_v2`//
+
+CREATE PROCEDURE `populateAnalysisSummaryTables_v2`()
 proc_main: BEGIN
 
     -- ========================================================================
@@ -24,6 +86,18 @@ proc_main: BEGIN
 
     -- Setup logging
     CALL setup_job_logging();
+
+    -- ========================================================================
+    -- GLOBAL JOB LOCK - Prevent concurrent execution
+    -- ========================================================================
+    IF GET_LOCK('populateAnalysisSummaryTables_v2_lock', 0) != 1 THEN
+        -- Could not acquire lock immediately - another job is running
+        INSERT INTO analysis_job_log (job_id, step, substep, status, message)
+        VALUES (v_job_id, 'Pre-flight check', 'Concurrent job detected', 'SKIPPED',
+                'Another instance is already running. Exiting to prevent conflicts.');
+        SELECT 'SKIPPED: Another job is already running' AS status;
+        LEAVE proc_main;
+    END IF;
 
     -- ========================================================================
     -- PRE-FLIGHT CHECK
@@ -61,10 +135,10 @@ proc_main: BEGIN
     CALL log_progress(v_job_id, v_step, 'Creating new staging tables', 'RUNNING', NULL, NULL);
 
     -- Create staging tables with same structure as production
-    CREATE TABLE IF NOT EXISTS analysis_summary_author_new LIKE analysis_summary_author;
-    CREATE TABLE IF NOT EXISTS analysis_summary_article_new LIKE analysis_summary_article;
-    CREATE TABLE IF NOT EXISTS analysis_summary_person_new LIKE analysis_summary_person;
-    CREATE TABLE IF NOT EXISTS analysis_summary_author_list_new LIKE analysis_summary_author_list;
+    CREATE TABLE analysis_summary_author_new LIKE analysis_summary_author;
+    CREATE TABLE analysis_summary_article_new LIKE analysis_summary_article;
+    CREATE TABLE analysis_summary_person_new LIKE analysis_summary_person;
+    CREATE TABLE analysis_summary_author_list_new LIKE analysis_summary_author_list;
 
     IF v_error_occurred THEN
         CALL log_progress(v_job_id, v_step, 'Create failed', 'ERROR', NULL, v_error_message);
@@ -83,7 +157,6 @@ proc_main: BEGIN
     SET v_step = '2. Populate analysis_summary_author';
     CALL log_progress(v_job_id, v_step, 'Inserting author records', 'RUNNING', NULL, NULL);
 
-	CREATE TABLE IF NOT EXISTS analysis_summary_author_new LIKE analysis_summary_author;
     INSERT INTO analysis_summary_author_new (pmid, personIdentifier, authorPosition, authors)
     SELECT
         y.pmid,
@@ -146,28 +219,38 @@ proc_main: BEGIN
     CALL log_progress(v_job_id, v_step, 'Copied authors to RTF', 'INFO', v_rows, NULL);
 
     -- Apply RTF special character escapes for authors (only if table exists)
+    -- Uses advisory lock to prevent deadlocks from concurrent cursor-based updates
     IF EXISTS (SELECT 1 FROM information_schema.tables
                WHERE table_schema = DATABASE() AND table_name = 'analysis_special_characters') THEN
         CALL log_progress(v_job_id, v_step, 'Escaping special chars in authorsRTF', 'RUNNING', NULL, NULL);
-        BEGIN
-            DECLARE v_done INT DEFAULT FALSE;
-            DECLARE v_special_char VARCHAR(10);
-            DECLARE v_rtf_escape VARCHAR(50);
-            DECLARE cur_special CURSOR FOR SELECT specialCharacter, RTFescape FROM analysis_special_characters;
-            DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = TRUE;
 
-            OPEN cur_special;
-            read_loop: LOOP
-                FETCH cur_special INTO v_special_char, v_rtf_escape;
-                IF v_done THEN
-                    LEAVE read_loop;
-                END IF;
-                UPDATE analysis_summary_author_new
-                SET authorsRTF = REPLACE(authorsRTF, v_special_char, v_rtf_escape)
-                WHERE authorsRTF LIKE CONCAT('%', v_special_char, '%');
-            END LOOP;
-            CLOSE cur_special;
-        END;
+        -- Acquire advisory lock to serialize RTF updates (wait up to 300 seconds)
+        IF GET_LOCK('rtf_author_update_lock', 300) = 1 THEN
+            BEGIN
+                DECLARE v_done INT DEFAULT FALSE;
+                DECLARE v_special_char VARCHAR(10);
+                DECLARE v_rtf_escape VARCHAR(50);
+                DECLARE cur_special CURSOR FOR SELECT specialCharacter, RTFescape FROM analysis_special_characters;
+                DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = TRUE;
+
+                OPEN cur_special;
+                read_loop: LOOP
+                    FETCH cur_special INTO v_special_char, v_rtf_escape;
+                    IF v_done THEN
+                        LEAVE read_loop;
+                    END IF;
+                    UPDATE analysis_summary_author_new
+                    SET authorsRTF = REPLACE(authorsRTF, v_special_char, v_rtf_escape)
+                    WHERE authorsRTF LIKE CONCAT('%', v_special_char, '%');
+                END LOOP;
+                CLOSE cur_special;
+            END;
+            DO RELEASE_LOCK('rtf_author_update_lock');
+        ELSE
+            CALL log_progress(v_job_id, v_step, 'Could not acquire RTF lock', 'ERROR', NULL, 'Another job may be running');
+            LEAVE proc_main;
+        END IF;
+
         CALL log_progress(v_job_id, v_step, 'Escaped special chars in authorsRTF', 'INFO', NULL, NULL);
     END IF;
 
@@ -188,7 +271,7 @@ proc_main: BEGIN
     -- Step 2b.1: Pre-compute maxRank per pmid
     CALL log_progress(v_job_id, v_step, 'Computing maxRank per article', 'RUNNING', NULL, NULL);
     DROP TABLE IF EXISTS temp_maxrank;
-    CREATE TABLE IF NOT EXISTS temp_maxrank (
+    CREATE TABLE temp_maxrank (
         pmid INT PRIMARY KEY,
         maxRank INT
     ) ENGINE=InnoDB;
@@ -199,7 +282,7 @@ proc_main: BEGIN
     -- Step 2b.2: Pre-compute equalContribAll per pmid (only for pmids with equal contrib)
     CALL log_progress(v_job_id, v_step, 'Computing equalContribAll per article', 'RUNNING', NULL, NULL);
     DROP TABLE IF EXISTS temp_equalcontrib_all;
-    CREATE TABLE IF NOT EXISTS temp_equalcontrib_all (
+    CREATE TABLE temp_equalcontrib_all (
         pmid INT PRIMARY KEY,
         equalContribAll VARCHAR(500)
     ) ENGINE=InnoDB;
@@ -214,7 +297,7 @@ proc_main: BEGIN
     -- Step 2b.3: Build the equal contrib result table
     CALL log_progress(v_job_id, v_step, 'Building equal contrib positions', 'RUNNING', NULL, NULL);
     DROP TABLE IF EXISTS analysis_temp_equalcontrib_v2;
-    CREATE TABLE IF NOT EXISTS analysis_temp_equalcontrib_v2 (
+    CREATE TABLE analysis_temp_equalcontrib_v2 (
         id INT AUTO_INCREMENT PRIMARY KEY,
         personIdentifier VARCHAR(30),
         pmid INT,
@@ -284,7 +367,6 @@ proc_main: BEGIN
     SET v_step = '2c. Populate author_list';
     CALL log_progress(v_job_id, v_step, 'Inserting author list records', 'RUNNING', NULL, NULL);
 
-	CREATE TABLE IF NOT EXISTS analysis_summary_author_list_new LIKE analysis_summary_author_list;
     INSERT INTO analysis_summary_author_list_new (pmid, authorFirstName, authorLastName, rank, personIdentifier)
     SELECT
         pmid,
@@ -334,8 +416,7 @@ proc_main: BEGIN
     -- ========================================================================
     SET v_step = '3. Populate analysis_summary_article';
     CALL log_progress(v_job_id, v_step, 'Inserting article records', 'RUNNING', NULL, NULL);
-	
-    CREATE TABLE IF NOT EXISTS analysis_summary_article_new LIKE analysis_summary_article;
+
     INSERT INTO analysis_summary_article_new (
         pmid, pmcid, publicationTypeCanonical, articleYear,
         publicationDateStandardized, publicationDateDisplay,
@@ -425,7 +506,8 @@ proc_main: BEGIN
         UPDATE analysis_summary_article_new a
         JOIN analysis_altmetric al ON al.doi = a.doi
         SET a.readersMendeley = al.`readers-mendeley`
-        WHERE ROUND((UNIX_TIMESTAMP() - UNIX_TIMESTAMP(STR_TO_DATE(datePublicationAddedtoEntrez,'%Y-%m-%d')) ) / (60 * 60 * 24), 0) < 366;
+        WHERE datePublicationAddedtoEntrez != ''
+          AND ROUND((UNIX_TIMESTAMP() - UNIX_TIMESTAMP(STR_TO_DATE(datePublicationAddedtoEntrez,'%Y-%m-%d')) ) / (60 * 60 * 24), 0) < 366;
         SET v_rows = ROW_COUNT();
         CALL log_progress(v_job_id, v_step, 'Updated Mendeley readers', 'INFO', v_rows, NULL);
     ELSE
@@ -439,28 +521,38 @@ proc_main: BEGIN
     CALL log_progress(v_job_id, v_step, 'Copied articleTitle to RTF', 'INFO', v_rows, NULL);
 
     -- Apply RTF special character escapes (only if table exists)
+    -- Uses advisory lock to prevent deadlocks from concurrent cursor-based updates
     IF EXISTS (SELECT 1 FROM information_schema.tables
                WHERE table_schema = DATABASE() AND table_name = 'analysis_special_characters') THEN
         CALL log_progress(v_job_id, v_step, 'Escaping special chars in articleTitleRTF', 'RUNNING', NULL, NULL);
-        BEGIN
-            DECLARE v_done INT DEFAULT FALSE;
-            DECLARE v_special_char VARCHAR(10);
-            DECLARE v_rtf_escape VARCHAR(50);
-            DECLARE cur_special CURSOR FOR SELECT specialCharacter, RTFescape FROM analysis_special_characters;
-            DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = TRUE;
 
-            OPEN cur_special;
-            read_loop: LOOP
-                FETCH cur_special INTO v_special_char, v_rtf_escape;
-                IF v_done THEN
-                    LEAVE read_loop;
-                END IF;
-                UPDATE analysis_summary_article_new
-                SET articleTitleRTF = REPLACE(articleTitleRTF, v_special_char, v_rtf_escape)
-                WHERE articleTitleRTF LIKE CONCAT('%', v_special_char, '%');
-            END LOOP;
-            CLOSE cur_special;
-        END;
+        -- Acquire advisory lock to serialize RTF updates (wait up to 300 seconds)
+        IF GET_LOCK('rtf_article_update_lock', 300) = 1 THEN
+            BEGIN
+                DECLARE v_done INT DEFAULT FALSE;
+                DECLARE v_special_char VARCHAR(10);
+                DECLARE v_rtf_escape VARCHAR(50);
+                DECLARE cur_special CURSOR FOR SELECT specialCharacter, RTFescape FROM analysis_special_characters;
+                DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = TRUE;
+
+                OPEN cur_special;
+                read_loop: LOOP
+                    FETCH cur_special INTO v_special_char, v_rtf_escape;
+                    IF v_done THEN
+                        LEAVE read_loop;
+                    END IF;
+                    UPDATE analysis_summary_article_new
+                    SET articleTitleRTF = REPLACE(articleTitleRTF, v_special_char, v_rtf_escape)
+                    WHERE articleTitleRTF LIKE CONCAT('%', v_special_char, '%');
+                END LOOP;
+                CLOSE cur_special;
+            END;
+            DO RELEASE_LOCK('rtf_article_update_lock');
+        ELSE
+            CALL log_progress(v_job_id, v_step, 'Could not acquire RTF lock', 'ERROR', NULL, 'Another job may be running');
+            LEAVE proc_main;
+        END IF;
+
         CALL log_progress(v_job_id, v_step, 'Escaped special chars in articleTitleRTF', 'INFO', NULL, NULL);
     END IF;
 
@@ -478,7 +570,6 @@ proc_main: BEGIN
     SET v_step = '4. Populate analysis_summary_person';
     CALL log_progress(v_job_id, v_step, 'Inserting person records', 'RUNNING', NULL, NULL);
 
-	 CREATE TABLE IF NOT EXISTS analysis_summary_person_new LIKE analysis_summary_person;
     INSERT INTO analysis_summary_person_new (personIdentifier, nameFirst, nameMiddle, nameLast, facultyRank, department)
     SELECT DISTINCT
         p.personIdentifier,
@@ -747,6 +838,7 @@ proc_main: BEGIN
                 FROM analysis_summary_author_new a
                 JOIN analysis_summary_article_new r ON r.pmid = a.pmid
                 WHERE r.citationCountNIH > 0
+                  AND r.datePublicationAddedToEntrez != ''
                   AND r.datePublicationAddedToEntrez > DATE_SUB(CURDATE(), INTERVAL 5 YEAR)
             ) AS ranked
             WHERE citationCountNIH >= rn
@@ -814,6 +906,7 @@ proc_main: BEGIN
                 FROM analysis_summary_author_new a
                 JOIN analysis_summary_article_new r ON r.pmid = a.pmid
                 WHERE r.citationCountScopus > 0
+                  AND r.datePublicationAddedToEntrez != ''
                   AND r.datePublicationAddedToEntrez > DATE_SUB(CURDATE(), INTERVAL 5 YEAR)
             ) AS ranked
             WHERE citationCountScopus >= rn
@@ -883,4 +976,141 @@ proc_main: BEGIN
     SELECT CONCAT('SUCCESS: populateAnalysisSummaryTables_v2 completed in ',
                   TIMESTAMPDIFF(SECOND, v_start_time, NOW()), ' seconds') AS status;
 
-END proc_main
+    -- Release global job lock
+    DO RELEASE_LOCK('populateAnalysisSummaryTables_v2_lock');
+
+END proc_main//
+
+-- ============================================================================
+-- HELPER PROCEDURE: Cleanup staging tables on error
+-- ============================================================================
+DROP PROCEDURE IF EXISTS `cleanup_staging_tables_v2`//
+
+CREATE PROCEDURE `cleanup_staging_tables_v2`()
+BEGIN
+    DROP TABLE IF EXISTS analysis_summary_author_new;
+    DROP TABLE IF EXISTS analysis_summary_article_new;
+    DROP TABLE IF EXISTS analysis_summary_person_new;
+    DROP TABLE IF EXISTS analysis_summary_author_list_new;
+    DROP TABLE IF EXISTS temp_maxrank;
+    DROP TABLE IF EXISTS temp_equalcontrib_all;
+    DROP TABLE IF EXISTS analysis_temp_equalcontrib_v2;
+    SELECT 'Staging tables cleaned up' AS status;
+END//
+
+-- ============================================================================
+-- HELPER PROCEDURE: Restore from backup tables
+-- Call this if you need to revert to the previous day's data
+-- ============================================================================
+DROP PROCEDURE IF EXISTS `restore_from_backup_v2`//
+
+CREATE PROCEDURE `restore_from_backup_v2`()
+BEGIN
+    DECLARE v_error INT DEFAULT 0;
+    DECLARE CONTINUE HANDLER FOR SQLEXCEPTION SET v_error = 1;
+
+    -- Check if backup tables exist
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'analysis_summary_author_backup' AND table_schema = DATABASE()) THEN
+
+        -- Drop current tables and rename backup to current
+        DROP TABLE IF EXISTS analysis_summary_author;
+        DROP TABLE IF EXISTS analysis_summary_article;
+        DROP TABLE IF EXISTS analysis_summary_person;
+        DROP TABLE IF EXISTS analysis_summary_author_list;
+
+        RENAME TABLE
+            analysis_summary_author_backup TO analysis_summary_author,
+            analysis_summary_article_backup TO analysis_summary_article,
+            analysis_summary_person_backup TO analysis_summary_person,
+            analysis_summary_author_list_backup TO analysis_summary_author_list;
+
+        IF v_error = 0 THEN
+            SELECT 'SUCCESS: Restored from backup tables' AS status;
+        ELSE
+            SELECT 'ERROR: Failed to restore from backup' AS status;
+        END IF;
+    ELSE
+        SELECT 'ERROR: Backup tables do not exist' AS status;
+    END IF;
+END//
+
+-- ============================================================================
+-- HELPER PROCEDURE: Check job status
+-- ============================================================================
+DROP PROCEDURE IF EXISTS `check_analysis_summary_status`//
+
+CREATE PROCEDURE `check_analysis_summary_status`()
+BEGIN
+    SELECT
+        'analysis_summary_author' AS table_name,
+        COUNT(*) AS row_count,
+        (SELECT MAX(id) FROM analysis_summary_author) AS max_id
+    UNION ALL
+    SELECT
+        'analysis_summary_article',
+        COUNT(*),
+        (SELECT MAX(id) FROM analysis_summary_article)
+    FROM analysis_summary_article
+    UNION ALL
+    SELECT
+        'analysis_summary_person',
+        COUNT(*),
+        (SELECT MAX(id) FROM analysis_summary_person)
+    FROM analysis_summary_person
+    UNION ALL
+    SELECT
+        'analysis_summary_author_list',
+        COUNT(*),
+        (SELECT MAX(id) FROM analysis_summary_author_list)
+    FROM analysis_summary_author_list;
+
+    -- Check if backup tables exist
+    SELECT
+        table_name,
+        CASE WHEN table_rows > 0 THEN 'EXISTS' ELSE 'EMPTY' END AS backup_status,
+        table_rows
+    FROM information_schema.tables
+    WHERE table_schema = DATABASE()
+      AND table_name LIKE 'analysis_summary_%_backup';
+END//
+
+-- ============================================================================
+-- HELPER PROCEDURE: View job progress logs
+-- ============================================================================
+DROP PROCEDURE IF EXISTS `view_job_progress`//
+
+CREATE PROCEDURE `view_job_progress`(IN p_job_id VARCHAR(50))
+BEGIN
+    IF p_job_id IS NULL THEN
+        -- Show last job
+        SELECT * FROM analysis_job_log
+        WHERE job_id = (SELECT MAX(job_id) FROM analysis_job_log)
+        ORDER BY id;
+    ELSE
+        SELECT * FROM analysis_job_log
+        WHERE job_id = p_job_id
+        ORDER BY id;
+    END IF;
+END//
+
+-- ============================================================================
+-- HELPER PROCEDURE: View latest progress (for polling)
+-- ============================================================================
+DROP PROCEDURE IF EXISTS `get_latest_progress`//
+
+CREATE PROCEDURE `get_latest_progress`()
+BEGIN
+    SELECT
+        job_id,
+        step,
+        substep,
+        status,
+        rows_affected,
+        message,
+        created_at,
+        TIMESTAMPDIFF(SECOND, (SELECT MIN(created_at) FROM analysis_job_log WHERE job_id = l.job_id), created_at) AS elapsed_seconds
+    FROM analysis_job_log l
+    WHERE id = (SELECT MAX(id) FROM analysis_job_log);
+END//
+
+DELIMITER ;
