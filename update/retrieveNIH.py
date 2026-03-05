@@ -207,6 +207,14 @@ def create_staging_tables(mysql_cursor, tables):
         mysql_cursor.execute(f"CREATE TABLE {staging_table} LIKE {table_name}")
         mysql_cursor.execute(f"ALTER TABLE {staging_table} MODIFY COLUMN id int(11) NOT NULL AUTO_INCREMENT")
         logger.info(f"Created staging table: {staging_table}")
+    # Add unique constraint on pmid for analysis_nih_new to prevent duplicates
+    try:
+        mysql_cursor.execute(
+            "ALTER TABLE analysis_nih_new ADD UNIQUE KEY uk_pmid (pmid)"
+        )
+        logger.info("Added UNIQUE constraint on pmid for analysis_nih_new")
+    except Exception as e:
+        logger.warning(f"Could not add UNIQUE constraint (may already exist): {e}")
 
 def atomic_table_swap(mysql_db, mysql_cursor, tables):
     """
@@ -274,6 +282,7 @@ def validate_data(mysql_cursor, staging_table, production_table, min_rows=100, m
     Validate staging table has sufficient data before swap.
     - Must have at least min_rows
     - Must have at least min_percentage of production table's row count
+    - Detects duplicate pmids in production (corruption) and uses unique count instead
     """
     mysql_cursor.execute(f"SELECT COUNT(*) as cnt FROM {staging_table}")
     staging_count = mysql_cursor.fetchone()['cnt']
@@ -281,8 +290,19 @@ def validate_data(mysql_cursor, staging_table, production_table, min_rows=100, m
     mysql_cursor.execute(f"SELECT COUNT(*) as cnt FROM {production_table}")
     production_count = mysql_cursor.fetchone()['cnt']
 
+    # Check for duplicates in production (corruption detection)
+    mysql_cursor.execute(f"SELECT COUNT(DISTINCT pmid) as cnt FROM {production_table}")
+    unique_production = mysql_cursor.fetchone()['cnt']
+
     logger.info(f"Validation: {staging_table} has {staging_count} rows, "
-                f"{production_table} has {production_count} rows")
+                f"{production_table} has {production_count} rows "
+                f"({unique_production} unique pmids)")
+
+    if production_count != unique_production:
+        logger.warning(f"CORRUPTION DETECTED: {production_table} has "
+                       f"{production_count - unique_production} duplicate rows. "
+                       f"Using unique count ({unique_production}) for validation.")
+        production_count = unique_production  # Use deduped count for comparison
 
     # Check minimum rows
     if staging_count < min_rows:
@@ -301,6 +321,21 @@ def validate_data(mysql_cursor, staging_table, production_table, min_rows=100, m
             return False
 
     logger.info(f"Validation PASSED for {staging_table}")
+    return True
+
+def check_production_integrity(mysql_cursor, table_name, key_column='pmid'):
+    """Check if production table has duplicate key values (corruption indicator)."""
+    mysql_cursor.execute(f"""
+        SELECT COUNT(*) as total_rows, COUNT(DISTINCT {key_column}) as unique_keys
+        FROM {table_name}
+    """)
+    result = mysql_cursor.fetchone()
+    total = result['total_rows']
+    unique = result['unique_keys']
+    if total != unique:
+        logger.warning(f"INTEGRITY CHECK: {table_name} has {total} rows but only "
+                       f"{unique} unique {key_column} values ({total - unique} duplicates)")
+        return False
     return True
 
 #########
