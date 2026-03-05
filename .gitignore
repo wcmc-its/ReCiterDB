@@ -1,6 +1,31 @@
-
+# macOS
 .DS_Store
-update/.DS_Store
-update/temp/.DS_Store
-update/temp/parsedOutput/.DS_Store
-update/temp/s3Output/.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Ephemeral data files (regenerated nightly)
+update/*.csv
+update/*.log
+update/app.log
+update/retrieveNIH.log
+update/temp/
+
+# Legacy ML models (unused)
+update/*.keras
+update/*.save
+
+# Credentials (NEVER commit)
+.env
+*.env
+credentials.*
+
+# Local agent config
+CLAUDE.md
+
+# IDE
+.idea/
+.vscode/
+*.swp
