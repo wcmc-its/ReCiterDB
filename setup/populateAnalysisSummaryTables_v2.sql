@@ -492,7 +492,7 @@ proc_main: BEGIN
         SET a.citationCountNIH = n.citation_count,
             a.percentileNIH = n.nih_percentile,
             a.relativeCitationRatioNIH = n.relative_citation_ratio,
-            a.publicationTypeNIH = CASE WHEN n.is_research_article = 'True' THEN 'Yes' ELSE NULL END;
+            a.publicationTypeNIH = CASE WHEN n.is_research_article = 'True' THEN 'Research Article' ELSE NULL END;
         SET v_rows = ROW_COUNT();
         CALL log_progress(v_job_id, v_step, 'Updated NIH citation data', 'INFO', v_rows, NULL);
     ELSE
