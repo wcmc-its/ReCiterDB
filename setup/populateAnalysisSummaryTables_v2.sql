@@ -564,53 +564,106 @@ proc_main: BEGIN
 
     CALL log_progress(v_job_id, v_step, 'Complete', 'DONE', NULL, CONCAT(TIMESTAMPDIFF(SECOND, v_start_time, NOW()), 's elapsed'));
 
+
     -- ========================================================================
     -- STEP 4: Populate analysis_summary_person_new
     -- ========================================================================
     SET v_step = '4. Populate analysis_summary_person';
     CALL log_progress(v_job_id, v_step, 'Inserting person records', 'RUNNING', NULL, NULL);
 
-    INSERT INTO analysis_summary_person_new (personIdentifier, nameFirst, nameMiddle, nameLast, facultyRank, department)
-    SELECT DISTINCT
-        p.personIdentifier,
-        p.firstName,
-        p.middleName,
-        p.lastName,
-        p.title,
-        p.primaryOrganizationalUnit
-    FROM person p
-    JOIN analysis_summary_person_scope s ON s.personIdentifier = p.personIdentifier;
+    -- Populate using person_person_type to derive facultyRank
+    INSERT INTO analysis_summary_person_new (personIdentifier, nameFirst, nameMiddle, nameLast, department, facultyRank)
+    SELECT * FROM (
+        SELECT DISTINCT
+            p.personIdentifier,
+            p.firstName AS nameFirst,
+            p.middleName AS nameMiddle,
+            p.lastName AS nameLast,
+            p.primaryOrganizationalUnit AS department,
+            COALESCE(a.facultyRank, b.facultyRank, c.facultyRank, d.facultyRank) AS facultyRank
+        FROM person p
+
+        LEFT JOIN (
+            SELECT personIdentifier, 'Full Professor' AS facultyRank
+            FROM person_person_type
+            WHERE personType = 'academic-faculty-fullprofessor'
+        ) a ON a.personIdentifier = p.personIdentifier
+
+        LEFT JOIN (
+            SELECT personIdentifier, 'Associate Professor' AS facultyRank
+            FROM person_person_type
+            WHERE personType = 'academic-faculty-associate'
+        ) b ON b.personIdentifier = p.personIdentifier
+
+        LEFT JOIN (
+            SELECT personIdentifier, 'Assistant Professor' AS facultyRank
+            FROM person_person_type
+            WHERE personType = 'academic-faculty-assistant'
+        ) c ON c.personIdentifier = p.personIdentifier
+
+        LEFT JOIN (
+            SELECT personIdentifier, 'Instructor or Lecturer' AS facultyRank
+            FROM person_person_type
+            WHERE personType IN ('academic-faculty-instructor', 'academic-faculty-lecturer')
+        ) d ON d.personIdentifier = p.personIdentifier
+
+        INNER JOIN analysis_summary_person_scope e ON e.personIdentifier = p.personIdentifier
+    ) x
+    WHERE facultyRank IS NOT NULL;
 
     SET v_rows = ROW_COUNT();
     CALL log_progress(v_job_id, v_step, 'Inserted person records', 'INFO', v_rows, NULL);
 
-    -- Update article counts
+    -- ========================================================================
+    -- STEP 4b: Compute article counts
+    -- Counts are for articles with publicationTypeNIH = 'Research Article'
+    -- and percentileNIH is not null
+    -- ========================================================================
     CALL log_progress(v_job_id, v_step, 'Updating article counts', 'RUNNING', NULL, NULL);
-    UPDATE analysis_summary_person_new p
-    JOIN (
-        SELECT personIdentifier, COUNT(DISTINCT pmid) AS cnt
-        FROM analysis_summary_author_new
-        GROUP BY personIdentifier
-    ) c ON c.personIdentifier = p.personIdentifier
-    SET p.countAll = c.cnt;
 
+    -- countAll: Count of research articles with NIH percentile
     UPDATE analysis_summary_person_new p
     JOIN (
-        SELECT personIdentifier, COUNT(DISTINCT pmid) AS cnt
-        FROM analysis_summary_author_new
-        WHERE authorPosition = 'first'
-        GROUP BY personIdentifier
-    ) c ON c.personIdentifier = p.personIdentifier
-    SET p.countFirst = c.cnt;
+        SELECT s.personIdentifier, COUNT(a1.pmid) AS count
+        FROM analysis_summary_person_new s
+        JOIN analysis_summary_author_new a ON a.personIdentifier = s.personIdentifier
+        Join analysis_summary_article_new a1 ON a1.pmid = a.pmid
+        WHERE publicationTypeNIH = 'Research Article' AND percentileNIH IS NOT NULL
+        GROUP BY s.personIdentifier
+    ) x ON x.personIdentifier = p.personIdentifier
+    SET p.countAll = x.count;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated countAll', 'INFO', v_rows, NULL);
 
+    -- countFirst: Count of first-authored research articles with NIH percentile
     UPDATE analysis_summary_person_new p
     JOIN (
-        SELECT personIdentifier, COUNT(DISTINCT pmid) AS cnt
-        FROM analysis_summary_author_new
-        WHERE authorPosition = 'last'
-        GROUP BY personIdentifier
-    ) c ON c.personIdentifier = p.personIdentifier
-    SET p.countSenior = c.cnt;
+        SELECT s.personIdentifier, COUNT(a1.pmid) AS count
+        FROM analysis_summary_person_new s
+        Join analysis_summary_author_new a ON a.personIdentifier = s.personIdentifier
+        Join analysis_summary_article_new a1 ON a1.pmid = a.pmid
+        WHERE publicationTypeNIH = 'Research Article' AND percentileNIH IS NOT NULL
+          AND a.authorPosition = 'first'
+        GROUP BY s.personIdentifier
+    ) x ON x.personIdentifier = p.personIdentifier
+    SET p.countFirst = x.count;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated countFirst', 'INFO', v_rows, NULL);
+
+    -- countSenior: Count of senior/last-authored research articles with NIH percentile
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT s.personIdentifier, COUNT(a1.pmid) AS count
+        FROM analysis_summary_person_new s
+        Join analysis_summary_author_new a ON a.personIdentifier = s.personIdentifier
+        Join analysis_summary_article_new a1 ON a1.pmid = a.pmid
+        WHERE publicationTypeNIH = 'Research Article' AND percentileNIH IS NOT NULL
+          AND a.authorPosition = 'last'
+        GROUP BY s.personIdentifier
+    ) x ON x.personIdentifier = p.personIdentifier
+    SET p.countSenior = x.count;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated countSenior', 'INFO', v_rows, NULL);
 
     IF v_error_occurred THEN
         CALL log_progress(v_job_id, v_step, 'Failed', 'ERROR', NULL, v_error_message);
@@ -621,152 +674,419 @@ proc_main: BEGIN
     CALL log_progress(v_job_id, v_step, 'Complete', 'DONE', NULL, CONCAT(TIMESTAMPDIFF(SECOND, v_start_time, NOW()), 's elapsed'));
 
     -- ========================================================================
-    -- STEP 5: Compute percentile rankings (with rank and denominator)
+    -- STEP 5: Compute percentile rankings (peer-based)
+    -- Percentile = average of top N articles by percentileNIH
+    -- Denominator = count of people with same facultyRank who have the metric
+    -- Rank = rank within facultyRank by percentile value
     -- ========================================================================
     SET v_step = '5. Compute percentile rankings';
-    CALL log_progress(v_job_id, v_step, 'Computing percentiles (8 metrics with rank/denominator)', 'RUNNING', NULL, NULL);
+    CALL log_progress(v_job_id, v_step, 'Computing percentiles (peer-based avg of top N)', 'RUNNING', NULL, NULL);
 
-    -- Top 5 percentile, first/last authored
+    -- ========================================================================
+    -- 5a. TOP 5 PERCENTILE - ALL POSITIONS
+    -- ========================================================================
+
+    -- top5PercentileAll: Average of top 5 percentiles (requires countAll > 4)
     UPDATE analysis_summary_person_new p
     JOIN (
-        SELECT
-            a.personIdentifier,
-            ROUND(100 * SUM(CASE WHEN percentileNIH >= 95 THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct,
-            SUM(CASE WHEN percentileNIH >= 95 THEN 1 ELSE 0 END) AS rank_count,
-            COUNT(*) AS denominator
-        FROM analysis_summary_author_new a
-        JOIN analysis_summary_article_new a1 ON a1.pmid = a.pmid
-        WHERE percentileNIH IS NOT NULL
-          AND authorPosition IN ('first', 'last')
-        GROUP BY a.personIdentifier
+        SELECT personIdentifier, ROUND(AVG(percentileNIH), 3) AS percentileNIH
+        FROM (
+            SELECT s.personIdentifier, a1.pmid, a1.percentileNIH,
+                   RANK() OVER (PARTITION BY s.personIdentifier ORDER BY a1.percentileNIH DESC) AS article_rank
+            FROM analysis_summary_person_new s
+            JOIN analysis_summary_author_new a ON a.personIdentifier = s.personIdentifier
+            Join analysis_summary_article_new a1 ON a1.pmid = a.pmid
+            WHERE a1.percentileNIH IS NOT NULL AND s.countAll > 4
+        ) y
+        WHERE article_rank < 6
+        GROUP BY personIdentifier
     ) x ON x.personIdentifier = p.personIdentifier
-    SET p.top5PercentileFirstSenior = x.pct,
-        p.top5RankFirstSenior = x.rank_count,
-        p.top5DenominatorFirstSenior = x.denominator;
+    SET p.top5PercentileAll = x.percentileNIH;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated top5PercentileAll', 'INFO', v_rows, NULL);
 
-    -- Top 10 percentile, first/last authored
+    -- top5DenominatorAll: Count of people in same facultyRank with valid top5PercentileAll
     UPDATE analysis_summary_person_new p
     JOIN (
-        SELECT
-            a.personIdentifier,
-            ROUND(100 * SUM(CASE WHEN percentileNIH >= 90 THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct,
-            SUM(CASE WHEN percentileNIH >= 90 THEN 1 ELSE 0 END) AS rank_count,
-            COUNT(*) AS denominator
-        FROM analysis_summary_author_new a
-        JOIN analysis_summary_article_new a1 ON a1.pmid = a.pmid
-        WHERE percentileNIH IS NOT NULL
-          AND authorPosition IN ('first', 'last')
-        GROUP BY a.personIdentifier
-    ) x ON x.personIdentifier = p.personIdentifier
-    SET p.top10PercentileFirstSenior = x.pct,
-        p.top10RankFirstSenior = x.rank_count,
-        p.top10DenominatorFirstSenior = x.denominator;
+        SELECT COUNT(*) AS count, facultyRank
+        FROM analysis_summary_person_new
+        WHERE top5PercentileAll IS NOT NULL AND countAll > 4
+        GROUP BY facultyRank
+    ) x ON x.facultyRank = p.facultyRank
+    SET p.top5DenominatorAll = x.count;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated top5DenominatorAll', 'INFO', v_rows, NULL);
 
-    -- Top 5 percentile, first authored only
+    -- top5RankAll: Rank within facultyRank by top5PercentileAll
     UPDATE analysis_summary_person_new p
     JOIN (
-        SELECT
-            a.personIdentifier,
-            ROUND(100 * SUM(CASE WHEN percentileNIH >= 95 THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct,
-            SUM(CASE WHEN percentileNIH >= 95 THEN 1 ELSE 0 END) AS rank_count,
-            COUNT(*) AS denominator
-        FROM analysis_summary_author_new a
-        JOIN analysis_summary_article_new a1 ON a1.pmid = a.pmid
-        WHERE percentileNIH IS NOT NULL
-          AND authorPosition = 'first'
-        GROUP BY a.personIdentifier
+        SELECT personIdentifier,
+               RANK() OVER (PARTITION BY facultyRank ORDER BY top5PercentileAll DESC) AS personRank
+        FROM analysis_summary_person_new
+        WHERE countAll > 4
     ) x ON x.personIdentifier = p.personIdentifier
-    SET p.top5PercentileFirst = x.pct,
-        p.top5RankFirst = x.rank_count,
-        p.top5DenominatorFirst = x.denominator;
+    SET p.top5RankAll = x.personRank;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated top5RankAll', 'INFO', v_rows, NULL);
 
-    -- Top 10 percentile, first authored only
+    -- ========================================================================
+    -- 5b. TOP 10 PERCENTILE - ALL POSITIONS
+    -- ========================================================================
+
+    -- top10PercentileAll: Average of top 10 percentiles (requires countAll > 9)
     UPDATE analysis_summary_person_new p
     JOIN (
-        SELECT
-            a.personIdentifier,
-            ROUND(100 * SUM(CASE WHEN percentileNIH >= 90 THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct,
-            SUM(CASE WHEN percentileNIH >= 90 THEN 1 ELSE 0 END) AS rank_count,
-            COUNT(*) AS denominator
-        FROM analysis_summary_author_new a
-        JOIN analysis_summary_article_new a1 ON a1.pmid = a.pmid
-        WHERE percentileNIH IS NOT NULL
-          AND authorPosition = 'first'
-        GROUP BY a.personIdentifier
+        SELECT personIdentifier, ROUND(AVG(percentileNIH), 3) AS percentileNIH
+        FROM (
+            SELECT s.personIdentifier, a1.pmid, a1.percentileNIH,
+                   RANK() OVER (PARTITION BY s.personIdentifier ORDER BY a1.percentileNIH DESC) AS article_rank
+            FROM analysis_summary_person_new s
+            JOIN analysis_summary_author_new a ON a.personIdentifier = s.personIdentifier
+            Join analysis_summary_article_new a1 ON a1.pmid = a.pmid
+            WHERE a1.percentileNIH IS NOT NULL AND s.countAll > 9
+        ) y
+        WHERE article_rank < 11
+        GROUP BY personIdentifier
     ) x ON x.personIdentifier = p.personIdentifier
-    SET p.top10PercentileFirst = x.pct,
-        p.top10RankFirst = x.rank_count,
-        p.top10DenominatorFirst = x.denominator;
+    SET p.top10PercentileAll = x.percentileNIH;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated top10PercentileAll', 'INFO', v_rows, NULL);
 
-    -- Top 5 percentile, last authored only
+    -- top10DenominatorAll: Count of people in same facultyRank with valid top10PercentileAll
     UPDATE analysis_summary_person_new p
     JOIN (
-        SELECT
-            a.personIdentifier,
-            ROUND(100 * SUM(CASE WHEN percentileNIH >= 95 THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct,
-            SUM(CASE WHEN percentileNIH >= 95 THEN 1 ELSE 0 END) AS rank_count,
-            COUNT(*) AS denominator
-        FROM analysis_summary_author_new a
-        JOIN analysis_summary_article_new a1 ON a1.pmid = a.pmid
-        WHERE percentileNIH IS NOT NULL
-          AND authorPosition = 'last'
-        GROUP BY a.personIdentifier
-    ) x ON x.personIdentifier = p.personIdentifier
-    SET p.top5PercentileSenior = x.pct,
-        p.top5RankSenior = x.rank_count,
-        p.top5DenominatorSenior = x.denominator;
+        SELECT COUNT(*) AS count, facultyRank
+        FROM analysis_summary_person_new
+        WHERE top10PercentileAll IS NOT NULL AND countAll > 9
+        GROUP BY facultyRank
+    ) x ON x.facultyRank = p.facultyRank
+    SET p.top10DenominatorAll = x.count;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated top10DenominatorAll', 'INFO', v_rows, NULL);
 
-    -- Top 10 percentile, last authored only
+    -- top10RankAll: Rank within facultyRank by top10PercentileAll
     UPDATE analysis_summary_person_new p
     JOIN (
-        SELECT
-            a.personIdentifier,
-            ROUND(100 * SUM(CASE WHEN percentileNIH >= 90 THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct,
-            SUM(CASE WHEN percentileNIH >= 90 THEN 1 ELSE 0 END) AS rank_count,
-            COUNT(*) AS denominator
-        FROM analysis_summary_author_new a
-        JOIN analysis_summary_article_new a1 ON a1.pmid = a.pmid
-        WHERE percentileNIH IS NOT NULL
-          AND authorPosition = 'last'
-        GROUP BY a.personIdentifier
+        SELECT personIdentifier,
+               RANK() OVER (PARTITION BY facultyRank ORDER BY top10PercentileAll DESC) AS personRank
+        FROM analysis_summary_person_new
+        WHERE countAll > 9
     ) x ON x.personIdentifier = p.personIdentifier
-    SET p.top10PercentileSenior = x.pct,
-        p.top10RankSenior = x.rank_count,
-        p.top10DenominatorSenior = x.denominator;
+    SET p.top10RankAll = x.personRank;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated top10RankAll', 'INFO', v_rows, NULL);
 
-    -- Top 5 percentile, all positions
+    -- ========================================================================
+    -- 5c. TOP 5 PERCENTILE - FIRST AUTHOR ONLY
+    -- ========================================================================
+
+    -- top5PercentileFirst: Average of top 5 percentiles for first-authored (requires countFirst > 4)
     UPDATE analysis_summary_person_new p
     JOIN (
-        SELECT
-            a.personIdentifier,
-            ROUND(100 * SUM(CASE WHEN percentileNIH >= 95 THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct,
-            SUM(CASE WHEN percentileNIH >= 95 THEN 1 ELSE 0 END) AS rank_count,
-            COUNT(*) AS denominator
-        FROM analysis_summary_author_new a
-        JOIN analysis_summary_article_new a1 ON a1.pmid = a.pmid
-        WHERE percentileNIH IS NOT NULL
-        GROUP BY a.personIdentifier
+        SELECT personIdentifier, ROUND(AVG(percentileNIH), 3) AS percentileNIH
+        FROM (
+            SELECT s.personIdentifier, a1.pmid, a1.percentileNIH,
+                   RANK() OVER (PARTITION BY s.personIdentifier ORDER BY a1.percentileNIH DESC) AS article_rank
+            FROM analysis_summary_person_new s
+            Join analysis_summary_author_new a ON a.personIdentifier = s.personIdentifier
+            Join analysis_summary_article_new a1 ON a1.pmid = a.pmid
+            WHERE a1.percentileNIH IS NOT NULL AND s.countFirst > 4
+              AND a.authorPosition = 'first'
+        ) y
+        WHERE article_rank < 6
+        GROUP BY personIdentifier
     ) x ON x.personIdentifier = p.personIdentifier
-    SET p.top5PercentileAll = x.pct,
-        p.top5RankAll = x.rank_count,
-        p.top5DenominatorAll = x.denominator;
+    SET p.top5PercentileFirst = x.percentileNIH;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated top5PercentileFirst', 'INFO', v_rows, NULL);
 
-    -- Top 10 percentile, all positions
+    -- top5DenominatorFirst
     UPDATE analysis_summary_person_new p
     JOIN (
-        SELECT
-            a.personIdentifier,
-            ROUND(100 * SUM(CASE WHEN percentileNIH >= 90 THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct,
-            SUM(CASE WHEN percentileNIH >= 90 THEN 1 ELSE 0 END) AS rank_count,
-            COUNT(*) AS denominator
-        FROM analysis_summary_author_new a
-        JOIN analysis_summary_article_new a1 ON a1.pmid = a.pmid
-        WHERE percentileNIH IS NOT NULL
-        GROUP BY a.personIdentifier
+        SELECT COUNT(*) AS count, facultyRank
+        FROM analysis_summary_person_new
+        WHERE top5PercentileFirst IS NOT NULL AND countFirst > 4
+        GROUP BY facultyRank
+    ) x ON x.facultyRank = p.facultyRank
+    SET p.top5DenominatorFirst = x.count;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated top5DenominatorFirst', 'INFO', v_rows, NULL);
+
+    -- top5RankFirst
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT personIdentifier,
+               RANK() OVER (PARTITION BY facultyRank ORDER BY top5PercentileFirst DESC) AS personRank
+        FROM analysis_summary_person_new
+        WHERE countFirst > 4
     ) x ON x.personIdentifier = p.personIdentifier
-    SET p.top10PercentileAll = x.pct,
-        p.top10RankAll = x.rank_count,
-        p.top10DenominatorAll = x.denominator;
+    SET p.top5RankFirst = x.personRank;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated top5RankFirst', 'INFO', v_rows, NULL);
+
+    -- ========================================================================
+    -- 5d. TOP 10 PERCENTILE - FIRST AUTHOR ONLY
+    -- ========================================================================
+
+    -- top10PercentileFirst: Average of top 10 percentiles for first-authored (requires countFirst > 9)
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT personIdentifier, ROUND(AVG(percentileNIH), 3) AS percentileNIH
+        FROM (
+            SELECT s.personIdentifier, a1.pmid, a1.percentileNIH,
+                   RANK() OVER (PARTITION BY s.personIdentifier ORDER BY a1.percentileNIH DESC) AS article_rank
+            FROM analysis_summary_person_new s
+            Join analysis_summary_author_new a ON a.personIdentifier = s.personIdentifier
+            Join analysis_summary_article_new a1 ON a1.pmid = a.pmid
+            WHERE a1.percentileNIH IS NOT NULL AND s.countFirst > 9
+              AND a.authorPosition = 'first'
+        ) y
+        WHERE article_rank < 11
+        GROUP BY personIdentifier
+    ) x ON x.personIdentifier = p.personIdentifier
+    SET p.top10PercentileFirst = x.percentileNIH;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated top10PercentileFirst', 'INFO', v_rows, NULL);
+
+    -- top10DenominatorFirst
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT COUNT(*) AS count, facultyRank
+        FROM analysis_summary_person_new
+        WHERE top10PercentileFirst IS NOT NULL AND countFirst > 9
+        GROUP BY facultyRank
+    ) x ON x.facultyRank = p.facultyRank
+    SET p.top10DenominatorFirst = x.count;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated top10DenominatorFirst', 'INFO', v_rows, NULL);
+
+    -- top10RankFirst
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT personIdentifier,
+               RANK() OVER (PARTITION BY facultyRank ORDER BY top10PercentileFirst DESC) AS personRank
+        FROM analysis_summary_person_new
+        WHERE countFirst > 9
+    ) x ON x.personIdentifier = p.personIdentifier
+    SET p.top10RankFirst = x.personRank;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated top10RankFirst', 'INFO', v_rows, NULL);
+
+    -- ========================================================================
+    -- 5e. TOP 5 PERCENTILE - SENIOR/LAST AUTHOR ONLY
+    -- ========================================================================
+
+    -- top5PercentileSenior: Average of top 5 percentiles for last-authored (requires countSenior > 4)
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT personIdentifier, ROUND(AVG(percentileNIH), 3) AS percentileNIH
+        FROM (
+            SELECT s.personIdentifier, a1.pmid, a1.percentileNIH,
+                   RANK() OVER (PARTITION BY s.personIdentifier ORDER BY a1.percentileNIH DESC) AS article_rank
+            FROM analysis_summary_person_new s
+            Join analysis_summary_author_new a ON a.personIdentifier = s.personIdentifier
+            Join analysis_summary_article_new a1 ON a1.pmid = a.pmid
+            WHERE a1.percentileNIH IS NOT NULL AND s.countSenior > 4
+              AND a.authorPosition = 'last'
+        ) y
+        WHERE article_rank < 6
+        GROUP BY personIdentifier
+    ) x ON x.personIdentifier = p.personIdentifier
+    SET p.top5PercentileSenior = x.percentileNIH;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated top5PercentileSenior', 'INFO', v_rows, NULL);
+
+    -- top5DenominatorSenior
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT COUNT(*) AS count, facultyRank
+        FROM analysis_summary_person_new
+        WHERE top5PercentileSenior IS NOT NULL AND countSenior > 4
+        GROUP BY facultyRank
+    ) x ON x.facultyRank = p.facultyRank
+    SET p.top5DenominatorSenior = x.count;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated top5DenominatorSenior', 'INFO', v_rows, NULL);
+
+    -- top5RankSenior
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT personIdentifier,
+               RANK() OVER (PARTITION BY facultyRank ORDER BY top5PercentileSenior DESC) AS personRank
+        FROM analysis_summary_person_new
+        WHERE countSenior > 4
+    ) x ON x.personIdentifier = p.personIdentifier
+    SET p.top5RankSenior = x.personRank;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated top5RankSenior', 'INFO', v_rows, NULL);
+
+    -- ========================================================================
+    -- 5f. TOP 10 PERCENTILE - SENIOR/LAST AUTHOR ONLY
+    -- ========================================================================
+
+    -- top10PercentileSenior: Average of top 10 percentiles for last-authored (requires countSenior > 9)
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT personIdentifier, ROUND(AVG(percentileNIH), 3) AS percentileNIH
+        FROM (
+            SELECT s.personIdentifier, a1.pmid, a1.percentileNIH,
+                   RANK() OVER (PARTITION BY s.personIdentifier ORDER BY a1.percentileNIH DESC) AS article_rank
+            FROM analysis_summary_person_new s
+            Join analysis_summary_author_new a ON a.personIdentifier = s.personIdentifier
+            Join analysis_summary_article_new a1 ON a1.pmid = a.pmid
+            WHERE a1.percentileNIH IS NOT NULL AND s.countSenior > 9
+              AND a.authorPosition = 'last'
+        ) y
+        WHERE article_rank < 11
+        GROUP BY personIdentifier
+    ) x ON x.personIdentifier = p.personIdentifier
+    SET p.top10PercentileSenior = x.percentileNIH;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated top10PercentileSenior', 'INFO', v_rows, NULL);
+
+    -- top10DenominatorSenior
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT COUNT(*) AS count, facultyRank
+        FROM analysis_summary_person_new
+        WHERE top10PercentileSenior IS NOT NULL AND countSenior > 9
+        GROUP BY facultyRank
+    ) x ON x.facultyRank = p.facultyRank
+    SET p.top10DenominatorSenior = x.count;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated top10DenominatorSenior', 'INFO', v_rows, NULL);
+
+    -- top10RankSenior
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT personIdentifier,
+               RANK() OVER (PARTITION BY facultyRank ORDER BY top10PercentileSenior DESC) AS personRank
+        FROM analysis_summary_person_new
+        WHERE countSenior > 9
+    ) x ON x.personIdentifier = p.personIdentifier
+    SET p.top10RankSenior = x.personRank;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated top10RankSenior', 'INFO', v_rows, NULL);
+
+    -- ========================================================================
+    -- 5g. TOP 5 PERCENTILE - FIRST OR SENIOR (combined)
+    -- Note: countFirstSenior is computed inline since column doesn't exist
+    -- ========================================================================
+
+    -- top5PercentileFirstSenior: Average of top 5 percentiles for first/last authored
+    -- Requires at least 5 first+last authored articles with percentileNIH
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT personIdentifier, ROUND(AVG(percentileNIH), 3) AS percentileNIH
+        FROM (
+            SELECT s.personIdentifier, a1.pmid, a1.percentileNIH,
+                   RANK() OVER (PARTITION BY s.personIdentifier ORDER BY a1.percentileNIH DESC) AS article_rank
+            FROM analysis_summary_person_new s
+            Join analysis_summary_author_new a ON a.personIdentifier = s.personIdentifier
+            Join analysis_summary_article_new a1 ON a1.pmid = a.pmid
+            WHERE a1.percentileNIH IS NOT NULL
+              AND a.authorPosition IN ('first', 'last')
+              AND s.personIdentifier IN (
+                  -- Only include people with > 4 first/last articles
+                  SELECT s2.personIdentifier
+                  FROM analysis_summary_person_new s2
+                  Join analysis_summary_author_new a2 ON a2.personIdentifier = s2.personIdentifier
+                  Join analysis_summary_article_new a12 ON a12.pmid = a2.pmid
+                  WHERE a12.publicationTypeNIH = 'Research Article' AND a12.percentileNIH IS NOT NULL
+                    AND a2.authorPosition IN ('first', 'last')
+                  GROUP BY s2.personIdentifier
+                  HAVING COUNT(*) > 4
+              )
+        ) y
+        WHERE article_rank < 6
+        GROUP BY personIdentifier
+    ) x ON x.personIdentifier = p.personIdentifier
+    SET p.top5PercentileFirstSenior = x.percentileNIH;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated top5PercentileFirstSenior', 'INFO', v_rows, NULL);
+
+    -- top5DenominatorFirstSenior
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT COUNT(*) AS count, facultyRank
+        FROM analysis_summary_person_new
+        WHERE top5PercentileFirstSenior IS NOT NULL
+        GROUP BY facultyRank
+    ) x ON x.facultyRank = p.facultyRank
+    SET p.top5DenominatorFirstSenior = x.count;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated top5DenominatorFirstSenior', 'INFO', v_rows, NULL);
+
+    -- top5RankFirstSenior
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT personIdentifier,
+               RANK() OVER (PARTITION BY facultyRank ORDER BY top5PercentileFirstSenior DESC) AS personRank
+        FROM analysis_summary_person_new
+        WHERE top5PercentileFirstSenior IS NOT NULL
+    ) x ON x.personIdentifier = p.personIdentifier
+    SET p.top5RankFirstSenior = x.personRank;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated top5RankFirstSenior', 'INFO', v_rows, NULL);
+
+    -- ========================================================================
+    -- 5h. TOP 10 PERCENTILE - FIRST OR SENIOR (combined)
+    -- ========================================================================
+
+    -- top10PercentileFirstSenior (requires > 9 first/last articles)
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT personIdentifier, ROUND(AVG(percentileNIH), 3) AS percentileNIH
+        FROM (
+            SELECT s.personIdentifier, a1.pmid, a1.percentileNIH,
+                   RANK() OVER (PARTITION BY s.personIdentifier ORDER BY a1.percentileNIH DESC) AS article_rank
+            FROM analysis_summary_person_new s
+            Join analysis_summary_author_new a ON a.personIdentifier = s.personIdentifier
+            Join analysis_summary_article_new a1 ON a1.pmid = a.pmid
+            WHERE a1.percentileNIH IS NOT NULL
+              AND a.authorPosition IN ('first', 'last')
+              AND s.personIdentifier IN (
+                  -- Only include people with > 9 first/last articles
+                  SELECT s2.personIdentifier
+                  FROM analysis_summary_person_new s2
+                  Join analysis_summary_author_new a2 ON a2.personIdentifier = s2.personIdentifier
+                  Join analysis_summary_article_new a12 ON a12.pmid = a2.pmid
+                  WHERE a12.publicationTypeNIH = 'Research Article' AND a12.percentileNIH IS NOT NULL
+                    AND a2.authorPosition IN ('first', 'last')
+                  GROUP BY s2.personIdentifier
+                  HAVING COUNT(*) > 9
+              )
+        ) y
+        WHERE article_rank < 11
+        GROUP BY personIdentifier
+    ) x ON x.personIdentifier = p.personIdentifier
+    SET p.top10PercentileFirstSenior = x.percentileNIH;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated top10PercentileFirstSenior', 'INFO', v_rows, NULL);
+
+    -- top10DenominatorFirstSenior
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT COUNT(*) AS count, facultyRank
+        FROM analysis_summary_person_new
+        WHERE top10PercentileFirstSenior IS NOT NULL
+        GROUP BY facultyRank
+    ) x ON x.facultyRank = p.facultyRank
+    SET p.top10DenominatorFirstSenior = x.count;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated top10DenominatorFirstSenior', 'INFO', v_rows, NULL);
+
+    -- top10RankFirstSenior
+    UPDATE analysis_summary_person_new p
+    JOIN (
+        SELECT personIdentifier,
+               RANK() OVER (PARTITION BY facultyRank ORDER BY top10PercentileFirstSenior DESC) AS personRank
+        FROM analysis_summary_person_new
+        WHERE top10PercentileFirstSenior IS NOT NULL
+    ) x ON x.personIdentifier = p.personIdentifier
+    SET p.top10RankFirstSenior = x.personRank;
+    SET v_rows = ROW_COUNT();
+    CALL log_progress(v_job_id, v_step, 'Updated top10RankFirstSenior', 'INFO', v_rows, NULL);
 
     IF v_error_occurred THEN
         CALL log_progress(v_job_id, v_step, 'Failed', 'ERROR', NULL, v_error_message);
