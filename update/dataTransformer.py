@@ -227,13 +227,15 @@ def process_person_article(items, output_path):
         "scopusNonTargetAuthorInstitutionalAffiliationSource",
         "scopusNonTargetAuthorInstitutionalAffiliationScore",
         
-        "datePublicationAddedToEntrez", "doi",
+        "datePublicationAddedToEntrez", "datePublicationAddedToPMC", "doi",
         "issn", "issue", "journalTitleISOabbreviation", "pages", "timesCited", "volume",
-        
+
         "feedbackScoreCites", "feedbackScoreCoAuthorName", "feedbackScoreEmail",
         "feedbackScoreInstitution", "feedbackScoreJournal", "feedbackScoreJournalSubField",
         "feedbackScoreKeyword", "feedbackScoreOrcid", "feedbackScoreOrcidCoAuthor",
         "feedbackScoreOrganization", "feedbackScoreTargetAuthorName", "feedbackScoreYear",
+        "feedbackScoreTextSimilarity", "feedbackScoreJournalTitleSimilarity",
+        "feedbackScoreBibliographicCoupling",
         "totalArticleScoreStandardized", "totalArticleScoreNonStandardized"
     ]
 
@@ -398,6 +400,7 @@ def process_person_article(items, output_path):
 
                         # Additional fields
                         date_publication_added_to_entrez = sanitize_field(article.get('datePublicationAddedToEntrez', ''))
+                        date_publication_added_to_pmc = sanitize_field(article.get('datePublicationAddedToPMC', ''))
                         doi = sanitize_field(article.get('doi', ''))
                         issn_list = article.get('issn', [])
                         issn = ''
@@ -432,11 +435,13 @@ def process_person_article(items, output_path):
                                     'feedbackScoreCites', 'feedbackScoreCoAuthorName', 'feedbackScoreEmail',
                                     'feedbackScoreInstitution', 'feedbackScoreJournal', 'feedbackScoreJournalSubField',
                                     'feedbackScoreKeyword', 'feedbackScoreOrcid', 'feedbackScoreOrcidCoAuthor',
-                                    'feedbackScoreOrganization', 'feedbackScoreTargetAuthorName', 'feedbackScoreYear'
+                                    'feedbackScoreOrganization', 'feedbackScoreTargetAuthorName', 'feedbackScoreYear',
+                                    'feedbackScoreTextSimilarity', 'feedbackScoreJournalTitleSimilarity',
+                                    'feedbackScoreBibliographicCoupling'
                                 ]
                             ]
                         else:
-                            feedback_scores = [''] * 12  # Assuming 12 feedback scores
+                            feedback_scores = [''] * 15  # Assuming 15 feedback scores
                         total_article_score_standardized = sanitize_field(article.get('totalArticleScoreStandardized', ''))
                         total_article_score_non_standardized = sanitize_field(article.get('totalArticleScoreNonStandardized', ''))                            
 
@@ -508,6 +513,7 @@ def process_person_article(items, output_path):
                             "scopusNonTargetAuthorInstitutionalAffiliationScore": scopus_non_target_author_institutional_affiliation_score,
                                                        
                             "datePublicationAddedToEntrez": date_publication_added_to_entrez,
+                            "datePublicationAddedToPMC": date_publication_added_to_pmc,
                             "doi": doi,
                             "issn": issn,
                             "issue": issue,
@@ -529,7 +535,10 @@ def process_person_article(items, output_path):
                             "feedbackScoreOrganization": feedback_scores[9],
                             "feedbackScoreTargetAuthorName": feedback_scores[10],
                             "feedbackScoreYear": feedback_scores[11],
-                            
+                            "feedbackScoreTextSimilarity": feedback_scores[12],
+                            "feedbackScoreJournalTitleSimilarity": feedback_scores[13],
+                            "feedbackScoreBibliographicCoupling": feedback_scores[14],
+
                             "totalArticleScoreStandardized": total_article_score_standardized,
                             "totalArticleScoreNonStandardized": total_article_score_non_standardized
                         }

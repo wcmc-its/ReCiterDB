@@ -420,7 +420,8 @@ proc_main: BEGIN
     INSERT INTO analysis_summary_article_new (
         pmid, pmcid, publicationTypeCanonical, articleYear,
         publicationDateStandardized, publicationDateDisplay,
-        datePublicationAddedToEntrez, articleTitle, journalTitleVerbose,
+        datePublicationAddedToEntrez, datePublicationAddedToPMC,
+        articleTitle, journalTitleVerbose,
         issn, doi, issue, volume, pages, citationCountScopus
     )
     SELECT DISTINCT
@@ -431,6 +432,7 @@ proc_main: BEGIN
         MIN(publicationDateStandardized),
         publicationDateDisplay,
         datePublicationAddedToEntrez,
+        MAX(datePublicationAddedToPMC),
         articleTitle,
         journalTitleVerbose,
         issn,

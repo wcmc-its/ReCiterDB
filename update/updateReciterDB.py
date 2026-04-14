@@ -303,12 +303,14 @@ def main(truncate_tables=True, skip_person_temp=False):
                 "pubmedTargetAuthorInstitutionalAffiliationMatchTypeScore",
                 "scopusNonTargetAuthorInstitutionalAffiliationSource",
                 "scopusNonTargetAuthorInstitutionalAffiliationScore",
-                "datePublicationAddedToEntrez", "doi",
+                "datePublicationAddedToEntrez", "datePublicationAddedToPMC", "doi",
                 "issn", "issue", "journalTitleISOabbreviation", "pages", "timesCited", "volume",
                 "feedbackScoreCites", "feedbackScoreCoAuthorName", "feedbackScoreEmail",
                 "feedbackScoreInstitution", "feedbackScoreJournal", "feedbackScoreJournalSubField",
                 "feedbackScoreKeyword", "feedbackScoreOrcid", "feedbackScoreOrcidCoAuthor",
                 "feedbackScoreOrganization", "feedbackScoreTargetAuthorName", "feedbackScoreYear",
+                "feedbackScoreTextSimilarity", "feedbackScoreJournalTitleSimilarity",
+                "feedbackScoreBibliographicCoupling",
                 "totalArticleScoreStandardized", "totalArticleScoreNonStandardized"
             ],
             'person_article_author': [

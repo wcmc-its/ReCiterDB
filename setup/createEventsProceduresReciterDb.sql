@@ -2455,10 +2455,10 @@ order by pmid desc, rank asc;
 
 #### 3. Populate "analysis_summary_article" table with articles ####
 
-insert into analysis_summary_article (pmid, pmcid, publicationTypeCanonical, articleYear, publicationDateStandardized, publicationDateDisplay, datePublicationAddedToEntrez, articleTitle, journalTitleVerbose, issn, doi, issue, volume, pages, citationCountScopus)
-select distinct 
-pmid, max(pmcid), publicationTypeCanonical, articleYear, min(publicationDateStandardized), publicationDateDisplay, datePublicationAddedToEntrez, articleTitle, journalTitleVerbose, issn, doi, issue, volume, pages, max(timesCited)
-from person_article 
+insert into analysis_summary_article (pmid, pmcid, publicationTypeCanonical, articleYear, publicationDateStandardized, publicationDateDisplay, datePublicationAddedToEntrez, datePublicationAddedToPMC, articleTitle, journalTitleVerbose, issn, doi, issue, volume, pages, citationCountScopus)
+select distinct
+pmid, max(pmcid), publicationTypeCanonical, articleYear, min(publicationDateStandardized), publicationDateDisplay, datePublicationAddedToEntrez, max(datePublicationAddedToPMC), articleTitle, journalTitleVerbose, issn, doi, issue, volume, pages, max(timesCited)
+from person_article
 where userAssertion = 'ACCEPTED'
 group by pmid
 order by datePublicationAddedToEntrez desc;
@@ -3584,7 +3584,8 @@ proc_main: BEGIN
     INSERT INTO analysis_summary_article_new (
         pmid, pmcid, publicationTypeCanonical, articleYear,
         publicationDateStandardized, publicationDateDisplay,
-        datePublicationAddedToEntrez, articleTitle, journalTitleVerbose,
+        datePublicationAddedToEntrez, datePublicationAddedToPMC,
+        articleTitle, journalTitleVerbose,
         issn, doi, issue, volume, pages, citationCountScopus
     )
     SELECT DISTINCT
@@ -3595,6 +3596,7 @@ proc_main: BEGIN
         MIN(publicationDateStandardized),
         publicationDateDisplay,
         datePublicationAddedToEntrez,
+        MAX(datePublicationAddedToPMC),
         articleTitle,
         journalTitleVerbose,
         issn,
