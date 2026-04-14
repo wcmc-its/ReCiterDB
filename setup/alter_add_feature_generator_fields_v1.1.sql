@@ -24,7 +24,7 @@ SET @sql = (SELECT IF(
     (SELECT COUNT(*) FROM information_schema.columns
      WHERE table_schema = @db AND table_name = 'person_article'
        AND column_name = 'datePublicationAddedToPMC') = 0,
-    'ALTER TABLE person_article ADD COLUMN `datePublicationAddedToPMC` varchar(128) DEFAULT NULL AFTER `datePublicationAddedToEntrez`',
+    'ALTER TABLE person_article ADD COLUMN `datePublicationAddedToPMC` varchar(128) DEFAULT NULL',
     'SELECT ''person_article.datePublicationAddedToPMC already exists'''));
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
@@ -32,7 +32,7 @@ SET @sql = (SELECT IF(
     (SELECT COUNT(*) FROM information_schema.columns
      WHERE table_schema = @db AND table_name = 'person_article'
        AND column_name = 'feedbackScoreTextSimilarity') = 0,
-    'ALTER TABLE person_article ADD COLUMN `feedbackScoreTextSimilarity` float DEFAULT NULL AFTER `feedbackScoreYear`',
+    'ALTER TABLE person_article ADD COLUMN `feedbackScoreTextSimilarity` float DEFAULT NULL',
     'SELECT ''person_article.feedbackScoreTextSimilarity already exists'''));
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
@@ -40,7 +40,7 @@ SET @sql = (SELECT IF(
     (SELECT COUNT(*) FROM information_schema.columns
      WHERE table_schema = @db AND table_name = 'person_article'
        AND column_name = 'feedbackScoreJournalTitleSimilarity') = 0,
-    'ALTER TABLE person_article ADD COLUMN `feedbackScoreJournalTitleSimilarity` float DEFAULT NULL AFTER `feedbackScoreTextSimilarity`',
+    'ALTER TABLE person_article ADD COLUMN `feedbackScoreJournalTitleSimilarity` float DEFAULT NULL',
     'SELECT ''person_article.feedbackScoreJournalTitleSimilarity already exists'''));
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
@@ -48,7 +48,7 @@ SET @sql = (SELECT IF(
     (SELECT COUNT(*) FROM information_schema.columns
      WHERE table_schema = @db AND table_name = 'person_article'
        AND column_name = 'feedbackScoreBibliographicCoupling') = 0,
-    'ALTER TABLE person_article ADD COLUMN `feedbackScoreBibliographicCoupling` float DEFAULT NULL AFTER `feedbackScoreJournalTitleSimilarity`',
+    'ALTER TABLE person_article ADD COLUMN `feedbackScoreBibliographicCoupling` float DEFAULT NULL',
     'SELECT ''person_article.feedbackScoreBibliographicCoupling already exists'''));
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
@@ -61,7 +61,7 @@ SET @sql = (SELECT IF(
     (SELECT COUNT(*) FROM information_schema.columns
      WHERE table_schema = @db AND table_name = 'analysis_summary_article'
        AND column_name = 'datePublicationAddedToPMC') = 0,
-    'ALTER TABLE analysis_summary_article ADD COLUMN `datePublicationAddedToPMC` varchar(128) DEFAULT NULL AFTER `datePublicationAddedToEntrez`',
+    'ALTER TABLE analysis_summary_article ADD COLUMN `datePublicationAddedToPMC` varchar(128) DEFAULT NULL',
     'SELECT ''analysis_summary_article.datePublicationAddedToPMC already exists'''));
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
