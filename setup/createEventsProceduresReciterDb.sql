@@ -3592,7 +3592,7 @@ proc_main: BEGIN
         pmid,
         MAX(pmcid),
         publicationTypeCanonical,
-        articleYear,
+        IF(articleYear != 0, articleYear, LEFT(publicationDateStandardized, 4)),
         MIN(publicationDateStandardized),
         publicationDateDisplay,
         datePublicationAddedToEntrez,
