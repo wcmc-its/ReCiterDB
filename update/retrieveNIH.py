@@ -138,22 +138,23 @@ def write_records_to_csv(records, csv_files):
             nih_writer.writerow(nih_record)
             nih_count += 1
 
-            citing_pmid = get_dict_value(record, "pmid")
+            queried_pmid = get_dict_value(record, "pmid")
 
-            # Write to analysis_nih_cites
+            # iCite "cited_by" = articles that cite queried_pmid; "references" = articles queried_pmid cites.
+            # CSV column order matches LOAD DATA columns: (cited_pmid, citing_pmid).
             if record.get("cited_by"):
-                for cited_by in record["cited_by"]:
-                    cites_writer.writerow([cited_by, citing_pmid])
+                for citing in record["cited_by"]:
+                    cites_writer.writerow([queried_pmid, citing])
                     cites_count += 1
             if record.get("references"):
-                for ref in record["references"]:
-                    cites_writer.writerow([ref, citing_pmid])
+                for cited in record["references"]:
+                    cites_writer.writerow([cited, queried_pmid])
                     cites_count += 1
 
             # Write to analysis_nih_cites_clin
             if record.get("cited_by_clin"):
-                for cited_by_clin in record["cited_by_clin"]:
-                    cites_clin_writer.writerow([cited_by_clin, citing_pmid])
+                for citing_clin in record["cited_by_clin"]:
+                    cites_clin_writer.writerow([queried_pmid, citing_clin])
                     cites_clin_count +=1
 
         except Exception as e:
