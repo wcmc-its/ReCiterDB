@@ -374,10 +374,19 @@ def main():
     # fields back than maintain two name conventions.
     project_rows = []
     appl_ids = []
+    seen_appl_ids = set()
     for proj in fetch_projects(base_criteria={'org_names': [org_name]}):
         appl_id = proj.get('appl_id')
         if not appl_id:
             continue
+        # RePORTER returns a project under every fiscal year it was active, so
+        # the FY-partitioned fetch (used when the corpus exceeds the 9,999
+        # offset cap) yields the same appl_id in multiple pages. appl_id is
+        # grant_reporter_project's PRIMARY KEY, so dedup before the reload —
+        # mirrors the seen_pairs guard in the publications loop below.
+        if appl_id in seen_appl_ids:
+            continue
+        seen_appl_ids.add(appl_id)
         appl_ids.append(appl_id)
         org = (proj.get('organization') or {}).get('org_name')
         project_rows.append((
