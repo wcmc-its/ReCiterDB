@@ -112,7 +112,8 @@ def main():
     scripts = [
         ("executeFeatureGenerator", "python3 executeFeatureGenerator.py"),
         ("retrieveArticles", "python3 retrieveArticles.py"),
-        ("retrieveNIH", "python3 retrieveNIH.py"),  
+        ("retrieveNIH", "python3 retrieveNIH.py"),
+        ("retrieveReporter", "python3 retrieveReporter.py"),
         ("nightlyIndexing", "bash run_nightly_indexing.sh"),
         ("abstractImport", "python3 abstractImport.py"),
         ("conflictsImport", "python3 conflictsImport.py")
