@@ -33,6 +33,11 @@
 -- abstracts from Postgres (Scholars-Profile-System) where they're joined to
 -- InfoEd grant rows; this column exists for ad-hoc analysis and future
 -- reciterdb-side consumers.
+--
+-- project_terms / pref_terms hold the NIH-curated keyword vocabulary RePORTER
+-- returns per project, stored raw (project_terms angle-bracket-wrapped,
+-- pref_terms semicolon-delimited). Added by alter_add_reporter_terms_v1.3.sql;
+-- mirrored into the CREATE TABLE here so a fresh build matches (issue #291).
 -- -----------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS `grant_reporter_project` (
@@ -45,6 +50,8 @@ CREATE TABLE IF NOT EXISTS `grant_reporter_project` (
   `project_start_date` date DEFAULT NULL,
   `project_end_date` date DEFAULT NULL,
   `abstract_text` mediumtext DEFAULT NULL,
+  `project_terms` text DEFAULT NULL,
+  `pref_terms` text DEFAULT NULL,
   `last_fetched_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`appl_id`),
   KEY `core_project_num` (`core_project_num`)
