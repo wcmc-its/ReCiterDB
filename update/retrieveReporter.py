@@ -390,6 +390,11 @@ def main():
             proj.get('project_start_date'),
             proj.get('project_end_date'),
             proj.get('abstract_text'),
+            # NIH-curated keyword vocabularies, stored raw (issue #291).
+            # 'terms' is angle-bracket-wrapped (<a><b><c>); 'pref_terms' is
+            # semicolon-delimited. Parsed downstream by the SPS funding ETL.
+            proj.get('terms'),
+            proj.get('pref_terms'),
         ))
     logger.info('Fetched %d RePORTER projects', len(project_rows))
     reload_table(
@@ -398,7 +403,7 @@ def main():
         project_rows,
         ['appl_id', 'core_project_num', 'project_title', 'org_name',
          'fiscal_year', 'activity_code', 'project_start_date',
-         'project_end_date', 'abstract_text'],
+         'project_end_date', 'abstract_text', 'project_terms', 'pref_terms'],
     )
 
     # ----- Loop B: publications -----
