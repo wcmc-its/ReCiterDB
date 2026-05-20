@@ -804,7 +804,7 @@ CREATE TABLE IF NOT EXISTS `reporting_abstracts` (
   `abstract` blob DEFAULT NULL,
   `abstractVarchar` varchar(15000) DEFAULT NULL,
   PRIMARY KEY (`id`),
-  KEY `idx_pmid` (`pmid`) USING BTREE
+  UNIQUE KEY `idx_pmid` (`pmid`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `reporting_ad_hoc_feature_generator_execution` (
