@@ -97,15 +97,31 @@ def count_matching(cur, pmids, batch=5000):
     return total
 
 
+def writable_columns(cur, table="reporting_abstracts"):
+    """Return the list of non-generated columns (those that accept INSERT).
+    Prod has a STORED generated column abstract_len that cannot be assigned;
+    INSERT must enumerate the real columns explicitly."""
+    cur.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() AND table_name = %s "
+        "  AND (extra IS NULL OR extra NOT LIKE '%%GENERATED%%') "
+        "ORDER BY ordinal_position",
+        (table,),
+    )
+    return [r["column_name"] for r in cur.fetchall()]
+
+
 def backup_rows(cur, pmids, backup_table, batch):
     cur.execute(f"CREATE TABLE `{backup_table}` LIKE reporting_abstracts")
+    cols = writable_columns(cur)
+    col_list = ", ".join(f"`{c}`" for c in cols)
     inserted = 0
     for i in range(0, len(pmids), batch):
         chunk = pmids[i:i + batch]
         placeholders = ",".join(["%s"] * len(chunk))
         cur.execute(
-            f"INSERT INTO `{backup_table}` "
-            f"SELECT * FROM reporting_abstracts WHERE pmid IN ({placeholders})",
+            f"INSERT INTO `{backup_table}` ({col_list}) "
+            f"SELECT {col_list} FROM reporting_abstracts WHERE pmid IN ({placeholders})",
             chunk,
         )
         inserted += cur.rowcount
@@ -153,9 +169,12 @@ def count_duplicate_extras(cur):
 def backup_duplicate_extras(cur, backup_table):
     """Insert into the backup table every duplicate row except the MIN(id)
     keeper for each pmid. Returns the number of rows backed up."""
+    cols = writable_columns(cur)
+    col_list = ", ".join(f"`{c}`" for c in cols)
+    select_list = ", ".join(f"ra.`{c}`" for c in cols)
     cur.execute(
-        f"INSERT INTO `{backup_table}` "
-        "SELECT ra.* FROM reporting_abstracts ra "
+        f"INSERT INTO `{backup_table}` ({col_list}) "
+        f"SELECT {select_list} FROM reporting_abstracts ra "
         "JOIN ("
         "  SELECT pmid, MIN(id) AS keep_id FROM reporting_abstracts "
         "  GROUP BY pmid HAVING COUNT(*) > 1"
