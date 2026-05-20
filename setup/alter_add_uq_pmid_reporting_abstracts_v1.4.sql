@@ -29,6 +29,13 @@ SET @db = DATABASE();
 
 -- -----------------------------------------------------------------------------
 -- Precondition: no duplicate pmids.
+--
+-- If duplicates exist, the precondition synthesizes a SELECT against a
+-- non-existent table whose name encodes the duplicate count. The resulting
+-- "Table doesn't exist" error halts execution (SELECT-with-1/0 only emits
+-- a warning, which MariaDB ignored outside a stored program in v1 of this
+-- migration -- the cleanup was attempted, ALTER ran anyway, ALTER failed
+-- on the first duplicate pmid).
 -- -----------------------------------------------------------------------------
 
 SET @dup_count = (
@@ -41,12 +48,9 @@ SET @dup_count = (
 SET @sql = IF(
     @dup_count > 0,
     CONCAT(
-        'SELECT ',
-        '''Migration aborted: reporting_abstracts has ',
+        'SELECT 1 FROM `__migration_aborted_reporting_abstracts_has_',
         @dup_count,
-        ' duplicate pmid value(s). Run update/repairAbstracts.py and resolve ',
-        'duplicates before re-running this migration.'' AS error, ',
-        '1/0 AS force_error'
+        '_duplicate_pmids__run_update_repairAbstracts_py_first`'
     ),
     'SELECT ''No duplicate pmids; precondition satisfied.'' AS status'
 );
