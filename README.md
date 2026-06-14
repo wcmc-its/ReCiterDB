@@ -69,15 +69,12 @@ CronJob (daily)
      ├─ 1. executeFeatureGenerator.py    Trigger ReCiter ML scoring API
      ├─ 2. retrieveArticles.py           Pull person/article data from S3 + DynamoDB
      ├─ 3. retrieveNIH.py                NIH iCite API → analysis_nih (atomic swap)
-     ├─ 4. retrieveReporter.py           NIH RePORTER grants → grant_reporter_* (reconcile)
-     ├─ 5. retrieveArticleProvenance.py  ArticleProvenance (DynamoDB) → article_provenance
-     │      └─ non-fatal: a failure here does not block nightly indexing
-     ├─ 6. run_nightly_indexing.sh        Run populateAnalysisSummaryTables_v2()
+     ├─ 4. run_nightly_indexing.sh        Run populateAnalysisSummaryTables_v2()
      │      ├─ Polls analysis_job_log every 3s for progress
      │      ├─ Auto-retries 3x with 60s backoff
      │      └─ Auto-restores from backup on failure
-     ├─ 7. abstractImport.py             PubMed abstracts from DynamoDB
-     └─ 8. conflictsImport.py            COI statements from DynamoDB
+     ├─ 5. abstractImport.py             PubMed abstracts from DynamoDB
+     └─ 6. conflictsImport.py            COI statements from DynamoDB
 ```
 
 **Key patterns:**
@@ -108,8 +105,6 @@ ReCiterDB/
 │   ├── run_nightly_indexing.sh                    # SP runner with monitoring/retry
 │   ├── retrieveArticles.py                        # S3 + DynamoDB article fetcher
 │   ├── retrieveNIH.py                             # NIH iCite fetcher (atomic swap)
-│   ├── retrieveReporter.py                        # NIH RePORTER grants fetcher (reconcile)
-│   ├── retrieveArticleProvenance.py               # ArticleProvenance (DynamoDB) → article_provenance
 │   ├── retrieveAltmetric.py                       # Altmetric API fetcher
 │   ├── updateReciterDB.py                         # Bulk loader (LOAD DATA LOCAL INFILE)
 │   ├── dataTransformer.py                         # ReCiter JSON → CSV
@@ -293,8 +288,6 @@ All defined in `setup/createEventsProceduresReciterDb.sql`.
 | `run_all.py` | EKS orchestrator: runs all pipeline steps in sequence with timeout enforcement, memory logging, and S3 log upload |
 | `retrieveArticles.py` | Fetches person and article data from S3 and DynamoDB in batches |
 | `retrieveNIH.py` | Fetches NIH iCite metrics in batches of 150; loads to staging table with validation and atomic swap |
-| `retrieveReporter.py` | Fetches NIH RePORTER grants/linkages and reconciles them into `grant_reporter_*` / `grant_provenance` |
-| `retrieveArticleProvenance.py` | Scans DynamoDB `ArticleProvenance` → `article_provenance` (pmid, personIdentifier) via staging + atomic swap; runs non-fatal |
 | `retrieveAltmetric.py` | Fetches Altmetric scores for articles published in the last 2 years |
 | `updateReciterDB.py` | Bulk data loader using `LOAD DATA LOCAL INFILE` with retry and reconnect logic |
 | `dataTransformer.py` | Transforms ReCiter JSON output to CSV format for all `person_*` tables |
