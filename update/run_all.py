@@ -109,22 +109,30 @@ def upload_log_to_s3():
 
 # ------------- Main Flow -------------
 def main():
+    # (name, command, non_fatal). non_fatal=True steps log a warning and continue
+    # on failure instead of aborting the pipeline.
     scripts = [
-        ("executeFeatureGenerator", "python3 executeFeatureGenerator.py"),
-        ("retrieveArticles", "python3 retrieveArticles.py"),
-        ("retrieveNIH", "python3 retrieveNIH.py"),
-        ("retrieveReporter", "python3 retrieveReporter.py"),
-        ("nightlyIndexing", "bash run_nightly_indexing.sh"),
-        ("abstractImport", "python3 abstractImport.py"),
-        ("conflictsImport", "python3 conflictsImport.py")
+        ("executeFeatureGenerator", "python3 executeFeatureGenerator.py", False),
+        ("retrieveArticles", "python3 retrieveArticles.py", False),
+        ("retrieveNIH", "python3 retrieveNIH.py", False),
+        ("retrieveReporter", "python3 retrieveReporter.py", False),
+        # article_provenance feeds a PM display field only; nothing downstream
+        # depends on it, so a failure here must not block nightly indexing.
+        ("retrieveArticleProvenance", "python3 retrieveArticleProvenance.py", True),
+        ("nightlyIndexing", "bash run_nightly_indexing.sh", False),
+        ("abstractImport", "python3 abstractImport.py", False),
+        ("conflictsImport", "python3 conflictsImport.py", False)
     ]
 
     overall_success = True
 
-    for name, cmd in scripts:
+    for name, cmd, non_fatal in scripts:
         #ok = run_script(name, cmd)
         ok = run_script(name, cmd, timeout_seconds=int(os.getenv("SCRIPT_TIMEOUT_SECONDS", "15000")))
         if not ok:
+            if non_fatal:
+                logger.warning(f"⚠️ NON-FATAL: {name} failed; continuing pipeline.")
+                continue
             overall_success = False
             logger.error("Stopping pipeline due to script failure.")
             break
