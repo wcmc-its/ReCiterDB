@@ -492,23 +492,6 @@ CREATE TABLE IF NOT EXISTS `analysis_temp_output_table_cell` (
   KEY `personIdentifier` (`personIdentifier`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- article_provenance: first-retrieval provenance per (article, person), loaded
--- nightly by update/retrieveArticleProvenance.py from the ReCiter DynamoDB
--- `ArticleProvenance` table (composite key uid + articleId). Keyed on
--- (pmid, personIdentifier) to mirror that source key exactly -- one row per
--- person+article. firstRetrievalDate is `frd` (epoch seconds, UTC) converted to
--- DATETIME. Loaded via staging->atomic-swap; NOT in any truncate list.
--- Consumed by Publication Manager #737 ("date a publication was first retrieved").
-CREATE TABLE IF NOT EXISTS `article_provenance` (
-  `pmid`               int(11)      NOT NULL,
-  `personIdentifier`   varchar(128) NOT NULL,
-  `firstRetrievalDate` datetime     DEFAULT NULL,
-  `retrievalStrategy`  varchar(64)  DEFAULT NULL,
-  `source`             varchar(32)  DEFAULT NULL,
-  PRIMARY KEY (`pmid`, `personIdentifier`),
-  KEY `idx_personIdentifier` (`personIdentifier`) USING BTREE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
 -- ============================================================================
 -- Journal Tables
 -- ============================================================================
