@@ -14,6 +14,7 @@ ENV PYTHONUNBUFFERED=1
 # Copy additional Python scripts
 COPY update/retrieveNIH.py ./
 COPY update/retrieveReporter.py ./
+COPY update/retrieveArticleProvenance.py ./
 COPY update/retrieveAltmetric.py ./
 COPY update/retrieveArticles.py ./
 COPY update/updateReciterDB.py ./
