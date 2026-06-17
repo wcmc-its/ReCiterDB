@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS `admin_feedback_log` (
   `personIdentifier` varchar(20) DEFAULT NULL,
   `articleIdentifier` int(11) DEFAULT NULL,
   `feedback` varchar(11) DEFAULT NULL,
+  `impersonatedByUserID` int(11) DEFAULT NULL,
   `createTimestamp` timestamp NOT NULL DEFAULT '0000-00-00 00:00:00',
   `modifyTimestamp` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
   PRIMARY KEY (`feedbackID`),
@@ -97,6 +98,49 @@ CREATE TABLE IF NOT EXISTS `admin_roles` (
   `createTimestamp` timestamp NOT NULL DEFAULT '0000-00-00 00:00:00',
   `modifyTimestamp` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
   PRIMARY KEY (`roleID`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Data-driven RBAC permission tables.
+-- Mirror of ReCiter-Publication-Manager scripts/migrations/add-permission-tables.sql
+-- (3-places rule). Seed data lives in setup/table_admin_permissions.sql.
+CREATE TABLE IF NOT EXISTS `admin_permissions` (
+  `permissionID` int(11) NOT NULL AUTO_INCREMENT,
+  `permissionKey` varchar(128) NOT NULL,
+  `label` varchar(255) NOT NULL,
+  `description` text DEFAULT NULL,
+  `category` varchar(64) NOT NULL,
+  `createTimestamp` timestamp NOT NULL DEFAULT '0000-00-00 00:00:00',
+  `modifyTimestamp` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
+  PRIMARY KEY (`permissionID`),
+  UNIQUE KEY `uq_permissionKey` (`permissionKey`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `admin_role_permissions` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `roleID` int(11) NOT NULL,
+  `permissionID` int(11) NOT NULL,
+  `createTimestamp` timestamp NOT NULL DEFAULT current_timestamp(),
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_role_permission` (`roleID`,`permissionID`),
+  KEY `idx_roleID` (`roleID`),
+  KEY `idx_permissionID` (`permissionID`),
+  CONSTRAINT `fk_rp_role` FOREIGN KEY (`roleID`) REFERENCES `admin_roles` (`roleID`) ON DELETE CASCADE,
+  CONSTRAINT `fk_rp_permission` FOREIGN KEY (`permissionID`) REFERENCES `admin_permissions` (`permissionID`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `admin_permission_resources` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `permissionID` int(11) NOT NULL,
+  `resourceType` varchar(32) NOT NULL,
+  `resourceKey` varchar(128) NOT NULL,
+  `displayOrder` int(11) NOT NULL DEFAULT 0,
+  `icon` varchar(64) DEFAULT NULL,
+  `label` varchar(255) NOT NULL,
+  `route` varchar(255) DEFAULT NULL,
+  `createTimestamp` timestamp NOT NULL DEFAULT current_timestamp(),
+  PRIMARY KEY (`id`),
+  KEY `idx_pr_permissionID` (`permissionID`),
+  CONSTRAINT `fk_pr_permission` FOREIGN KEY (`permissionID`) REFERENCES `admin_permissions` (`permissionID`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `admin_settings` (
