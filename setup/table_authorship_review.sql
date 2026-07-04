@@ -7,9 +7,16 @@
 -- (see update/updateReciterDB.py `all_tables`) and is not touched by any nightly
 -- stored procedure or ETL step. CREATE TABLE IF NOT EXISTS so re-applying is safe.
 --
--- One row per WCM-affiliated AUTHORSHIP (a PubMed author carrying a WCM affiliation
--- on a publication) that is NOT yet assigned to any identity. Powers the Curator_All
+-- One row per WCM-affiliated AUTHORSHIP (an author carrying a WCM affiliation on a
+-- publication) that is NOT yet assigned to any identity. Powers the Curator_All
 -- `/authorships` tab in ReCiter-Publication-Manager (reads this table via Sequelize).
+--
+-- MULTI-SOURCE (v1.6): `source` distinguishes the PubMed lane from the Scopus lane.
+--   pubmed  — PMID-keyed rows; author_key = `{pmid}:{position}`; resolves to gold standard.
+--   scopus  — documents NOT in PubMed (no PMID); author_key = `scopus:{doi-or-scopusid}:{position}`;
+--             external_id = DOI (else numeric Scopus ID); pub_type = subtypeDescription;
+--             container_id = book base DOI where derivable; resolves to ExternalArticle.
+--   Existing (pre-v1.6) rows are PubMed via the column default.
 --
 -- POPULATED EXTERNALLY (this repo's ETL cannot compute the scores). The producer is
 -- the adversarial-attribution-review pipeline in the ReCiter Research project
@@ -36,8 +43,12 @@
 
 CREATE TABLE IF NOT EXISTS `authorship_review` (
   `id`                     BIGINT       NOT NULL AUTO_INCREMENT,
-  `pmid`                   BIGINT       NOT NULL,
-  `author_key`             VARCHAR(32)  NOT NULL,            -- `pmid:position`
+  `source`                 ENUM('pubmed','scopus') NOT NULL DEFAULT 'pubmed',
+  `pmid`                   BIGINT       NULL,                -- NULL for scopus rows
+  `external_id`            VARCHAR(96)  NULL,                -- numeric Scopus record ID (Accept articleId + link)
+  `author_key`             VARCHAR(160) NOT NULL,            -- `{pmid}:{position}` or `scopus:{doi-or-scopusid}:{position}`
+  `pub_type`               VARCHAR(40)  NULL,                -- Article / Book Chapter / Conference Paper…
+  `container_id`           VARCHAR(96)  NULL,                -- book base DOI (chapter → book)
   `author_position`        INT          NULL,
   `author_position_label`  VARCHAR(8)   NULL,                -- first/middle/last
   `wcm_author`             VARCHAR(255) NULL,                -- PubMed author name
@@ -72,6 +83,7 @@ CREATE TABLE IF NOT EXISTS `authorship_review` (
   `last_checked`           DATETIME     NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_author_key` (`author_key`),
+  KEY `ix_source` (`source`),
   KEY `ix_pmid` (`pmid`),
   KEY `ix_classification` (`classification`),
   KEY `ix_status` (`status`),
