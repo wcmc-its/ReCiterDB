@@ -69,6 +69,22 @@ spec:
                 configMapKeyRef:
                   name: reciterdb-configmap
                   key: S3_KEY_PREFIX
+            # AAR Scopus lane (weekly, gated in run_all.py) — Scopus AF-ID sweep + PubMed DOI resolution
+            - name: SCOPUS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: scopus-secret
+                  key: SCOPUS_API_KEY
+            - name: SCOPUS_INST_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: scopus-secret
+                  key: SCOPUS_INST_TOKEN
+            - name: PUBMED_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: pubmed-secret
+                  key: PUBMED_API_KEY
             resources:
               requests:
                 memory: 4G

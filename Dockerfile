@@ -23,6 +23,12 @@ COPY update/dataTransformer.py ./
 COPY update/executeFeatureGenerator.py ./
 COPY update/run_all.py ./
 
+# AAR Scopus lane (not-in-PubMed WCM authorship detector — weekly, gated in run_all.py)
+COPY update/identity_index.py ./
+COPY update/aar_db.py ./
+COPY update/aar_universe_scopus.py ./
+COPY update/scopus_afids.csv ./
+
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 # Or, if not using requirements.txt:
