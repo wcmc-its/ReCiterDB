@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS `authorship_review` (
   `id`                     BIGINT       NOT NULL AUTO_INCREMENT,
   `source`                 ENUM('pubmed','scopus') NOT NULL DEFAULT 'pubmed',
   `pmid`                   BIGINT       NULL,                -- NULL for scopus rows
-  `external_id`            VARCHAR(96)  NULL,                -- DOI-first, numeric Scopus ID fallback
+  `external_id`            VARCHAR(96)  NULL,                -- numeric Scopus record ID (Accept articleId + link)
   `author_key`             VARCHAR(160) NOT NULL,            -- `{pmid}:{position}` or `scopus:{doi-or-scopusid}:{position}`
   `pub_type`               VARCHAR(40)  NULL,                -- Article / Book Chapter / Conference Paper…
   `container_id`           VARCHAR(96)  NULL,                -- book base DOI (chapter → book)

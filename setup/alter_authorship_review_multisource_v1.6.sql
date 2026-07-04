@@ -5,8 +5,10 @@
 -- the new Scopus detector lane (ReCiterDB#103 / PM#775) can write authorships
 -- found on documents NOT in PubMed. Adds:
 --   - source        ENUM('pubmed','scopus') NOT NULL DEFAULT 'pubmed' (+ index)
---   - external_id   VARCHAR(96)  NULL  — DOI-first, numeric Scopus ID fallback
---                                        (EIDs are unstable across record merges)
+--   - external_id   VARCHAR(96)  NULL  — numeric Scopus record ID (dc:identifier minus
+--                                        SCOPUS_ID:); drives the PM Accept articleId
+--                                        "SCOPUS:<id>" + the Scopus record link. DOI lives
+--                                        in `doi`; author_key is DOI-first for merge-stable dedup
 --   - pub_type      VARCHAR(40)  NULL  — Article / Book Chapter / Conference Paper…
 --   - container_id  VARCHAR(96)  NULL  — book base DOI (chapter → book), enables
 --                                        the tab's "N chapters in this book" runs
@@ -55,7 +57,7 @@ SET @sql = (SELECT IF(
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 -- -----------------------------------------------------------------------------
--- external_id VARCHAR(96) NULL — DOI-first, numeric Scopus ID fallback
+-- external_id VARCHAR(96) NULL — numeric Scopus record ID (Accept articleId + record link)
 -- -----------------------------------------------------------------------------
 SET @sql = (SELECT IF(
     (SELECT COUNT(*) FROM information_schema.columns
