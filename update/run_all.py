@@ -107,6 +107,28 @@ def upload_log_to_s3():
         logger.error("Failed to upload logs to S3")
         logger.exception(e)
 
+# ------------- AAR Scopus lane (weekly, isolated) -------------
+def run_scopus_lane_if_due():
+    """Weekly Scopus not-in-PubMed authorship detector (AAR / PM#775).
+
+    Fully isolated from the reporting rebuild: gated to Sundays, skipped if its API
+    keys are absent, and any failure is caught and logged so it can NEVER fail the
+    nightly job. A pre-migration DB (missing authorship_review columns) surfaces here
+    as a swallowed script failure, not a pipeline abort."""
+    try:
+        import datetime as _datetime
+        if _datetime.datetime.utcnow().weekday() != 6:   # 6 = Sunday
+            logger.info("Scopus lane: not due (runs weekly on Sundays) — skipped")
+            return
+        if not (os.getenv("SCOPUS_API_KEY") and os.getenv("SCOPUS_INST_TOKEN")):
+            logger.warning("Scopus lane: SCOPUS_API_KEY/INST_TOKEN unset — skipped")
+            return
+        run_script("aarScopusLane", "python3 aar_universe_scopus.py --mode rolling --apply",
+                   timeout_seconds=int(os.getenv("SCOPUS_TIMEOUT_SECONDS", "3600")))
+    except Exception as e:
+        logger.exception(f"Scopus lane failed (ignored — reporting unaffected): {e}")
+
+
 # ------------- Main Flow -------------
 def main():
     scripts = [
@@ -128,6 +150,10 @@ def main():
             overall_success = False
             logger.error("Stopping pipeline due to script failure.")
             break
+
+    # AAR Scopus lane — runs only if the reporting rebuild succeeded, weekly, isolated.
+    if overall_success:
+        run_scopus_lane_if_due()
 
     upload_log_to_s3()
 
