@@ -41,7 +41,10 @@ KEYWORDS_KEY = "strategy.authorAffiliationScoringStrategy.homeInstitution-keywor
 DEFAULT_HOME_INSTITUTION_KEYWORDS = (
     "weil|cornell, weill|cornell, weill|medicine, cornell|medicine, cornell|medical, "
     "weill|medical, weill|bugando, weill|graduate, cornell|presbyterian, "
-    "weill|presbyterian, 10065|cornell, 10065|pres"
+    "weill|presbyterian, 10065|cornell, 10065|presbyterian, 10021|cornell, "
+    "10021|presbyterian, weill|qatar, cornell|qatar, @med.cornell.edu, "
+    "@qatar-med.cornell.edu, tri-institutional|md-phd, memorial|sloan|kettering, "
+    "rockefeller|university, hospital|special|surgery"
 )
 TOOL = "reciter-aar"
 API_KEY = os.environ.get("PUBMED_API_KEY")
