@@ -21,6 +21,7 @@ COPY update/abstractImport.py ./
 COPY update/conflictsImport.py ./
 COPY update/dataTransformer.py ./
 COPY update/executeFeatureGenerator.py ./
+COPY update/retrieveExternalArticles.py ./
 COPY update/run_all.py ./
 
 # AAR Scopus lane (not-in-PubMed WCM authorship detector — weekly, gated in run_all.py)

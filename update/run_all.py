@@ -155,6 +155,22 @@ def run_pubmed_lane_if_due():
         logger.exception(f"PubMed lane failed (ignored — reporting unaffected): {e}")
 
 
+# ------------- External-source article projection (ReCiterDB #101) -------------
+def run_external_article_etl():
+    """Project the ExternalArticle DynamoDB table -> reciterdb.external_article.
+
+    Isolated (try/except + timeout) so a scan/load hiccup can never fail the nightly
+    reporting rebuild. Runs every night; robust to an empty/absent DynamoDB table.
+    NOTE: once reporting views/SPs consume external_article (ReCiterDB #101 reporting
+    inclusion), move this INTO the ordered `scripts` list BEFORE `nightlyIndexing` so
+    the stored procedures see freshly-loaded rows."""
+    try:
+        run_script("externalArticles", "python3 retrieveExternalArticles.py",
+                   timeout_seconds=int(os.getenv("EXTERNAL_ARTICLE_TIMEOUT_SECONDS", "600")))
+    except Exception as e:
+        logger.exception(f"External-article ETL failed (ignored — reporting unaffected): {e}")
+
+
 # ------------- Main Flow -------------
 def main():
     scripts = [
@@ -177,10 +193,12 @@ def main():
             logger.error("Stopping pipeline due to script failure.")
             break
 
-    # AAR lanes — run only if the reporting rebuild succeeded, weekly, each isolated.
+    # Post-reporting projections/lanes — run only if the reporting rebuild succeeded,
+    # each isolated so it can never fail the nightly.
     if overall_success:
-        run_scopus_lane_if_due()
-        run_pubmed_lane_if_due()
+        run_external_article_etl()            # nightly: ExternalArticle DynamoDB -> external_article
+        run_scopus_lane_if_due()              # weekly (Sun): AAR Scopus lane
+        run_pubmed_lane_if_due()              # weekly (Sun): AAR PubMed lane
 
     upload_log_to_s3()
 
