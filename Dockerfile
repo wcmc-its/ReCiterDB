@@ -29,6 +29,16 @@ COPY update/aar_db.py ./
 COPY update/aar_universe_scopus.py ./
 COPY update/scopus_afids.csv ./
 
+# AAR PubMed lane (orphan-authorship detector + IO/FB scoring — weekly, gated in run_all.py)
+COPY update/aar_universe.py ./
+COPY update/aar_gate.py ./
+COPY update/aar_matcher.py ./
+COPY update/adversarial_attribution_review.py ./
+COPY update/aar_orchestrator.py ./
+COPY update/preprocessing.py ./
+COPY update/aar_models/ ./aar_models/
+COPY update/aar_data/ ./aar_data/
+
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 # Or, if not using requirements.txt:
