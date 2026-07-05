@@ -6,7 +6,8 @@ requests
 psutil
 pandas==2.2.3
 keras
-scikit-learn
+scikit-learn==1.8.0
 sqlalchemy
 joblib
 tensorflow
+xgboost==3.2.0

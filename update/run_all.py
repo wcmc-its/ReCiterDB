@@ -129,6 +129,32 @@ def run_scopus_lane_if_due():
         logger.exception(f"Scopus lane failed (ignored — reporting unaffected): {e}")
 
 
+# ------------- AAR PubMed lane (weekly, isolated) -------------
+def run_pubmed_lane_if_due():
+    """Weekly PubMed orphan-authorship detector + IO/FB scoring (AAR).
+
+    Same isolation contract as the Scopus lane: Sunday-gated, keys-gated, wrapped in
+    try/except with a timeout, so any failure is logged and can NEVER fail the nightly
+    reporting rebuild. Ledger/processed_log state lives in S3 (--s3-state) because the
+    CronJob has no persistent filesystem; upserts land in reciterdb.authorship_review
+    (source='pubmed')."""
+    try:
+        import datetime as _datetime
+        if _datetime.datetime.utcnow().weekday() != 6:   # 6 = Sunday
+            logger.info("PubMed lane: not due (runs weekly on Sundays) — skipped")
+            return
+        if not os.getenv("PUBMED_API_KEY"):
+            logger.warning("PubMed lane: PUBMED_API_KEY unset — skipped")
+            return
+        if not (os.getenv("AAR_S3_BUCKET") or os.getenv("S3_BUCKET")):
+            logger.warning("PubMed lane: AAR_S3_BUCKET/S3_BUCKET unset (needed for --s3-state) — skipped")
+            return
+        run_script("aarPubmedLane", "python3 aar_orchestrator.py --mode recurring --s3-state",
+                   timeout_seconds=int(os.getenv("PUBMED_LANE_TIMEOUT_SECONDS", "5400")))
+    except Exception as e:
+        logger.exception(f"PubMed lane failed (ignored — reporting unaffected): {e}")
+
+
 # ------------- Main Flow -------------
 def main():
     scripts = [
@@ -151,9 +177,10 @@ def main():
             logger.error("Stopping pipeline due to script failure.")
             break
 
-    # AAR Scopus lane — runs only if the reporting rebuild succeeded, weekly, isolated.
+    # AAR lanes — run only if the reporting rebuild succeeded, weekly, each isolated.
     if overall_success:
         run_scopus_lane_if_due()
+        run_pubmed_lane_if_due()
 
     upload_log_to_s3()
 
