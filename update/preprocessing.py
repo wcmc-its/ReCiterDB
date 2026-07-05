@@ -58,6 +58,9 @@ def _load_name_frequency():
     """Load name frequency table from data/name_frequency.json.
     Returns (table_dict, median_score) or ({}, 0.0) if unavailable."""
     freq_path = Path(__file__).parent.parent / 'data' / 'name_frequency.json'
+    if not freq_path.exists():
+        # In-cluster / vendored: baked next to this module at aar_data/ (see Dockerfile).
+        freq_path = Path(__file__).parent / 'aar_data' / 'name_frequency.json'
     if freq_path.exists():
         with open(freq_path, 'r') as f:
             table = json.load(f)

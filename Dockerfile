@@ -37,6 +37,7 @@ COPY update/adversarial_attribution_review.py ./
 COPY update/aar_orchestrator.py ./
 COPY update/preprocessing.py ./
 COPY update/aar_models/ ./aar_models/
+COPY update/aar_data/ ./aar_data/
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
