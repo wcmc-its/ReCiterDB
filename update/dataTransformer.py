@@ -268,13 +268,17 @@ def process_person_article(items, output_path):
                         journal_title_verbose = sanitize_field(article.get('journalTitleVerbose', ''))
                         article_title = sanitize_field(article.get('articleTitle', ''))
 
-                        # Evidence fields
-                        evidence = article.get('evidence', {})
+                        # Evidence fields. DynamoDBMapper serializes an absent
+                        # @DynamoDBDocument evidence block as a NULL attribute, so
+                        # .get(key, {}) can return None (not {}); use `or {}` / `or []`
+                        # so a null block coerces to empty instead of raising
+                        # AttributeError and silently dropping the whole article.
+                        evidence = article.get('evidence') or {}
 
                         # Author name evidence
-                        author_name_evidence = evidence.get('authorNameEvidence', {})
-                        article_author_name = author_name_evidence.get('articleAuthorName', {})
-                        institutional_author_name = author_name_evidence.get('institutionalAuthorName', {})
+                        author_name_evidence = evidence.get('authorNameEvidence') or {}
+                        article_author_name = author_name_evidence.get('articleAuthorName') or {}
+                        institutional_author_name = author_name_evidence.get('institutionalAuthorName') or {}
                         article_author_first_name = sanitize_field(article_author_name.get('firstName', ''))
                         article_author_last_name = sanitize_field(article_author_name.get('lastName', ''))
                         institutional_author_first_name = sanitize_field(institutional_author_name.get('firstName', ''))
@@ -294,19 +298,19 @@ def process_person_article(items, output_path):
                         target_author_count_penalty = sanitize_field(evidence.get('targetAuthorCountPenalty', ''))
                         
                         # Email evidence
-                        email_evidence = evidence.get('emailEvidence', {})
+                        email_evidence = evidence.get('emailEvidence') or {}
                         email_match = sanitize_field(email_evidence.get('emailMatch', ''))
                         email_match_score = sanitize_field(email_evidence.get('emailMatchScore', ''))
 
                         # Journal subfield evidence
-                        journal_subfield_evidence = evidence.get('journalCategoryEvidence', {})
+                        journal_subfield_evidence = evidence.get('journalCategoryEvidence') or {}
                         journal_subfield_label = sanitize_field(journal_subfield_evidence.get('journalSubfieldScienceMetrixLabel', ''))
                         journal_subfield_id = sanitize_field(journal_subfield_evidence.get('journalSubfieldScienceMetrixID', ''))
                         journal_subfield_department = sanitize_field(journal_subfield_evidence.get('journalSubfieldDepartment', ''))
                         journal_subfield_score = sanitize_field(journal_subfield_evidence.get('journalSubfieldScore', ''))
 
                         # Relationship evidence
-                        relationship_evidence = evidence.get('relationshipEvidence', {})
+                        relationship_evidence = evidence.get('relationshipEvidence') or {}
                         relationship_total_score = sanitize_field(relationship_evidence.get('relationshipEvidenceTotalScore', ''))
 
                         relationship_positive_match_score = sanitize_field(
@@ -331,7 +335,7 @@ def process_person_article(items, output_path):
                             relationship_non_match_score = ''
 
                         # Education year evidence
-                        education_year_evidence = evidence.get('educationYearEvidence', {})
+                        education_year_evidence = evidence.get('educationYearEvidence') or {}
                         article_year = sanitize_field(education_year_evidence.get('articleYear', ''))
                         identity_bachelor_year = sanitize_field(education_year_evidence.get('identityBachelorYear', ''))
                         discrepancy_degree_year_bachelor = sanitize_field(education_year_evidence.get('discrepancyDegreeYearBachelor', ''))
@@ -341,28 +345,28 @@ def process_person_article(items, output_path):
                         discrepancy_degree_year_doctoral_score = sanitize_field(education_year_evidence.get('discrepancyDegreeYearDoctoralScore', ''))
 
                         # Gender evidence
-                        gender_evidence = evidence.get('genderEvidence', {})
+                        gender_evidence = evidence.get('genderEvidence') or {}
                         gender_score_article = sanitize_field(gender_evidence.get('genderScoreArticle', ''))
                         gender_score_identity = sanitize_field(gender_evidence.get('genderScoreIdentity', ''))
                         gender_score_identity_article_discrepancy = sanitize_field(gender_evidence.get('genderScoreIdentityArticleDiscrepancy', ''))
 
                         # Person type evidence
-                        person_type_evidence = evidence.get('personTypeEvidence', {})
+                        person_type_evidence = evidence.get('personTypeEvidence') or {}
                         person_type = sanitize_field(person_type_evidence.get('personType', ''))
                         person_type_score = sanitize_field(person_type_evidence.get('personTypeScore', ''))
 
                         # Article count evidence
-                        article_count_evidence = evidence.get('articleCountEvidence', {})
+                        article_count_evidence = evidence.get('articleCountEvidence') or {}
                         count_articles_retrieved = sanitize_field(article_count_evidence.get('countArticlesRetrieved', ''))
                         article_count_score = sanitize_field(article_count_evidence.get('articleCountScore', ''))
 
                         # Author count evidence
-                        author_count_evidence = evidence.get('authorCountEvidence', {})
+                        author_count_evidence = evidence.get('authorCountEvidence') or {}
                         count_authors = sanitize_field(author_count_evidence.get('countAuthors', ''))
                         author_count_score = sanitize_field(author_count_evidence.get('authorCountScore', ''))
 
                         # PubMed affiliation evidence
-                        affiliation_evidence = evidence.get('affiliationEvidence', {})
+                        affiliation_evidence = evidence.get('affiliationEvidence') or {}
                         pubmed_target_author_affiliation = affiliation_evidence.get('pubmedTargetAuthorAffiliation', {})
                         if isinstance(pubmed_target_author_affiliation, dict):
                             target_author_institutional_affiliation_article_pubmed_label = sanitize_field(
@@ -654,7 +658,7 @@ def process_person_article_department(items, output_path):
                     pmid = article.get('pmid', 0)
 
                     # Extract organizational unit evidence
-                    org_units = article.get('evidence', {}).get('organizationalUnitEvidence', [])
+                    org_units = (article.get('evidence') or {}).get('organizationalUnitEvidence') or []
                     for org_unit in org_units:
                         rows.append([
                             person_identifier,
@@ -703,7 +707,7 @@ def process_person_article_grant(items, output_path):
                     pmid = article.get('pmid', 0)  # PMIDs are typically integers
 
                     # Extract grant evidence
-                    grant_evidence = article.get('evidence', {}).get('grantEvidence', {})
+                    grant_evidence = (article.get('evidence') or {}).get('grantEvidence') or {}
                     grants = grant_evidence.get('grants', [])
 
                     for grant in grants:
@@ -809,7 +813,7 @@ def process_person_article_relationship(items, output_path):
             try:
                 for article in item.get('reCiterArticleFeatures', []):
                     pmid = article.get('pmid', 0)
-                    relationship_evidence = article.get('evidence', {}).get('relationshipEvidence', {})
+                    relationship_evidence = (article.get('evidence') or {}).get('relationshipEvidence') or {}
 
                     if relationship_evidence:
                         # Process 'relationshipPositiveMatch' if it exists
@@ -888,7 +892,7 @@ def process_person_article_scopus_non_target_author_affiliation(items, output_pa
                         pmid = sanitize_field(article.get('pmid', 0))  # PMIDs are typically integers
 
                         # Extract affiliation evidence
-                        affiliation_evidence = article.get('evidence', {}).get('affiliationEvidence', {})
+                        affiliation_evidence = (article.get('evidence') or {}).get('affiliationEvidence') or {}
                         scopus_non_target_affiliations = affiliation_evidence.get(
                             'scopusNonTargetAuthorAffiliation', {}
                         )
@@ -984,9 +988,9 @@ def process_person_article_scopus_target_author_affiliation(items, output_path):
 
                 # Extract Scopus target affiliation evidence
                 scopus_target_affiliations = (
-                    article.get('evidence', {})
-                          .get('affiliationEvidence', {})
-                          .get('scopusTargetAuthorAffiliation', [])
+                    ((article.get('evidence') or {})
+                          .get('affiliationEvidence') or {})
+                          .get('scopusTargetAuthorAffiliation') or []
                 )
 
                 for affiliation in scopus_target_affiliations:
