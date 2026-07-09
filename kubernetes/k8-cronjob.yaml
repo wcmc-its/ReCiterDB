@@ -1,4 +1,4 @@
-apiVersion: batch/v1beta1
+apiVersion: batch/v1
 kind: CronJob
 metadata:
   name: reciterdb
@@ -7,9 +7,10 @@ metadata:
     app: reciterdb
     tier: backend
     owner: szd2013
-  
 spec:
-  schedule: "30 17 * * *"
+  # Matches the live prod object so `kubectl apply` is a no-op. Do NOT change the
+  # schedule here without changing it live — this is the sole source of truth.
+  schedule: "15 4 * * *"
   concurrencyPolicy: Forbid
   jobTemplate:
     spec:
@@ -17,59 +18,12 @@ spec:
         spec:
           containers:
           - name: reciterdb
+            # Substituted at build time by the ReCiterDB pipeline (set-image); a raw
+            # apply of this file would set the literal string CONTAINER_IMAGE — build
+            # first, or patch the image separately.
             image: CONTAINER_IMAGE
             env:
-            - name: DB_USERNAME
-              valueFrom: 
-                secretKeyRef:
-                  name: reciterdb-secrets
-                  key: DB_USERNAME
-            - name: DB_PASSWORD
-              valueFrom: 
-                secretKeyRef:
-                  name: reciterdb-secrets
-                  key: DB_PASSWORD
-            - name: AWS_ACCESS_KEY_ID
-              valueFrom: 
-                secretKeyRef:
-                  name: reciterdb-secrets
-                  key: AWS_ACCESS_KEY_ID
-            - name: AWS_SECRET_ACCESS_KEY
-              valueFrom: 
-                secretKeyRef:
-                  name: reciterdb-secrets
-                  key: AWS_SECRET_ACCESS_KEY
-            - name: AWS_DEFAULT_REGION
-              valueFrom:
-                configMapKeyRef:
-                  name: reciterdb-configmap
-                  key: AWS_DEFAULT_REGION
-            - name: DB_HOST
-              valueFrom:
-                configMapKeyRef:
-                  name: reciterdb-configmap
-                  key: DB_HOST
-            - name: DB_NAME
-              valueFrom:
-                configMapKeyRef:
-                  name: reciterdb-configmap
-                  key: DB_NAME      
-            - name: LOG_FILE
-              valueFrom:
-                configMapKeyRef:
-                  name: reciterdb-configmap
-                  key: LOG_FILE
-            - name: S3_BUCKET
-              valueFrom:
-                configMapKeyRef:
-                  name: reciterdb-configmap
-                  key: S3_BUCKET
-            - name: S3_KEY_PREFIX
-              valueFrom:
-                configMapKeyRef:
-                  name: reciterdb-configmap
-                  key: S3_KEY_PREFIX
-            # AAR Scopus lane (weekly, gated in run_all.py) — Scopus AF-ID sweep + PubMed DOI resolution
+            # AAR Scopus + PubMed lanes (weekly, gated in run_all.py)
             - name: SCOPUS_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -85,20 +39,64 @@ spec:
                 secretKeyRef:
                   name: pubmed-secret
                   key: PUBMED_API_KEY
-            resources:
-              requests:
-                memory: 4G
-                cpu: 1.5
-              limits:
-                memory: 4G
-                cpu: 1.6
-            readinessProbe:
-              exec:
-                command:
-                - cat
-                - /usr/src/app/retrieveArticles.py
-              initialDelaySeconds: 10
-              periodSeconds: 5
-          nodeSelector:
-            lifecycle: Ec2Spot
+            - name: DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: reciterdb-secrets
+                  key: DB_USERNAME
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: reciterdb-secrets
+                  key: DB_PASSWORD
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: reciterdb-secrets
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: reciterdb-secrets
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: URL
+              valueFrom:
+                secretKeyRef:
+                  name: reciterdb-secrets
+                  key: URL
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: reciterdb-secrets
+                  key: API_KEY
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: reciterdb-configmap
+                  key: AWS_DEFAULT_REGION
+            - name: DB_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: reciterdb-configmap
+                  key: DB_HOST
+            - name: DB_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: reciterdb-configmap
+                  key: DB_NAME
+            - name: LOG_FILE
+              valueFrom:
+                configMapKeyRef:
+                  name: reciterdb-configmap
+                  key: LOG_FILE
+            - name: S3_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: reciterdb-configmap
+                  key: S3_BUCKET
+            - name: S3_KEY_PREFIX
+              valueFrom:
+                configMapKeyRef:
+                  name: reciterdb-configmap
+                  key: S3_KEY_PREFIX
           restartPolicy: OnFailure
