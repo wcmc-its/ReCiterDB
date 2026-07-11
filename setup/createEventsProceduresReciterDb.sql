@@ -4404,6 +4404,91 @@ proc_main: BEGIN
     CALL log_progress(v_job_id, v_step, 'Complete', 'DONE', NULL, CONCAT(TIMESTAMPDIFF(SECOND, v_start_time, NOW()), 's elapsed'));
 
     -- ========================================================================
+    -- STEP 6b: UNION EXTERNAL-SOURCE PUBLICATIONS (ReCiterDB #101, Option B)
+    -- Inject non-suppressed external_article rows (manually-added Scopus/OpenAlex/
+    -- WOS pubs) into the person-publication staging tables. Runs AFTER all
+    -- bibliometric computation (STEPs 4-6) and BEFORE the atomic swap, so external
+    -- pubs appear in the live publication list WITHOUT affecting any count /
+    -- percentile / h-index -- they are physically absent while those are computed.
+    -- Keyed on a per-article_id SYNTHETIC NEGATIVE pmid: real pmid is normally
+    -- absent, negative never collides with real (positive) pmids, and the
+    -- AUTO_INCREMENT id stays the real PK. SPS dedups external rows on doi +
+    -- source_type, NOT this internal pmid (rebuilt every nightly).
+    -- Isolated: skipped when external_article is absent; an injection error is
+    -- logged and cleared so it can never abort the swap.
+    -- ponytail: external rows get no NIH/Scopus/Mendeley enrichment or RTF (out of
+    -- v1 scope); inject earlier (after the STEP 3 article INSERT) if they ever need it.
+    -- ========================================================================
+    SET v_step = '6b. Union external-source publications';
+
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_schema = DATABASE() AND table_name = 'external_article') THEN
+
+        CALL log_progress(v_job_id, v_step, 'Mapping external article_ids to synthetic pmids', 'RUNNING', NULL, NULL);
+
+        DROP TABLE IF EXISTS temp_external_pmid;
+        CREATE TABLE temp_external_pmid (
+            article_id VARCHAR(96) NOT NULL,
+            syn_pmid   INT NOT NULL,
+            PRIMARY KEY (article_id)
+        );
+        -- One synthetic negative pmid per DISTINCT non-suppressed article_id, so a
+        -- paper co-added by several WCM authors shares a single article row.
+        INSERT INTO temp_external_pmid (article_id, syn_pmid)
+        SELECT article_id, -1 * ROW_NUMBER() OVER (ORDER BY article_id)
+        FROM (SELECT DISTINCT article_id FROM external_article WHERE suppressed = 0) d;
+
+        -- Article-detail rows (one per synthetic pmid). Text fields LEFT()-clamped to
+        -- the target column widths so a long external title/venue can't error under
+        -- strict SQL mode. Score / NIH / RTF columns left NULL.
+        INSERT INTO analysis_summary_article_new (
+            pmid, articleTitle, journalTitleVerbose, doi, articleYear,
+            publicationDateDisplay, publicationDateStandardized,
+            publicationTypeCanonical, source_type
+        )
+        SELECT
+            t.syn_pmid,
+            LEFT(MAX(e.title), 1000),
+            LEFT(MAX(e.journal_or_venue), 500),
+            LEFT(MAX(e.doi), 255),
+            MAX(CASE WHEN e.pub_date REGEXP '^[0-9]{4}' THEN CAST(LEFT(e.pub_date, 4) AS SIGNED) END),
+            LEFT(MAX(e.pub_date), 200),
+            LEFT(MAX(e.pub_date), 128),
+            LEFT(MAX(e.publication_type), 128),
+            MAX(e.source_type)
+        FROM external_article e
+        JOIN temp_external_pmid t ON t.article_id = e.article_id
+        WHERE e.suppressed = 0
+        GROUP BY t.syn_pmid;
+        SET v_rows = ROW_COUNT();
+        CALL log_progress(v_job_id, v_step, 'Inserted external article rows', 'INFO', v_rows, NULL);
+
+        -- Person -> publication link rows (one per uid + article_id). authorPosition
+        -- and authors left NULL: external has no target-author signal, and SPS renders
+        -- the byline from the external_article JSON.
+        INSERT INTO analysis_summary_author_new (pmid, personIdentifier, authorPosition, authors)
+        SELECT t.syn_pmid, e.uid, NULL, NULL
+        FROM external_article e
+        JOIN temp_external_pmid t ON t.article_id = e.article_id
+        WHERE e.suppressed = 0;
+        SET v_rows = ROW_COUNT();
+        CALL log_progress(v_job_id, v_step, 'Inserted external author-link rows', 'INFO', v_rows, NULL);
+
+        DROP TABLE IF EXISTS temp_external_pmid;
+
+        IF v_error_occurred THEN
+            -- External injection is supplementary; log and clear the flag so a hiccup
+            -- here can never abort the swap or trigger a false restore in STEP 7.
+            CALL log_progress(v_job_id, v_step, 'External injection error (ignored - reporting unaffected)', 'ERROR', NULL, v_error_message);
+            SET v_error_occurred = FALSE;
+        ELSE
+            CALL log_progress(v_job_id, v_step, 'Complete', 'DONE', NULL, NULL);
+        END IF;
+    ELSE
+        CALL log_progress(v_job_id, v_step, 'Skipped (external_article table absent)', 'INFO', 0, NULL);
+    END IF;
+
+    -- ========================================================================
     -- STEP 7: ATOMIC TABLE SWAP
     -- This is the key improvement - production tables are only unavailable
     -- for the brief moment of the RENAME operation
