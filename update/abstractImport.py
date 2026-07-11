@@ -87,6 +87,7 @@ def fetch_missing_pmids(mysql_conn):
         FROM analysis_summary_article p
         LEFT JOIN reporting_abstracts a ON a.pmid = p.pmid
         WHERE a.pmid IS NULL
+          AND p.pmid > 0
     """
     with mysql_conn.cursor() as cursor:
         cursor.execute(sql)
