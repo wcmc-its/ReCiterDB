@@ -160,10 +160,11 @@ def run_external_article_etl():
     """Project the ExternalArticle DynamoDB table -> reciterdb.external_article.
 
     Isolated (try/except + timeout) so a scan/load hiccup can never fail the nightly
-    reporting rebuild. Runs every night; robust to an empty/absent DynamoDB table.
-    NOTE: once reporting views/SPs consume external_article (ReCiterDB #101 reporting
-    inclusion), move this INTO the ordered `scripts` list BEFORE `nightlyIndexing` so
-    the stored procedures see freshly-loaded rows."""
+    reporting rebuild. Runs every night BEFORE `nightlyIndexing` (see main()) so the
+    reporting SP's STEP 6b sees freshly-loaded external rows and unions them into the
+    person-publication tables (ReCiterDB #101, Option B). Robust to an empty/absent
+    DynamoDB table. Kept isolated -- NOT a fatal `scripts` entry -- so an external-
+    source hiccup degrades to stale/empty external pubs, never a failed nightly."""
     try:
         run_script("externalArticles", "python3 retrieveExternalArticles.py",
                    timeout_seconds=int(os.getenv("EXTERNAL_ARTICLE_TIMEOUT_SECONDS", "600")))
@@ -185,6 +186,11 @@ def main():
 
     overall_success = True
 
+    # External-source projection MUST run before nightlyIndexing so the reporting SP
+    # (STEP 6b) unions freshly-loaded external_article rows (ReCiterDB #101). Isolated,
+    # so a failure here degrades to stale/empty external pubs, never a failed nightly.
+    run_external_article_etl()
+
     for name, cmd in scripts:
         #ok = run_script(name, cmd)
         ok = run_script(name, cmd, timeout_seconds=int(os.getenv("SCRIPT_TIMEOUT_SECONDS", "15000")))
@@ -196,7 +202,6 @@ def main():
     # Post-reporting projections/lanes — run only if the reporting rebuild succeeded,
     # each isolated so it can never fail the nightly.
     if overall_success:
-        run_external_article_etl()            # nightly: ExternalArticle DynamoDB -> external_article
         run_scopus_lane_if_due()              # weekly (Sun): AAR Scopus lane
         run_pubmed_lane_if_due()              # weekly (Sun): AAR PubMed lane
 

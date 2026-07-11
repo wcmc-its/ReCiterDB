@@ -45,6 +45,7 @@ with mysql_conn.cursor() as mysql_cursor:
         LEFT JOIN reporting_conflicts a ON a.pmid = p.pmid
         WHERE a.pmid is null
         and articleYear >= 2017
+        and p.pmid > 0
         LIMIT 90
     ''')
     results = mysql_cursor.fetchall()
@@ -108,6 +109,7 @@ while True:
         LEFT JOIN reporting_conflicts a ON a.pmid = p.pmid
         WHERE a.pmid is null
         and articleYear >= 2017
+        and p.pmid > 0
         LIMIT %s OFFSET %s
     ''', (limit, offset))
 
