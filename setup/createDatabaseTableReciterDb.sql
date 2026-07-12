@@ -379,6 +379,7 @@ CREATE TABLE IF NOT EXISTS `analysis_summary_article` (
   `readersMendeley` int(11) DEFAULT NULL,
   `trendingPubsScore` float(7,2) DEFAULT NULL,
   `source_type` varchar(16) DEFAULT 'PUBMED',
+  `article_id` varchar(96) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `x` (`doi`) USING BTREE,
   KEY `z` (`pmid`) USING BTREE,

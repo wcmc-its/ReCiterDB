@@ -1292,7 +1292,7 @@ proc_main: BEGIN
         INSERT INTO analysis_summary_article_new (
             pmid, articleTitle, journalTitleVerbose, doi, articleYear,
             publicationDateDisplay, publicationDateStandardized,
-            publicationTypeCanonical, source_type
+            publicationTypeCanonical, source_type, article_id
         )
         SELECT
             t.syn_pmid,
@@ -1303,7 +1303,11 @@ proc_main: BEGIN
             LEFT(MAX(e.pub_date), 200),
             LEFT(MAX(e.pub_date), 128),
             LEFT(MAX(e.publication_type), 128),
-            MAX(e.source_type)
+            MAX(e.source_type),
+            -- #101 downstream: expose the stable source-prefixed article_id so SPS can
+            -- key external pubs on it instead of the churning synthetic pmid. 1:1 with
+            -- syn_pmid (temp_external_pmid PK is article_id), so MAX() is exact.
+            MAX(t.article_id)
         FROM external_article e
         JOIN temp_external_pmid t ON t.article_id = e.article_id
         WHERE e.suppressed = 0
