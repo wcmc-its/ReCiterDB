@@ -51,8 +51,11 @@ CREATE TABLE IF NOT EXISTS `external_article` (
   KEY `ix_source` (`source_type`),
   KEY `ix_doi` (`doi`),
   KEY `ix_suppressed` (`suppressed`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
+# Keep this DDL in sync with setup/table_external_article.sql. COLLATE is load-bearing:
+# without it utf8mb4 means general_ci, and STEP 6b's join against unicode_ci tables
+# fails silently (6b swallows the error; the nightly still reports SUCCESS).
 
 COLS = ["uid", "article_id", "source_type", "doi", "pmid", "title", "journal_or_venue",
         "authors", "pub_date", "publication_type", "added_by", "date_added", "method",
