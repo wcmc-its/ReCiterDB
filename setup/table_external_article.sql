@@ -34,4 +34,8 @@ CREATE TABLE IF NOT EXISTS `external_article` (
   KEY `ix_source` (`source_type`),
   KEY `ix_doi` (`doi`),
   KEY `ix_suppressed` (`suppressed`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+-- COLLATE is load-bearing: `CHARSET=utf8mb4` alone means general_ci, but every join
+-- partner (analysis_summary_*, person) is unicode_ci. STEP 6b's join then raises
+-- "Illegal mix of collations" — which 6b swallows, so the nightly reports SUCCESS
+-- having injected zero external rows. See alter_fix_external_article_collation_v1.8.
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
