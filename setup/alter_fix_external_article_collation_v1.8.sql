@@ -1,0 +1,35 @@
+-- =============================================================================
+-- v1.8 — fix external_article collation so STEP 6b can actually join (ReCiterDB #101)
+-- =============================================================================
+-- `external_article` was created with `ENGINE=InnoDB DEFAULT CHARSET=utf8mb4` and no
+-- COLLATE clause. Specifying the charset without a collation does NOT inherit the
+-- schema default — utf8mb4 resolves to utf8mb4_general_ci. That made external_article
+-- the only table in the reporting chain on general_ci; the reciterdb default and every
+-- table it joins against (analysis_summary_article, analysis_summary_author, person,
+-- person_article) are utf8mb4_unicode_ci.
+--
+-- STEP 6b (populateAnalysisSummaryTables_v2) does:
+--     JOIN temp_external_pmid t ON t.article_id = e.article_id
+-- temp_external_pmid is created inside the SP with no charset clause, so it takes the
+-- schema default (unicode_ci) while e.article_id is general_ci. The `=` then raises:
+--     Illegal mix of collations (utf8mb4_unicode_ci,IMPLICIT)
+--     and (utf8mb4_general_ci,IMPLICIT) for operation '='
+--
+-- This failed SILENTLY. STEP 6b is deliberately wrapped in a CONTINUE HANDLER so an
+-- injection error can never abort the reporting rebuild — so the nightly logged
+-- "External injection error (ignored)" and still finished SUCCESS, with ZERO external
+-- rows in analysis_summary_article. A green nightly was not evidence that 6b worked.
+--
+-- Fixing the table (rather than adding COLLATE clauses inside the SP) fixes every
+-- present and future join against external_article, not just the two in 6b.
+--
+-- external_article is a rebuildable projection of the ExternalArticle DynamoDB table
+-- (TRUNCATE + reload each nightly), so converting it cannot lose durable state. The
+-- nightly uses CREATE TABLE IF NOT EXISTS + TRUNCATE and never DROPs, so this
+-- conversion survives subsequent reloads.
+--
+-- Apply BEFORE the next nightly run. Idempotent — safe to re-run.
+-- =============================================================================
+
+ALTER TABLE `external_article`
+  CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
