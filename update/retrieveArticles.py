@@ -431,8 +431,12 @@ def main():
     for chunk in yield_analysis_items_in_chunks(table_name="Analysis", page_size=CHUNK_SIZE):
         logger.info(f"Processing chunk of {len(chunk)} items from Analysis.")
         for item in chunk:
+            # ReCiter writes the offload flag as s3StorageFlag (BOOL); older rows use
+            # usingS3 (N). Both forms are live in the table, so accept either. Reading
+            # only usingS3 silently routes an offloaded row to direct_buffer, where its
+            # 200-byte pointer yields no articles and the person imports zero rows.
             using_s3_val = item.get("usingS3", 0)
-            if using_s3_val == 1:
+            if using_s3_val == 1 or item.get("s3StorageFlag") is True:
                 s3_buffer.append(item)
             else:
                 direct_buffer.append(item)
