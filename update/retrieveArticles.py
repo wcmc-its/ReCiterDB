@@ -431,8 +431,21 @@ def main():
     for chunk in yield_analysis_items_in_chunks(table_name="Analysis", page_size=CHUNK_SIZE):
         logger.info(f"Processing chunk of {len(chunk)} items from Analysis.")
         for item in chunk:
-            using_s3_val = item.get("usingS3", 0)
-            if using_s3_val == 1:
+            # The offload flag lives under two names and inconsistent types:
+            #   s3StorageFlag - BOOL, written by current ReCiter
+            #   usingS3       - legacy; N 0/1 on most rows but BOOL on ~1,660
+            # Reading only usingS3 sends an s3StorageFlag row to direct_buffer, where
+            # its 200-byte pointer yields no articles and the person imports zero rows.
+            # s3StorageFlag wins where both exist: it is the newer writer's signal, and
+            # a row that shrank back under the offload threshold keeps a stale usingS3=1
+            # alongside s3StorageFlag=false + inline data, so trusting usingS3 there
+            # would import a long-dead S3 payload instead of the current inline one.
+            # bool() rather than `is True` so an N-typed flag still reads correctly.
+            if "s3StorageFlag" in item:
+                use_s3 = bool(item["s3StorageFlag"])
+            else:
+                use_s3 = item.get("usingS3", 0) == 1
+            if use_s3:
                 s3_buffer.append(item)
             else:
                 direct_buffer.append(item)
