@@ -129,6 +129,29 @@ def run_scopus_lane_if_due():
         logger.exception(f"Scopus lane failed (ignored — reporting unaffected): {e}")
 
 
+# ------------- COI refresh pass (weekly, isolated) -------------
+def run_conflicts_refresh_if_due():
+    """Weekly refill of reporting_conflicts rows that exist but are empty (#130).
+
+    The nightly conflictsImport backfill selects on `a.pmid IS NULL`, so a row
+    written empty (no coiStatement upstream at import time) is never revisited and
+    a statement PubMed adds later stays invisible -- ~5,100 rows when measured.
+
+    Weekly, not nightly: COI statements accrue over months, and a full pass re-reads
+    ~87k pmids from DynamoDB. Isolated like the AAR lanes -- any failure is caught
+    and logged so it can NEVER fail the nightly, since this only ever adds data that
+    was missing and is safe to skip until next week."""
+    try:
+        import datetime as _datetime
+        if _datetime.datetime.utcnow().weekday() != 6:   # 6 = Sunday
+            logger.info("COI refresh: not due (runs weekly on Sundays) — skipped")
+            return
+        run_script("conflictsRefresh", "python3 conflictsImport.py --refresh-empty",
+                   timeout_seconds=int(os.getenv("CONFLICTS_REFRESH_TIMEOUT_SECONDS", "3600")))
+    except Exception as e:
+        logger.exception(f"COI refresh failed (ignored — reporting unaffected): {e}")
+
+
 # ------------- AAR PubMed lane (weekly, isolated) -------------
 def run_pubmed_lane_if_due():
     """Weekly PubMed orphan-authorship detector + IO/FB scoring (AAR).
@@ -204,6 +227,7 @@ def main():
     if overall_success:
         run_scopus_lane_if_due()              # weekly (Sun): AAR Scopus lane
         run_pubmed_lane_if_due()              # weekly (Sun): AAR PubMed lane
+        run_conflicts_refresh_if_due()        # weekly (Sun): refill empty COI rows (#130)
 
     upload_log_to_s3()
 

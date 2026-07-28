@@ -293,7 +293,7 @@ All defined in `setup/createEventsProceduresReciterDb.sql`.
 | `dataTransformer.py` | Transforms ReCiter JSON output to CSV format for all `person_*` tables |
 | `run_nightly_indexing.sh` | Calls `populateAnalysisSummaryTables_v2()` with progress monitoring, auto-retry, and auto-restore |
 | `abstractImport.py` | Imports PubMed abstracts from DynamoDB (parallel batch fetches) |
-| `conflictsImport.py` | Imports conflict-of-interest statements from DynamoDB |
+| `conflictsImport.py` | Imports conflict-of-interest statements from DynamoDB (parallel batch fetches) |
 | `executeFeatureGenerator.py` | Triggers ReCiter feature generator API with rate limiting and metrics |
 
 
