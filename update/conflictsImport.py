@@ -56,6 +56,9 @@ DRY_RUN = "--dry-run" in sys.argv
 DRY_RUN_SAMPLE = 500          # PMIDs processed when --dry-run is passed
 DRY_RUN_TABLE = "reporting_conflicts_dryrun"
 
+# Refresh pass (#130). Combines with --dry-run to report without writing.
+REFRESH_EMPTY = "--refresh-empty" in sys.argv
+
 
 # ------------------------------------------------------------------------------
 # Database Connection
@@ -217,6 +220,69 @@ def insert_conflicts(mysql_conn, results, target_table="reporting_conflicts"):
 
 
 # ------------------------------------------------------------------------------
+# Refresh Empty Statements (#130)
+# ------------------------------------------------------------------------------
+def refresh_empty_statements(mysql_conn):
+    """
+    Re-checks rows that exist but hold an empty statement, and fills the ones
+    DynamoDB now has content for.
+
+    The nightly backfill cannot do this. It selects work with
+    `LEFT JOIN ... WHERE a.pmid IS NULL`, and an article with no coiStatement at
+    import time still gets a row written (deliberately -- otherwise the PMID stays
+    "missing" forever and the importer never converges). So the row exists, is
+    never selected again, and any statement PubMed adds in a later record revision
+    stays invisible. Measured at ~5,100 affected rows on 2026-07-28.
+
+    Deliberately does NOT touch rows that already have a statement. Refreshing
+    those means overwriting curated-looking production text on the strength of a
+    single upstream read, and the audit put that class at only ~0.85%. Fill-only
+    is the safe half; revisit the other half separately if it turns out to matter.
+    """
+    with mysql_conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT pmid FROM reporting_conflicts "
+            "WHERE pmid > 0 AND LENGTH(conflictStatement) = 0"
+        )
+        pmids = [row["pmid"] for row in cursor.fetchall()]
+
+    logger.info(f"{len(pmids)} row(s) currently hold an empty conflict statement.")
+    if not pmids:
+        logger.info("Nothing to refresh.")
+        return 0
+
+    results = fetch_all_conflicts(pmids)
+    logger.info(f"Re-fetched {len(results)} of {len(pmids)} from DynamoDB.")
+
+    filled = [(text, text, pmid) for pmid, text in results if text]
+    logger.info(f"{len(filled)} now have a statement upstream.")
+    if not filled:
+        return 0
+
+    if DRY_RUN:
+        for text, _, pmid in filled[:3]:
+            logger.info(f"  would fill PMID {pmid}: {text[:120]!r}")
+        logger.info(f"=== DRY RUN === {len(filled)} row(s) would be filled; nothing written.")
+        return 0
+
+    # `AND LENGTH(conflictStatement) = 0` is the data-loss guard: even if the set
+    # went stale between the SELECT and here, this can only ever fill an empty
+    # statement, never overwrite one. Do not drop it.
+    update_sql = (
+        "UPDATE reporting_conflicts "
+        "SET conflictStatement = %s, conflictsVarchar = CAST(%s AS CHAR(15000)) "
+        "WHERE pmid = %s AND LENGTH(conflictStatement) = 0"
+    )
+    updated = 0
+    with mysql_conn.cursor() as cursor:
+        for i in range(0, len(filled), INSERT_BATCH_SIZE):
+            cursor.executemany(update_sql, filled[i:i + INSERT_BATCH_SIZE])
+            updated += cursor.rowcount   # actual rows changed, not rows attempted
+    logger.info(f"{time.ctime()} -- Filled {updated} previously-empty statement(s).")
+    return updated
+
+
+# ------------------------------------------------------------------------------
 # Dry Run
 # ------------------------------------------------------------------------------
 def run_dry_run(mysql_conn):
@@ -319,6 +385,16 @@ def run_dry_run(mysql_conn):
 # ------------------------------------------------------------------------------
 def main():
     mysql_conn = connect_mysql_server(DB_USERNAME, DB_PASSWORD, DB_HOST, DB_NAME)
+
+    # Checked before DRY_RUN so `--refresh-empty --dry-run` reports the refresh
+    # rather than falling into the insert-path dry run.
+    if REFRESH_EMPTY:
+        try:
+            refresh_empty_statements(mysql_conn)
+        finally:
+            mysql_conn.close()
+        logger.info("Refresh pass complete.")
+        return
 
     if DRY_RUN:
         run_dry_run(mysql_conn)
