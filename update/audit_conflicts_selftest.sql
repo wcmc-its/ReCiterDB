@@ -46,6 +46,7 @@ INSERT INTO reporting_conflicts (pmid, conflictStatement) VALUES
  (1001, 'The authors have declared that no competing interest exists.'),
  (1002, 'Dr. Smith reports grants from NIH. The other authors declare no competing interest.'),
  (1003, 'The authors declare "no" competing interest. Path: C:\\data\\coi.txt'),
+ (1005, '<b>Conflict of Interest:</b> The authors declare none.'),  -- PubMed's own markup, healthy
  (1004, '');
 
 -- Corrupt rows, one per shape the old path produced.
@@ -58,6 +59,14 @@ INSERT INTO reporting_conflicts (pmid, conflictStatement) VALUES
 
 INSERT INTO reporting_conflicts (pmid, conflictStatement)
   VALUES (2005, CONCAT('competing interest ', REPEAT('x', 16000)));      -- exceeds the varchar copy
+
+-- Contamination pair: one long text under two pmids. Plus 3103, the Elsevier header
+-- that legitimately says "competing interest" twice and must stay unflagged.
+INSERT INTO reporting_conflicts (pmid, conflictStatement) VALUES
+ (3101, CONCAT('Conflicts of Interest: Dr Roe reports grants from NIH. ', REPEAT('y', 1200))),
+ (3102, CONCAT('Conflicts of Interest: Dr Roe reports grants from NIH. ', REPEAT('y', 1200))),
+ (3103, CONCAT('Declaration of Competing Interest The authors declare the following financial ',
+               'interests which may be considered as potential competing interests: ', REPEAT('z', 1200)));
 
 UPDATE reporting_conflicts SET conflictsVarchar = CAST(conflictStatement AS CHAR(15000)) WHERE conflictsVarchar IS NULL;
 
@@ -96,13 +105,25 @@ SELECT 'embedded quotes counted' AS assertion,
           CONCAT('FAIL got ', SUM(CONVERT(conflictStatement USING utf8mb4) LIKE '%"%'))) AS result
 FROM reporting_conflicts WHERE LENGTH(conflictStatement) > 0;
 
-SELECT 'cross-paper concatenation detected' AS assertion,
-       IF(COUNT(*) = 1, 'PASS', CONCAT('FAIL got ', COUNT(*))) AS result
-FROM reporting_conflicts
-WHERE LENGTH(conflictStatement) > 0
-  AND ( CHAR_LENGTH(LOWER(CONVERT(conflictStatement USING utf8mb4)))
-        - CHAR_LENGTH(REPLACE(LOWER(CONVERT(conflictStatement USING utf8mb4)), 'competing interest', ''))
-      ) / CHAR_LENGTH('competing interest') >= 2;
+-- Contamination: pmids 3101/3102 share one long text; the Elsevier-boilerplate row
+-- 3103 repeats "competing interest" twice but is a single legitimate statement and
+-- must NOT be flagged. The old repeat-counting heuristic flagged 5,272 rows on the
+-- live table, almost all of them the 3103 shape. That is what this asserts against.
+SELECT 'contamination detected, boilerplate NOT flagged' AS assertion,
+       IF(COUNT(*) = 1 AND SUM(n_pmids) = 2, 'PASS',
+          CONCAT('FAIL texts=', COUNT(*), ' rows=', COALESCE(SUM(n_pmids),0))) AS result
+FROM (SELECT MD5(conflictStatement) AS h, COUNT(DISTINCT pmid) AS n_pmids
+      FROM reporting_conflicts
+      WHERE LENGTH(conflictStatement) > 1000
+      GROUP BY h HAVING COUNT(DISTINCT pmid) > 1) x;
+
+SELECT 'HTML markup start not counted as desync' AS assertion,
+       IF(SUM(CONVERT(conflictStatement USING utf8mb4) REGEXP '^[[:punct:]]'
+              AND CONVERT(conflictStatement USING utf8mb4) NOT LIKE '<%') = 1, 'PASS',
+          CONCAT('FAIL got ', SUM(CONVERT(conflictStatement USING utf8mb4) REGEXP '^[[:punct:]]'
+                 AND CONVERT(conflictStatement USING utf8mb4) NOT LIKE '<%'),
+                 ' -- PubMed ships <b>Conflict...</b> markup; only the bare-quote row is real')) AS result
+FROM reporting_conflicts WHERE LENGTH(conflictStatement) > 0;
 
 -- The regression this file exists for. Expect 2: the truncated row 2002 and the
 -- oversized row 2005, which also happens to start lowercase. Without the binary
@@ -113,9 +134,14 @@ SELECT 'starts_lowercase is case-SENSITIVE' AS assertion,
                  ' expected 2 -- the ci collation is matching uppercase')) AS result
 FROM reporting_conflicts WHERE LENGTH(conflictStatement) > 0;
 
-SELECT 'field-shift and punctuation-start detected' AS assertion,
+-- The un-excluded form must see BOTH the real bare-quote row and the healthy <b> row.
+-- If this ever equals the excluded form's 1, the fixture lost its HTML row and the
+-- markup exclusion above is passing vacuously.
+SELECT 'field-shift detected; markup exclusion is load-bearing' AS assertion,
        IF(SUM(CONVERT(conflictStatement USING utf8mb4) REGEXP '^[0-9]+$') = 1
-          AND SUM(CONVERT(conflictStatement USING utf8mb4) REGEXP '^[[:punct:]]') = 1, 'PASS', 'FAIL') AS result
+          AND SUM(CONVERT(conflictStatement USING utf8mb4) REGEXP '^[[:punct:]]') = 2, 'PASS',
+          CONCAT('FAIL bare_number=', SUM(CONVERT(conflictStatement USING utf8mb4) REGEXP '^[0-9]+$'),
+                 ' punct_unexcluded=', SUM(CONVERT(conflictStatement USING utf8mb4) REGEXP '^[[:punct:]]'))) AS result
 FROM reporting_conflicts WHERE LENGTH(conflictStatement) > 0;
 
 SELECT 'blob exceeding the varchar copy detected' AS assertion,

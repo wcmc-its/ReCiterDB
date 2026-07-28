@@ -47,10 +47,17 @@ WHERE p.articleYear >= 2017
 -- Q2. The escaping skew -- the tell the issue calls out.
 --
 -- LOAD DATA defaulted to ESCAPED BY '\\', so a backslash in the source text was
--- consumed as an escape character rather than stored as data. If essentially no
--- stored statement contains a backslash while a meaningful share contain other
--- punctuation, the backslashes were eaten. A doubled quote ("") is csv.writer's
--- escaping leaking through as literal data.
+-- consumed as an escape character rather than stored as data. A doubled quote ("")
+-- is csv.writer's escaping leaking through as literal data.
+--
+-- CALIBRATION, measured on the live table 2026-07-28: 1 backslash and 65 quotes in
+-- 74,170 non-empty statements. That looks alarming and is NOT -- COI statements are
+-- short stereotyped prose (64% under 200 bytes) whose natural backslash rate really
+-- is near zero, and the one hit is a genuine 'http:\<...>' stored intact. A verbatim
+-- DynamoDB comparison over 1,660 sampled rows found ZERO escaping damage.
+-- contains_comma_control is the control: it must be large (it was 27,251), proving
+-- the LIKE machinery works and a low backslash count is a real base rate, not a
+-- broken query. Do not read a low backslash count here as corruption on its own.
 -- ---------------------------------------------------------------------------
 SELECT 'Q2 escaping skew' AS check_name,
        COUNT(*)                                                                  AS nonempty_rows,
@@ -63,33 +70,40 @@ FROM reporting_conflicts
 WHERE LENGTH(conflictStatement) > 0;
 
 -- ---------------------------------------------------------------------------
--- Q3. Cross-paper concatenation -- the #87/#89/#88 shape.
+-- Q3. Cross-paper contamination -- the #87/#89/#88 shape.
 --
--- COI statements are highly stereotyped. A row where the boilerplate opening
--- appears two or more times is two papers' text welded together by a desynced
--- LOAD DATA parse. Occurrence count via the standard length-of-REPLACE idiom.
+-- Detect it as one long statement appearing under MORE THAN ONE pmid. A desynced
+-- reader assigns the same text to several rows, so a shared fingerprint is the
+-- signature; a length threshold keeps short shared boilerplate ("None declared.")
+-- out, since that repeats legitimately across thousands of papers.
+--
+-- DO NOT go back to counting repeated boilerplate ("competing interest" appearing
+-- twice in one row). That was tried and measured against the live table: it
+-- flagged 5,272 rows, essentially all false positives, because the standard
+-- Elsevier header "Declaration of Competing Interest ... may be considered as
+-- potential competing interests" legitimately contains the phrase twice. A
+-- detector that fires on 7% of a healthy table is worse than no detector.
 -- ---------------------------------------------------------------------------
-SELECT 'Q3 concatenation' AS check_name,
-       COUNT(*) AS suspect_rows
-FROM reporting_conflicts
-WHERE LENGTH(conflictStatement) > 0
-  AND ( CHAR_LENGTH(LOWER(CONVERT(conflictStatement USING utf8mb4)))
-        - CHAR_LENGTH(REPLACE(LOWER(CONVERT(conflictStatement USING utf8mb4)),
-                              'competing interest', ''))
-      ) / CHAR_LENGTH('competing interest') >= 2;
+SELECT 'Q3 contamination' AS check_name,
+       COUNT(*)         AS shared_texts,
+       COALESCE(SUM(n_pmids), 0) AS rows_involved
+FROM (SELECT MD5(conflictStatement) AS h, COUNT(DISTINCT pmid) AS n_pmids
+      FROM reporting_conflicts
+      WHERE LENGTH(conflictStatement) > 1000
+      GROUP BY h
+      HAVING COUNT(DISTINCT pmid) > 1) x;
 
--- The worst offenders, to eyeball. If these read as one coherent statement the
--- detector is just seeing a wordy disclosure; if they read as two papers, it is real.
-SELECT pmid,
-       LENGTH(conflictStatement) AS blob_bytes,
-       LEFT(CONVERT(conflictStatement USING utf8mb4), 300) AS head_300
+-- Eyeball these. Co-authors on a consortium paper and same-group submissions do
+-- legitimately share a long disclosure, so a handful here is normal; what is not
+-- normal is one text spread across many unrelated pmids.
+SELECT COUNT(DISTINCT pmid) AS n_pmids,
+       MIN(LENGTH(conflictStatement)) AS blob_bytes,
+       LEFT(CONVERT(MIN(conflictStatement) USING utf8mb4), 200) AS head_200
 FROM reporting_conflicts
-WHERE LENGTH(conflictStatement) > 0
-  AND ( CHAR_LENGTH(LOWER(CONVERT(conflictStatement USING utf8mb4)))
-        - CHAR_LENGTH(REPLACE(LOWER(CONVERT(conflictStatement USING utf8mb4)),
-                              'competing interest', ''))
-      ) / CHAR_LENGTH('competing interest') >= 2
-ORDER BY LENGTH(conflictStatement) DESC
+WHERE LENGTH(conflictStatement) > 1000
+GROUP BY MD5(conflictStatement)
+HAVING COUNT(DISTINCT pmid) > 1
+ORDER BY n_pmids DESC, blob_bytes DESC
 LIMIT 10;
 
 -- ---------------------------------------------------------------------------
@@ -103,9 +117,14 @@ LIMIT 10;
 -- utf8mb4_unicode_ci, under which REGEXP '^[a-z]' matches uppercase too and every
 -- healthy row is reported as a desync. Verified against a seeded fixture -- without
 -- the binary collation this counted 7 of 9 rows instead of the 1 that is real.
+--
+-- starts_punctuation excludes a leading '<': PubMed ships COI statements containing
+-- its own HTML markup, and on the live table 8,646 of 8,646 punctuation-starts were
+-- just '<b>Conflict of Interest...'. Without the exclusion this reads as 12% corruption.
 SELECT 'Q4 desync tells' AS check_name,
        SUM(CONVERT(conflictStatement USING utf8mb4) COLLATE utf8mb4_bin REGEXP '^[a-z]') AS starts_lowercase,
-       SUM(CONVERT(conflictStatement USING utf8mb4) REGEXP '^[[:punct:]]') AS starts_punctuation,
+       SUM(CONVERT(conflictStatement USING utf8mb4) REGEXP '^[[:punct:]]'
+           AND CONVERT(conflictStatement USING utf8mb4) NOT LIKE '<%') AS starts_punctuation,
        SUM(CONVERT(conflictStatement USING utf8mb4) REGEXP '^[0-9]+$')     AS is_bare_number,
        MAX(LENGTH(conflictStatement))                                      AS max_blob_bytes,
        SUM(LENGTH(conflictStatement) >= 65535)                             AS at_blob_ceiling
