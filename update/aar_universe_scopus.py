@@ -18,11 +18,13 @@ Authorships tab (WP3) lets curators Accept them as ExternalArticle records (no P
 Per-doc pipeline (probe-verified — analysis/.../2026-07-03-scopus-probe/):
   1. Sweep Scopus COMPLETE view for the family AF-IDs over an ORIG-LOAD-DATE window.
   2. Drop docs carrying a Scopus pubmed-id (the PubMed lane owns them).
-  3. Resolve remaining DOIs against PubMed ([DOI] esearch); resolved -> drop.
-     What's left is the Scopus-only lane (~1% have no DOI -> keyed by numeric Scopus ID).
+  3. Resolve remaining docs against PubMed: [DOI] esearch when a DOI exists, else a
+     Book skip / ISSN pre-filter / unquoted title+author esearch fallback for the
+     13.7% with no DOI (live-measured 2026-08-14, not the ~1% originally assumed —
+     see resolve_no_doi). Either hit -> drop.
   4. Per-author WCM tagging (afid in the family set) -> match via identity_index.
   5. Upsert via aar_db (source='scopus', external_id=numeric-id|DOI, pmid=NULL).
-  6. Re-check: open scopus rows whose DOI is now in PubMed are resolved out.
+  6. Re-check: open scopus rows now in PubMed (DOI, else title) are resolved out.
 
 Windowing (in-cluster default): rolling short-lag window (Decision A) — each weekly
 run sweeps ORIG-LOAD-DATE over [today-90d, today-14d]. New Scopus authorships surface
@@ -67,10 +69,10 @@ _PUBMED_API_KEY = os.environ.get("PUBMED_API_KEY")
 _PM_SLEEP = 0.12 if _PUBMED_API_KEY else 0.34   # 10 req/s with key, 3/s without
 
 
-def _pubmed_count(term):
-    """esearch hit-count for a PubMed term (throttled, retrying). Returns 0 on any
-    persistent failure — the safe direction: an unresolved DOI stays a scopus row and
-    is re-checked next run rather than being silently dropped."""
+def _pubmed_esearch(term):
+    """esearch result dict for a PubMed term (throttled, retrying), or None on
+    persistent failure — the safe direction: an unresolved DOI/title stays a scopus
+    row and is re-checked next run rather than being silently dropped."""
     params = {"db": "pubmed", "term": term, "retmax": 1, "retmode": "json",
               "tool": "reciterdb-aar-scopus", "email": os.environ.get("NCBI_EMAIL", "")}
     if _PUBMED_API_KEY:
@@ -79,20 +81,96 @@ def _pubmed_count(term):
         try:
             r = requests.get(f"{EUTILS}/esearch.fcgi", params=params, timeout=60)
             if r.status_code == 200:
-                return int(r.json()["esearchresult"]["count"])
+                return r.json().get("esearchresult")
             if r.status_code in (429, 500, 502, 503, 504):
                 time.sleep(1.5 * (attempt + 1))
                 continue
             r.raise_for_status()
         except (requests.RequestException, KeyError, ValueError, TypeError):
             if attempt == 4:
-                return 0
+                return None
             time.sleep(1.5 * (attempt + 1))
-    return 0
+    return None
+
+
+def _pubmed_count(term):
+    """esearch hit-count for a PubMed term. Returns 0 on any persistent failure or
+    malformed response — same safe direction as _pubmed_esearch."""
+    j = _pubmed_esearch(term)
+    try:
+        return int(j["count"]) if j else 0
+    except (KeyError, ValueError, TypeError):
+        return 0
 
 
 def doi_in_pubmed(doi):
     return bool(doi) and _pubmed_count(f'"{doi}"[DOI]') > 0
+
+
+def title_in_pubmed(title, author_last=None):
+    """Fallback for no-DOI Scopus docs (13.7% of the corpus, not the ~1% originally
+    assumed — live-measured 2026-08-14). Deliberately UNQUOTED: NCBI's exact
+    quoted-phrase [Title] search is unreliable on long, punctuation-heavy titles
+    (live-verified — it reports the phrase 'not found in the phrase index' even with
+    punctuation matching byte-for-byte against PubMed's own stored title). Unquoted
+    `{title}[ti]` instead ANDs every title word via Automatic Term Mapping
+    (live-verified against the case that motivated this: 0 hits quoted, 1 exact hit
+    unquoted). Titles alone are not always unique, so AND in the author's surname
+    when known — cuts collision risk for shorter or more generic titles at
+    negligible cost."""
+    title = (title or "").strip()
+    if not title:
+        return False
+    term = f"{title}[ti]"
+    if author_last:
+        term += f" AND {author_last}[au]"
+    return _pubmed_count(term) > 0
+
+
+def issn_in_pubmed(issn):
+    """Does this journal have ANY MEDLINE/PubMed presence at all? Scopus gives ISSNs
+    unhyphenated (e.g. '0732183X'); PubMed's [issn] field tag needs NNNN-NNNC (live-
+    verified: unhyphenated silently falls through to a useless All-Fields text match,
+    hyphenated correctly resolves to the journal). NOT proof a *specific* article is
+    indexed — MEDLINE indexing is selective within a journal — only that the venue is
+    indexable at all.
+
+    GOTCHA caught live: an unrecognized ISSN doesn't error, it silently falls back to
+    an All-Fields free-text search and can return a coincidental non-zero count — a
+    fake '9999-9999[issn]' matched 6 unrelated articles via translation
+    '"9999-9999"[All Fields]'. So a non-zero count alone isn't enough;
+    querytranslation must actually show [Journal] or the "hit" is meaningless.
+    Returns None (not False) whenever the ISSN is missing/malformed/unrecognized, so
+    callers don't mistake "we can't check" for "confirmed absent"."""
+    issn = (issn or "").strip().upper()
+    if len(issn) != 8:
+        return None
+    hyphenated = f"{issn[:4]}-{issn[4:]}"
+    j = _pubmed_esearch(f"{hyphenated}[issn]")
+    if not j or "[Journal]" not in (j.get("querytranslation") or ""):
+        return None  # not recognized as a journal ISSN — don't trust the count
+    try:
+        return int(j["count"]) > 0
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+def resolve_no_doi(title, author_last, pub_type, issn):
+    """Best-effort PubMed resolution for a DOI-less doc, cheapest signal first.
+    - Book: skip entirely, no PubMed call. Live-measured 8% hit rate (n=25) and books
+      are ISBN-keyed (no ISSN), so there's no cheaper signal available for them anyway.
+    - Otherwise, an ISSN-has-any-presence check is a cheap, high-confidence early exit
+      when the whole journal has zero PubMed footprint — a title search would almost
+      certainly miss too. Only short-circuits on a *confirmed* False; unknown/
+      malformed ISSN (None) falls through same as no ISSN at all.
+    - Falls through to the title+author search otherwise (MEDLINE indexing is
+      selective even within an indexed journal, so journal-level presence alone
+      isn't sufficient)."""
+    if pub_type == "Book":
+        return False
+    if issn and issn_in_pubmed(issn) is False:
+        return False
+    return title_in_pubmed(title, author_last)
 
 
 # ---- tiny local helpers -----------------------------------------------------
@@ -266,25 +344,39 @@ def _build_row(entry, i, n, author, top, cands, run_ts):
 
 # ---- re-check open scopus rows ----------------------------------------------
 def recheck_open_scopus(run_ts):
-    """Open scopus rows whose DOI is now PubMed-reachable are resolved out — the PubMed
-    lane will surface them if still orphaned. Guarded on status='open' so a curator's
-    accept/reject is never clobbered. (No dedicated 'resolved' ENUM value; dismissed +
-    an auto note is the removal-from-queue state.)"""
+    """Open scopus rows now PubMed-reachable are resolved out — by DOI when present,
+    else the title fallback, skipping Book entirely (live-measured 8% hit rate — see
+    resolve_no_doi). The PubMed lane will surface them if still orphaned. Guarded on
+    status='open' so a curator's accept/reject is never clobbered. (No dedicated
+    'resolved' ENUM value; dismissed + an auto note is the removal-from-queue state.)
+
+    No ISSN pre-check here unlike resolve_no_doi's ingest-time path — the table has no
+    issn column (never persisted), so an already-stored row can't be journal-filtered
+    without a migration. Deferred; ingest-time filtering already stops new Book/dead-
+    journal rows from accumulating, this only affects rows already in the backlog
+    before that shipped."""
     from sqlalchemy import text
     eng = aar_db.engine()
     with eng.connect() as c:
         rows = c.execute(text(
-            "SELECT author_key, doi FROM authorship_review "
-            "WHERE source='scopus' AND status='open' AND doi IS NOT NULL")).mappings().all()
+            "SELECT author_key, doi, title, wcm_author, pub_type FROM authorship_review "
+            "WHERE source='scopus' AND status='open'")).mappings().all()
     resolved = 0
     for r in rows:
-        if doi_in_pubmed(r["doi"]):
+        if r["pub_type"] == "Book":
+            continue
+        if r["doi"]:
+            hit = doi_in_pubmed(r["doi"])
+        else:
+            author_last = (r["wcm_author"] or "").split()[-1] if r["wcm_author"] else None
+            hit = title_in_pubmed(r["title"], author_last)
+        if hit:
             with eng.begin() as c:
                 c.execute(text(
                     "UPDATE authorship_review SET status='dismissed', resolved_at=:ts, "
-                    "note=CONCAT('auto: DOI now in PubMed (', :d, ')') "
+                    "note=CONCAT('auto: now in PubMed (', :d, ')') "
                     "WHERE author_key=:k AND status='open'"),
-                    {"ts": run_ts, "d": r["doi"], "k": r["author_key"]})
+                    {"ts": run_ts, "d": r["doi"] or "title match", "k": r["author_key"]})
             resolved += 1
         time.sleep(_PM_SLEEP)
     return resolved
@@ -304,8 +396,8 @@ def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True,
     print(f"[2/5] {len(docs) - len(no_pmid)} carry a Scopus PMID (dropped); "
           f"{len(no_pmid)} no-PMID", flush=True)
 
-    print("[3/5] Resolving no-PMID DOIs against PubMed ...", flush=True)
-    scopus_only, resolved = [], 0
+    print("[3/5] Resolving no-PMID docs against PubMed (DOI, else title) ...", flush=True)
+    scopus_only, resolved, resolved_by_title = [], 0, 0
     for d in no_pmid:
         doi = d.get("prism:doi")
         if doi:
@@ -314,8 +406,17 @@ def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True,
             if hit:
                 resolved += 1
                 continue
-        scopus_only.append(d)                          # no DOI (~1%) kept, keyed by scopus id
-    print(f"      {resolved} resolved to PubMed by DOI (dropped); "
+        else:
+            authors = _as_list(d.get("author"))
+            author_last = authors[0].get("surname") if authors else None
+            issn = d.get("prism:issn") or d.get("prism:eIssn")
+            hit = resolve_no_doi(d.get("dc:title"), author_last, d.get("subtypeDescription"), issn)
+            time.sleep(_PM_SLEEP)
+            if hit:
+                resolved_by_title += 1
+                continue
+        scopus_only.append(d)
+    print(f"      {resolved} resolved to PubMed by DOI, {resolved_by_title} by title (dropped); "
           f"{len(scopus_only)} SCOPUS-ONLY", flush=True)
 
     print("[4/5] Matching WCM authorships against the identity roster ...", flush=True)
@@ -436,6 +537,10 @@ def _selftest():
           _container_doi("10.1007/s11940-026-00868-8", "Article") is None)
     check("119027669 (UCSF) excluded from family set",
           "119027669" not in load_family_afids())
+    check("resolve_no_doi skips Book entirely (no PubMed call)",
+          resolve_no_doi("t", "x", "Book", "12345678") is False)
+    check("issn_in_pubmed rejects malformed length without a network call",
+          issn_in_pubmed("bad") is None)
     check("rolling window spans [today-90d, today-14d]",
           rolling_window(date(2026, 7, 4)) == ("20260405", "20260620"))
     check("rolling window honours custom lag/span",
