@@ -142,10 +142,9 @@ def issn_in_pubmed(issn):
     querytranslation must actually show [Journal] or the "hit" is meaningless.
     Returns None (not False) whenever the ISSN is missing/malformed/unrecognized, so
     callers don't mistake "we can't check" for "confirmed absent"."""
-    issn = (issn or "").strip().upper()
-    if len(issn) != 8:
+    hyphenated = _normalize_issn(issn)
+    if not hyphenated:
         return None
-    hyphenated = f"{issn[:4]}-{issn[4:]}"
     j = _pubmed_esearch(f"{hyphenated}[issn]")
     if not j or "[Journal]" not in (j.get("querytranslation") or ""):
         return None  # not recognized as a journal ISSN — don't trust the count
@@ -174,6 +173,15 @@ def resolve_no_doi(title, author_last, pub_type, issn):
 
 
 # ---- tiny local helpers -----------------------------------------------------
+def _normalize_issn(issn):
+    """Scopus gives ISSN unhyphenated (e.g. '0732183X'); PubMed's [issn] tag and the
+    authorship_review.issn column both want hyphenated NNNN-NNNC. Returns None for
+    anything that isn't exactly 8 chars (missing/malformed — stored as NULL rather
+    than guessed at)."""
+    issn = (issn or "").strip().upper()
+    return f"{issn[:4]}-{issn[4:]}" if len(issn) == 8 else None
+
+
 def _position_label(i, n):
     return "first" if i == 0 else "last" if i == n - 1 else "middle"
 
@@ -324,6 +332,7 @@ def _build_row(entry, i, n, author, top, cands, run_ts):
         "entrez_date": entry.get("prism:coverDate"),   # Scopus has no entrez date; coverDate ~ recency
         "title": entry.get("dc:title"),
         "journal": _trunc(entry.get("prism:publicationName"), 512),
+        "issn": _normalize_issn(entry.get("prism:issn") or entry.get("prism:eIssn")),
         "doi": _trunc(doi, 255),
         "classification": "absent",                    # no PMID -> production never scored it
         "top_cwid": top["cwid"] if top else None,
@@ -345,21 +354,21 @@ def _build_row(entry, i, n, author, top, cands, run_ts):
 # ---- re-check open scopus rows ----------------------------------------------
 def recheck_open_scopus(run_ts):
     """Open scopus rows now PubMed-reachable are resolved out — by DOI when present,
-    else the title fallback, skipping Book entirely (live-measured 8% hit rate — see
-    resolve_no_doi). The PubMed lane will surface them if still orphaned. Guarded on
-    status='open' so a curator's accept/reject is never clobbered. (No dedicated
-    'resolved' ENUM value; dismissed + an auto note is the removal-from-queue state.)
+    else ISSN dead-journal pre-filter + title fallback, skipping Book entirely
+    (live-measured 8% hit rate — see resolve_no_doi). The PubMed lane will surface
+    them if still orphaned. Guarded on status='open' so a curator's accept/reject is
+    never clobbered. (No dedicated 'resolved' ENUM value; dismissed + an auto note is
+    the removal-from-queue state.)
 
-    No ISSN pre-check here unlike resolve_no_doi's ingest-time path — the table has no
-    issn column (never persisted), so an already-stored row can't be journal-filtered
-    without a migration. Deferred; ingest-time filtering already stops new Book/dead-
-    journal rows from accumulating, this only affects rows already in the backlog
-    before that shipped."""
+    `issn` reaches the backlog two ways: rows upserted after the issn column shipped
+    already have it; older rows have issn=NULL until their next producer refresh
+    re-upserts them (source doc still has prism:issn) — until then they just skip
+    straight to the title check, same as before this column existed."""
     from sqlalchemy import text
     eng = aar_db.engine()
     with eng.connect() as c:
         rows = c.execute(text(
-            "SELECT author_key, doi, title, wcm_author, pub_type FROM authorship_review "
+            "SELECT author_key, doi, title, wcm_author, pub_type, issn FROM authorship_review "
             "WHERE source='scopus' AND status='open'")).mappings().all()
     resolved = 0
     for r in rows:
@@ -367,6 +376,8 @@ def recheck_open_scopus(run_ts):
             continue
         if r["doi"]:
             hit = doi_in_pubmed(r["doi"])
+        elif r["issn"] and issn_in_pubmed(r["issn"]) is False:
+            hit = False   # dead journal — a title search would almost certainly miss too
         else:
             author_last = (r["wcm_author"] or "").split()[-1] if r["wcm_author"] else None
             hit = title_in_pubmed(r["title"], author_last)
@@ -541,6 +552,8 @@ def _selftest():
           resolve_no_doi("t", "x", "Book", "12345678") is False)
     check("issn_in_pubmed rejects malformed length without a network call",
           issn_in_pubmed("bad") is None)
+    check("_normalize_issn hyphenates Scopus's unhyphenated form",
+          _normalize_issn("0732183X") == "0732-183X" and _normalize_issn("bad") is None)
     check("rolling window spans [today-90d, today-14d]",
           rolling_window(date(2026, 7, 4)) == ("20260405", "20260620"))
     check("rolling window honours custom lag/span",
