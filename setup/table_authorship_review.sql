@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS `authorship_review` (
   `entrez_date`            DATE         NULL,                -- ReCiter entrez add date
   `title`                  TEXT         NULL,
   `journal`                VARCHAR(512) NULL,
+  `issn`                   VARCHAR(9)   NULL,                -- hyphenated NNNN-NNNC, scopus only
   `doi`                    VARCHAR(255) NULL,
   `classification`         ENUM('assigned','suggested','buried','absent') NULL,
   `top_cwid`               VARCHAR(32)  NULL,                -- proposed identity

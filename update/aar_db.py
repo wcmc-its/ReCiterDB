@@ -30,7 +30,7 @@ TABLE = "authorship_review"
 _REFRESH_COLS = [
     "source", "external_id", "pub_type", "container_id",
     "author_position", "author_position_label", "wcm_author", "author_affiliation",
-    "entrez_date", "title", "journal", "doi", "classification",
+    "entrez_date", "title", "journal", "issn", "doi", "classification",
     "top_cwid", "top_name", "top_person_type", "top_dept",
     "top_fg_score", "top_io_score", "top_confidence", "top_cohort_size",
     "top_given_match", "top_affil_match", "n_candidates", "single_candidate",
@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
   entrez_date            DATE         NULL,
   title                  TEXT         NULL,
   journal                VARCHAR(512) NULL,
+  issn                   VARCHAR(9)   NULL,
   doi                    VARCHAR(255) NULL,
   classification         ENUM('assigned','suggested','buried','absent') NULL,
   top_cwid               VARCHAR(32)  NULL,
