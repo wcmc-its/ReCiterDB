@@ -18,10 +18,10 @@ Authorships tab (WP3) lets curators Accept them as ExternalArticle records (no P
 Per-doc pipeline (probe-verified — analysis/.../2026-07-03-scopus-probe/):
   1. Sweep Scopus COMPLETE view for the family AF-IDs over an ORIG-LOAD-DATE window.
   2. Drop docs carrying a Scopus pubmed-id (the PubMed lane owns them).
-  3. Resolve remaining docs against PubMed: [DOI] esearch when a DOI exists, else a
-     Book skip / ISSN pre-filter / unquoted title+author esearch fallback for the
-     13.7% with no DOI (live-measured 2026-08-14, not the ~1% originally assumed —
-     see resolve_no_doi). Either hit -> drop.
+  3. Resolve remaining docs against PubMed: [DOI] esearch when a DOI exists, else an
+     ISSN pre-filter (Book: ISBN instead — no ISSN) / unquoted title+author esearch
+     fallback for the 13.7% with no DOI (live-measured 2026-08-14, not the ~1%
+     originally assumed — see resolve_no_doi). Either hit -> drop.
   4. Per-author WCM tagging (afid in the family set) -> match via identity_index.
   5. Upsert via aar_db (source='scopus', external_id=numeric-id|DOI, pmid=NULL).
   6. Re-check: open scopus rows now in PubMed (DOI, else title) are resolved out.
@@ -154,11 +154,39 @@ def issn_in_pubmed(issn):
         return None
 
 
-def resolve_no_doi(title, author_last, pub_type, issn):
+def isbn_in_pubmed(isbns):
+    """Does PubMed/NLM have a catalog record for this book, by any of its ISBNs (Scopus
+    gives several — print/ebook editions)? Unlike [issn], PubMed's [ISBN] tag doesn't
+    silently fall back to an All-Fields text match on an unrecognized value (live-
+    verified: a garbage 10-digit ISBN correctly comes back with an empty
+    querytranslation match and phrasesnotfound, not a coincidental hit) — still checked
+    defensively here to match the [issn] guard's spirit, in case that holds only for
+    the specific cases tested. Tries each ISBN in turn, first hit wins; returns False
+    (not None) when nothing hits or none were supplied — resolve_no_doi falls through
+    to the title search either way, same as an unconfirmable ISSN."""
+    for isbn in isbns or []:
+        isbn = (isbn or "").strip()
+        if not isbn:
+            continue
+        j = _pubmed_esearch(f"{isbn}[ISBN]")
+        if j and "[ISBN]" in (j.get("querytranslation") or ""):
+            try:
+                if int(j["count"]) > 0:
+                    return True
+            except (KeyError, ValueError, TypeError):
+                pass
+        time.sleep(_PM_SLEEP)
+    return False
+
+
+def resolve_no_doi(title, author_last, pub_type, issn, isbns=None):
     """Best-effort PubMed resolution for a DOI-less doc, cheapest signal first.
-    - Book: skip entirely, no PubMed call. Live-measured 8% hit rate (n=25) and books
-      are ISBN-keyed (no ISSN), so there's no cheaper signal available for them anyway.
-    - Otherwise, an ISSN-has-any-presence check is a cheap, high-confidence early exit
+    - Book: no ISSN (ISBN-keyed, not journal-keyed), so try each ISBN first — a live
+      probe (2026-08-14, n=26) found ISBN resolves 3.8% on its own and title 7.7%,
+      together 11.5% (one book each caught that the other missed — complementary, not
+      redundant). Falls through to title if ISBN comes up empty/unavailable, same as
+      every other type; there's no Book-specific skip left.
+    - Non-Book: an ISSN-has-any-presence check is a cheap, high-confidence early exit
       when the whole journal has zero PubMed footprint — a title search would almost
       certainly miss too. Only short-circuits on a *confirmed* False; unknown/
       malformed ISSN (None) falls through same as no ISSN at all.
@@ -166,7 +194,9 @@ def resolve_no_doi(title, author_last, pub_type, issn):
       selective even within an indexed journal, so journal-level presence alone
       isn't sufficient)."""
     if pub_type == "Book":
-        return False
+        if isbn_in_pubmed(isbns):
+            return True
+        return title_in_pubmed(title, author_last)
     if issn and issn_in_pubmed(issn) is False:
         return False
     return title_in_pubmed(title, author_last)
@@ -180,6 +210,21 @@ def _normalize_issn(issn):
     than guessed at)."""
     issn = (issn or "").strip().upper()
     return f"{issn[:4]}-{issn[4:]}" if len(issn) == 8 else None
+
+
+def _extract_isbns(entry):
+    """Scopus packs multiple ISBNs (print/ebook editions) into prism:isbn as a list
+    holding ONE dict whose '$' is itself a bracketed comma-separated string —
+    e.g. '[9781609136826, 9781469879918]' — not a real JSON array of separate
+    values. Live-verified against a real Book doc, 2026-08-14; unpacked here
+    rather than trusted as-is."""
+    out = []
+    for item in _as_list(entry.get("prism:isbn")):
+        s = (item.get("$", "") if isinstance(item, dict) else str(item or "")).strip()
+        if s.startswith("[") and s.endswith("]"):
+            s = s[1:-1]
+        out.extend(p.strip() for p in s.split(",") if p.strip())
+    return out
 
 
 def _position_label(i, n):
@@ -354,16 +399,20 @@ def _build_row(entry, i, n, author, top, cands, run_ts):
 # ---- re-check open scopus rows ----------------------------------------------
 def recheck_open_scopus(run_ts):
     """Open scopus rows now PubMed-reachable are resolved out — by DOI when present,
-    else ISSN dead-journal pre-filter + title fallback, skipping Book entirely
-    (live-measured 8% hit rate — see resolve_no_doi). The PubMed lane will surface
-    them if still orphaned. Guarded on status='open' so a curator's accept/reject is
-    never clobbered. (No dedicated 'resolved' ENUM value; dismissed + an auto note is
-    the removal-from-queue state.)
+    else delegated to resolve_no_doi (ISSN dead-journal pre-filter / ISBN for Book /
+    title fallback — same logic ingest uses, no more Book-specific branch here). The
+    PubMed lane will surface them if still orphaned. Guarded on status='open' so a
+    curator's accept/reject is never clobbered. (No dedicated 'resolved' ENUM value;
+    dismissed + an auto note is the removal-from-queue state.)
 
     `issn` reaches the backlog two ways: rows upserted after the issn column shipped
     already have it; older rows have issn=NULL until their next producer refresh
-    re-upserts them (source doc still has prism:issn) — until then they just skip
-    straight to the title check, same as before this column existed."""
+    re-upserts them (source doc still has prism:issn) — until then resolve_no_doi
+    just falls through to the title check, same as before that column existed.
+    isbn isn't persisted at all (no column yet — unlike issn, ISBN only matters for
+    the small Book slice, not worth a migration until it's shown to matter at scale)
+    so Book rows in the backlog only get title-checked here, missing the ISBN-only
+    catches ingest-time resolution would find; deferred, matching the issn gap."""
     from sqlalchemy import text
     eng = aar_db.engine()
     with eng.connect() as c:
@@ -372,15 +421,11 @@ def recheck_open_scopus(run_ts):
             "WHERE source='scopus' AND status='open'")).mappings().all()
     resolved = 0
     for r in rows:
-        if r["pub_type"] == "Book":
-            continue
         if r["doi"]:
             hit = doi_in_pubmed(r["doi"])
-        elif r["issn"] and issn_in_pubmed(r["issn"]) is False:
-            hit = False   # dead journal — a title search would almost certainly miss too
         else:
             author_last = (r["wcm_author"] or "").split()[-1] if r["wcm_author"] else None
-            hit = title_in_pubmed(r["title"], author_last)
+            hit = resolve_no_doi(r["title"], author_last, r["pub_type"], r["issn"])
         if hit:
             with eng.begin() as c:
                 c.execute(text(
@@ -421,7 +466,8 @@ def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True,
             authors = _as_list(d.get("author"))
             author_last = authors[0].get("surname") if authors else None
             issn = d.get("prism:issn") or d.get("prism:eIssn")
-            hit = resolve_no_doi(d.get("dc:title"), author_last, d.get("subtypeDescription"), issn)
+            isbns = _extract_isbns(d)
+            hit = resolve_no_doi(d.get("dc:title"), author_last, d.get("subtypeDescription"), issn, isbns)
             time.sleep(_PM_SLEEP)
             if hit:
                 resolved_by_title += 1
@@ -548,8 +594,13 @@ def _selftest():
           _container_doi("10.1007/s11940-026-00868-8", "Article") is None)
     check("119027669 (UCSF) excluded from family set",
           "119027669" not in load_family_afids())
-    check("resolve_no_doi skips Book entirely (no PubMed call)",
-          resolve_no_doi("t", "x", "Book", "12345678") is False)
+    check("isbn_in_pubmed makes no network call for an empty/missing isbn list",
+          isbn_in_pubmed([]) is False and isbn_in_pubmed(None) is False)
+    check("_extract_isbns unpacks Scopus's bracketed-string-in-a-dict-in-a-list form",
+          _extract_isbns({"prism:isbn": [{"$": "[9781609136826, 9781469879918]"}]})
+          == ["9781609136826", "9781469879918"])
+    check("_extract_isbns returns [] when the doc has no isbn field",
+          _extract_isbns({}) == [])
     check("issn_in_pubmed rejects malformed length without a network call",
           issn_in_pubmed("bad") is None)
     check("_normalize_issn hyphenates Scopus's unhyphenated form",
