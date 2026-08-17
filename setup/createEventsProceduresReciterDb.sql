@@ -3590,7 +3590,9 @@ proc_main: BEGIN
     )
     SELECT DISTINCT
         pmid,
-        MAX(pmcid),
+        -- #141: gate on datePublicationAddedToPMC so pmcid only reflects confirmed
+        -- full-text availability, not PubMed's raw (often pre-embargo) cross-reference
+        CASE WHEN MAX(datePublicationAddedToPMC) IS NOT NULL THEN MAX(pmcid) END,
         publicationTypeCanonical,
         IF(articleYear != 0, articleYear, LEFT(publicationDateStandardized, 4)),
         MIN(publicationDateStandardized),
