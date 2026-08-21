@@ -8,7 +8,8 @@ INSERT INTO `admin_roles` (`roleID`, `roleLabel`) VALUES
   (3,'Reporter_All'),
   (4,'Curator_Self'),
   (5,'Curator_Department'),
-  (6,'Curator_Department_Delegate');
+  (6,'Curator_Department_Delegate'),
+  (7,'Curator_Scoped');
 UNLOCK TABLES;
 
 TRUNCATE `analysis_special_characters`;
