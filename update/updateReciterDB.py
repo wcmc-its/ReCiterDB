@@ -44,6 +44,11 @@ connection = None
 # (env var on the reciterdb CronJob) once verified on dev.
 ATOMIC_SWAP = os.getenv("ATOMIC_SWAP", "0") == "1"
 
+# main() is called once per Analysis chunk (176 times in a measured nightly run),
+# so the shadow-table warning below is emitted only on the first call per process.
+# A warning that fires 176 times a night is a warning operators learn to ignore.
+_SWAP_WARNING_EMITTED = False
+
 # The 10 tables that participate in the atomic swap. person_temp is
 # deliberately excluded -- it is internal staging, always truncated and
 # loaded in place, never swapped.
@@ -285,7 +290,7 @@ def main(truncate_tables=True, skip_person_temp=False):
                            loads data, then re-enables keys at the end.
     :param skip_person_temp: If True, skip loading person_temp (and thus skip update_person).
     """
-    global connection
+    global connection, _SWAP_WARNING_EMITTED
     connection = establish_connection()
     cursor = connection.cursor()
 
@@ -476,7 +481,8 @@ def main(truncate_tables=True, skip_person_temp=False):
 
         connection.commit()
 
-        if ATOMIC_SWAP:
+        if ATOMIC_SWAP and not _SWAP_WARNING_EMITTED:
+            _SWAP_WARNING_EMITTED = True
             logger.warning(
                 "ATOMIC_SWAP=1: this run wrote to `<table>_new` SHADOW TABLES, not the "
                 "live tables. That data will NOT be visible to readers until "
