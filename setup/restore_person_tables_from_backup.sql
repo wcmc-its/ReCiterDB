@@ -1,4 +1,5 @@
--- Rollback helper for the nightly loader's atomic table swap (ATOMIC_SWAP=1).
+-- Rollback helper for the nightly loader's atomic table swap.
+-- The swap itself is swap_person_tables() in setup/person_table_swap.sql.
 -- Mirrors restore_from_backup_v2 (setup/restore_from_backup_v2.sql) but for the
 -- 10 person_* tables promoted by swap_new_tables_into_place() in update/updateReciterDB.py.
 -- The `_backup` tables persist until the NEXT run's pre-swap drop, so this can restore the
@@ -6,6 +7,14 @@
 --
 -- Apply with:  mysql --host=... --user=... --password=... reciterdb < this_file.sql
 -- Invoke with: CALL restore_person_tables_from_backup();
+--
+-- OPERATIONAL WARNING: do NOT run this while a nightly job holds a database
+-- connection. This procedure DROPs the live tables and then RENAMEs the backups
+-- into place -- that sequence is not atomic, and pymysql defaults to autocommit
+-- off, so any idle job connection that has run a SELECT pins a metadata lock and
+-- blocks the DROP/RENAME midway, leaving the live tables absent until the lock
+-- clears. Stop the job (or kill its connection) first; the restore itself takes
+-- well under a second when nothing is holding a lock.
 
 DELIMITER //
 
