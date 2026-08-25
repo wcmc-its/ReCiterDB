@@ -22,7 +22,7 @@ Usage:
 """
 import argparse, json, os
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import bindparam, create_engine, text
 
 TABLE = "authorship_review"
 
@@ -30,11 +30,11 @@ TABLE = "authorship_review"
 _REFRESH_COLS = [
     "source", "external_id", "pub_type", "container_id",
     "author_position", "author_position_label", "wcm_author", "author_affiliation",
-    "entrez_date", "title", "journal", "issn", "doi", "classification",
+    "entrez_date", "title", "journal", "issn", "doi", "authors_json", "classification",
     "top_cwid", "top_name", "top_person_type", "top_dept",
     "top_fg_score", "top_io_score", "top_confidence", "top_cohort_size",
     "top_given_match", "top_affil_match", "n_candidates", "single_candidate",
-    "candidate_cwids_json", "last_refreshed",
+    "candidate_cwids_json", "dup_flag", "dup_reason", "last_refreshed",
 ]
 # full insert column set (curator columns default on first insert)
 _INSERT_COLS = ["pmid", "author_key"] + _REFRESH_COLS + [
@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
   journal                VARCHAR(512) NULL,
   issn                   VARCHAR(9)   NULL,
   doi                    VARCHAR(255) NULL,
+  authors_json           LONGTEXT     NULL,
   classification         ENUM('assigned','suggested','buried','absent') NULL,
   top_cwid               VARCHAR(32)  NULL,
   top_name               VARCHAR(255) NULL,
@@ -85,6 +86,8 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
   n_candidates           INT          NULL,
   single_candidate       TINYINT(1)   NULL,
   candidate_cwids_json   LONGTEXT     NULL,
+  dup_flag               TINYINT(1)   NOT NULL DEFAULT 0,
+  dup_reason             VARCHAR(255) NULL,
   status                 ENUM('open','assigned','accepted','rejected','dismissed','snoozed')
                                       NOT NULL DEFAULT 'open',
   resolution_cwid        VARCHAR(32)  NULL,
@@ -132,6 +135,40 @@ def upsert(rows):
             c.execute(stmt, [{k: r.get(k) for k in _INSERT_COLS} for r in chunk])
             n += len(chunk)
     return n
+
+
+def dup_flags_by_doi(dois):
+    """doi -> (uid, article_id) for DOIs already present in reciterdb `external_article`
+    (the nightly ExternalArticle projection, update/retrieveExternalArticles.py, which
+    runs before the weekly AAR lane). Lives here (not aar_orchestrator.py) so both the
+    PubMed lane (aar_orchestrator._db_rows) and the self-contained Scopus lane
+    (aar_universe_scopus, which deliberately avoids importing the xgboost/S3-heavy
+    PubMed-lane modules) can call it without a heavier import.
+
+    Used to precompute authorship_review.dup_flag/dup_reason at producer time, so a
+    curator sees an "already added" heads-up before spending a click on Accept/Assign.
+    The live 409 conflict check at Accept/Assign time (Publication Manager) stays as
+    the final same-day-race safety net — this is a heads-up, not a replacement.
+
+    Batched (500 DOIs/query) rather than one unbounded IN-clause, same convention as
+    aar_gate.attributed_pmids / this module's own upsert() chunking. Read-only.
+
+    Keyed by lowercased DOI: MySQL's IN-clause match is case-insensitive (ci collation),
+    but a plain Python dict lookup isn't -- without normalizing both sides, a DOI that
+    differs only in case between authorship_review and external_article would join fine
+    in SQL yet silently miss the dict lookup, under-flagging the duplicate."""
+    dois = sorted({d for d in dois if d})
+    out = {}
+    if not dois:
+        return out
+    stmt = text("SELECT doi, uid, article_id FROM external_article WHERE doi IN :ds") \
+        .bindparams(bindparam("ds", expanding=True))
+    with engine().connect() as c:
+        for i in range(0, len(dois), 500):
+            chunk = dois[i:i + 500]
+            for doi, uid, article_id in c.execute(stmt, {"ds": chunk}):
+                out.setdefault(doi.lower(), (uid, article_id))
+    return out
 
 
 def _describe():

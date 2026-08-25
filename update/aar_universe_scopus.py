@@ -356,12 +356,31 @@ def wcm_authorships(entry, family):
         }, hits
 
 
-def _build_row(entry, i, n, author, top, cands, run_ts):
+def _authors_json(entry):
+    """Simplified {given,surname} list of EVERY author on the document (not just the
+    WCM-matched one) — the Scopus Search API COMPLETE view already returns this full
+    array (entry.get("author")); _build_row() previously discarded everyone but the
+    one WCM author, leaving curators no way to see the paper's byline the way a PubMed
+    row's PMID link shows it. Scopus-internal fields (@seq/afid) are dropped — this is
+    a curator-facing display list, not a re-parseable structure. Always a JSON array
+    string, never null, even when the document has no author field."""
+    return json.dumps([
+        {"given": a.get("given-name"), "surname": a.get("surname")}
+        for a in _as_list(entry.get("author"))
+    ])
+
+
+def _build_row(entry, i, n, author, top, cands, run_ts, dup_map=None):
     doi = entry.get("prism:doi")
     sid = _numeric_scopus_id(entry.get("eid"))
     dedup = doi or sid          # author_key identity: DOI-first, stable across Scopus record merges
     pub_type = entry.get("subtypeDescription")
     cohort = top.get("cohort_size") if top else None
+    # dup_flag/dup_reason: heads-up "already added as ExternalArticle" signal, joined
+    # by DOI against reciterdb.external_article (aar_db.dup_flags_by_doi, batched once
+    # per run() call, not per row — see that function's docstring). Live 409 at
+    # Accept/Assign time (Publication Manager) remains the final same-day-race check.
+    dup_hit = (dup_map or {}).get(doi.lower()) if doi else None
     return {
         "source": "scopus", "pmid": None,
         # numeric Scopus record id -> the PM Accept builds articleId "SCOPUS:<external_id>"
@@ -379,6 +398,7 @@ def _build_row(entry, i, n, author, top, cands, run_ts):
         "journal": _trunc(entry.get("prism:publicationName"), 512),
         "issn": _normalize_issn(entry.get("prism:issn") or entry.get("prism:eIssn")),
         "doi": _trunc(doi, 255),
+        "authors_json": _authors_json(entry),
         "classification": "absent",                    # no PMID -> production never scored it
         "top_cwid": top["cwid"] if top else None,
         "top_name": _trunc(top["name"], 255) if top else None,
@@ -391,6 +411,9 @@ def _build_row(entry, i, n, author, top, cands, run_ts):
         "top_affil_match": int(bool(top["affil_dept_match"])) if top else None,
         "n_candidates": len(cands), "single_candidate": int(cohort == 1) if cohort else None,
         "candidate_cwids_json": json.dumps(_compact(cands)),
+        "dup_flag": int(bool(dup_hit)),
+        "dup_reason": (f"Already added as ExternalArticle for {dup_hit[0]} (DOI match)"
+                       if dup_hit else None),
         "status": "open", "first_seen": run_ts,
         "last_checked": run_ts, "last_refreshed": run_ts,
     }
@@ -479,6 +502,11 @@ def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True,
     print("[4/5] Matching WCM authorships against the identity roster ...", flush=True)
     if idx is None:
         idx = IdentityIndex.load()
+    # one batched dup-check join over every DOI in this month/window, not a query per
+    # row (aar_db.dup_flags_by_doi docstring) — mirrors the "load the roster once"
+    # convention already used for idx above.
+    dois = {d.get("prism:doi") for d in scopus_only if d.get("prism:doi")}
+    dup_map = aar_db.dup_flags_by_doi(dois) if dois else {}
     rows, unmatched = [], 0
     for d in scopus_only:
         for i, n, au, _ in wcm_authorships(d, family):
@@ -488,7 +516,7 @@ def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True,
             if top is None:
                 unmatched += 1                         # nothing to assign (v1 skips unmatched)
                 continue
-            rows.append(_build_row(d, i, n, au, top, cands, run_ts))
+            rows.append(_build_row(d, i, n, au, top, cands, run_ts, dup_map=dup_map))
     print(f"      {len(rows)} matched authorships; {unmatched} unmatched (skipped)", flush=True)
 
     if apply_writes:
@@ -652,6 +680,20 @@ def _selftest():
           row["classification"] == "absent"
           and row["top_fg_score"] is None and row["top_io_score"] is None)
     check("row single_candidate=1", row["single_candidate"] == 1)
+    check("row authors_json lists both authors on the document, not just the WCM one",
+          json.loads(row["authors_json"]) == [
+              {"given": "Jane", "surname": "Smith"}, {"given": "John", "surname": "Doe"}])
+    check("row dup_flag=0/dup_reason=None with no dup_map (default)",
+          row["dup_flag"] == 0 and row["dup_reason"] is None)
+
+    row_dup = _build_row(entry, i, n, au, top, [top], "2026-07-03 00:00:00",
+                         dup_map={"10.1/x": ("abc1234", "SCOPUS:105037523511")})
+    check("row dup_flag=1 and dup_reason names the uid when the DOI is in dup_map",
+          row_dup["dup_flag"] == 1 and row_dup["dup_reason"]
+          == "Already added as ExternalArticle for abc1234 (DOI match)")
+
+    check("_authors_json returns '[]' (not null) when the document has no author field",
+          _authors_json({}) == "[]")
 
     entry2 = dict(entry, **{"prism:doi": None})
     au2 = {"last": "Smith", "fore": "Jane", "initials": "J.", "affiliations": []}
