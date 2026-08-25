@@ -540,6 +540,15 @@ def main():
     updateReciterDB.call_update_person_only()
     logger.info("Final UPDATE_PERSON completed.")
 
+    # Step 7: Atomic table swap -- promote the `_new` shadow tables (built
+    # throughout this run) into the live table names with a single RENAME.
+    # Must run after Step 6 above so the person table being swapped in
+    # already has firstName/lastName/etc. populated. No-op unless the
+    # nightly loader is running with ATOMIC_SWAP=1.
+    logger.info("Calling swap_new_tables_into_place (no-op unless ATOMIC_SWAP=1).")
+    updateReciterDB.swap_new_tables_into_place()
+    logger.info("Table swap step complete.")
+
     # Log final debugging info about processed/skipped UIDs
     logger.info(f"Processed UIDs count: {len(processed_uids)}")
     logger.info(f"Skipped UIDs count: {len(skipped_uids)}")
