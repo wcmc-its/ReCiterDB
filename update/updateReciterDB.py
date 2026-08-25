@@ -57,6 +57,15 @@ SWAP_TABLES = [
 ]
 
 
+class ShadowTableProcedureFailed(RuntimeError):
+    """A table-lifecycle stored procedure ran but reported failure in its
+    status row. The procedures use CONTINUE HANDLER FOR SQLEXCEPTION, so a
+    failed DROP/CREATE/RENAME does NOT surface as a MySQL error to the client --
+    it comes back as a 'ERROR: ...' status row. Treating that as success would
+    let a failed swap log 'complete' and leave the live tables silently serving
+    the previous run's data."""
+
+
 class ShadowTableProcedureMissing(RuntimeError):
     """Raised when prepare_person_shadow_tables() or swap_person_tables() is
     not installed in the target database (setup/person_table_swap.sql has not
@@ -103,10 +112,25 @@ def _call_swap_procedure(cursor, procedure_name):
     """
     try:
         cursor.execute(f"CALL {procedure_name}();")
+        rows = []
         try:
-            cursor.fetchall()
+            rows = cursor.fetchall() or []
         except pymysql.err.ProgrammingError:
             pass  # no result set to consume
+
+        # The procedures swallow SQLEXCEPTION internally and report outcome in a
+        # status row, so success/failure MUST be read off that row -- not off the
+        # absence of a client-side exception.
+        for row in rows:
+            status = None
+            if isinstance(row, dict):
+                status = row.get('status')
+            elif isinstance(row, (list, tuple)) and row:
+                status = row[0]
+            if isinstance(status, str) and status.strip().upper().startswith('ERROR'):
+                raise ShadowTableProcedureFailed(
+                    f"Stored procedure `{procedure_name}` reported failure: {status}"
+                )
         return cursor
     except pymysql.err.MySQLError as e:
         error_code = e.args[0] if e.args else None
@@ -504,10 +528,12 @@ def main(truncate_tables=True, skip_person_temp=False):
 
         connection.commit()
 
-    except ShadowTableProcedureMissing:
-        # A missing swap procedure means this run wrote to shadow tables that
-        # will never be promoted -- never swallow this like the generic
-        # handler below does for other errors.
+    except (ShadowTableProcedureMissing, ShadowTableProcedureFailed):
+        # A missing procedure means this run wrote to shadow tables that will
+        # never be promoted; a procedure that reported failure means the
+        # prepare/swap did not actually happen. Either way the live tables
+        # would silently keep serving stale data -- never swallow these like
+        # the generic handler below does for other errors.
         raise
     except Exception as e:
         logger.error(f"An error occurred: {e}")
