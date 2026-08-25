@@ -77,23 +77,43 @@ def test_build_swap_rename_sql_is_single_statement():
 def test_build_swap_rename_sql_covers_every_swap_table_both_directions():
     sql = u.build_swap_rename_sql()
     for t in u.SWAP_TABLES:
-        assert f"`{t}` TO `{t}_old`" in sql, f"{t} -> {t}_old clause missing"
+        assert f"`{t}` TO `{t}_backup`" in sql, f"{t} -> {t}_backup clause missing"
         assert f"`{t}_new` TO `{t}`" in sql, f"{t}_new -> {t} clause missing"
     # And nothing else snuck in.
     assert "person_temp" not in sql
 
 
 def test_build_swap_rename_sql_matches_ticket_form():
-    # Verbatim shape requested: RENAME TABLE person TO person_old,
-    # person_new TO person, person_article TO person_article_old, ... ;
+    # Verbatim shape requested: RENAME TABLE person TO person_backup,
+    # person_new TO person, person_article TO person_article_backup, ... ;
+    # Matches the naming precedent in setup/populateAnalysisSummaryTables_v2.sql
+    # ("7. Atomic table swap") -- `_backup`, not `_old`.
     sql = u.build_swap_rename_sql()
-    person_idx = sql.index("`person` TO `person_old`")
+    person_idx = sql.index("`person` TO `person_backup`")
     person_new_idx = sql.index("`person_new` TO `person`")
-    person_article_idx = sql.index("`person_article` TO `person_article_old`")
+    person_article_idx = sql.index("`person_article` TO `person_article_backup`")
     assert person_idx < person_new_idx < person_article_idx, (
-        "clause order must be: person->person_old, person_new->person, "
-        "person_article->person_article_old, ..."
+        "clause order must be: person->person_backup, person_new->person, "
+        "person_article->person_article_backup, ..."
     )
+
+
+def test_build_swap_rename_sql_maps_each_live_table_to_backup_and_each_new_table_to_live():
+    # Explicit statement of the RENAME's meaning for every one of the 10
+    # SWAP_TABLES: `<table>` -> `<table>_backup` and `<table>_new` -> `<table>`,
+    # all within the single statement (not per-table separate RENAMEs).
+    sql = u.build_swap_rename_sql()
+    assert sql.count("RENAME TABLE") == 1
+    for t in u.SWAP_TABLES:
+        live_to_backup = f"`{t}` TO `{t}_backup`"
+        new_to_live = f"`{t}_new` TO `{t}`"
+        assert live_to_backup in sql, f"missing live->backup mapping for {t}"
+        assert new_to_live in sql, f"missing new->live mapping for {t}"
+        # The live->backup clause for this table must precede its new->live
+        # clause, matching the precedent's per-table pair ordering.
+        assert sql.index(live_to_backup) < sql.index(new_to_live), (
+            f"{t}: expected `{t}` TO `{t}_backup` before `{t}_new` TO `{t}`"
+        )
 
 
 if __name__ == "__main__":
@@ -105,4 +125,5 @@ if __name__ == "__main__":
     test_build_swap_rename_sql_is_single_statement()
     test_build_swap_rename_sql_covers_every_swap_table_both_directions()
     test_build_swap_rename_sql_matches_ticket_form()
+    test_build_swap_rename_sql_maps_each_live_table_to_backup_and_each_new_table_to_live()
     print("OK: shadow-table routing and RENAME TABLE construction verified (no DB).")
