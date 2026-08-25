@@ -151,7 +151,12 @@ def dup_flags_by_doi(dois):
     the final same-day-race safety net — this is a heads-up, not a replacement.
 
     Batched (500 DOIs/query) rather than one unbounded IN-clause, same convention as
-    aar_gate.attributed_pmids / this module's own upsert() chunking. Read-only."""
+    aar_gate.attributed_pmids / this module's own upsert() chunking. Read-only.
+
+    Keyed by lowercased DOI: MySQL's IN-clause match is case-insensitive (ci collation),
+    but a plain Python dict lookup isn't -- without normalizing both sides, a DOI that
+    differs only in case between authorship_review and external_article would join fine
+    in SQL yet silently miss the dict lookup, under-flagging the duplicate."""
     dois = sorted({d for d in dois if d})
     out = {}
     if not dois:
@@ -162,7 +167,7 @@ def dup_flags_by_doi(dois):
         for i in range(0, len(dois), 500):
             chunk = dois[i:i + 500]
             for doi, uid, article_id in c.execute(stmt, {"ds": chunk}):
-                out.setdefault(doi, (uid, article_id))
+                out.setdefault(doi.lower(), (uid, article_id))
     return out
 
 

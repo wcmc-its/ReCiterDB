@@ -380,7 +380,7 @@ def _build_row(entry, i, n, author, top, cands, run_ts, dup_map=None):
     # by DOI against reciterdb.external_article (aar_db.dup_flags_by_doi, batched once
     # per run() call, not per row — see that function's docstring). Live 409 at
     # Accept/Assign time (Publication Manager) remains the final same-day-race check.
-    dup_hit = (dup_map or {}).get(doi) if doi else None
+    dup_hit = (dup_map or {}).get(doi.lower()) if doi else None
     return {
         "source": "scopus", "pmid": None,
         # numeric Scopus record id -> the PM Accept builds articleId "SCOPUS:<external_id>"

@@ -170,7 +170,7 @@ def _db_rows(resolved_auth, run_date):
                else "suggested" if fg >= gate.STORAGE_THRESHOLD else "buried")
         cohort = top.get("cohort_size")
         doi = a.get("doi")
-        dup_hit = dup_map.get(doi) if doi else None
+        dup_hit = dup_map.get(doi.lower()) if doi else None
         out.append({
             "source": "pubmed",
             "pmid": a["pmid"],
