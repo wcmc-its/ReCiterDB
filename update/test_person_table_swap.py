@@ -18,6 +18,19 @@ groups:
    prepare_person_shadow_tables() drops each `_new` table before recreating
    it, and swap_person_tables() renames all 10 tables in both directions as
    a single RENAME TABLE statement.
+3. updateReciterDB.py's _call_swap_procedure() -- the CONTINUE HANDLER FOR
+   SQLEXCEPTION in both stored procedures means a failed DROP/CREATE/RENAME
+   never reaches the client as a MySQLError; it comes back as an
+   `SELECT 'ERROR: ...' AS status` result row instead. These tests drive
+   _call_swap_procedure() against a fake cursor (no DB) to prove it reads
+   that status row and raises ShadowTableProcedureFailed on ERROR, for both
+   the dict-shaped and tuple-shaped rows either DB-API cursor type could
+   hand back -- and that a missing/empty/odd result set never raises the
+   wrong exception type.
+4. setup/person_table_swap.sql again -- swap_person_tables()'s RENAME TABLE
+   must be gated by `IF v_error = 0 THEN ... END IF`, so a failed backup
+   DROP (which the CONTINUE HANDLER absorbs) skips the promotion instead of
+   renaming onto a collision.
 
 Run: python3 test_person_table_swap.py
 """
@@ -25,6 +38,7 @@ import os
 import re
 
 import updateReciterDB as u
+import pymysql.err
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SQL_FILE = os.path.join(REPO_ROOT, "setup", "person_table_swap.sql")
@@ -78,7 +92,105 @@ def test_missing_procedure_raises_named_exception_type():
 
 
 # ------------------------------------------------------------------------------
-# Group 2: setup/person_table_swap.sql, parsed like the mysql CLI would
+# Group 2: updateReciterDB.py's _call_swap_procedure(), against a fake cursor
+# ------------------------------------------------------------------------------
+
+class FakeCursor:
+    """Stands in for a pymysql cursor. `rows` is what fetchall() returns;
+    `no_result_set` simulates a CALL that leaves nothing to fetch (the real
+    cursor raises pymysql.err.ProgrammingError in that case, which
+    _call_swap_procedure() is written to swallow)."""
+
+    def __init__(self, rows=None, no_result_set=False):
+        self._rows = rows
+        self._no_result_set = no_result_set
+        self.executed = []
+
+    def execute(self, sql):
+        self.executed.append(sql)
+        return 1
+
+    def fetchall(self):
+        if self._no_result_set:
+            raise pymysql.err.ProgrammingError("no result set to fetch")
+        return self._rows
+
+
+def test_call_swap_procedure_returns_normally_on_success_dict_row():
+    cursor = FakeCursor(rows=[{'status': 'SUCCESS: Swapped 10 person tables into place'}])
+    result = u._call_swap_procedure(cursor, "swap_person_tables")
+    assert result is cursor
+
+
+def test_call_swap_procedure_returns_normally_on_success_tuple_row():
+    cursor = FakeCursor(rows=[('SUCCESS: Swapped 10 person tables into place',)])
+    result = u._call_swap_procedure(cursor, "swap_person_tables")
+    assert result is cursor
+
+
+def test_call_swap_procedure_raises_on_error_dict_row():
+    # This is the regression check: with the CONTINUE HANDLER swallowing the
+    # underlying SQLEXCEPTION, this ERROR status row is the ONLY signal that
+    # the swap failed. If _call_swap_procedure() goes back to discarding the
+    # result set, this must fail.
+    cursor = FakeCursor(rows=[{'status': 'ERROR: Failed to swap person tables into place'}])
+    try:
+        u._call_swap_procedure(cursor, "swap_person_tables")
+        raised = False
+    except u.ShadowTableProcedureFailed:
+        raised = True
+    assert raised, "ERROR status row (dict-shaped) must raise ShadowTableProcedureFailed"
+
+
+def test_call_swap_procedure_raises_on_error_tuple_row():
+    cursor = FakeCursor(rows=[('ERROR: Failed to swap person tables into place',)])
+    try:
+        u._call_swap_procedure(cursor, "swap_person_tables")
+        raised = False
+    except u.ShadowTableProcedureFailed:
+        raised = True
+    assert raised, "ERROR status row (tuple-shaped) must raise ShadowTableProcedureFailed"
+
+
+def test_call_swap_procedure_error_detection_is_case_insensitive_and_strips_whitespace():
+    cursor = FakeCursor(rows=[{'status': '  error: lowercase and padded  '}])
+    try:
+        u._call_swap_procedure(cursor, "swap_person_tables")
+        raised = False
+    except u.ShadowTableProcedureFailed:
+        raised = True
+    assert raised, "status matching must be case-insensitive and whitespace-tolerant"
+
+
+def test_call_swap_procedure_handles_empty_result_set_without_raising():
+    cursor = FakeCursor(rows=[])
+    result = u._call_swap_procedure(cursor, "swap_person_tables")
+    assert result is cursor
+
+
+def test_call_swap_procedure_handles_none_result_without_raising():
+    cursor = FakeCursor(rows=None)
+    result = u._call_swap_procedure(cursor, "swap_person_tables")
+    assert result is cursor
+
+
+def test_call_swap_procedure_handles_no_result_set_without_raising():
+    # Simulates cursor.fetchall() raising ProgrammingError because CALL left
+    # nothing to fetch -- must be swallowed, not propagated as a TypeError or
+    # anything else.
+    cursor = FakeCursor(no_result_set=True)
+    result = u._call_swap_procedure(cursor, "swap_person_tables")
+    assert result is cursor
+
+
+def test_call_swap_procedure_handles_non_string_status_without_raising():
+    cursor = FakeCursor(rows=[{'status': None}, (12345,), {'status': 0}])
+    result = u._call_swap_procedure(cursor, "swap_person_tables")
+    assert result is cursor
+
+
+# ------------------------------------------------------------------------------
+# Group 3: setup/person_table_swap.sql, parsed like the mysql CLI would
 # ------------------------------------------------------------------------------
 
 def parse_mysql_statements(sql_text):
@@ -212,6 +324,44 @@ def test_swap_person_tables_does_not_drop_the_backup_tables_it_just_created():
     )
 
 
+def test_swap_person_tables_guards_rename_with_v_error_check():
+    # The CONTINUE HANDLER means a failed backup DROP does not stop
+    # execution -- without this guard, RENAME TABLE would run anyway and
+    # either compound the failure or rename onto a `_backup` name that
+    # still exists. This is the regression check for that guard: it must
+    # fail if `IF v_error = 0 THEN` around the RENAME is ever removed.
+    statements = parse_mysql_statements(_read_sql())
+    swap_body = statements[3]
+    rename_idx = swap_body.upper().index("RENAME TABLE")
+
+    guard_open_idx = swap_body.upper().rfind("IF V_ERROR = 0 THEN", 0, rename_idx)
+    assert guard_open_idx != -1, (
+        "RENAME TABLE must be preceded by `IF v_error = 0 THEN` -- found no such "
+        "guard before the RENAME in swap_person_tables"
+    )
+
+    guard_close_idx = swap_body.upper().find("END IF", rename_idx)
+    assert guard_close_idx != -1, (
+        "no `END IF` found after RENAME TABLE -- the v_error guard around the "
+        "RENAME must be closed"
+    )
+
+    assert guard_open_idx < rename_idx < guard_close_idx, (
+        "RENAME TABLE must sit strictly between its `IF v_error = 0 THEN` and "
+        "the matching `END IF`"
+    )
+
+    # Nothing else (no other statement) sits between the guard's THEN and the
+    # RENAME keyword -- the guard wraps the RENAME directly, not some other
+    # statement that merely precedes it.
+    between = swap_body[guard_open_idx:rename_idx].upper()
+    then_idx = between.index("THEN") + len("THEN")
+    assert between[then_idx:].strip() == "", (
+        "unexpected statement(s) between `IF v_error = 0 THEN` and RENAME TABLE: "
+        f"{between[then_idx:].strip()!r}"
+    )
+
+
 if __name__ == "__main__":
     test_shadow_table_name_routes_swap_tables_unconditionally()
     test_shadow_table_name_never_routes_person_temp()
@@ -219,10 +369,21 @@ if __name__ == "__main__":
     test_swap_tables_excludes_person_temp_and_has_ten_entries()
     test_no_atomic_swap_symbol_remains_in_module()
     test_missing_procedure_raises_named_exception_type()
+    test_call_swap_procedure_returns_normally_on_success_dict_row()
+    test_call_swap_procedure_returns_normally_on_success_tuple_row()
+    test_call_swap_procedure_raises_on_error_dict_row()
+    test_call_swap_procedure_raises_on_error_tuple_row()
+    test_call_swap_procedure_error_detection_is_case_insensitive_and_strips_whitespace()
+    test_call_swap_procedure_handles_empty_result_set_without_raising()
+    test_call_swap_procedure_handles_none_result_without_raising()
+    test_call_swap_procedure_handles_no_result_set_without_raising()
+    test_call_swap_procedure_handles_non_string_status_without_raising()
     test_sql_file_exists()
     test_sql_parses_into_exactly_four_statements_with_internal_semicolons_preserved()
     test_prepare_person_shadow_tables_drops_before_creating_each_table()
     test_swap_person_tables_renames_all_ten_tables_both_directions_as_one_statement()
     test_swap_person_tables_drops_stale_backup_before_renaming()
     test_swap_person_tables_does_not_drop_the_backup_tables_it_just_created()
-    print("OK: shadow-table routing and setup/person_table_swap.sql structure verified (no DB).")
+    test_swap_person_tables_guards_rename_with_v_error_check()
+    print("OK: shadow-table routing, _call_swap_procedure() status handling, and "
+          "setup/person_table_swap.sql structure verified (no DB).")
