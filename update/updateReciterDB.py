@@ -56,6 +56,21 @@ SWAP_TABLES = [
     'person_person_type',
 ]
 
+# RENAME TABLE safety / disk-space analysis (verified against this repo):
+# - FOREIGN KEYs: none of the 10 SWAP_TABLES is referenced by a FOREIGN KEY
+#   anywhere in setup/createDatabaseTableReciterDb.sql -- the only FKs in that
+#   file are on the admin_* auth tables, which are untouched by this swap.
+# - TRIGGERs / VIEWs: setup/ contains no SQL TRIGGERs and no SQL VIEWs. The
+#   only "view" hit is a stored procedure named `view_job_progress`, not a
+#   database VIEW.
+# - Stored procedures: table names inside them resolve at execution time, so
+#   a RENAME TABLE between runs is safe -- no procedure can be left pointing
+#   at a stale/renamed table.
+# - Disk space: every swap table exists twice (live + `_new`) for the full
+#   build window, so peak usage is roughly 2x the combined footprint of the
+#   10 SWAP_TABLES. person_article_author (~3.9M rows) dominates that total.
+#   Confirm headroom on the target volume before enabling ATOMIC_SWAP=1 in
+#   production.
 
 def shadow_table_name(table_name):
     """Return the table this run should actually load/update: `<table_name>_new`
@@ -294,12 +309,15 @@ def main(truncate_tables=True, skip_person_temp=False):
             for table in all_tables:
                 if ATOMIC_SWAP and table in SWAP_TABLES:
                     # Build into a shadow table instead of truncating the live one.
-                    # CREATE ... LIKE copies structure/indexes (no data); TRUNCATE
-                    # clears out any partial data left by a prior crashed run.
-                    create_sql = f"CREATE TABLE IF NOT EXISTS `{table}_new` LIKE `{table}`;"
+                    # Drop any `_new` left by a prior crashed run before recreating it
+                    # -- CREATE ... IF NOT EXISTS would silently reuse that leftover
+                    # table, which may carry a stale schema if a migration has since
+                    # altered the live table. Drop-then-CREATE ... LIKE guarantees the
+                    # shadow table always matches the live schema exactly.
+                    drop_sql = f"DROP TABLE IF EXISTS `{table}_new`;"
+                    cursor = execute_with_reconnect(cursor, drop_sql)
+                    create_sql = f"CREATE TABLE `{table}_new` LIKE `{table}`;"
                     cursor = execute_with_reconnect(cursor, create_sql)
-                    truncate_sql = f"TRUNCATE TABLE `{table}_new`;"
-                    cursor = execute_with_reconnect(cursor, truncate_sql)
                 else:
                     sql = f"TRUNCATE TABLE `{table}`;"
                     cursor = execute_with_reconnect(cursor, sql)
@@ -457,6 +475,18 @@ def main(truncate_tables=True, skip_person_temp=False):
             cursor = update_person(cursor)
 
         connection.commit()
+
+        if ATOMIC_SWAP:
+            logger.warning(
+                "ATOMIC_SWAP=1: this run wrote to `<table>_new` SHADOW TABLES, not the "
+                "live tables. That data will NOT be visible to readers until "
+                "swap_new_tables_into_place() runs. The nightly path (retrieveArticles.py) "
+                "calls that automatically after the identity merge -- but if this main() "
+                "call came from a manual/recovery run of retrieveS3.py or "
+                "retrieveDynamoDb.py, nothing promotes the shadow tables for you. Run "
+                "updateReciterDB.swap_new_tables_into_place() yourself, or the live "
+                "tables will silently keep serving the prior run's data."
+            )
 
     except Exception as e:
         logger.error(f"An error occurred: {e}")
