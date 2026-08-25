@@ -543,9 +543,9 @@ def main():
     # Step 7: Atomic table swap -- promote the `_new` shadow tables (built
     # throughout this run) into the live table names with a single RENAME.
     # Must run after Step 6 above so the person table being swapped in
-    # already has firstName/lastName/etc. populated. No-op unless the
-    # nightly loader is running with ATOMIC_SWAP=1.
-    logger.info("Calling swap_new_tables_into_place (no-op unless ATOMIC_SWAP=1).")
+    # already has firstName/lastName/etc. populated. Delegates to the
+    # swap_person_tables() stored procedure (setup/person_table_swap.sql).
+    logger.info("Calling swap_new_tables_into_place (CALL swap_person_tables).")
     updateReciterDB.swap_new_tables_into_place()
     logger.info("Table swap step complete.")
 
