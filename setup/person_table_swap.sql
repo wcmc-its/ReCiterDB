@@ -104,27 +104,33 @@ BEGIN
     -- tables this produces are intentionally left in place -- they are the
     -- rollback window consumed by restore_person_tables_from_backup() and are
     -- only cleared by the DROPs above on the next call to this procedure.
-    RENAME TABLE
-        person TO person_backup,
-        person_new TO person,
-        person_article TO person_article_backup,
-        person_article_new TO person_article,
-        person_article_author TO person_article_author_backup,
-        person_article_author_new TO person_article_author,
-        person_article_department TO person_article_department_backup,
-        person_article_department_new TO person_article_department,
-        person_article_grant TO person_article_grant_backup,
-        person_article_grant_new TO person_article_grant,
-        person_article_keyword TO person_article_keyword_backup,
-        person_article_keyword_new TO person_article_keyword,
-        person_article_relationship TO person_article_relationship_backup,
-        person_article_relationship_new TO person_article_relationship,
-        person_article_scopus_target_author_affiliation TO person_article_scopus_target_author_affiliation_backup,
-        person_article_scopus_target_author_affiliation_new TO person_article_scopus_target_author_affiliation,
-        person_article_scopus_non_target_author_affiliation TO person_article_scopus_non_target_author_affiliation_backup,
-        person_article_scopus_non_target_author_affiliation_new TO person_article_scopus_non_target_author_affiliation,
-        person_person_type TO person_person_type_backup,
-        person_person_type_new TO person_person_type;
+    -- Only attempt the promotion if the backup drops above succeeded. The
+    -- CONTINUE HANDLER means a failed DROP does not stop execution, and
+    -- renaming onto a `_backup` name that still exists would fail anyway --
+    -- better to skip cleanly and report ERROR than to compound the failure.
+    IF v_error = 0 THEN
+        RENAME TABLE
+            person TO person_backup,
+            person_new TO person,
+            person_article TO person_article_backup,
+            person_article_new TO person_article,
+            person_article_author TO person_article_author_backup,
+            person_article_author_new TO person_article_author,
+            person_article_department TO person_article_department_backup,
+            person_article_department_new TO person_article_department,
+            person_article_grant TO person_article_grant_backup,
+            person_article_grant_new TO person_article_grant,
+            person_article_keyword TO person_article_keyword_backup,
+            person_article_keyword_new TO person_article_keyword,
+            person_article_relationship TO person_article_relationship_backup,
+            person_article_relationship_new TO person_article_relationship,
+            person_article_scopus_target_author_affiliation TO person_article_scopus_target_author_affiliation_backup,
+            person_article_scopus_target_author_affiliation_new TO person_article_scopus_target_author_affiliation,
+            person_article_scopus_non_target_author_affiliation TO person_article_scopus_non_target_author_affiliation_backup,
+            person_article_scopus_non_target_author_affiliation_new TO person_article_scopus_non_target_author_affiliation,
+            person_person_type TO person_person_type_backup,
+            person_person_type_new TO person_person_type;
+    END IF;
 
     IF v_error = 0 THEN
         SELECT 'SUCCESS: Swapped 10 person tables into place' AS status;
