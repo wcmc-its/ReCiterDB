@@ -125,11 +125,20 @@ class IdentityIndex:
 
         cohort = []
         for rec in pool:
-            if author_init and rec["given_norm"]:
-                if rec["given_norm"][0] != author_init:
-                    continue                       # initial mismatch -> not this person
-                given_match = ("full" if author_given and rec["given_norm"] == author_given
-                               else "initial")
+            # An adopted/preferred first name is sometimes recorded in middleName
+            # rather than givenName in the HR-sourced identity table (legal name in
+            # givenName, adopted Western first name in middleName); PubMed/Scopus
+            # bylines use the preferred name, so try middleName as an alternate
+            # given-name source whenever givenName alone doesn't match.
+            middle_norm = _norm(rec["middle"])
+            name_sources = [n for n in (rec["given_norm"], middle_norm) if n]
+            if author_init and name_sources:
+                if author_given and any(n == author_given for n in name_sources):
+                    given_match = "full"
+                elif any(n[0] == author_init for n in name_sources):
+                    given_match = "initial"
+                else:
+                    continue                       # initial mismatch on both fields -> not this person
             else:
                 given_match = "unknown"            # no usable given on either side
             cohort.append((rec, given_match))
@@ -175,3 +184,50 @@ class IdentityIndex:
         affil = 0.25 if affil_match else 0.0
         hist = -0.10 if historical else 0.0
         return round(max(0.0, min(1.0, base + rarity + affil + hist)), 3)
+
+
+# ---- offline self-test ------------------------------------------------------
+def _selftest():
+    """Builds an IdentityIndex from hand-built records (no DB) to prove the
+    middleName-as-alternate-given-name fix (Judy/Hua Zhong, PMID 40681448)."""
+    def rec(given, middle, surname):
+        return {
+            "cwid": f"{given or middle}_{surname}".lower(),
+            "given": given, "middle": middle, "surname": surname,
+            "given_norm": _norm(given), "surname_norm": _norm(surname),
+            "dept": "", "division": "", "program": "", "title": "",
+            "person_type": "Full-Time Faculty", "historical": False,
+        }
+
+    records = [
+        rec("Hua", "Judy", "Zhong"),   # publishing name in middleName -> should match "full"
+        rec("Jian", "", "Zhong"),      # plain given-name initial match -> unchanged behaviour
+        rec("Xiu", "Wei", "Zhong"),    # neither given nor middle matches initial -> excluded
+    ]
+    idx = IdentityIndex(records)
+    out, cohort_size = idx.candidates("Zhong", "Judy", "J")
+    by_cwid = {c["cwid"]: c for c in out}
+
+    checks = []
+    hua = by_cwid.get("hua_zhong")
+    checks.append(("Judy/Hua Zhong present with given_match=full",
+                    hua is not None and hua["given_match"] == "full"))
+    jian = by_cwid.get("jian_zhong")
+    checks.append(("Jian Zhong present with given_match=initial",
+                    jian is not None and jian["given_match"] == "initial"))
+    checks.append(("Xiu/Wei Zhong absent (no initial match on either field)",
+                    "xiu_zhong" not in by_cwid))
+    checks.append(("cohort_size counts only the two initial-matching records",
+                    cohort_size == 2))
+
+    ok = True
+    for desc, passed in checks:
+        print(f"[OK] {desc}" if passed else f"[** FAIL] {desc}")
+        ok = ok and passed
+    print("SELFTEST PASS" if ok else "SELFTEST FAIL")
+    return ok
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(0 if _selftest() else 1)
