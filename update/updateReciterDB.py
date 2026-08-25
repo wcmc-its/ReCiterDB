@@ -36,8 +36,8 @@ connection = None
 # retrieveArticles.py after the final identity merge). This removes the daily
 # window where the live tables are empty/partial while being read for
 # reporting. Mirrors the pattern in setup/populateAnalysisSummaryTables_v2.sql
-# ("7. Atomic table swap"), adapted to Python/pymysql and to `_old`/immediate
-# drop instead of that script's `_backup`/next-run drop.
+# ("7. Atomic table swap"), adapted to Python/pymysql -- same `_backup`
+# naming and next-run drop as that script.
 #
 # Default OFF: this is the core nightly loader and this branch has not been
 # exercised against a real database. Opt in explicitly with ATOMIC_SWAP=1
@@ -89,10 +89,10 @@ def shadow_table_name(table_name):
 def build_swap_rename_sql():
     """Build the single atomic RENAME TABLE statement that promotes every
     `_new` shadow table into its live name, moving the current live table to
-    `_old` in the same statement. Pure string construction, no DB access."""
+    `_backup` in the same statement. Pure string construction, no DB access."""
     clauses = []
     for t in SWAP_TABLES:
-        clauses.append(f"`{t}` TO `{t}_old`")
+        clauses.append(f"`{t}` TO `{t}_backup`")
         clauses.append(f"`{t}_new` TO `{t}`")
     return "RENAME TABLE " + ", ".join(clauses) + ";"
 
@@ -555,9 +555,9 @@ def swap_new_tables_into_place():
     connection = establish_connection()
     cursor = connection.cursor()
     try:
-        logger.info("7. Atomic table swap -- dropping any stale `_old` tables from a prior run.")
+        logger.info("7. Atomic table swap -- dropping any stale `_backup` tables from the prior run.")
         for t in SWAP_TABLES:
-            drop_sql = f"DROP TABLE IF EXISTS `{t}_old`;"
+            drop_sql = f"DROP TABLE IF EXISTS `{t}_backup`;"
             cursor = execute_with_reconnect(cursor, drop_sql)
         connection.commit()
 
@@ -567,18 +567,11 @@ def swap_new_tables_into_place():
         connection.commit()
         logger.info("Atomic table swap complete -- live tables now reflect tonight's rebuild.")
 
-        # The RENAME above already succeeded at this point: live tables are
-        # the new data. Dropping the now-stale `_old` tables is best-effort
-        # cleanup, not part of the atomicity guarantee -- a failure here is
-        # non-fatal and swept up by next run's pre-swap drop.
-        try:
-            for t in SWAP_TABLES:
-                drop_sql = f"DROP TABLE IF EXISTS `{t}_old`;"
-                cursor = execute_with_reconnect(cursor, drop_sql)
-            connection.commit()
-            logger.info("Dropped `_old` tables from this run.")
-        except Exception as cleanup_err:
-            logger.warning(f"Swap succeeded but failed to drop `_old` backup tables (non-fatal, cleaned up next run): {cleanup_err}")
+        # The RENAME above already moved the previous live tables to
+        # `_backup`. Leave them in place -- they are NOT dropped here.
+        # This run's `_backup` tables serve as a rollback window (see
+        # setup/restore_person_tables_from_backup.sql) until the next run's
+        # pre-swap drop above clears them to make room for the next backup.
 
     except Exception as e:
         logger.error(f"Atomic table swap FAILED -- live tables left untouched (prior run's data still serving): {e}")
