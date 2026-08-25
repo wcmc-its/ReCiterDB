@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS `authorship_review` (
   `journal`                VARCHAR(512) NULL,
   `issn`                   VARCHAR(9)   NULL,                -- hyphenated NNNN-NNNC, scopus only
   `doi`                    VARCHAR(255) NULL,
+  `authors_json`           LONGTEXT     NULL,                -- Scopus full author list, scopus only
   `classification`         ENUM('assigned','suggested','buried','absent') NULL,
   `top_cwid`               VARCHAR(32)  NULL,                -- proposed identity
   `top_name`               VARCHAR(255) NULL,
@@ -72,6 +73,8 @@ CREATE TABLE IF NOT EXISTS `authorship_review` (
   `n_candidates`           INT          NULL,
   `single_candidate`       TINYINT(1)   NULL,                -- cohort_size == 1
   `candidate_cwids_json`   LONGTEXT     NULL,                -- ranked alternates
+  `dup_flag`               TINYINT(1)   NOT NULL DEFAULT 0,  -- matches an external_article by DOI
+  `dup_reason`             VARCHAR(255) NULL,                -- e.g. "Already added as ExternalArticle for <uid> (DOI match)"
   `status`                 ENUM('open','assigned','accepted','rejected','dismissed','snoozed')
                                         NOT NULL DEFAULT 'open',   -- curator state
   `resolution_cwid`        VARCHAR(32)  NULL,
