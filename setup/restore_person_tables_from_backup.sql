@@ -1,3 +1,16 @@
+-- Rollback helper for the nightly loader's atomic table swap (ATOMIC_SWAP=1).
+-- Mirrors restore_from_backup_v2 (see populateAnalysisSummaryTables_v2.sql) but for the
+-- 10 person_* tables promoted by swap_new_tables_into_place() in update/updateReciterDB.py.
+-- The `_backup` tables persist until the NEXT run's pre-swap drop, so this can restore the
+-- previous run's data any time before then.
+--
+-- Apply with:  mysql --host=... --user=... --password=... reciterdb < this_file.sql
+-- Invoke with: CALL restore_person_tables_from_backup();
+
+DELIMITER //
+
+DROP PROCEDURE IF EXISTS `restore_person_tables_from_backup`//
+
 CREATE DEFINER=`admin`@`%` PROCEDURE `reciterdb`.`restore_person_tables_from_backup`()
 BEGIN
     DECLARE v_error INT DEFAULT 0;
@@ -38,4 +51,6 @@ BEGIN
     ELSE
         SELECT 'ERROR: Backup tables do not exist' AS status;
     END IF;
-END
+END//
+
+DELIMITER ;
