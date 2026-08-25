@@ -1,0 +1,41 @@
+CREATE DEFINER=`admin`@`%` PROCEDURE `reciterdb`.`restore_person_tables_from_backup`()
+BEGIN
+    DECLARE v_error INT DEFAULT 0;
+    DECLARE CONTINUE HANDLER FOR SQLEXCEPTION SET v_error = 1;
+
+    -- Check if backup tables exist
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'person_backup' AND table_schema = DATABASE()) THEN
+
+        -- Drop current tables and rename backup to current
+        DROP TABLE IF EXISTS person;
+        DROP TABLE IF EXISTS person_article;
+        DROP TABLE IF EXISTS person_article_author;
+        DROP TABLE IF EXISTS person_article_department;
+        DROP TABLE IF EXISTS person_article_grant;
+        DROP TABLE IF EXISTS person_article_keyword;
+        DROP TABLE IF EXISTS person_article_relationship;
+        DROP TABLE IF EXISTS person_article_scopus_target_author_affiliation;
+        DROP TABLE IF EXISTS person_article_scopus_non_target_author_affiliation;
+        DROP TABLE IF EXISTS person_person_type;
+
+        RENAME TABLE
+            person_backup TO person,
+            person_article_backup TO person_article,
+            person_article_author_backup TO person_article_author,
+            person_article_department_backup TO person_article_department,
+            person_article_grant_backup TO person_article_grant,
+            person_article_keyword_backup TO person_article_keyword,
+            person_article_relationship_backup TO person_article_relationship,
+            person_article_scopus_target_author_affiliation_backup TO person_article_scopus_target_author_affiliation,
+            person_article_scopus_non_target_author_affiliation_backup TO person_article_scopus_non_target_author_affiliation,
+            person_person_type_backup TO person_person_type;
+
+        IF v_error = 0 THEN
+            SELECT 'SUCCESS: Restored from backup tables' AS status;
+        ELSE
+            SELECT 'ERROR: Failed to restore from backup' AS status;
+        END IF;
+    ELSE
+        SELECT 'ERROR: Backup tables do not exist' AS status;
+    END IF;
+END
