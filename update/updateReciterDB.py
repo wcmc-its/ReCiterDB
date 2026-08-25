@@ -27,27 +27,22 @@ CONNECT_TIMEOUT = 10   # seconds
 connection = None
 
 # ------------------------------------------------------------------------------
-#                     ATOMIC TABLE SWAP CONFIG
+#                     TABLE-LIFECYCLE (SHADOW BUILD / ATOMIC SWAP)
 # ------------------------------------------------------------------------------
-# When ATOMIC_SWAP=1, the nightly load builds into `<table>_new` shadow tables
-# instead of truncating the live tables and rebuilding them in place, then
-# promotes the shadow tables into their live names with a single atomic
-# RENAME TABLE at the very end (swap_new_tables_into_place(), called from
-# retrieveArticles.py after the final identity merge). This removes the daily
-# window where the live tables are empty/partial while being read for
-# reporting. Mirrors the pattern in setup/populateAnalysisSummaryTables_v2.sql
-# ("7. Atomic table swap"), adapted to Python/pymysql -- same `_backup`
-# naming and next-run drop as that script.
+# The nightly load builds into `<table>_new` shadow tables instead of
+# truncating the live tables and rebuilding them in place, then promotes the
+# shadow tables into their live names with a single atomic RENAME TABLE at
+# the very end (swap_new_tables_into_place(), called from retrieveArticles.py
+# after the final identity merge). This removes the daily window where the
+# live tables are empty/partial while being read for reporting. This is
+# unconditional -- there is no flag to opt out.
 #
-# Default OFF: this is the core nightly loader and this branch has not been
-# exercised against a real database. Opt in explicitly with ATOMIC_SWAP=1
-# (env var on the reciterdb CronJob) once verified on dev.
-ATOMIC_SWAP = os.getenv("ATOMIC_SWAP", "0") == "1"
-
-# main() is called once per Analysis chunk (176 times in a measured nightly run),
-# so the shadow-table warning below is emitted only on the first call per process.
-# A warning that fires 176 times a night is a warning operators learn to ignore.
-_SWAP_WARNING_EMITTED = False
+# Table lifecycle -- creating the `_new` shadow tables, dropping stale
+# `_backup` tables, and the atomic RENAME itself -- lives in the stored
+# procedures `prepare_person_shadow_tables()` and `swap_person_tables()`
+# (setup/person_table_swap.sql), matching the pattern already used for the
+# analysis_summary_* tables in setup/populateAnalysisSummaryTables_v2.sql
+# ("1. Create staging tables" and "7. Atomic table swap").
 
 # The 10 tables that participate in the atomic swap. person_temp is
 # deliberately excluded -- it is internal staging, always truncated and
@@ -60,6 +55,16 @@ SWAP_TABLES = [
     'person_article_scopus_non_target_author_affiliation',
     'person_person_type',
 ]
+
+
+class ShadowTableProcedureMissing(RuntimeError):
+    """Raised when prepare_person_shadow_tables() or swap_person_tables() is
+    not installed in the target database (setup/person_table_swap.sql has not
+    been applied). Always propagates out of main() -- never swallowed like
+    other errors there -- because it means the load already wrote to shadow
+    tables that will never be promoted."""
+    pass
+
 
 # RENAME TABLE safety / disk-space analysis (verified against this repo):
 # - FOREIGN KEYs: none of the 10 SWAP_TABLES is referenced by a FOREIGN KEY
@@ -74,27 +79,47 @@ SWAP_TABLES = [
 # - Disk space: every swap table exists twice (live + `_new`) for the full
 #   build window, so peak usage is roughly 2x the combined footprint of the
 #   10 SWAP_TABLES. person_article_author (~3.9M rows) dominates that total.
-#   Confirm headroom on the target volume before enabling ATOMIC_SWAP=1 in
-#   production.
+#   Confirm headroom on the target volume before running the nightly loader
+#   in production.
 
 def shadow_table_name(table_name):
     """Return the table this run should actually load/update: `<table_name>_new`
-    when atomic-swap mode is on and the table participates in the swap,
-    otherwise `table_name` unchanged. Pure string logic, no DB access."""
-    if ATOMIC_SWAP and table_name in SWAP_TABLES:
+    when the table participates in the swap, otherwise `table_name` unchanged
+    (person_temp always passes through unchanged). Pure string logic, no DB
+    access."""
+    if table_name in SWAP_TABLES:
         return f"{table_name}_new"
     return table_name
 
 
-def build_swap_rename_sql():
-    """Build the single atomic RENAME TABLE statement that promotes every
-    `_new` shadow table into its live name, moving the current live table to
-    `_backup` in the same statement. Pure string construction, no DB access."""
-    clauses = []
-    for t in SWAP_TABLES:
-        clauses.append(f"`{t}` TO `{t}_backup`")
-        clauses.append(f"`{t}_new` TO `{t}`")
-    return "RENAME TABLE " + ", ".join(clauses) + ";"
+def _call_swap_procedure(cursor, procedure_name):
+    """CALL a table-lifecycle stored procedure from setup/person_table_swap.sql
+    (prepare_person_shadow_tables or swap_person_tables) and consume its
+    `SELECT ... AS status` result set so the connection is left usable for the
+    next statement. Raises ShadowTableProcedureMissing with an actionable
+    message if the procedure is not installed in this database -- this must
+    never be silently swallowed: a missing procedure means the load wrote (or
+    is about to write) to shadow tables that will never be promoted.
+    """
+    try:
+        cursor.execute(f"CALL {procedure_name}();")
+        try:
+            cursor.fetchall()
+        except pymysql.err.ProgrammingError:
+            pass  # no result set to consume
+        return cursor
+    except pymysql.err.MySQLError as e:
+        error_code = e.args[0] if e.args else None
+        if error_code == 1305:  # ER_SP_DOES_NOT_EXIST
+            raise ShadowTableProcedureMissing(
+                f"Stored procedure `{procedure_name}` is not installed in this "
+                "database. Apply setup/person_table_swap.sql "
+                "(mysql --host=... --user=... --password=... reciterdb < "
+                "setup/person_table_swap.sql) before running the nightly "
+                "loader -- otherwise the load writes to shadow tables that "
+                "are never promoted."
+            ) from e
+        raise
 
 # ------------------------------------------------------------------------------
 #                     EXECUTE WITH RECONNECT
@@ -290,7 +315,7 @@ def main(truncate_tables=True, skip_person_temp=False):
                            loads data, then re-enables keys at the end.
     :param skip_person_temp: If True, skip loading person_temp (and thus skip update_person).
     """
-    global connection, _SWAP_WARNING_EMITTED
+    global connection
     connection = establish_connection()
     cursor = connection.cursor()
 
@@ -311,21 +336,19 @@ def main(truncate_tables=True, skip_person_temp=False):
         # (1) Optional: TRUNCATE TABLES if requested
         # ------------------------------------------------------------------------------
         if truncate_tables:
-            for table in all_tables:
-                if ATOMIC_SWAP and table in SWAP_TABLES:
-                    # Build into a shadow table instead of truncating the live one.
-                    # Drop any `_new` left by a prior crashed run before recreating it
-                    # -- CREATE ... IF NOT EXISTS would silently reuse that leftover
-                    # table, which may carry a stale schema if a migration has since
-                    # altered the live table. Drop-then-CREATE ... LIKE guarantees the
-                    # shadow table always matches the live schema exactly.
-                    drop_sql = f"DROP TABLE IF EXISTS `{table}_new`;"
-                    cursor = execute_with_reconnect(cursor, drop_sql)
-                    create_sql = f"CREATE TABLE `{table}_new` LIKE `{table}`;"
-                    cursor = execute_with_reconnect(cursor, create_sql)
-                else:
-                    sql = f"TRUNCATE TABLE `{table}`;"
-                    cursor = execute_with_reconnect(cursor, sql)
+            # person_temp is internal staging -- always truncated and loaded
+            # in place, never swapped.
+            truncate_sql = "TRUNCATE TABLE `person_temp`;"
+            cursor = execute_with_reconnect(cursor, truncate_sql)
+            connection.commit()
+
+            # The 10 swap-managed tables are rebuilt as fresh `_new` shadow
+            # tables by the stored procedure in setup/person_table_swap.sql --
+            # table lifecycle (dropping any `_new` left by a prior crashed
+            # run, then CREATE ... LIKE) is managed in SQL, not Python, so it
+            # can't silently drift from setup/populateAnalysisSummaryTables_v2.sql's
+            # equivalent "1. Create staging tables" step.
+            cursor = _call_swap_procedure(cursor, "prepare_person_shadow_tables")
             connection.commit()
 
             # Disable keys once at the outset (on the shadow table when swapping)
@@ -481,19 +504,11 @@ def main(truncate_tables=True, skip_person_temp=False):
 
         connection.commit()
 
-        if ATOMIC_SWAP and not _SWAP_WARNING_EMITTED:
-            _SWAP_WARNING_EMITTED = True
-            logger.warning(
-                "ATOMIC_SWAP=1: this run wrote to `<table>_new` SHADOW TABLES, not the "
-                "live tables. That data will NOT be visible to readers until "
-                "swap_new_tables_into_place() runs. The nightly path (retrieveArticles.py) "
-                "calls that automatically after the identity merge -- but if this main() "
-                "call came from a manual/recovery run of retrieveS3.py or "
-                "retrieveDynamoDb.py, nothing promotes the shadow tables for you. Run "
-                "updateReciterDB.swap_new_tables_into_place() yourself, or the live "
-                "tables will silently keep serving the prior run's data."
-            )
-
+    except ShadowTableProcedureMissing:
+        # A missing swap procedure means this run wrote to shadow tables that
+        # will never be promoted -- never swallow this like the generic
+        # handler below does for other errors.
+        raise
     except Exception as e:
         logger.error(f"An error occurred: {e}")
     finally:
@@ -530,14 +545,18 @@ def call_update_person_only():
 #                swap_new_tables_into_place (Atomic Table Swap)
 # ------------------------------------------------------------------------------
 def swap_new_tables_into_place():
-    """Promote every `<table>_new` shadow table into its live name with a
-    single atomic RENAME TABLE statement, mirroring the "7. Atomic table
-    swap" step in setup/populateAnalysisSummaryTables_v2.sql.
+    """Promote every `<table>_new` shadow table into its live name by calling
+    the swap_person_tables() stored procedure (setup/person_table_swap.sql),
+    which performs the drop-stale-backups-then-single-atomic-RENAME sequence
+    mirroring the "7. Atomic table swap" step in
+    setup/populateAnalysisSummaryTables_v2.sql. Table lifecycle lives in that
+    stored procedure now, not here.
 
-    No-op unless ATOMIC_SWAP=1. Must be called after the final identity merge
-    (call_update_person_only(), which updates person_new) has completed, so
-    the person table swapped into place already has firstName/lastName/etc.
-    populated -- call this from retrieveArticles.py's Step 6, after that call.
+    Always runs -- there is no flag to disable it. Must be called after the
+    final identity merge (call_update_person_only(), which updates
+    person_new) has completed, so the person table swapped into place
+    already has firstName/lastName/etc. populated -- call this from
+    retrieveArticles.py's Step 6, after that call.
 
     MySQL executes a multi-table RENAME TABLE atomically: either every listed
     rename takes effect or none do. So a crash or error during the RENAME
@@ -546,32 +565,20 @@ def swap_new_tables_into_place():
     RENAME only ever touches `_new` shadow tables (or person_temp, which was
     never live-reporting data), so a crash anywhere earlier in the nightly
     run is equally harmless to the live tables.
-    """
-    if not ATOMIC_SWAP:
-        logger.info("ATOMIC_SWAP not enabled; skipping table swap (legacy truncate-in-place mode).")
-        return
 
+    The `_backup` tables the procedure produces are NOT dropped here -- they
+    are the rollback window consumed by
+    setup/restore_person_tables_from_backup.sql, cleared only by the next
+    run's call to swap_person_tables().
+    """
     global connection
     connection = establish_connection()
     cursor = connection.cursor()
     try:
-        logger.info("7. Atomic table swap -- dropping any stale `_backup` tables from the prior run.")
-        for t in SWAP_TABLES:
-            drop_sql = f"DROP TABLE IF EXISTS `{t}_backup`;"
-            cursor = execute_with_reconnect(cursor, drop_sql)
-        connection.commit()
-
-        rename_sql = build_swap_rename_sql()
-        logger.info(f"Performing atomic RENAME to swap {len(SWAP_TABLES)} tables into place: {rename_sql}")
-        cursor = execute_with_reconnect(cursor, rename_sql)
+        logger.info("7. Atomic table swap -- calling swap_person_tables().")
+        cursor = _call_swap_procedure(cursor, "swap_person_tables")
         connection.commit()
         logger.info("Atomic table swap complete -- live tables now reflect tonight's rebuild.")
-
-        # The RENAME above already moved the previous live tables to
-        # `_backup`. Leave them in place -- they are NOT dropped here.
-        # This run's `_backup` tables serve as a rollback window (see
-        # setup/restore_person_tables_from_backup.sql) until the next run's
-        # pre-swap drop above clears them to make room for the next backup.
 
     except Exception as e:
         logger.error(f"Atomic table swap FAILED -- live tables left untouched (prior run's data still serving): {e}")
