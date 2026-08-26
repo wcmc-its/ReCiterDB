@@ -10,7 +10,7 @@ metadata:
 spec:
   # Matches the live prod object so `kubectl apply` is a no-op. Do NOT change the
   # schedule here without changing it live — this is the sole source of truth.
-  schedule: "15 4 * * *"
+  schedule: "30 14 * * *"
   concurrencyPolicy: Forbid
   jobTemplate:
     spec:
