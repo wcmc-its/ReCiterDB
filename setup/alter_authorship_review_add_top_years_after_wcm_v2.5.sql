@@ -1,5 +1,5 @@
 -- =============================================================================
--- Migration: authorship_review add top_years_after_wcm (v2.3)
+-- Migration: authorship_review add top_years_after_wcm (v2.5)
 -- =============================================================================
 -- Adds:
 --   - top_years_after_wcm  INT  NULL  — paper publication year MINUS the top
@@ -43,7 +43,7 @@
 --
 --   Apply with:
 --     mysql -h "$DB_HOST" -u "$DB_USERNAME" -p "$DB_NAME" \
---       < setup/alter_authorship_review_add_top_years_after_wcm_v2.3.sql
+--       < setup/alter_authorship_review_add_top_years_after_wcm_v2.5.sql
 --
 -- DURABILITY: authorship_review is curator state, not a reporting export — not in
 --   update/updateReciterDB.py's truncate list, not touched by any nightly ETL step.
