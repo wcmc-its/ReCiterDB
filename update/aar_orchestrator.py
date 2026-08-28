@@ -37,6 +37,7 @@ Usage:
   python aar_orchestrator.py --from 2026/05/26 --to 2026/06/02 --state-dir /tmp/aar_test   # test
   python aar_orchestrator.py --mode initial        # one-time backlog clear (long)
   python aar_orchestrator.py --mode recurring      # monthly rolling slice
+  python aar_orchestrator.py --mode backfill       # re-explode old 'attributed' pmids
 """
 import argparse, json, os, sys
 from concurrent.futures import ThreadPoolExecutor
@@ -151,12 +152,32 @@ def _trunc(s, n):
     return s[:n] if isinstance(s, str) and len(s) > n else s
 
 
+def _already_curated(top):
+    """This authorship is already attributed at the production final score the reciterdb
+    gate itself uses (>= STORAGE_THRESHOLD), so it is a resolved attribution, not a
+    curation record. Three sites decide this -- the DB sink, the CSV sink, and the run
+    log -- and they must never disagree, so they all call here.
+
+    Note the score is `final_score` from aar_matcher, i.e. the production final read out
+    of the person's scoring artifact (aar_gate classifies `suggested_ge30` from the same
+    number). It is not a fresh local rescore. It can still disagree with
+    gate.attributed_pmids(), which reads reciterdb.analysis_summary_author -- same
+    underlying score, different staleness -- if a reciterdb import lags or drops rows."""
+    return (top is not None
+            and top.get("final_score") is not None
+            and top["final_score"] >= gate.STORAGE_THRESHOLD)
+
+
 def _db_rows(resolved_auth, run_date):
     """authorship_review rows for matched authorships, classified PER-AUTHORSHIP:
-    absent (top candidate never scored) / suggested (FG>=30, in a pending queue) /
-    buried (FG<30). Includes suggested rows (PM shows them with FG+IO). Unmatched
-    authorships (no candidate to assign) are skipped in v1. single_candidate uses the
-    true cohort size (unique surname+initial), the strongest precision signal.
+    absent (top candidate never scored) / buried (FG<30). suggested (FG>=30) means
+    this authorship is ALREADY curated -- already attributed at production score
+    >=30, the same signal the reciterdb gate itself uses -- so it is not a curation
+    record and is skipped entirely, not just hidden behind a PM filter. (Was
+    previously written and left for PM to display; per product decision 2026-08-19
+    that is wrong -- don't create a queue record for something already resolved.)
+    Unmatched authorships (no candidate to assign) are also skipped. single_candidate
+    uses the true cohort size (unique surname+initial), the strongest precision signal.
 
     dup_flag/dup_reason: one batched aar_db.dup_flags_by_doi() call over every DOI in
     this run's resolved_auth (not a query per row), narrowed per row to THIS
@@ -170,8 +191,9 @@ def _db_rows(resolved_auth, run_date):
         if top is None:
             continue                                   # unmatched: nothing to assign
         fg = top.get("final_score")
-        cls = ("absent" if fg is None
-               else "suggested" if fg >= gate.STORAGE_THRESHOLD else "buried")
+        if _already_curated(top):
+            continue                                   # already curated -- not a queue record
+        cls = "absent" if fg is None else "buried"
         cohort = top.get("cohort_size")
         doi = a.get("doi")
         dup_uid = aar_db.dup_uid_for_authorship(dup_map, doi, top, cands)
@@ -263,18 +285,27 @@ def run(date_from, date_to, state_dir, export_dir, run_date, workers=16, max_rec
     log(f"      {u['in_window']} in window, {len(arts)} with a WCM author, "
         f"{len(new_pmids)} new (not yet processed)")
 
-    # --- 2. gate (batched, global) ------------------------------------------
+    # --- 2. gate (batched, global) -- LABEL ONLY, no longer an explosion filter
+    # Article-level "attributed" (>=1 WCM co-author already >=30) used to skip step 3
+    # entirely for the whole article. That's wrong: an article can have SOME WCM
+    # co-authors correctly attributed and OTHERS never scored at all (the
+    # prs4005/PMID 41000987 case -- 5 co-authors attributed, prs4005 himself never
+    # even retrieved). Every new WCM-authored pmid now gets exploded; the
+    # per-authorship classification in step 4 (not this query) decides what a
+    # curator sees. Kept here for the processed_log label and for _recheck's
+    # attribution lookups (attr_who).
     log("[2/6] Gating new pmids against reciterdb (analysis_summary_author) ...")
     attributed = gate.attributed_pmids(new_pmids) if new_pmids else set()
-    orphan_pmids = [p for p in new_pmids if p not in attributed]
-    log(f"      {len(attributed)} attributed, {len(orphan_pmids)} ORPHAN articles")
+    orphan_pmids = [p for p in new_pmids if p not in attributed]  # metric only now
+    log(f"      {len(attributed)} of {len(new_pmids)} new pmids have >=1 WCM co-author "
+        f"already attributed (article-level label; ALL still get exploded below)")
 
-    # --- 3. explode orphan articles into WCM authorships + match -------------
-    log("[3/6] Matching WCM authorships on orphan articles ...")
+    # --- 3. explode ALL new WCM-authored articles into authorships + match ---
+    log("[3/6] Matching WCM authorships on new articles ...")
     log(f"      identity index: {sum(len(v) for v in idx.by_surname.values())} people")
     authorships = []  # (article, position, author, candidates)
     cwid_pool = set()
-    for p in orphan_pmids:
+    for p in new_pmids:
         a = by_pmid[p]
         n = len(a["authors"])
         for i, au in enumerate(a["authors"]):
@@ -303,10 +334,10 @@ def run(date_from, date_to, state_dir, export_dir, run_date, workers=16, max_rec
             list(ex.map(_warm, pool))
     log(f"      identity-only cache warm: {len(pool)} CWIDs")
 
-    # production-final gate (cache hits now; no further S3): an article already SUGGESTED
-    # to a WCM person at the storage threshold sits in that curator's pending queue, so it
-    # is NOT buried -> exclude the whole article (the lja2002/42026694 case). Resolve the
-    # top candidate per authorship, flag articles with ANY candidate final >= 30, drop them.
+    # production-final gate (cache hits now; no further S3). Resolve the top candidate per
+    # authorship. suggested_pmids is the ARTICLE-level roll-up -- >=1 authorship on the
+    # article scored >=30 -- and since #160 it is informational only: exclusion is decided
+    # per authorship below, not per article (the prs4005 / PMID 41000987 case).
     resolved_auth, suggested_pmids = [], set()
     for a, i, n, au, _ in authorships:
         cands = matcher.match_authorship(au, a["pmid"], idx, io, top_k=5,
@@ -316,12 +347,16 @@ def run(date_from, date_to, state_dir, export_dir, run_date, workers=16, max_rec
                 and top["final_score"] >= gate.STORAGE_THRESHOLD:
             suggested_pmids.add(a["pmid"])
         resolved_auth.append((a, i, n, au, cands, top))
-    log(f"      {len(suggested_pmids)} orphan articles already SUGGESTED (final>=30, in a "
-        f"pending queue) -> EXCLUDED; {len(orphan_pmids) - len(suggested_pmids)} buried/absent kept")
+    n_row_suggested = sum(1 for *_, top in resolved_auth if _already_curated(top))
+    log(f"      {len(suggested_pmids)} articles have >=1 authorship already SUGGESTED "
+        f"(article-level, informational); {n_row_suggested}/{len(resolved_auth)} individual "
+        f"authorships are SUGGESTED and excluded from the curator queue below, "
+        f"{len(resolved_auth) - n_row_suggested} kept (buried/absent, per-authorship)")
 
-    # DB sink (Publication Manager source): upsert ALL matched authorships, classified
-    # per-authorship (suggested/buried/absent). Unlike the CSV path below, suggested rows
-    # are kept — PM shows them with FG+IO. Curator status on existing rows is preserved.
+    # DB sink (Publication Manager source): upsert the matched authorships that are still
+    # curation records -- absent/buried. Since #160 an authorship already at FG>=30 is
+    # already curated, so _db_rows skips it rather than writing it for PM to filter.
+    # Curator status on existing rows is preserved.
     if write_db:
         db_rows = _db_rows(resolved_auth, run_date)
         aar_db.upsert(db_rows)
@@ -329,8 +364,8 @@ def run(date_from, date_to, state_dir, export_dir, run_date, workers=16, max_rec
 
     new_rows = []
     for a, i, n, au, cands, top in resolved_auth:
-        if a["pmid"] in suggested_pmids:
-            continue                                  # whole article is in a pending queue
+        if _already_curated(top):
+            continue                                  # THIS authorship is already suggested/covered
         new_rows.append({
             "pmid": a["pmid"],
             "author_key": f"{a['pmid']}:{i}",
@@ -387,10 +422,16 @@ def run(date_from, date_to, state_dir, export_dir, run_date, workers=16, max_rec
 
     # --- 6. persist + export -------------------------------------------------
     store.save()
+    # orphan_pmids (no attribution at all) and suggested_pmids (>=1 authorship
+    # rescored >=30) are no longer nested subsets now that step 3 explodes every
+    # new pmid, not just orphan ones -- an already-`attributed` pmid can also land
+    # in suggested_pmids (its co-author reproduces the same production score on
+    # rescore). Compute the overlap-safe count explicitly rather than subtracting.
+    n_orphan_buried = len(set(orphan_pmids) - suggested_pmids)
     summary = _export(store, export_dir, run_date, date_from, date_to, u,
                       len(new_pmids), len(attributed), len(orphan_pmids),
-                      len(suggested_pmids), len(authorships), len(pool),
-                      len(new_rows), resolved)
+                      len(suggested_pmids), n_orphan_buried, len(authorships),
+                      len(pool), len(new_rows), resolved)
     log(f"[6/6] State -> {store.ledger_path}")
     log(f"      Export -> {os.path.join(export_dir, run_date)}")
     log("\n==== RUN SUMMARY ====")
@@ -422,18 +463,33 @@ def _recheck(store, run_date):
     gs = _batch_gold_standard(cwids)
 
     counts = {"attributed": 0, "accepted": 0, "rejected": 0, "snooze_expired": n_expired}
+    # The old code resolved EVERY open ledger row for a pmid the instant ANY co-author
+    # on it became attributed -- the same article-vs-authorship conflation as the gate
+    # and dup_flag (issue #158) bugs, just in the recheck path. Now a row is resolved
+    # only when that row's own candidate cwid is among the pmid's attributed cwids.
+    #
+    # Exception, and it is the majority of the ledger: a row with NO candidate cwids at
+    # all (match_status='no_identity_match' -- 1,336 of 1,923 open rows in prod as of
+    # 2026-08-28) has nothing to narrow TO. Requiring "this row's own cwid is attributed"
+    # of a row that names no cwid would make resolved_attributed unreachable for it
+    # forever. The conflation bug being fixed here is specifically "the row named
+    # candidates and none of them is the attributed one", which presupposes candidates,
+    # so candidate-less rows keep the old article-level signal.
     for j in open_idx:
         row = led.loc[j]
         pmid = int(row["pmid"])
         cc = _row_cwids(row)
         accept_cwid = next((c for c in cc if pmid in gs.get(c, (set(), set()))[0]), None)
         reject_cwid = next((c for c in cc if pmid in gs.get(c, (set(), set()))[1]), None)
+        attr_hits = attr_who.get(pmid, []) if pmid in attr else []
+        attr_cwid = next((c for c in cc if c in {w[0] for w in attr_hits}), None)
+        if not cc and attr_hits:                       # candidate-less row: article-level only
+            attr_cwid = attr_hits[0][0]
         if accept_cwid:
             _resolve(led, j, "resolved_accepted", accept_cwid, run_date)
             counts["accepted"] += 1
-        elif pmid in attr:
-            who = attr_who.get(pmid) or [(None, None)]
-            _resolve(led, j, "resolved_attributed", who[0][0], run_date)
+        elif attr_cwid:
+            _resolve(led, j, "resolved_attributed", attr_cwid, run_date)
             counts["attributed"] += 1
         elif reject_cwid:
             _resolve(led, j, "resolved_rejected", reject_cwid, run_date)
@@ -471,7 +527,8 @@ def _resolve(led, j, status, cwid, run_date):
 
 
 def _export(store, export_dir, run_date, date_from, date_to, u, n_new, n_attr,
-            n_orphan, n_suggested, n_authorships, n_scored, n_rows, resolved):
+            n_orphan, n_suggested, n_orphan_buried, n_authorships, n_scored, n_rows,
+            resolved):
     out = os.path.join(export_dir, run_date)
     os.makedirs(out, exist_ok=True)
     led = store.ledger
@@ -501,7 +558,7 @@ def _export(store, export_dir, run_date, date_from, date_to, u, n_new, n_attr,
                      "with_wcm_author": u["with_wcm_author"]},
         "new_pmids": n_new, "attributed": n_attr,
         "orphan_articles_not_accepted": n_orphan,
-        "suggested_excluded": n_suggested, "buried_articles_kept": n_orphan - n_suggested,
+        "suggested_excluded": n_suggested, "buried_articles_kept": n_orphan_buried,
         "wcm_authorships_added": n_authorships, "candidate_cwids_scored": n_scored,
         "ledger_rows_added": n_rows, "resolved_this_run": resolved,
         "ledger_totals": _status_counts(led),
@@ -559,9 +616,168 @@ def run_tiled(date_from, date_to, state_dir, export_dir, run_date, workers=16,
     }, indent=2), flush=True)
 
 
+def _selftest():
+    """Offline checks for the per-authorship gate (issue #160). No network, no DB:
+    every article here has doi=None so _db_rows never calls aar_db.dup_flags_by_doi,
+    and _recheck's gate/GoldStandard lookups are stubbed."""
+    ok = True
+
+    def check(label, cond):
+        nonlocal ok
+        ok &= bool(cond)
+        print(f"  [{'OK' if cond else '** FAIL'}] {label}")
+
+    T = gate.STORAGE_THRESHOLD
+
+    def auth(fg, cwid="aaa1001"):
+        art = {"pmid": 1, "entrez_date": "2026-01-01", "title": "t", "journal": "j",
+               "doi": None, "authors": [], "pub_year": 2026}
+        top = {"cwid": cwid, "name": "N", "person_type": "p", "dept": "d",
+               "final_score": fg, "io_score": 5.0, "confidence": "high",
+               "years_after_wcm": None, "cohort_size": 1, "given_match": 1,
+               "affil_dept_match": True}
+        return (art, 0, 1, {"last": "N", "fore": "F", "affiliations": []}, [top], top)
+
+    rows = _db_rows([auth(T + 1), auth(None), auth(T - 1)], "2026-01-01")
+    check("_db_rows skips an authorship already curated at FG>=threshold",
+          len(rows) == 2 and all(r["classification"] != "suggested" for r in rows))
+    check("_db_rows keeps absent (no FG) and buried (FG<threshold)",
+          sorted(r["classification"] for r in rows) == ["absent", "buried"])
+    check("_db_rows still skips an unmatched authorship (top is None)",
+          _db_rows([(auth(None)[0], 0, 1, {}, [], None)], "2026-01-01") == [])
+
+    # _recheck: an open row must resolve only when ITS OWN cwid is attributed.
+    led = pd.DataFrame([
+        {"pmid": 99, "top_cwid": "mine001", "candidate_cwids_json": "[]",
+         "status": "open", "snooze_until": None, "last_checked": None},
+        {"pmid": 99, "top_cwid": "other02", "candidate_cwids_json": "[]",
+         "status": "open", "snooze_until": None, "last_checked": None},
+    ])
+    for c in LEDGER_COLS:
+        if c not in led.columns:
+            led[c] = pd.NA
+    store = type("S", (), {"ledger": led[LEDGER_COLS],
+                           "processed": pd.DataFrame({c: pd.Series(dtype="object")
+                                                      for c in PROCESSED_COLS})})()
+    g_attr, g_who, g_gs = gate.attributed_pmids, gate.attributions, _batch_gold_standard
+    gate.attributed_pmids = lambda ps: {99}
+    gate.attributions = lambda ps: {99: [("mine001", None)]}
+    globals()["_batch_gold_standard"] = lambda cwids: {}
+    try:
+        counts = _recheck(store, "2026-01-02")
+    finally:
+        gate.attributed_pmids, gate.attributions = g_attr, g_who
+        globals()["_batch_gold_standard"] = g_gs
+    st = list(store.ledger["status"])
+    check("_recheck resolves the row whose own cwid is attributed",
+          counts["attributed"] == 1 and st[0] == "resolved_attributed")
+    check("_recheck leaves a co-author's row on the same pmid OPEN",
+          st[1] == "open")
+
+    # A row that names no candidate at all has nothing to narrow to; it must still close
+    # on article-level attribution, or 1,336 of prod's 1,923 open rows never resolve.
+    led2 = pd.DataFrame([{"pmid": 99, "top_cwid": None, "candidate_cwids_json": "[]",
+                          "status": "open", "snooze_until": None, "last_checked": None}])
+    for c in LEDGER_COLS:
+        if c not in led2.columns:
+            led2[c] = pd.NA
+    store2 = type("S", (), {"ledger": led2[LEDGER_COLS],
+                            "processed": pd.DataFrame({c: pd.Series(dtype="object")
+                                                       for c in PROCESSED_COLS})})()
+    gate.attributed_pmids = lambda ps: {99}
+    gate.attributions = lambda ps: {99: [("someone1", None)]}
+    globals()["_batch_gold_standard"] = lambda cwids: {}
+    try:
+        c2 = _recheck(store2, "2026-01-02")
+    finally:
+        gate.attributed_pmids, gate.attributions = g_attr, g_who
+        globals()["_batch_gold_standard"] = g_gs
+    check("_recheck still closes a candidate-less (no_identity_match) row on "
+          "article-level attribution",
+          c2["attributed"] == 1
+          and store2.ledger["status"].iloc[0] == "resolved_attributed")
+
+    print("SELFTEST", "PASS" if ok else "FAIL")
+    return ok
+
+
+def run_backfill(state_dir, run_date, workers=16, batch_size=500, limit=None, write_db=True):
+    """Re-processes pmids previously logged as article-level 'attributed' -- under the
+    OLD gate these were skipped at step 3 entirely, so any co-author who wasn't the
+    one already attributed (e.g. prs4005 on PMID 41000987) was never scored or
+    written to reciterdb.authorship_review. Re-fetches those specific pmids by ID
+    (EFetch id= list, not an ESearch/date window -- processed_log only stores
+    pmid/entrez_date, not full author metadata), explodes into WCM authorships,
+    classifies per-authorship, and upserts into reciterdb.authorship_review only
+    (idempotent by author_key, never touches an existing curator decision; does NOT
+    also append to ledger.csv/processed_log -- those stay accurate as article-level
+    records, this only backfills the PM-facing per-authorship sink)."""
+    store = LedgerStore(state_dir)
+    idx = matcher.IdentityIndex.load()
+    io = matcher.IdentityOnlyScorer()
+    pmids = sorted(int(p) for p in
+                   store.processed.loc[store.processed["last_status"] == "attributed",
+                                       "pmid"].dropna())
+    if limit:
+        pmids = pmids[:limit]
+    if not len(store.processed):
+        # In-cluster the ledger lives in S3, so `--mode backfill` without `--s3-state`
+        # reads an empty state dir, finds nothing, and exits 0 looking like a success.
+        raise SystemExit(f"Backfill: processed_log at {store.processed_path} is empty or "
+                         f"missing -- in-cluster that means --s3-state was omitted. "
+                         f"Refusing to report success on a zero-row run.")
+    print(f"Backfill: {len(pmids)} previously-'attributed' pmids to re-explode "
+          f"(of {len(store.processed)} processed)", flush=True)
+    groups = uni.load_home_institution_groups()
+    total_rows = 0
+    n_batches = -(-len(pmids) // batch_size) if pmids else 0
+    for bi, i in enumerate(range(0, len(pmids), batch_size), 1):
+        chunk = pmids[i:i + batch_size]
+        arts = uni.efetch_by_ids(chunk, groups)
+        by_pmid = {a["pmid"]: a for a in arts}
+        authorships = []
+        cwid_pool = set()
+        for p in chunk:
+            a = by_pmid.get(p)
+            if not a:
+                continue
+            n = len(a["authors"])
+            for j, au in enumerate(a["authors"]):
+                if not au.get("home_inst"):
+                    continue
+                cands, _ = idx.candidates(au.get("last"), au.get("fore"),
+                                          au.get("initials"), au.get("affiliations"),
+                                          top_k=5, pub_year=a.get("pub_year"))
+                cwid_pool.update(c["cwid"] for c in cands)
+                authorships.append((a, j, n, au, cands))
+        pool = sorted(c for c in cwid_pool if c not in io._cache)
+        if pool:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                list(ex.map(io.scores, pool))
+        resolved_auth = []
+        for a, j, n, au, _ in authorships:
+            cands = matcher.match_authorship(au, a["pmid"], idx, io, top_k=5,
+                                             pub_year=a.get("pub_year"))
+            top = cands[0] if cands else None
+            resolved_auth.append((a, j, n, au, cands, top))
+        if write_db:
+            db_rows = _db_rows(resolved_auth, run_date)
+            aar_db.upsert(db_rows)
+            total_rows += len(db_rows)
+        missing = [p for p in chunk if p not in by_pmid]
+        print(f"  batch {bi}/{n_batches}: {len(chunk)} requested, {len(by_pmid)} fetched"
+              f"{f' ({len(missing)} NOT RETURNED by EFetch)' if missing else ''} -> "
+              f"{len(authorships)} authorships ({len(pool)} newly IO-scored)", flush=True)
+    print(f"Backfill done: {total_rows} authorship_review rows upserted "
+          f"({'DRY RUN, no DB write' if not write_db else 'written'})", flush=True)
+    return total_rows
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["initial", "recurring"])
+    ap.add_argument("--selftest", action="store_true",
+                    help="offline per-authorship gate checks (no network, no DB)")
+    ap.add_argument("--mode", choices=["initial", "recurring", "backfill"])
     ap.add_argument("--from", dest="date_from")
     ap.add_argument("--to", dest="date_to")
     ap.add_argument("--max", type=int, default=None, help="cap universe fetch (testing)")
@@ -576,6 +792,9 @@ def main():
                          "state-dir/export-dir become ephemeral temp dirs")
     args = ap.parse_args()
 
+    if args.selftest:
+        sys.exit(0 if _selftest() else 1)
+
     if args.s3_state:
         if not S3_STATE_BUCKET:
             ap.error("--s3-state requires AAR_S3_BUCKET or S3_BUCKET in the environment")
@@ -583,6 +802,12 @@ def main():
         args.state_dir = tempfile.mkdtemp(prefix="aar-state-")
         args.export_dir = tempfile.mkdtemp(prefix="aar-export-")
         _s3_pull_state(args.state_dir)
+
+    if args.mode == "backfill":
+        # DB sink only -- no ledger/processed_log mutation, so no _s3_push_state.
+        run_backfill(args.state_dir, args.run_date, workers=args.workers,
+                     limit=args.max, write_db=not args.no_db)
+        return
 
     if args.mode:
         d_from, d_to = (uni._fmt(x) for x in uni.window_for_mode(args.mode))

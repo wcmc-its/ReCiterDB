@@ -124,6 +124,23 @@ def _req(method, path, **params):
     raise RuntimeError(f"E-utilities {path} failed after retries")
 
 
+def efetch_by_ids(pmids, groups):
+    """EFetch a specific PMID list (not an ESearch/date window) and parse them the same
+    way pull_universe() does. Used by the orchestrator's backfill path to re-fetch full
+    article/author metadata for pmids that were only ever logged as (pmid, entrez_date)
+    in processed_log.csv, without re-running the affiliation ESearch over the whole
+    historical window."""
+    pmids = sorted({int(p) for p in pmids})
+    out = []
+    for i in range(0, len(pmids), EFETCH_BATCH):
+        chunk = pmids[i:i + EFETCH_BATCH]
+        r = _req("POST", "efetch.fcgi", db="pubmed",
+                 id=",".join(str(p) for p in chunk), retmode="xml")
+        out.extend(parse_articles(r.content, groups))
+        time.sleep(SLEEP)
+    return out
+
+
 def esearch_history(term, date_from, date_to):
     r = _req("POST", "esearch.fcgi", db="pubmed", term=term, datetype="edat",
              mindate=date_from, maxdate=date_to, usehistory="y", retmax=0, retmode="json")
