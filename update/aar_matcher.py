@@ -23,11 +23,24 @@ Ranking key per candidate: (identity-only score desc, full>initial given match,
 confidence desc). The orchestrator (next step) calls `match_authorship()` for each
 WCM authorship on each orphan article and writes the ranked candidates to the ledger.
 
+Temporal plausibility (issue #159) reaches that key ONLY through `confidence`. A
+WCM-affiliated paper was written by someone who was at WCM when it was published, so a
+candidate proposed for a paper that appeared years after their appointment ended loses
+confidence points — a graduated, capped penalty (`identity_index.temporal_penalty`)
+that breaks ties but deliberately does NOT outrank the identity-only score or the
+given-name match, and never drops anyone. It needs the paper's year:
+`match_authorship(..., pub_year=None)` is exactly the pre-#159 ranking, so a caller
+that has no year loses nothing. The gap itself is published per row as
+`authorship_review.top_years_after_wcm`, which is the lever for the stale rows whose
+homonym cohort is one person and where re-ranking can do nothing.
+
 Confidence is an explainable ordering aid, NOT a probability:
     base   = 0.50 full given-name match | 0.25 initial-only
     rarity = 0.40 / cohort_size          (1 person -> 0.40, 2 -> 0.20, ...)
     affil  = +0.25 if the affiliation text names the candidate's dept/division
     hist   = -0.10 if the person is alumni / inactive / emeritus
+    stale  = -0.01 per year the paper postdates their WCM end year, after 5 grace
+             years, capped at -0.15 (reached at a 20-year gap)
     -> clipped to [0, 1]
 
 Env: DB_USERNAME/DB_PASSWORD/DB_HOST/DB_NAME (reciterdb, read-only). S3 + pinned
@@ -118,17 +131,23 @@ class IdentityOnlyScorer:
 
 
 # ---- public entry point ----------------------------------------------------
-def match_authorship(author, pmid, idx, io_scorer, top_k=5):
+def match_authorship(author, pmid, idx, io_scorer, top_k=5, pub_year=None):
     """Rank candidate CWIDs for one WCM authorship on an orphan article.
 
     author = {"last","fore","initials","affiliations"} (a universe author block).
-    Returns the ranked candidate list; each candidate gains:
+    pub_year = the paper's publication year (None -> no temporal penalty, pre-#159
+    ranking). Returns the ranked candidate list; each candidate gains:
       io_score  (float 0-100 | None)   ReCiter identity-only score for this pmid
       io_source ("retrieved" | "not_retrieved")
-    Ranking: identity-only score desc (nulls last) -> full given match -> confidence."""
+    Ranking: identity-only score desc (nulls last) -> full given match -> confidence.
+    The temporal penalty is inside `confidence` (issue #159) and is deliberately NOT a
+    term of its own: leading the key with it would let a one-year-past-grace gap
+    outrank a 50-point identity-only score, and would sink the penalised candidate out
+    of `candidates()`'s top_k altogether. So on this lane it moves the top pick only
+    among candidates otherwise tied — in practice the ones production never scored."""
     cands, cohort = idx.candidates(
         author.get("last"), author.get("fore"), author.get("initials"),
-        author.get("affiliations"), top_k=top_k)
+        author.get("affiliations"), top_k=top_k, pub_year=pub_year)
     for c in cands:
         v = io_scorer.scores(c["cwid"]).get(int(pmid)) if io_scorer else None
         c["io_score"] = round(v[0], 2) if v else None
@@ -148,14 +167,91 @@ def _print_candidates(cands, cohort_size):
         return
     for i, c in enumerate(cands, 1):
         io = f"{c['io_score']:.2f}" if c["io_score"] is not None else "  -  "
+        gap = c.get("years_after_wcm")
+        stale = f"stale={gap:+d}y" if gap is not None else ""
         print(f"  {i}. cwid={c['cwid']:10} io={io:>6} ({c['io_source']:13}) "
               f"conf={c['confidence']:.3f} {c['given_match']:7} "
-              f"affil={'Y' if c['affil_dept_match'] else '.'} "
+              f"affil={'Y' if c['affil_dept_match'] else '.'} {stale} "
               f"| {c['name']} — {c['person_type']}, {c['dept']}")
 
 
+def _rank_selftest():
+    """Offline (no DB, no S3): the temporal penalty rides inside `confidence` and must
+    stay BEHIND the identity-only score and the given-name match in this module's
+    re-sort (issue #159). Two Lees who both match "K Lee", plus the live Weiss row that
+    a penalty-leading sort key got wrong."""
+    def rec(given, surname, end_year, cwid):
+        return {"cwid": cwid, "given": given, "middle": "", "surname": surname,
+                "given_norm": _norm(given), "surname_norm": _norm(surname),
+                "dept": "", "division": "", "program": "", "title": "",
+                "person_type": "Inactive Faculty", "historical": True,
+                "end_year": end_year}
+
+    class _FakeIO:
+        """io_scorer stub: `scored` names the CWIDs production ever retrieved."""
+        def __init__(self, scored=("departed",)):
+            self.scored = scored
+
+        def scores(self, cwid):
+            return {99: (95.0, 0.0)} if cwid in self.scored else {}
+
+    idx = IdentityIndex([rec("Kevin", "Lee", 1999, "departed"),
+                         rec("Karen", "Lee", 2027, "here")])
+    author = {"last": "Lee", "fore": None, "initials": "K", "affiliations": []}
+    before = match_authorship(author, 99, idx, _FakeIO())                   # no pub_year
+    after = match_authorship(author, 99, idx, _FakeIO(), pub_year=2024)     # 25y stale
+    # nobody scored -> io ties at -1.0 and given_match ties, so confidence (carrying the
+    # penalty) is what decides. This is the `absent` classification, the common case.
+    tie = match_authorship(author, 99, idx, _FakeIO(scored=()), pub_year=2024)
+
+    # Blocker 2 regression. The shape is taken from live row 60896 / PMID 42430466
+    # ("Robert S Weiss"), where a penalty-leading key demoted weissro (io 50.61) below
+    # rww2001 (io 1.47) -- but the gap on that live row is 35 years (weissro's
+    # endDateWCMFaculty is 1991, the paper is 2026), NOT six. The six-year gap below is
+    # SYNTHETIC, chosen because a lexicographic lead term ignores magnitude: the
+    # smallest gap one year past the grace has to beat 49 points of identity evidence
+    # for the point to hold. Replaying the rejected key over 12,007 open rows, 23 flips
+    # did turn on a gap of exactly 6, but none of those demoted a candidate carrying a
+    # real io_score -- the smallest gap that demoted a SCORED candidate is 8 (row 34105,
+    # jjt2004, io 50.61). So do not read this as evidence that six-year gaps are
+    # dangerous in the live data, and do not tighten TEMPORAL_GRACE_YEARS on its basis.
+    weiss = IdentityIndex([rec("Robert", "Weiss", 2018, "weissro"),
+                           rec("Ronald", "Weiss", 2030, "rww2001")])
+
+    class _WeissIO:
+        def scores(self, cwid):
+            return {99: (50.61, 0.0) if cwid == "weissro" else (1.47, 0.0)}
+
+    wr = match_authorship({"last": "Weiss", "fore": None, "initials": "R",
+                           "affiliations": []}, 99, weiss, _WeissIO(), pub_year=2024)
+
+    checks = [
+        ("pre-#159 (no pub_year): io_score alone puts the departed Lee on top",
+         before[0]["cwid"] == "departed" and before[0]["io_score"] == 95.0),
+        ("INTENDED: a 25-year gap does NOT outrank a 95-point identity-only score",
+         after[0]["cwid"] == "departed"),
+        ("...the gap is still recorded for the curator-facing column",
+         after[0]["years_after_wcm"] == 25),
+        ("...and it costs confidence, capped so it never reaches 0.000",
+         0 < after[0]["confidence"] < before[0]["confidence"]),
+        ("with no identity-only score on either side the penalty breaks the tie",
+         tie[0]["cwid"] == "here" and tie[-1]["cwid"] == "departed"),
+        ("nothing is dropped: both Lees come back either way",
+         len(after) == 2 and len(tie) == 2),
+        ("a synthetic 6-year gap does not promote a 1.47 io_score over a 50.61 one "
+         "(shape of live row 60896, whose real gap is 35y)", wr[0]["cwid"] == "weissro"),
+    ]
+    ok = True
+    for label, passed in checks:
+        ok &= bool(passed)
+        print(f"  [{'OK' if passed else '** FAIL'}] {label}")
+    return ok
+
+
 def _selftest():
-    print("Loading identity index from reciterdb ...", flush=True)
+    print("=== Temporal-penalty ranking (offline) ===")
+    rank_ok = _rank_selftest()
+    print("\nLoading identity index from reciterdb ...", flush=True)
     idx = IdentityIndex.load()
     n = sum(len(v) for v in idx.by_surname.values())
     print(f"  indexed {n} identities across {len(idx.by_surname)} surnames")
@@ -187,7 +283,7 @@ def _selftest():
                       common_cohort)
 
     print("\n==== SELFTEST ====")
-    ok = True
+    ok = rank_ok
     for label, passed in checks:
         ok &= bool(passed)
         print(f"  [{'OK' if passed else '** FAIL'}] {label}")
@@ -203,6 +299,8 @@ def main():
     ap.add_argument("--initials")
     ap.add_argument("--affil", action="append", default=None)
     ap.add_argument("--pmid", type=int)
+    ap.add_argument("--pub-year", type=int, help="paper's publication year (enables the "
+                                                 "temporal-plausibility penalty)")
     ap.add_argument("--top-k", type=int, default=5)
     args = ap.parse_args()
 
@@ -216,11 +314,13 @@ def main():
     author = {"last": args.surname, "fore": args.given,
               "initials": args.initials, "affiliations": args.affil}
     if args.pmid:
-        cands = match_authorship(author, args.pmid, idx, io, top_k=args.top_k)
+        cands = match_authorship(author, args.pmid, idx, io, top_k=args.top_k,
+                                 pub_year=args.pub_year)
         cohort = idx.candidates(args.surname, args.given, args.initials, args.affil)[1]
     else:
         cands, cohort = idx.candidates(args.surname, args.given, args.initials,
-                                       args.affil, top_k=args.top_k)
+                                       args.affil, top_k=args.top_k,
+                                       pub_year=args.pub_year)
         for c in cands:
             c["io_score"], c["io_source"] = None, "(no --pmid)"
     print(f"=== {args.surname}, {args.given or args.initials or '?'} ===")

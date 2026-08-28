@@ -67,6 +67,9 @@ CREATE TABLE IF NOT EXISTS `authorship_review` (
   `top_fg_score`           FLOAT        NULL,                -- production final (FG)
   `top_io_score`           FLOAT        NULL,                -- identity-only (IO)
   `top_confidence`         FLOAT        NULL,
+  `top_years_after_wcm`    INT          NULL,                -- paper year - top candidate's WCM end year;
+                                                             -- NEGATIVE = paper predates the departure,
+                                                             -- NULL = unknown (no end year / no pub year)
   `top_cohort_size`        INT          NULL,                -- homonyms (surname+initial)
   `top_given_match`        VARCHAR(16)  NULL,                -- full|initial
   `top_affil_match`        TINYINT(1)   NULL,

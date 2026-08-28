@@ -142,7 +142,8 @@ def _position_label(i, n):
 def _compact(cands):
     """Trim candidate dicts for JSON storage in the ledger."""
     keep = ("cwid", "name", "person_type", "dept", "given_match", "affil_dept_match",
-            "cohort_size", "confidence", "io_score", "final_score", "io_source")
+            "cohort_size", "confidence", "years_after_wcm", "io_score", "final_score",
+            "io_source")
     return [{k: c.get(k) for k in keep} for c in cands]
 
 
@@ -187,7 +188,9 @@ def _db_rows(resolved_auth, run_date):
             "top_person_type": _trunc(top["person_type"], 64),
             "top_dept": _trunc(top["dept"], 255),
             "top_fg_score": fg, "top_io_score": top.get("io_score"),
-            "top_confidence": top["confidence"], "top_cohort_size": cohort,
+            "top_confidence": top["confidence"],
+            "top_years_after_wcm": top.get("years_after_wcm"),
+            "top_cohort_size": cohort,
             "top_given_match": top["given_match"],
             "top_affil_match": int(bool(top["affil_dept_match"])),
             "n_candidates": len(cands), "single_candidate": int(cohort == 1),
@@ -275,7 +278,8 @@ def run(date_from, date_to, state_dir, export_dir, run_date, workers=16, max_rec
             if not au.get("home_inst"):
                 continue
             cands, _ = idx.candidates(au.get("last"), au.get("fore"),
-                                      au.get("initials"), au.get("affiliations"), top_k=5)
+                                      au.get("initials"), au.get("affiliations"), top_k=5,
+                                      pub_year=a.get("pub_year"))
             cwid_pool.update(c["cwid"] for c in cands)
             authorships.append((a, i, n, au, cands))
     log(f"      {len(authorships)} WCM authorships; {len(cwid_pool)} distinct candidate CWIDs")
@@ -302,7 +306,8 @@ def run(date_from, date_to, state_dir, export_dir, run_date, workers=16, max_rec
     # top candidate per authorship, flag articles with ANY candidate final >= 30, drop them.
     resolved_auth, suggested_pmids = [], set()
     for a, i, n, au, _ in authorships:
-        cands = matcher.match_authorship(au, a["pmid"], idx, io, top_k=5)
+        cands = matcher.match_authorship(au, a["pmid"], idx, io, top_k=5,
+                                         pub_year=a.get("pub_year"))
         top = cands[0] if cands else None
         if top and top.get("final_score") is not None \
                 and top["final_score"] >= gate.STORAGE_THRESHOLD:

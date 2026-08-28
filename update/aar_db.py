@@ -32,7 +32,8 @@ _REFRESH_COLS = [
     "author_position", "author_position_label", "wcm_author", "author_affiliation",
     "entrez_date", "title", "journal", "issn", "doi", "authors_json", "classification",
     "top_cwid", "top_name", "top_person_type", "top_dept",
-    "top_fg_score", "top_io_score", "top_confidence", "top_cohort_size",
+    "top_fg_score", "top_io_score", "top_confidence", "top_years_after_wcm",
+    "top_cohort_size",
     "top_given_match", "top_affil_match", "n_candidates", "single_candidate",
     "candidate_cwids_json", "dup_flag", "dup_reason", "last_refreshed",
 ]
@@ -80,6 +81,7 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
   top_fg_score           FLOAT        NULL,
   top_io_score           FLOAT        NULL,
   top_confidence         FLOAT        NULL,
+  top_years_after_wcm    INT          NULL,
   top_cohort_size        INT          NULL,
   top_given_match        VARCHAR(16)  NULL,
   top_affil_match        TINYINT(1)   NULL,
