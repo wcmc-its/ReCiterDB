@@ -739,7 +739,7 @@ def _selftest():
 
 
 def run_backfill(state_dir, run_date, workers=16, batch_size=500, limit=None, write_db=True,
-                 before=None):
+                 before=None, pmid_file=None):
     """Re-processes pmids previously logged as article-level 'attributed' -- under the
     OLD gate these were skipped at step 3 entirely, so any co-author who wasn't the
     one already attributed (e.g. prs4005 on PMID 41000987) was never scored or
@@ -756,26 +756,43 @@ def run_backfill(state_dir, run_date, workers=16, batch_size=500, limit=None, wr
     gate; from #160 on, every new pmid is exploded, so rows first seen after the deploy
     carry that label while already being fully processed. Pass the deploy date and the
     target set stays the actual backlog. Without it the run is still correct -- the
-    upsert is idempotent -- just increasingly wasteful of EFetch and IO quota."""
+    upsert is idempotent -- just increasingly wasteful of EFetch and IO quota.
+
+    `pmid_file` (one pmid per line, blanks and #comments ignored) drives the run from an
+    explicit list instead of processed_log, and is how the pre-in-cluster backlog gets
+    recovered. The S3 processed_log only goes back to the first in-cluster run: 2,747
+    rows, entrez 2026-04-25 onward. The 2024-06-08..2026-04-29 backlog -- 21,080 rows,
+    10,325 of them 'attributed' -- exists only in the Mac-era state file now living at
+    `analysis/adversarial_attribution_review/state/processed_log.csv` in the ReCiter
+    Research repo. PMID 41000987, the prs4005 case this function's first paragraph names,
+    is in that file and NOT in S3, so --s3-state alone cannot reach the case that
+    motivates the whole recovery. Extract the list from there and pass it here."""
     store = LedgerStore(state_dir)
     idx = matcher.IdentityIndex.load()
     io = matcher.IdentityOnlyScorer()
-    target = store.processed["last_status"] == "attributed"
-    if before:
-        target &= store.processed["first_seen"].astype(str) < before
-    pmids = sorted(int(p) for p in store.processed.loc[target, "pmid"].dropna())
+    if pmid_file:
+        with open(pmid_file) as fh:
+            pmids = sorted({int(ln.split("#")[0].strip())
+                            for ln in fh if ln.split("#")[0].strip()})
+        scope = f"explicit list from {pmid_file}"
+    else:
+        target = store.processed["last_status"] == "attributed"
+        if before:
+            target &= store.processed["first_seen"].astype(str) < before
+        pmids = sorted(int(p) for p in store.processed.loc[target, "pmid"].dropna())
+        scope = (f"processed_log 'attributed', first_seen < {before}" if before else
+                 "processed_log 'attributed', UNBOUNDED -- pass --before <deploy date> "
+                 "to target only the pre-#160 backlog")
     if limit:
         pmids = pmids[:limit]
-    if not len(store.processed):
+    if not pmid_file and not len(store.processed):
         # In-cluster the ledger lives in S3, so `--mode backfill` without `--s3-state`
         # reads an empty state dir, finds nothing, and exits 0 looking like a success.
         raise SystemExit(f"Backfill: processed_log at {store.processed_path} is empty or "
                          f"missing -- in-cluster that means --s3-state was omitted. "
                          f"Refusing to report success on a zero-row run.")
-    scope = (f"first_seen < {before}" if before else
-             "UNBOUNDED -- pass --before <deploy date> to target only the pre-#160 backlog")
-    print(f"Backfill: {len(pmids)} previously-'attributed' pmids to re-explode "
-          f"(of {len(store.processed)} processed; {scope})", flush=True)
+    print(f"Backfill: {len(pmids)} pmids to re-explode "
+          f"({len(store.processed)} in processed_log; scope = {scope})", flush=True)
     groups = uni.load_home_institution_groups()
     total_rows = 0
     n_batches = -(-len(pmids) // batch_size) if pmids else 0
@@ -835,6 +852,10 @@ def main():
     ap.add_argument("--export-dir", default=DEFAULT_EXPORT)
     ap.add_argument("--run-date", default=date.today().isoformat())
     ap.add_argument("--workers", type=int, default=16)
+    ap.add_argument("--pmid-file", default=None,
+                    help="backfill only: re-explode exactly these pmids (one per line) "
+                         "instead of processed_log -- the only route to the "
+                         "pre-in-cluster backlog, which is not in S3 state")
     ap.add_argument("--before", default=None,
                     help="backfill only: restrict to processed_log rows with "
                          "first_seen < this YYYY-MM-DD (pass the #160 deploy date)")
@@ -859,7 +880,8 @@ def main():
     if args.mode == "backfill":
         # DB sink only -- no ledger/processed_log mutation, so no _s3_push_state.
         run_backfill(args.state_dir, args.run_date, workers=args.workers,
-                     limit=args.max, write_db=not args.no_db, before=args.before)
+                     limit=args.max, write_db=not args.no_db, before=args.before,
+                     pmid_file=args.pmid_file)
         return
 
     if args.mode:
