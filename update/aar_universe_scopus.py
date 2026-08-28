@@ -378,9 +378,11 @@ def _build_row(entry, i, n, author, top, cands, run_ts, dup_map=None):
     cohort = top.get("cohort_size") if top else None
     # dup_flag/dup_reason: heads-up "already added as ExternalArticle" signal, joined
     # by DOI against reciterdb.external_article (aar_db.dup_flags_by_doi, batched once
-    # per run() call, not per row — see that function's docstring). Live 409 at
-    # Accept/Assign time (Publication Manager) remains the final same-day-race check.
-    dup_hit = (dup_map or {}).get(doi.lower()) if doi else None
+    # per run() call, not per row — see that function's docstring) and then narrowed to
+    # THIS authorship's own candidates, so a co-author's already-added authorship never
+    # flags this one (issue #158). Live 409 at Accept/Assign time (Publication Manager)
+    # remains the final same-day-race check.
+    dup_uid = aar_db.dup_uid_for_authorship(dup_map, doi, top, cands)
     return {
         "source": "scopus", "pmid": None,
         # numeric Scopus record id -> the PM Accept builds articleId "SCOPUS:<external_id>"
@@ -411,9 +413,9 @@ def _build_row(entry, i, n, author, top, cands, run_ts, dup_map=None):
         "top_affil_match": int(bool(top["affil_dept_match"])) if top else None,
         "n_candidates": len(cands), "single_candidate": int(cohort == 1) if cohort else None,
         "candidate_cwids_json": json.dumps(_compact(cands)),
-        "dup_flag": int(bool(dup_hit)),
-        "dup_reason": (f"Already added as ExternalArticle for {dup_hit[0]} (DOI match)"
-                       if dup_hit else None),
+        "dup_flag": int(bool(dup_uid)),
+        "dup_reason": (f"Already added as ExternalArticle for {dup_uid} (DOI match)"
+                       if dup_uid else None),
         "status": "open", "first_seen": run_ts,
         "last_checked": run_ts, "last_refreshed": run_ts,
     }
@@ -686,11 +688,32 @@ def _selftest():
     check("row dup_flag=0/dup_reason=None with no dup_map (default)",
           row["dup_flag"] == 0 and row["dup_reason"] is None)
 
+    # issue #158: dup_flag is per-AUTHORSHIP. A DOI already added for someone who is
+    # not a candidate for this authorship (a co-author on the same paper) is not a
+    # duplicate of this row.
+    row_other = _build_row(entry, i, n, au, top, [top], "2026-07-03 00:00:00",
+                           dup_map={"10.1/x": {"him4004"}})
+    check("row dup_flag=0 when the DOI was added for a NON-candidate (co-author)",
+          row_other["dup_flag"] == 0 and row_other["dup_reason"] is None)
+
     row_dup = _build_row(entry, i, n, au, top, [top], "2026-07-03 00:00:00",
-                         dup_map={"10.1/x": ("abc1234", "SCOPUS:105037523511")})
-    check("row dup_flag=1 and dup_reason names the uid when the DOI is in dup_map",
+                         dup_map={"10.1/x": {"js1"}})
+    check("row dup_flag=1 and dup_reason names the candidate the DOI was added for",
           row_dup["dup_flag"] == 1 and row_dup["dup_reason"]
-          == "Already added as ExternalArticle for abc1234 (DOI match)")
+          == "Already added as ExternalArticle for js1 (DOI match)")
+
+    alt = dict(top, cwid="jd2", name="Jane Doe")
+    row_alt = _build_row(entry, i, n, au, top, [top, alt], "2026-07-03 00:00:00",
+                         dup_map={"10.1/x": {"him4004", "jd2"}})
+    check("row dup_flag=1 off an alternate candidate, and dup_reason names that "
+          "candidate rather than the unrelated co-author",
+          row_alt["dup_flag"] == 1 and row_alt["dup_reason"]
+          == "Already added as ExternalArticle for jd2 (DOI match)")
+
+    row_both = _build_row(entry, i, n, au, top, [top, alt], "2026-07-03 00:00:00",
+                          dup_map={"10.1/x": {"js1", "jd2"}})
+    check("dup_reason names the top candidate when several candidates match",
+          row_both["dup_reason"] == "Already added as ExternalArticle for js1 (DOI match)")
 
     check("_authors_json returns '[]' (not null) when the document has no author field",
           _authors_json({}) == "[]")

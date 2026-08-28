@@ -138,17 +138,26 @@ def upsert(rows):
 
 
 def dup_flags_by_doi(dois):
-    """doi -> (uid, article_id) for DOIs already present in reciterdb `external_article`
-    (the nightly ExternalArticle projection, update/retrieveExternalArticles.py, which
-    runs before the weekly AAR lane). Lives here (not aar_orchestrator.py) so both the
-    PubMed lane (aar_orchestrator._db_rows) and the self-contained Scopus lane
-    (aar_universe_scopus, which deliberately avoids importing the xgboost/S3-heavy
-    PubMed-lane modules) can call it without a heavier import.
+    """doi -> {uid, ...}: EVERY person a DOI is already added for in reciterdb
+    `external_article` (the nightly ExternalArticle projection,
+    update/retrieveExternalArticles.py, which runs before the weekly AAR lane). Lives
+    here (not aar_orchestrator.py) so both the PubMed lane (aar_orchestrator._db_rows)
+    and the self-contained Scopus lane (aar_universe_scopus, which deliberately avoids
+    importing the xgboost/S3-heavy PubMed-lane modules) can call it without a heavier
+    import.
 
     Used to precompute authorship_review.dup_flag/dup_reason at producer time, so a
     curator sees an "already added" heads-up before spending a click on Accept/Assign.
     The live 409 conflict check at Accept/Assign time (Publication Manager) stays as
     the final same-day-race safety net — this is a heads-up, not a replacement.
+
+    The FULL uid set per DOI, never one arbitrary uid: `authorship_review` is one row
+    per AUTHORSHIP, so the heads-up is only true when the article is already added for
+    a person who is a candidate for THAT authorship. Callers hand the set to
+    dup_uid_for_authorship() to intersect it with the row's own candidates. Returning
+    the first uid seen (what this did before issue #158) made every co-author of an
+    already-added paper look like a duplicate of somebody else's authorship. The
+    article_id half of that old tuple went with it — neither lane ever read it.
 
     Batched (500 DOIs/query) rather than one unbounded IN-clause, same convention as
     aar_gate.attributed_pmids / this module's own upsert() chunking. Read-only.
@@ -161,14 +170,33 @@ def dup_flags_by_doi(dois):
     out = {}
     if not dois:
         return out
-    stmt = text("SELECT doi, uid, article_id FROM external_article WHERE doi IN :ds") \
+    stmt = text("SELECT doi, uid FROM external_article WHERE doi IN :ds") \
         .bindparams(bindparam("ds", expanding=True))
     with engine().connect() as c:
         for i in range(0, len(dois), 500):
             chunk = dois[i:i + 500]
-            for doi, uid, article_id in c.execute(stmt, {"ds": chunk}):
-                out.setdefault(doi.lower(), (uid, article_id))
+            for doi, uid in c.execute(stmt, {"ds": chunk}):
+                out.setdefault(doi.lower(), set()).add(uid)
     return out
+
+
+def dup_uid_for_authorship(dup_map, doi, top, cands):
+    """The candidate for THIS authorship whose ExternalArticle already covers `doi`,
+    or None — the per-authorship duplicate test both lanes use to set dup_flag/
+    dup_reason. Candidates are the row's own top_cwid plus every cwid that goes into
+    candidate_cwids_json, tested top-first so dup_reason names the person the row
+    actually proposes when more than one candidate matches.
+
+    Article-level "this paper is already in the system for somebody" is deliberately
+    not surfaced (issue #158): on a per-authorship row a "Possible duplicate" chip
+    naming an unrelated co-author reads as "already handled" and sends a curator past
+    work that is genuinely open."""
+    uids = (dup_map or {}).get(doi.lower()) if doi else None
+    if not uids:
+        return None
+    cwids = [top["cwid"]] if top else []
+    cwids += [c.get("cwid") for c in cands or ()]
+    return next((c for c in cwids if c in uids), None)
 
 
 def _describe():
