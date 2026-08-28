@@ -153,28 +153,37 @@ def _trunc(s, n):
     return s[:n] if isinstance(s, str) and len(s) > n else s
 
 
-def _already_curated(top):
-    """This authorship is already attributed at the production final score the reciterdb
-    gate itself uses (>= STORAGE_THRESHOLD), so it is a resolved attribution, not a
-    curation record. Three sites decide this -- the DB sink, the CSV sink, and the run
-    log -- and they must never disagree, so they all call here.
+def _already_curated(top, attributed_cwids=()):
+    """This authorship is already resolved, so it is not a curation record. Three sites
+    decide this -- the DB sink, the CSV sink, and the run log -- and they must never
+    disagree, so they all call here.
 
-    Note the score is `final_score` from aar_matcher, i.e. the production final read out
-    of the person's scoring artifact (aar_gate classifies `suggested_ge30` from the same
-    number). It is not a fresh local rescore. It can still disagree with
-    gate.attributed_pmids(), which reads reciterdb.analysis_summary_author -- same
-    underlying score, different staleness -- if a reciterdb import lags or drops rows."""
-    return (top is not None
-            and top.get("final_score") is not None
-            and top["final_score"] >= gate.STORAGE_THRESHOLD)
+    Two signals, and the order matters:
+
+    1. `attributed_cwids` -- reciterdb's OWN per-authorship attribution for this pmid,
+       from gate.attributions() over analysis_summary_author. Authoritative: if reciterdb
+       says this cwid holds this article, it is curated, full stop.
+    2. `final_score >= STORAGE_THRESHOLD` -- aar_matcher's score for the pair. This is a
+       LOCAL rescore (det._score runs pinned XGBoost + isotonic over production's S3
+       feature vectors), not a value read back from production, so it can be None on any
+       S3 or scoring failure: NoSuchKey, cold-storage InvalidObjectState, an empty or
+       malformed artifact, a scoring exception. Signal 1 exists precisely because of
+       that: without it a transient S3 failure would silently reclassify an attributed
+       authorship as `absent` and push a spurious row into the curator queue -- a hole
+       that could not exist before #160, when attributed articles were never exploded."""
+    if top is None:
+        return False
+    if attributed_cwids and top.get("cwid") in attributed_cwids:
+        return True
+    fg = top.get("final_score")
+    return fg is not None and fg >= gate.STORAGE_THRESHOLD
 
 
-def _db_rows(resolved_auth, run_date):
+def _db_rows(resolved_auth, run_date, attr_cwids_by_pmid=None):
     """authorship_review rows for matched authorships, classified PER-AUTHORSHIP:
-    absent (top candidate never scored) / buried (FG<30). suggested (FG>=30) means
-    this authorship is ALREADY curated -- already attributed at production score
-    >=30, the same signal the reciterdb gate itself uses -- so it is not a curation
-    record and is skipped entirely, not just hidden behind a PM filter. (Was
+    absent (top candidate never scored) / buried (FG<30). An authorship _already_curated
+    is skipped entirely rather than hidden behind a PM filter -- see that function for
+    the two signals and why reciterdb's own attribution leads. (Was
     previously written and left for PM to display; per product decision 2026-08-19
     that is wrong -- don't create a queue record for something already resolved.)
     Unmatched authorships (no candidate to assign) are also skipped. single_candidate
@@ -185,6 +194,7 @@ def _db_rows(resolved_auth, run_date):
     authorship's own candidates by aar_db.dup_uid_for_authorship — a co-author's
     already-added authorship must not flag this one (issue #158). See those
     functions' docstrings."""
+    attr_cwids_by_pmid = attr_cwids_by_pmid or {}
     dois = {a.get("doi") for a, i, n, au, cands, top in resolved_auth if a.get("doi")}
     dup_map = aar_db.dup_flags_by_doi(dois) if dois else {}
     out = []
@@ -192,7 +202,7 @@ def _db_rows(resolved_auth, run_date):
         if top is None:
             continue                                   # unmatched: nothing to assign
         fg = top.get("final_score")
-        if _already_curated(top):
+        if _already_curated(top, attr_cwids_by_pmid.get(a["pmid"], ())):
             continue                                   # already curated -- not a queue record
         cls = "absent" if fg is None else "buried"
         cohort = top.get("cohort_size")
@@ -297,6 +307,13 @@ def run(date_from, date_to, state_dir, export_dir, run_date, workers=16, max_rec
     # attribution lookups (attr_who).
     log("[2/6] Gating new pmids against reciterdb (analysis_summary_author) ...")
     attributed = gate.attributed_pmids(new_pmids) if new_pmids else set()
+    # Per-authorship attribution (pmid -> {cwid}) for the same set. gate.attributed_pmids
+    # answers "is this ARTICLE attributed"; this answers "to WHOM", which is what the
+    # per-authorship gate below actually needs and what makes the skip authoritative
+    # rather than dependent on a local rescore that can fail open. One batched query.
+    attr_cwids_by_pmid = ({p: {w[0] for w in who}
+                           for p, who in gate.attributions(sorted(attributed)).items()}
+                          if attributed else {})
     orphan_pmids = [p for p in new_pmids if p not in attributed]  # metric only now
     log(f"      {len(attributed)} of {len(new_pmids)} new pmids have >=1 WCM co-author "
         f"already attributed (article-level label; ALL still get exploded below)")
@@ -348,7 +365,9 @@ def run(date_from, date_to, state_dir, export_dir, run_date, workers=16, max_rec
                 and top["final_score"] >= gate.STORAGE_THRESHOLD:
             suggested_pmids.add(a["pmid"])
         resolved_auth.append((a, i, n, au, cands, top))
-    n_row_suggested = sum(1 for *_, top in resolved_auth if _already_curated(top))
+    n_row_suggested = sum(
+        1 for a, i, n, au, cands, top in resolved_auth
+        if _already_curated(top, attr_cwids_by_pmid.get(a["pmid"], ())))
     log(f"      {len(suggested_pmids)} articles have >=1 authorship already SUGGESTED "
         f"(article-level, informational); {n_row_suggested}/{len(resolved_auth)} individual "
         f"authorships are SUGGESTED and excluded from the curator queue below, "
@@ -359,13 +378,13 @@ def run(date_from, date_to, state_dir, export_dir, run_date, workers=16, max_rec
     # already curated, so _db_rows skips it rather than writing it for PM to filter.
     # Curator status on existing rows is preserved.
     if write_db:
-        db_rows = _db_rows(resolved_auth, run_date)
+        db_rows = _db_rows(resolved_auth, run_date, attr_cwids_by_pmid)
         aar_db.upsert(db_rows)
         log(f"      upserted {len(db_rows)} matched authorships -> reciterdb.authorship_review")
 
     new_rows = []
     for a, i, n, au, cands, top in resolved_auth:
-        if _already_curated(top):
+        if _already_curated(top, attr_cwids_by_pmid.get(a["pmid"], ())):
             continue                                  # THIS authorship is already suggested/covered
         new_rows.append({
             "pmid": a["pmid"],
@@ -647,6 +666,23 @@ def _selftest():
     check("_db_rows still skips an unmatched authorship (top is None)",
           _db_rows([(auth(None)[0], 0, 1, {}, [], None)], "2026-01-01") == [])
 
+    # The S3/scoring failure hole. final_score is None on NoSuchKey, cold storage, a
+    # malformed artifact, or a scoring exception. Before #160 that never mattered --
+    # attributed articles were not exploded at all. Now they are, so without reciterdb's
+    # own attribution the failure would write a spurious "absent" row for an authorship
+    # production already holds.
+    check("_db_rows writes an 'absent' row when the score is unavailable and reciterdb "
+          "has no attribution for the pmid",
+          [r["classification"] for r in _db_rows([auth(None)], "2026-01-01")] == ["absent"])
+    check("_db_rows skips it once reciterdb says that cwid holds the article, even with "
+          "no score at all",
+          _db_rows([auth(None, cwid="aaa1001")], "2026-01-01",
+                   {1: {"aaa1001"}}) == [])
+    check("reciterdb attribution for a DIFFERENT cwid does not suppress this authorship",
+          [r["classification"] for r in
+           _db_rows([auth(None, cwid="aaa1001")], "2026-01-01", {1: {"bbb2002"}})]
+          == ["absent"])
+
     # _recheck: an open row must resolve only when ITS OWN cwid is attributed.
     led = pd.DataFrame([
         {"pmid": 99, "top_cwid": "mine001", "candidate_cwids_json": "[]",
@@ -773,7 +809,9 @@ def run_backfill(state_dir, run_date, workers=16, batch_size=500, limit=None, wr
             top = cands[0] if cands else None
             resolved_auth.append((a, j, n, au, cands, top))
         if write_db:
-            db_rows = _db_rows(resolved_auth, run_date)
+            chunk_attr = {p: {w[0] for w in who}
+                          for p, who in gate.attributions(chunk).items()} if chunk else {}
+            db_rows = _db_rows(resolved_auth, run_date, chunk_attr)
             aar_db.upsert(db_rows)
             total_rows += len(db_rows)
         missing = [p for p in chunk if p not in by_pmid]
