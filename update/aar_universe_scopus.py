@@ -262,8 +262,17 @@ def _trunc(s, n):
 
 def _compact(cands):
     keep = ("cwid", "name", "person_type", "dept", "given_match", "affil_dept_match",
-            "cohort_size", "confidence")
+            "cohort_size", "confidence", "years_after_wcm")
     return [{k: c.get(k) for k in keep} for c in cands]
+
+
+def _pub_year(entry):
+    """Publication year from Scopus `prism:coverDate` ('2026-05-10'), for the matcher's
+    temporal-plausibility penalty (issue #159). This IS the paper's own date on this
+    lane — unlike the PubMed lane, where the stored `entrez_date` is the NCBI index
+    date and the publication year comes from the record's Journal PubDate instead."""
+    cover = entry.get("prism:coverDate") or ""
+    return int(cover[:4]) if cover[:4].isdigit() else None
 
 
 def _as_list(v):
@@ -437,6 +446,7 @@ def _build_row(entry, i, n, author, top, cands, run_ts, dup_map=None):
         "top_dept": _trunc(top["dept"], 255) if top else None,
         "top_fg_score": None, "top_io_score": None,    # scopus rail shows neither
         "top_confidence": top["confidence"] if top else None,
+        "top_years_after_wcm": top.get("years_after_wcm") if top else None,
         "top_cohort_size": cohort,
         "top_given_match": top["given_match"] if top else None,
         "top_affil_match": int(bool(top["affil_dept_match"])) if top else None,
@@ -549,7 +559,8 @@ def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True,
     for d in scopus_only:
         for i, n, au, _ in wcm_authorships(d, family):
             cands, _ = idx.candidates(au["last"], au["fore"], au["initials"],
-                                      au["affiliations"], top_k=5)
+                                      au["affiliations"], top_k=5,
+                                      pub_year=_pub_year(d))
             top = cands[0] if cands else None
             if top is None:
                 unmatched += 1                         # nothing to assign (v1 skips unmatched)
@@ -772,6 +783,10 @@ def _selftest():
 
     check("_authors_json returns '[]' (not null) when the document has no author field",
           _authors_json({}) == "[]")
+
+    check("_pub_year reads the year off prism:coverDate, None when absent/malformed",
+          _pub_year(entry) == 2026 and _pub_year({}) is None
+          and _pub_year({"prism:coverDate": "n/a"}) is None)
 
     entry2 = dict(entry, **{"prism:doi": None})
     au2 = {"last": "Smith", "fore": "Jane", "initials": "J.", "affiliations": []}

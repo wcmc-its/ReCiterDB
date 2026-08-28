@@ -11,8 +11,10 @@ What it does:
      and builds the same affiliation OR-query AffiliationRetrievalStrategy uses.
   2. ESearch (db=pubmed, datetype=edat, usehistory=y) over the entrez-date window.
   3. EFetch the records and parse: pmid, entrez date (PubStatus="entrez" history date,
-     identical to ArticleTranslator.java:329-351), title, journal, doi, authors+affils,
-     and which authors carry a home-institution affiliation.
+     identical to ArticleTranslator.java:329-351), publication year (the Journal
+     PubDate — a different thing from the entrez index date, and the one the matcher's
+     temporal-plausibility penalty compares against), title, journal, doi,
+     authors+affils, and which authors carry a home-institution affiliation.
   4. Filters to the precise parsed-entrez-date window and caches universe.json.
 
 Windows (entrez date):
@@ -22,6 +24,7 @@ Windows (entrez date):
 Env: PUBMED_API_KEY (read from environment, never logged), NCBI_EMAIL (optional).
 
 Usage:
+  python aar_universe.py --selftest                              # offline _pub_year checks
   python aar_universe.py --mode recurring
   python aar_universe.py --mode initial
   python aar_universe.py --from 2026/05/05 --to 2026/05/20 --out /tmp/u.json   # custom/test
@@ -151,6 +154,22 @@ def _entrez_date(article_el):
     return None
 
 
+def _pub_year(article_el):
+    """The paper's PUBLICATION year, for the matcher's temporal-plausibility penalty.
+
+    Deliberately not `_entrez_date`, which is the NCBI index date (and, on the Scopus
+    lane, a Scopus coverDate) — see issue #159. Journal PubDate/Year first, then the
+    leading year of a MedlineDate ('2019 Nov-Dec' -> 2019), then the electronic
+    ArticleDate. None when unparseable, which simply disables the penalty."""
+    pub = article_el.find("./MedlineCitation/Article/Journal/JournalIssue/PubDate")
+    if pub is not None:
+        for src in (pub.findtext("Year"), pub.findtext("MedlineDate")):
+            if src and src.strip()[:4].isdigit():
+                return int(src.strip()[:4])
+    y = article_el.findtext("./MedlineCitation/Article/ArticleDate/Year")
+    return int(y) if y and y.strip().isdigit() else None
+
+
 def _doi(article_el):
     for aid in article_el.findall("./PubmedData/ArticleIdList/ArticleId"):
         if aid.get("IdType") == "doi":
@@ -187,6 +206,7 @@ def parse_articles(xml_bytes, groups):
         out.append({
             "pmid": int(pmid),
             "entrez_date": _entrez_date(art),
+            "pub_year": _pub_year(art),
             "title": _text(art.find("./MedlineCitation/Article/ArticleTitle")),
             "journal": art.findtext("./MedlineCitation/Article/Journal/Title"),
             "doi": _doi(art),
@@ -241,8 +261,39 @@ def pull_universe(date_from, date_to, max_records=None, progress=True):
     }
 
 
+def _selftest():
+    """Offline (no network) checks for `_pub_year` — the publication-year parser the
+    temporal-plausibility penalty depends on (issue #159), on the larger of the two
+    lanes. Nothing else in this module asserted it."""
+    ok = True
+
+    def check(label, cond):
+        nonlocal ok
+        ok &= bool(cond)
+        print(f"  [{'OK' if cond else '** FAIL'}] {label}")
+
+    def art(pubdate, article_date=""):
+        return ET.fromstring(
+            "<PubmedArticle><MedlineCitation><Article><Journal><JournalIssue>"
+            f"{pubdate}</JournalIssue></Journal>{article_date}</Article>"
+            "</MedlineCitation></PubmedArticle>")
+
+    check("_pub_year reads Journal PubDate/Year",
+          _pub_year(art("<PubDate><Year>2024</Year><Month>Mar</Month></PubDate>")) == 2024)
+    check("_pub_year takes the leading year of a MedlineDate ('2019 Nov-Dec')",
+          _pub_year(art("<PubDate><MedlineDate>2019 Nov-Dec</MedlineDate></PubDate>")) == 2019)
+    check("_pub_year falls back to the electronic ArticleDate when PubDate has no year",
+          _pub_year(art("<PubDate/>", "<ArticleDate><Year>2021</Year></ArticleDate>")) == 2021)
+    check("_pub_year is None when the record carries no year at all "
+          "(absent case -> the penalty is simply off, pre-#159 ranking)",
+          _pub_year(art("<PubDate/>")) is None and _pub_year(art("")) is None)
+    print("SELFTEST", "PASS" if ok else "FAIL")
+    return ok
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--selftest", action="store_true", help="offline _pub_year checks")
     ap.add_argument("--mode", choices=["initial", "recurring"])
     ap.add_argument("--from", dest="date_from", help="YYYY/MM/DD (custom window)")
     ap.add_argument("--to", dest="date_to", help="YYYY/MM/DD (custom window)")
@@ -250,6 +301,8 @@ def main():
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
+    if args.selftest:
+        sys.exit(0 if _selftest() else 1)
     if args.mode:
         d_from, d_to = window_for_mode(args.mode)
         d_from, d_to = _fmt(d_from), _fmt(d_to)
