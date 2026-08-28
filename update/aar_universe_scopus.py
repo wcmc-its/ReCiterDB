@@ -141,7 +141,19 @@ def issn_in_pubmed(issn):
     '"9999-9999"[All Fields]'. So a non-zero count alone isn't enough;
     querytranslation must actually show [Journal] or the "hit" is meaningless.
     Returns None (not False) whenever the ISSN is missing/malformed/unrecognized, so
-    callers don't mistake "we can't check" for "confirmed absent"."""
+    callers don't mistake "we can't check" for "confirmed absent".
+
+    CONSEQUENCE, measured 2026-08-28 (issue #157) and left deliberately in place: on
+    the open no-DOI backlog this returns True or None but essentially never False, so
+    the pre-filter almost never short-circuits. All 21 distinct ISSNs among those rows
+    came back either [Journal]-recognized with a non-zero count (14, -> True) or with
+    no [Journal] translation at all (7, -> None). Only a venue PubMed recognizes as a
+    journal AND holds zero articles for yields False, which is close to an empty set.
+    Making "well-formed but unrecognized" mean False WOULD fire on that second group
+    and is the safe direction (a False keeps the row open rather than dismissing it),
+    but it trades away the guard that this docstring's GOTCHA paragraph exists for.
+    That is a deliberate call for a human, not a silent change: don't "fix" this
+    without re-reading the gotcha above."""
     hyphenated = _normalize_issn(issn)
     if not hyphenated:
         return None
@@ -206,9 +218,19 @@ def resolve_no_doi(title, author_last, pub_type, issn, isbns=None):
 def _normalize_issn(issn):
     """Scopus gives ISSN unhyphenated (e.g. '0732183X'); PubMed's [issn] tag and the
     authorship_review.issn column both want hyphenated NNNN-NNNC. Returns None for
-    anything that isn't exactly 8 chars (missing/malformed — stored as NULL rather
-    than guessed at)."""
+    anything that is neither (missing/malformed — stored as NULL rather than guessed
+    at).
+
+    IDEMPOTENT, and that is load-bearing: recheck_open_scopus() feeds the ALREADY-
+    hyphenated stored column value back through resolve_no_doi -> issn_in_pubmed ->
+    here. Normalizing only the 8-char form made that second pass fail the length test
+    and return None, so the ISSN pre-filter silently no-op'd for EVERY stored row —
+    the column shipped by #137/#138 could never once have changed a recheck decision.
+    Live-verified 2026-08-28 (issue #157): issn_in_pubmed('0890-9091') returned None
+    with no network call, while the raw '08909091' returned True."""
     issn = (issn or "").strip().upper()
+    if len(issn) == 9 and issn[4] == "-":
+        return issn
     return f"{issn[:4]}-{issn[4:]}" if len(issn) == 8 else None
 
 
@@ -217,7 +239,10 @@ def _extract_isbns(entry):
     holding ONE dict whose '$' is itself a bracketed comma-separated string —
     e.g. '[9781609136826, 9781469879918]' — not a real JSON array of separate
     values. Live-verified against a real Book doc, 2026-08-14; unpacked here
-    rather than trusted as-is."""
+    rather than trusted as-is.
+
+    _build_row stores the result comma-joined in authorship_review.isbn; recheck_open_
+    scopus splits it back on ',' — hence no comma inside an individual ISBN."""
     out = []
     for item in _as_list(entry.get("prism:isbn")):
         s = (item.get("$", "") if isinstance(item, dict) else str(item or "")).strip()
@@ -397,6 +422,10 @@ def _build_row(entry, i, n, author, top, cands, run_ts, dup_map=None):
         "title": entry.get("dc:title"),
         "journal": _trunc(entry.get("prism:publicationName"), 512),
         "issn": _normalize_issn(entry.get("prism:issn") or entry.get("prism:eIssn")),
+        # comma-joined (books carry several — print/ebook editions); NULL when absent.
+        # Book-like types are ISBN-keyed and carry no ISSN at all, so this is the only
+        # venue identifier they ever have — see recheck_open_scopus.
+        "isbn": _trunc(",".join(_extract_isbns(entry)), 128) or None,
         "doi": _trunc(doi, 255),
         "authors_json": _authors_json(entry),
         "classification": "absent",                    # no PMID -> production never scored it
@@ -428,19 +457,25 @@ def recheck_open_scopus(run_ts):
     curator's accept/reject is never clobbered. (No dedicated 'resolved' ENUM value;
     dismissed + an auto note is the removal-from-queue state.)
 
-    `issn` reaches the backlog two ways: rows upserted after the issn column shipped
-    already have it; older rows have issn=NULL until their next producer refresh
-    re-upserts them (source doc still has prism:issn) — until then resolve_no_doi
-    just falls through to the title check, same as before that column existed.
-    isbn isn't persisted at all (no column yet — unlike issn, ISBN only matters for
-    the small Book slice, not worth a migration until it's shown to matter at scale)
-    so Book rows in the backlog only get title-checked here, missing the ISBN-only
-    catches ingest-time resolution would find; deferred, matching the issn gap."""
+    `issn`/`isbn` reach the backlog two ways: rows upserted after each column shipped
+    already have it; older rows stay NULL until their next producer refresh re-upserts
+    them. The recurring cron only sweeps a recent ORIG-LOAD-DATE window, so rows from
+    the 2026-07-05 --mode initial five-year backfill are never revisited by it — they
+    need update/targeted_authors_backfill.py, which looks each document up by its
+    stored doi/external_id and fills the columns in place (see issue #157).
+
+    ISBN is passed for every pub_type, exactly as at ingest; resolve_no_doi still only
+    consults it for pub_type='Book'. Measured 2026-08-28 against the live open no-DOI
+    backlog, that narrowness is correct, not a leftover: 0 of 25 sampled Book Chapters
+    and 0 of 10 Editorials hit PubMed on ANY of their ISBNs (the ISBN is the parent
+    book's, and these books are simply not in NLM's catalog). Widening the branch to
+    Book Chapter — 505 of the 729 open no-DOI rows — would have added ~1,160 esearch
+    calls per weekly recheck for a measured zero catches."""
     from sqlalchemy import text
     eng = aar_db.engine()
     with eng.connect() as c:
         rows = c.execute(text(
-            "SELECT author_key, doi, title, wcm_author, pub_type, issn FROM authorship_review "
+            "SELECT author_key, doi, title, wcm_author, pub_type, issn, isbn FROM authorship_review "
             "WHERE source='scopus' AND status='open'")).mappings().all()
     resolved = 0
     for r in rows:
@@ -448,7 +483,8 @@ def recheck_open_scopus(run_ts):
             hit = doi_in_pubmed(r["doi"])
         else:
             author_last = (r["wcm_author"] or "").split()[-1] if r["wcm_author"] else None
-            hit = resolve_no_doi(r["title"], author_last, r["pub_type"], r["issn"])
+            hit = resolve_no_doi(r["title"], author_last, r["pub_type"], r["issn"],
+                                 (r["isbn"] or "").split(","))
         if hit:
             with eng.begin() as c:
                 c.execute(text(
@@ -633,6 +669,13 @@ def _selftest():
           issn_in_pubmed("bad") is None)
     check("_normalize_issn hyphenates Scopus's unhyphenated form",
           _normalize_issn("0732183X") == "0732-183X" and _normalize_issn("bad") is None)
+    # regression guard for #157: recheck_open_scopus feeds the STORED (already
+    # hyphenated) value back in. Re-normalizing used to return None, silently
+    # disabling the ISSN pre-filter for every row that had the column populated.
+    check("_normalize_issn is idempotent on the stored hyphenated form",
+          _normalize_issn("0890-9091") == "0890-9091"
+          and _normalize_issn(_normalize_issn("0732183X")) == "0732-183X"
+          and _normalize_issn("08909-091") is None)
     check("rolling window spans [today-90d, today-14d]",
           rolling_window(date(2026, 7, 4)) == ("20260405", "20260620"))
     check("rolling window honours custom lag/span",
@@ -685,6 +728,18 @@ def _selftest():
               {"given": "Jane", "surname": "Smith"}, {"given": "John", "surname": "Doe"}])
     check("row dup_flag=0/dup_reason=None with no dup_map (default)",
           row["dup_flag"] == 0 and row["dup_reason"] is None)
+    check("row isbn is None when the document carries no prism:isbn (an Article)",
+          row["isbn"] is None)
+
+    # a real Book entry: Scopus's bracketed-string-in-a-dict-in-a-list, stored
+    # comma-joined so recheck_open_scopus can split it straight back into a list
+    book = dict(entry, **{"subtypeDescription": "Book",
+                          "prism:isbn": [{"$": "[9781609136826, 9781469879918]"}]})
+    row_book = _build_row(book, i, n, au, top, [top], "2026-07-03 00:00:00")
+    check("row isbn stores the Scopus ISBN list comma-joined",
+          row_book["isbn"] == "9781609136826,9781469879918")
+    check("stored isbn splits back into exactly what _extract_isbns produced",
+          row_book["isbn"].split(",") == _extract_isbns(book))
 
     row_dup = _build_row(entry, i, n, au, top, [top], "2026-07-03 00:00:00",
                          dup_map={"10.1/x": ("abc1234", "SCOPUS:105037523511")})
