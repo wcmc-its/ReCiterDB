@@ -109,13 +109,19 @@ WHERE table_schema = DATABASE()
 --
 -- GREATEST over COALESCE(...,0) reproduces the producer's max(facultyEnd, studentEnd)
 -- reading, and the > 0 guard keeps rows with neither year at NULL rather than
--- inventing a gap. The COLLATE casts on both sides of the cwid join are required —
--- identity.cwid and authorship_review.top_cwid carry different collations and the join
--- throws "Illegal mix of collations" without them.
+-- inventing a gap.
+--
+-- A COLLATE cast is required — identity.cwid is utf8mb4_unicode_ci and
+-- authorship_review.top_cwid is utf8mb4_general_ci, so the join throws "Illegal mix of
+-- collations" without one. Cast ONLY the authorship_review side, to identity's
+-- collation. Casting both sides makes identity.cwid's index unusable and the join
+-- degenerates to a full index scan per row: EXPLAIN went from 26,884 estimated row
+-- combinations to 880,934,912, and a dev run sat in "Sending data" for 5+ minutes with
+-- nothing committed. Leaving i.cwid bare keeps the plan at type=ref, rows=1.
 -- -----------------------------------------------------------------------------
 UPDATE authorship_review ar
 JOIN identity i
-  ON i.cwid COLLATE utf8mb4_general_ci = ar.top_cwid COLLATE utf8mb4_general_ci
+  ON i.cwid = ar.top_cwid COLLATE utf8mb4_unicode_ci
 SET ar.top_years_after_wcm =
       YEAR(ar.entrez_date) - GREATEST(COALESCE(i.endDateWCMFaculty, 0),
                                       COALESCE(i.endDateWCMStudent, 0))
