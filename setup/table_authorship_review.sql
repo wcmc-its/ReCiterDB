@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS `authorship_review` (
   `title`                  TEXT         NULL,
   `journal`                VARCHAR(512) NULL,
   `issn`                   VARCHAR(9)   NULL,                -- hyphenated NNNN-NNNC, scopus only
+  `isbn`                   VARCHAR(128) NULL,                -- comma-joined ISBNs, scopus book-like only
   `doi`                    VARCHAR(255) NULL,
   `authors_json`           LONGTEXT     NULL,                -- Scopus full author list, scopus only
   `classification`         ENUM('assigned','suggested','buried','absent') NULL,
