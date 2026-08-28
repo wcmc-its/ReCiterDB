@@ -158,7 +158,10 @@ def _db_rows(resolved_auth, run_date):
     true cohort size (unique surname+initial), the strongest precision signal.
 
     dup_flag/dup_reason: one batched aar_db.dup_flags_by_doi() call over every DOI in
-    this run's resolved_auth (not a query per row) — see that function's docstring."""
+    this run's resolved_auth (not a query per row), narrowed per row to THIS
+    authorship's own candidates by aar_db.dup_uid_for_authorship — a co-author's
+    already-added authorship must not flag this one (issue #158). See those
+    functions' docstrings."""
     dois = {a.get("doi") for a, i, n, au, cands, top in resolved_auth if a.get("doi")}
     dup_map = aar_db.dup_flags_by_doi(dois) if dois else {}
     out = []
@@ -170,7 +173,7 @@ def _db_rows(resolved_auth, run_date):
                else "suggested" if fg >= gate.STORAGE_THRESHOLD else "buried")
         cohort = top.get("cohort_size")
         doi = a.get("doi")
-        dup_hit = dup_map.get(doi.lower()) if doi else None
+        dup_uid = aar_db.dup_uid_for_authorship(dup_map, doi, top, cands)
         out.append({
             "source": "pubmed",
             "pmid": a["pmid"],
@@ -192,9 +195,9 @@ def _db_rows(resolved_auth, run_date):
             "top_affil_match": int(bool(top["affil_dept_match"])),
             "n_candidates": len(cands), "single_candidate": int(cohort == 1),
             "candidate_cwids_json": json.dumps(_compact(cands)),
-            "dup_flag": int(bool(dup_hit)),
-            "dup_reason": (f"Already added as ExternalArticle for {dup_hit[0]} (DOI match)"
-                           if dup_hit else None),
+            "dup_flag": int(bool(dup_uid)),
+            "dup_reason": (f"Already added as ExternalArticle for {dup_uid} (DOI match)"
+                           if dup_uid else None),
             "status": "open", "first_seen": run_date,
             "last_checked": run_date, "last_refreshed": run_date,
         })
