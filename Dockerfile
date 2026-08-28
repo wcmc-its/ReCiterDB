@@ -40,6 +40,14 @@ COPY update/preprocessing.py ./
 COPY update/aar_models/ ./aar_models/
 COPY update/aar_data/ ./aar_data/
 
+# Manual reference tool: per-document backfill of producer-owned authorship_review
+# columns (authors_json / issn / isbn) on rows a sweep can no longer revisit. Not run by
+# run_all.py -- invoked by hand as a one-off Job off this image. Its own docstring says it
+# "must run inside the reciterdb container", which was not true until it was shipped here:
+# it sys.path.insert("/usr/src/app") and imports aar_universe_scopus + aar_db, both of
+# which are already in the image above.
+COPY update/targeted_authors_backfill.py ./
+
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 # Or, if not using requirements.txt:
