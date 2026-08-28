@@ -37,7 +37,8 @@ Usage:
   python aar_orchestrator.py --from 2026/05/26 --to 2026/06/02 --state-dir /tmp/aar_test   # test
   python aar_orchestrator.py --mode initial        # one-time backlog clear (long)
   python aar_orchestrator.py --mode recurring      # monthly rolling slice
-  python aar_orchestrator.py --mode backfill       # re-explode old 'attributed' pmids
+  python aar_orchestrator.py --mode backfill --s3-state --before 2026-08-29
+                                                   # re-explode the pre-#160 backlog
 """
 import argparse, json, os, sys
 from concurrent.futures import ThreadPoolExecutor
@@ -701,7 +702,8 @@ def _selftest():
     return ok
 
 
-def run_backfill(state_dir, run_date, workers=16, batch_size=500, limit=None, write_db=True):
+def run_backfill(state_dir, run_date, workers=16, batch_size=500, limit=None, write_db=True,
+                 before=None):
     """Re-processes pmids previously logged as article-level 'attributed' -- under the
     OLD gate these were skipped at step 3 entirely, so any co-author who wasn't the
     one already attributed (e.g. prs4005 on PMID 41000987) was never scored or
@@ -711,13 +713,21 @@ def run_backfill(state_dir, run_date, workers=16, batch_size=500, limit=None, wr
     classifies per-authorship, and upserts into reciterdb.authorship_review only
     (idempotent by author_key, never touches an existing curator decision; does NOT
     also append to ledger.csv/processed_log -- those stay accurate as article-level
-    records, this only backfills the PM-facing per-authorship sink)."""
+    records, this only backfills the PM-facing per-authorship sink).
+
+    `before` (YYYY-MM-DD, matched against processed_log.first_seen) is what keeps this
+    targeted. 'attributed' meant "skipped at step 3" only under the OLD article-level
+    gate; from #160 on, every new pmid is exploded, so rows first seen after the deploy
+    carry that label while already being fully processed. Pass the deploy date and the
+    target set stays the actual backlog. Without it the run is still correct -- the
+    upsert is idempotent -- just increasingly wasteful of EFetch and IO quota."""
     store = LedgerStore(state_dir)
     idx = matcher.IdentityIndex.load()
     io = matcher.IdentityOnlyScorer()
-    pmids = sorted(int(p) for p in
-                   store.processed.loc[store.processed["last_status"] == "attributed",
-                                       "pmid"].dropna())
+    target = store.processed["last_status"] == "attributed"
+    if before:
+        target &= store.processed["first_seen"].astype(str) < before
+    pmids = sorted(int(p) for p in store.processed.loc[target, "pmid"].dropna())
     if limit:
         pmids = pmids[:limit]
     if not len(store.processed):
@@ -726,8 +736,10 @@ def run_backfill(state_dir, run_date, workers=16, batch_size=500, limit=None, wr
         raise SystemExit(f"Backfill: processed_log at {store.processed_path} is empty or "
                          f"missing -- in-cluster that means --s3-state was omitted. "
                          f"Refusing to report success on a zero-row run.")
+    scope = (f"first_seen < {before}" if before else
+             "UNBOUNDED -- pass --before <deploy date> to target only the pre-#160 backlog")
     print(f"Backfill: {len(pmids)} previously-'attributed' pmids to re-explode "
-          f"(of {len(store.processed)} processed)", flush=True)
+          f"(of {len(store.processed)} processed; {scope})", flush=True)
     groups = uni.load_home_institution_groups()
     total_rows = 0
     n_batches = -(-len(pmids) // batch_size) if pmids else 0
@@ -785,6 +797,9 @@ def main():
     ap.add_argument("--export-dir", default=DEFAULT_EXPORT)
     ap.add_argument("--run-date", default=date.today().isoformat())
     ap.add_argument("--workers", type=int, default=16)
+    ap.add_argument("--before", default=None,
+                    help="backfill only: restrict to processed_log rows with "
+                         "first_seen < this YYYY-MM-DD (pass the #160 deploy date)")
     ap.add_argument("--no-db", action="store_true",
                     help="skip the reciterdb.authorship_review sink (CSV/state only)")
     ap.add_argument("--s3-state", action="store_true",
@@ -806,7 +821,7 @@ def main():
     if args.mode == "backfill":
         # DB sink only -- no ledger/processed_log mutation, so no _s3_push_state.
         run_backfill(args.state_dir, args.run_date, workers=args.workers,
-                     limit=args.max, write_db=not args.no_db)
+                     limit=args.max, write_db=not args.no_db, before=args.before)
         return
 
     if args.mode:
