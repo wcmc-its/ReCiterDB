@@ -214,17 +214,47 @@ class IdentityIndex:
             # An adopted/preferred first name is sometimes recorded in middleName
             # rather than givenName in the HR-sourced identity table (legal name in
             # givenName, adopted Western first name in middleName); PubMed/Scopus
-            # bylines use the preferred name, so try middleName as an alternate
-            # given-name source whenever givenName alone doesn't match.
+            # bylines use the preferred name, so middleName is an alternate
+            # given-name source -- EXACT ONLY, on the whole field (issue #173).
+            #
+            # It used to feed the INITIAL tier too, and that is where nearly all of its
+            # output came from. Measured against curator resolutions: top picks reached
+            # through a givenName initial were accepted as proposed 91.7% of the time
+            # (11,360/12,388), middleName-only picks 26.4% (29/110), and all 16
+            # accepted-but-overridden rows in the whole ledger were middleName-only
+            # picks. Sharing an initial with someone's middle name is not evidence, it
+            # is a ~1-in-20 coincidence, and the surname pool is already the homonym
+            # set. This tier is what proposed Leah *T*eresa Rosen (Alumni MD, cohort of
+            # one) for a byline reading "Tony Rosen" on pmid 42424133 -- a paper aer2006
+            # had already held at score 100.0 ACCEPTED for 44 days when the row opened.
+            #
+            # The WHOLE normalised field, not its tokens. Splitting on whitespace was
+            # tried and reverted: it promotes junk into the `full` tier, and `full` is the
+            # LEAD term of the sort below, so a spurious full match displaces a correct
+            # pick rather than merely joining it. 392 of the 910 multi-token middleNames
+            # are comma-joined concatenations of separately recorded names, and 222 yield
+            # a token of <=2 characters -- so "Keith Richards,Keith Richards" offers a bare
+            # "keith", and a middleName of "L." offers "l", each an EXACT first-name match.
+            # Measured over all 11,668 curator-resolved rows, tokenising bought zero
+            # correct top picks and zero extra reachability on either lane while flipping
+            # 7 curator-ACCEPTED scopus rows to the wrong person (byline "Keith Jamison",
+            # resolution kwj2001, displaced by jaj7021 on exactly that concatenation).
+            #
+            # ponytail: whole field only. This gives up the adopted-name case where the
+            # byline carries only an initial ("J Zhong" for Hua Judy Zhong) AND the case
+            # where the adopted name is a non-leading token of a multi-token middleName.
+            # Both want a PUBLISHING-name source rather than a looser test on the legal
+            # one -- that is `person.firstName` (issue #171 / PR #172), exact-only for the
+            # same reason this is.
             middle_norm = _norm(rec["middle"])
-            name_sources = [n for n in (rec["given_norm"], middle_norm) if n]
-            if author_init and name_sources:
-                if author_given and any(n == author_given for n in name_sources):
+            if author_init and (rec["given_norm"] or middle_norm):
+                if author_given and (author_given == rec["given_norm"]
+                                     or author_given == middle_norm):
                     given_match = "full"
-                elif any(n[0] == author_init for n in name_sources):
+                elif rec["given_norm"][:1] == author_init:
                     given_match = "initial"
                 else:
-                    continue                       # initial mismatch on both fields -> not this person
+                    continue                       # no exact name, no givenName initial -> not this person
             else:
                 given_match = "unknown"            # no usable given on either side
             cohort.append((rec, given_match))
@@ -282,8 +312,9 @@ class IdentityIndex:
 # ---- offline self-test ------------------------------------------------------
 def _selftest():
     """Builds an IdentityIndex from hand-built records (no DB) to prove the
-    middleName-as-alternate-given-name fix (Judy/Hua Zhong, PMID 40681448) and the
-    temporal-plausibility penalty (issue #159)."""
+    middleName-as-alternate-given-name fix (Judy/Hua Zhong, PMID 40681448), its
+    narrowing to exact-match-only (issue #173), and the temporal-plausibility
+    penalty (issue #159)."""
     def rec(given, middle, surname, end_year=None, cwid=None):
         return {
             "cwid": cwid or f"{given or middle}_{surname}".lower(),
@@ -314,6 +345,57 @@ def _selftest():
                     "xiu_zhong" not in by_cwid))
     checks.append(("cohort_size counts only the two initial-matching records",
                     cohort_size == 2))
+
+    # --- middleName is exact-match-only (issue #173) --------------------------
+    # The anchor case. Byline "Tony Rosen" (pmid 42424133) against Leah *T*eresa
+    # Rosen, a cohort of one, whose only tie to the byline is a shared middle
+    # initial. The initial tier used to hand her the row at confidence 0.55 while
+    # the real author already held the paper at score 100.
+    rosens = IdentityIndex([rec("Leah", "Teresa", "Rosen", cwid="ltr4001")])
+    tony, tony_cohort = rosens.candidates("Rosen", "Tony", "T")
+    # ...and the same person under a byline that DOES carry her name, to prove the
+    # exclusion is about the initial tier and not about middleName as such.
+    leah, _ = rosens.candidates("Rosen", "Teresa", "T")
+    checks += [
+        ("a shared middleName INITIAL no longer admits a candidate ('Tony Rosen' "
+         "vs Leah Teresa Rosen)", tony == [] and tony_cohort == 0),
+        ("...while the exact middleName still does, at given_match=full",
+         len(leah) == 1 and leah[0]["given_match"] == "full"),
+    ]
+
+    # Multi-token middleName is deliberately NOT split. _norm over the whole field
+    # collapses "Wing Guinevere" to "wingguinevere", so only a byline spelling every
+    # middle name out reaches her -- 910 identity rows are shaped like this and this
+    # change does not help them. Splitting was implemented, measured and reverted:
+    # `full` leads the sort, 392 of those 910 fields are comma-joined concatenations
+    # and 222 yield a <=2-char token, so tokenising promotes junk to the top of the
+    # ranking. It flipped 7 curator-ACCEPTED scopus rows to the wrong person and won
+    # nothing anywhere in the ledger. gul4001's real fix is person.firstName (PR #172),
+    # where the mirror already holds "Guinevere".
+    lees = IdentityIndex([rec("Qi", "Wing Guinevere", "Lee", cwid="gul4001")])
+    spelled, _ = lees.candidates("Lee", "Wing Guinevere", "WG")
+    second_token, _ = lees.candidates("Lee", "Guinevere", "G")
+    junk = IdentityIndex([rec("Jonathan", "Keith Richards,Keith Richards", "J", cwid="jaj7021")])
+    checks += [
+        ("a byline spelling the whole middleName out matches at full",
+         len(spelled) == 1 and spelled[0]["given_match"] == "full"),
+        ("a multi-token middleName is NOT split -- its second token alone does not match",
+         second_token == []),
+        ("...which is what keeps a comma-joined concatenation from offering a bare "
+         "first name ('Keith' out of 'Keith Richards,Keith Richards')",
+         junk.candidates("J", "Keith", "K")[0] == []),
+    ]
+
+    # givenName keeps BOTH tiers, untouched: nothing above may narrow it.
+    kims = IdentityIndex([rec("John", "Andrew", "Kim", cwid="jak")])
+    checks += [
+        ("givenName full tier intact",
+         kims.candidates("Kim", "John", "J")[0][0]["given_match"] == "full"),
+        ("givenName initial tier intact",
+         kims.candidates("Kim", "Jonathan", "J")[0][0]["given_match"] == "initial"),
+        ("a givenName initial match is not disturbed by a mismatched middleName",
+         kims.candidates("Kim", "Jonathan", "J")[1] == 1),
+    ]
 
     # --- temporal plausibility (issue #159) ---------------------------------
     # Three Smiths who all match "J Smith" equally on name; only the WCM end year
