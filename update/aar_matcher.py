@@ -60,7 +60,8 @@ import adversarial_attribution_review as det   # Step-0 scoring engine (S3 + pin
 # IdentityIndex + name helpers + person-type table extracted to identity_index.py so the
 # Scopus lane can reuse them without this module's S3/model deps. Re-exported here for
 # any importer that still reaches for aar_matcher.IdentityIndex / _norm.
-from identity_index import IdentityIndex, _norm, _first_initial, PERSON_TYPES  # noqa: F401
+from identity_index import (IdentityIndex, _norm, _first_initial,  # noqa: F401
+                            name_tokens, PERSON_TYPES)
 
 IDENTITY_ONLY_SUFFIX = "-identityOnlyScoringInput.json"
 
