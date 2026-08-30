@@ -164,7 +164,10 @@ def _byline_owner(byline, attributed):
     pmid's entry from gate.attributions().
 
     Match is deliberately strict: the person's surname must be the tail of the byline AND
-    the byline's first token must be their whole given name, no initials on either side.
+    the byline's first token must equal the first token of their given name, no initials on
+    either side. First TOKEN, not the whole given name -- an owner recorded as "Kristin Lees"
+    matches a byline "Kristin Haggerty". That is consistent with the census key, which is
+    built on the same `f[0]`, so a spelling either can reach is a spelling both can.
     'Tony Rosen' vs Tony Rosen = suppress; 'J Kim' vs Junbum Kim = do not. The loose
     first-initial tier was measured on the live queue and rejected -- 19 extra rows for a
     predicate that matches half a surname cohort.
@@ -180,6 +183,14 @@ def _byline_owner(byline, attributed):
     pmid at 100/ACCEPTED, and WCM also employs djc2004 (David J Chung, Medicine) and
     dic2022 (David I Chung, Pediatrics). Suppressing on 'David Chung' would have buried
     the likelier reading of that byline.
+
+    One class this reaches that signal 1 never can: `person` carries 6,991 external-validation
+    cohort ids (ucsf_/ucsd_/uci_/ucdavis_/fh_) that `identity` does not, so no open row has one
+    as its top_cwid and the candidate test can never fire on them -- but a byline can. Five live
+    rows suppress on such an owner (42874, 46056, 46487, 72789, 72813); all five were inspected
+    and are AAR false positives with UC Davis / MSKCC / UCSF / Rockefeller affiliations and no
+    WCM roster row of that name. The census is fed from `person`, so the dangerous variant --
+    a WCM person sharing a name with an external cohort id -- is withheld like any other homonym.
 
     ponytail: position would break some of those ties -- the anchor row and its holder are
     both 'last'. It is not available as a general guard and this does not try:
@@ -817,7 +828,7 @@ def _selftest():
                            "processed": pd.DataFrame({c: pd.Series(dtype="object")
                                                       for c in PROCESSED_COLS})})()
     g_attr, g_who, g_gs = gate.attributed_pmids, gate.attributions, _batch_gold_standard
-    gate.attributed_pmids = lambda ps: {99}
+    gate.attributed_pmids = lambda ps: {98, 99}
     gate.attributions = lambda ps: {99: [("mine001", None, ())]}
     globals()["_batch_gold_standard"] = lambda cwids: {}
     try:
@@ -842,7 +853,7 @@ def _selftest():
     store2 = type("S", (), {"ledger": led2[LEDGER_COLS],
                             "processed": pd.DataFrame({c: pd.Series(dtype="object")
                                                        for c in PROCESSED_COLS})})()
-    gate.attributed_pmids = lambda ps: {99}
+    gate.attributed_pmids = lambda ps: {98, 99}
     gate.attributions = lambda ps: {99: [("someone1", None, ())]}
     globals()["_batch_gold_standard"] = lambda cwids: {}
     try:
@@ -866,6 +877,16 @@ def _selftest():
         {"pmid": 99, "top_cwid": "xyz1234", "candidate_cwids_json": "[]",
          "wcm_author": "Dana Vance", "status": "open", "snooze_until": None,
          "last_checked": None},
+        # Candidate-less row (match_status='no_identity_match' -- the majority of the
+        # ledger). It keeps the pre-#174 article-level fallback "credit the first
+        # attributed cwid", but the byline owner must WIN over it, and `bxx1111` is
+        # deliberately listed first so the fallback would credit the wrong person if the
+        # ordering were reversed. Without this row every fixture has a top_cwid, `cc` is
+        # never empty, and the fallback branch is unreachable -- the ordering could be
+        # inverted with the suite still green.
+        {"pmid": 98, "top_cwid": None, "candidate_cwids_json": "[]",
+         "wcm_author": "Tony Rosen", "status": "open", "snooze_until": None,
+         "last_checked": None},
     ])
     for c in LEDGER_COLS:
         if c not in led3.columns:
@@ -873,8 +894,9 @@ def _selftest():
     store3 = type("S", (), {"ledger": led3[LEDGER_COLS],
                             "processed": pd.DataFrame({c: pd.Series(dtype="object")
                                                        for c in PROCESSED_COLS})})()
-    gate.attributed_pmids = lambda ps: {99}
-    gate.attributions = lambda ps: {99: [rosen]}
+    gate.attributed_pmids = lambda ps: {98, 99}
+    other = ("bxx1111", "first", (("Dana", "Vance"),))
+    gate.attributions = lambda ps: {99: [rosen], 98: [other, rosen]}
     globals()["_batch_gold_standard"] = lambda cwids: {}
     try:
         c3 = _recheck(store3, "2026-01-02")
@@ -883,11 +905,15 @@ def _selftest():
         globals()["_batch_gold_standard"] = g_gs
     check("_recheck closes a row on the BYLINE's owner and credits that owner, not the "
           "candidate the matcher proposed",
-          c3["attributed"] == 1
+          c3["attributed"] == 2                    # this row and the candidate-less one below
           and store3.ledger["status"].iloc[0] == "resolved_attributed"
           and store3.ledger["resolution_cwid"].iloc[0] == "aer2006")
     check("_recheck leaves a different byline on the same attributed pmid OPEN",
           store3.ledger["status"].iloc[1] == "open")
+    check("_recheck on a CANDIDATE-LESS row credits the byline's owner, not merely the "
+          "first attributed cwid on the pmid",
+          store3.ledger["status"].iloc[2] == "resolved_attributed"
+          and store3.ledger["resolution_cwid"].iloc[2] == "aer2006")
 
     print("SELFTEST", "PASS" if ok else "FAIL")
     return ok
