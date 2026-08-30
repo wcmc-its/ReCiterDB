@@ -1,4 +1,4 @@
-"""Check that a DynamoDB NULL attribute cannot silently drop a person from person_temp.
+"""Check that a DynamoDB NULL attribute cannot silently drop a person from the CSVs.
 
 A NULL attribute deserializes to None with the key PRESENT, so `.get(k, default)` returns
 None and the default never fires. Iterating that raises, process_person_temp()'s per-person
@@ -13,7 +13,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from dataTransformer import process_person_temp  # noqa: E402
+from dataTransformer import process_person_temp, process_person_person_type  # noqa: E402
 
 
 def rows_for(identities):
@@ -72,6 +72,35 @@ def main():
     if by_uid.get("a7", {}).get("knownRelationshipCount") != "1":
         failures.append(f"a7: expected knownRelationshipCount 1, got "
                         f"{by_uid.get('a7', {}).get('knownRelationshipCount')!r}")
+
+    # process_person_person_type carries the same trap. 2,448 live identities have
+    # personTypes: NULL. No ROWS are lost when it fires (those people have no types to emit),
+    # so counting output rows cannot tell fixed from broken — the only observable difference
+    # is whether the per-identity `except` swallowed anything. Assert on that instead.
+    pt_cases = [
+        ("personTypes NULL",    {"uid": "p1", "identity": {"personTypes": None}}),
+        ("identity NULL",       {"uid": "p2", "identity": None}),
+        ("key absent",          {"uid": "p3", "identity": {}}),
+        ("populated, control",  {"uid": "p4", "identity": {"personTypes": ["faculty", "postdoc"]}}),
+    ]
+    import dataTransformer
+    swallowed = []
+    real_log_error = dataTransformer.log_error
+    dataTransformer.log_error = lambda pid, msg: swallowed.append((pid, msg))
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            dataTransformer.process_person_person_type([c[1] for c in pt_cases], d)
+            with open(os.path.join(d, "person_person_type.csv")) as f:
+                pt_rows = list(csv.DictReader(f))
+    finally:
+        dataTransformer.log_error = real_log_error
+
+    emitted = [r["personIdentifier"] for r in pt_rows]
+    if emitted != ["p4", "p4"]:
+        failures.append(f"person_person_type: expected exactly p4's two types, got {emitted}")
+    for pid, msg in swallowed:
+        failures.append(f"person_person_type: {pid} raised and was swallowed -- {msg}")
+    print(f"person_person_type: {len(pt_rows)} rows emitted, {len(swallowed)} swallowed exception(s)")
 
     for f in failures:
         print(f"  FAIL {f}")
