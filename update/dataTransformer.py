@@ -73,13 +73,22 @@ def process_person_temp(identities, output_path):
         for identity in identities:
             try:
                 person_identifier = sanitize_field(identity.get('uid', ''))
-                identity_data = identity.get('identity', {})
-                primary_name = identity_data.get('primaryName', {})
+                # `or {}` / `or []` rather than a .get() default, here and below: a DynamoDB NULL
+                # attribute deserializes to None with the KEY PRESENT, so .get(k, default) hands
+                # back None and the default never fires. Whatever we then subscript or iterate
+                # raises, the `except` below swallows it, and the person disappears from
+                # person_temp.csv entirely — taking their name with them, because update_person()
+                # fills names by INNER JOIN against that file.
+                # These two are hardening: every Identity item currently carries both as maps.
+                identity_data = identity.get('identity') or {}
+                primary_name = identity_data.get('primaryName') or {}
                 first_name = sanitize_field(primary_name.get('firstName', ''))
                 middle_name = sanitize_field(primary_name.get('middleName', ''))
                 last_name = sanitize_field(primary_name.get('lastName', ''))
                 title = sanitize_field(identity_data.get('title', ''))
-                emails = identity_data.get('emails', [])
+                # emails: NULL on 170 of 35,052 live Identity items — this is the line that was
+                # actually firing, and on its own accounts for most of the 174 dropped people.
+                emails = identity_data.get('emails') or []
                 sanitized_emails = [sanitize_field(email.split(",")[0].strip()) for email in emails]
                 primary_email = None
                 for domain in preferred_domains:
@@ -93,9 +102,12 @@ def process_person_temp(identities, output_path):
                 primary_organizational_unit = sanitize_field(identity_data.get('primaryOrganizationalUnit', ''))
                 primary_institution = sanitize_field(identity_data.get('primaryInstitution', ''))
 
-                # Count the number of "uid" in knownRelationships
-                known_relationships = identity_data.get('knownRelationships', [])
-                relationshipIdentityCount = sum(1 for rel in known_relationships if rel.get('uid'))
+                # Count the number of "uid" in knownRelationships.
+                # NULL on 28 live items; the second line that was firing. ABSENT is harmless here
+                # (8,745 items omit the key entirely and the .get default handles those) — it is
+                # explicitly-NULL that is fatal, which is why this looked like a rare edge case.
+                known_relationships = identity_data.get('knownRelationships') or []
+                relationshipIdentityCount = sum(1 for rel in known_relationships if (rel or {}).get('uid'))
 
                 rows.append([
                     sanitize_field(last_name), sanitize_field(title), sanitize_field(first_name),
@@ -111,7 +123,13 @@ def process_person_temp(identities, output_path):
         # Normalize line endings to Unix-style (\n)
         normalize_line_endings(output_file)
 
-        print(f"Processed {len(rows)} identities successfully.")
+        # Report drops on the same line as successes. log_error() writes to error.txt, which
+        # never reaches the job log, and the old message printed only the success count — so
+        # spotting the 174 missing people meant differencing "retrieved N" against
+        # "Processed N" across two lines of a 2.5-hour run, which nobody did for eight weeks.
+        dropped = len(identities) - len(rows)
+        print(f"Processed {len(rows)} of {len(identities)} identities successfully"
+              f"{f' — DROPPED {dropped}, see error.txt' if dropped else ''}.")
     except Exception as e:
         log_error('N/A', f"Error writing to person_temp.csv: {e}")
 
@@ -1046,7 +1064,13 @@ def process_person_person_type(identities, output_path):
         for identity in identities:
             person_identifier = sanitize_field(identity.get('uid', ''))
             try:
-                person_types = identity.get('identity', {}).get('personTypes', [])
+                # Same NULL trap as process_person_temp (#168): a DynamoDB NULL attribute
+                # deserializes to None with the key PRESENT, so the .get() default never fires
+                # and the loop below raises. 2,448 live identities carry personTypes: NULL, so
+                # this throws 2,448 swallowed exceptions a night. No rows are lost — those
+                # people genuinely have no person types to emit — but the noise buries real
+                # errors in error.txt, which is the only place log_error writes.
+                person_types = (identity.get('identity') or {}).get('personTypes') or []
                 for person_type in person_types:
                     rows.append([person_identifier, sanitize_field(person_type)])
             except Exception as e:
