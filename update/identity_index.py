@@ -16,7 +16,7 @@ published per row as `authorship_review.top_years_after_wcm`. See `temporal_pena
 
 Env: DB_USERNAME/DB_PASSWORD/DB_HOST/DB_NAME (reciterdb, read-only).
 """
-import os, unicodedata
+import os, re, unicodedata
 
 from sqlalchemy import create_engine, text
 
@@ -56,6 +56,26 @@ def _norm(s):
     s = unicodedata.normalize("NFKD", str(s))
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     return "".join(ch for ch in s.lower() if ch.isalnum())
+
+
+def name_tokens(s):
+    """Name -> normalised word tokens. 'Han-Jo Kim' -> ('han', 'jo', 'kim').
+
+    `_norm` collapses a whole string ('Kristin Lees' -> 'kristinlees'), which is what a
+    surname index key wants and the opposite of what comparing a byline word by word
+    wants -- the byline-owner gate (issue #174) needs to line up the FIRST token and the
+    TRAILING tokens separately. Hyphens split like spaces because reciterdb carries both
+    spellings of the same compound name: 'Han-Jo'/'Han Jo' in `identity.givenName`,
+    'Lees-Haggerty'/'Lees Haggerty' between `person.lastName` and the PubMed byline in
+    `person_article`. Apostrophes deliberately do NOT split -- `_norm` already folds
+    "O'Brien" and 'OBrien' onto the same token, and splitting would pull them apart again.
+
+    Anything that isn't a string is no tokens at all, not the token 'nan': reciterdb hands
+    NULL through as None, and the pandas ledger hands a missing byline through as a float
+    NaN that str() would happily turn into a name."""
+    if not isinstance(s, str):
+        return ()
+    return tuple(t for t in (_norm(w) for w in re.split(r"[\s,.\-‐-―]+", s)) if t)
 
 
 def _first_initial(fore, initials):

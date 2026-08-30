@@ -46,6 +46,7 @@ from sqlalchemy import create_engine, text, bindparam
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adversarial_attribution_review as det  # model scoring engine (step 0)
+from identity_index import name_tokens        # shared name normalisation
 
 _dyn = boto3.client("dynamodb", region_name="us-east-1")
 IDENTITY_ONLY_SUFFIX = "-identityOnlyScoringInput.json"
@@ -88,20 +89,113 @@ def attributed_pmids(pmids):
     return found
 
 
+def _identifying_name(first, last):
+    """(given token, surname tokens) for a name spelling, or None when the spelling
+    identifies nobody: no surname, no given name, or a given name that is a bare initial
+    ('J Kim' names half the Kims at WCM). This is the granularity a byline can be pinned
+    to, so it is also the key the homonym census counts on."""
+    f, l = name_tokens(first), name_tokens(last)
+    if not f or not l or len(f[0]) < 2:
+        return None
+    return (f[0], l)
+
+
+_AMBIGUOUS = None
+
+
+def _ambiguous_names():
+    """Name spellings more than one WCM person answers to, so a byline carrying one of
+    them cannot be pinned to a single person. Measured live 2026-08-30: 68,539 roster rows
+    yield 43,506 identifying spellings, 1,222 of them shared, and those 1,222 cover 90 of
+    the 479 authorships the byline signal would otherwise suppress. 'Andrew Lee' is 8 WCM
+    people, 'Arnab Ghosh' 4, 'David Chung' 3.
+
+    Both rosters in ONE census, since `attributions` returns names from both: `person`
+    (33k DynamoDB publishing names) and `identity` (35k HR legal names). Combined, not
+    per-table then unioned -- a spelling that is unique inside each table but names two
+    different people across them is still ambiguous, and that is 121 of the 1,222.
+    0.75s, once per process; the roster is a nightly snapshot and a run is minutes.
+
+    `person_article` is deliberately NOT censused, though it is the third name source. It
+    is ReCiter's own matching OUTPUT, not a roster: a byline it once matched to two
+    different people becomes an "ambiguity" no human shares ('Aaron Gupta' -> aag2010 +
+    ajg9004; 'Aastha Bansal' -> fh_abansal + fredhutch_abansal, the same person under an
+    external-validation cohort id). Measured, it adds 1,066 further keys -- nearly
+    doubling the census off the very evidence this gate exists to audit -- to spare 32
+    more rows. The roster answers who exists, which is the question being asked here."""
+    global _AMBIGUOUS
+    if _AMBIGUOUS is None:
+        held = {}
+        with _reciterdb().connect() as c:
+            for cwid, first, last in c.execute(text(
+                    "SELECT personIdentifier, firstName, lastName FROM person "
+                    "UNION ALL "
+                    "SELECT cwid, givenName, surname FROM identity")):
+                key = _identifying_name(first, last)
+                if key:
+                    held.setdefault(key, set()).add(cwid)
+        _AMBIGUOUS = frozenset(k for k, cwids in held.items() if len(cwids) > 1)
+    return _AMBIGUOUS
+
+
 def attributions(pmids):
-    """pmid -> [(cwid, authorPosition), ...] for the article-level matcher (who's
-    already assigned, so the ledger can mark which WCM authorships are still open)."""
+    """pmid -> [(cwid, authorPosition, names), ...] for the article-level matcher (who's
+    already assigned, so the ledger can mark which WCM authorships are still open).
+
+    `names` is the ((first, last), ...) spellings that person is known by, which is what
+    lets the orchestrator ask the question the cwid alone cannot -- "is this BYLINE
+    already attributed, to ANYONE?" (issue #174). Three sources, all of them, because they
+    disagree and the anchor case is exactly where: aer2006 publishes as 'Tony Rosen' but
+    is 'Anthony Rosen' in HR, so an identity-only comparison misses the byline this was
+    written for.
+
+      person_article.articleAuthorName{First,Last}Name   the exact PubMed byline ReCiter
+          matched on this very pmid. Preferred over normalising a roster name and hoping
+          it lands: it reproduces 472 of the 473 known leak bylines character-for-
+          character. Measured alone it catches 478 of the 479, so it carries the signal
+          and the two rosters are the belt-and-braces.
+      person.firstName / lastName        the DynamoDB Identity publishing name (461)
+      identity.givenName / surname       the HR/LDAP LEGAL name (320 -- on its own it
+          misses a third of the set, which is what 'Anthony' vs 'Tony' costs at scale)
+
+    A spelling shared by two or more WCM people is dropped rather than returned (see
+    `_ambiguous_names`): it identifies nobody, and suppressing an authorship on it would
+    hide a genuine unattributed one behind a homonym.
+
+    Aggregated per (pmid, cwid) in Python rather than left to the joins, which are not
+    one-to-one -- 23 (personIdentifier, pmid) pairs are duplicated in `person_article`
+    and 14 personIdentifiers in `person`, and a caller reading `attr_hits[0][0]` must not
+    see the same person twice."""
     pmids = sorted({int(p) for p in pmids})
     if not pmids:
         return {}
-    stmt = text("SELECT pmid, personIdentifier, authorPosition "
-                "FROM analysis_summary_author WHERE pmid IN :ps") \
+    stmt = text("SELECT a.pmid, a.personIdentifier, a.authorPosition, "
+                "       pa.articleAuthorNameFirstName, pa.articleAuthorNameLastName, "
+                "       p.firstName, p.lastName, i.givenName, i.surname "
+                "FROM analysis_summary_author a "
+                "LEFT JOIN person_article pa ON pa.pmid = a.pmid "
+                "                           AND pa.personIdentifier = a.personIdentifier "
+                "LEFT JOIN person p ON p.personIdentifier = a.personIdentifier "
+                "LEFT JOIN identity i ON i.cwid = a.personIdentifier "
+                "WHERE a.pmid IN :ps") \
         .bindparams(bindparam("ps", expanding=True))
-    out = {}
+    # no COLLATE: every join key here is utf8mb4_unicode_ci. (authorship_review's
+    # top_cwid/resolution_cwid are utf8mb4_general_ci and would need one -- this query
+    # deliberately never reaches that table.)
+    ambiguous = _ambiguous_names()
+    per_person = {}                                    # (pmid, cwid) -> [position, names]
     with _reciterdb().connect() as c:
         for i in range(0, len(pmids), 1000):
-            for pmid, cwid, pos in c.execute(stmt, {"ps": pmids[i:i + 1000]}):
-                out.setdefault(int(pmid), []).append((cwid, pos))
+            for pmid, cwid, pos, a_first, a_last, p_first, p_last, i_given, i_sur in \
+                    c.execute(stmt, {"ps": pmids[i:i + 1000]}):
+                rec = per_person.setdefault((int(pmid), cwid), [pos, []])
+                for spelling in ((a_first, a_last), (p_first, p_last), (i_given, i_sur)):
+                    key = _identifying_name(*spelling)
+                    if key and key not in ambiguous and spelling not in rec[1]:
+                        rec[1].append(spelling)
+    out = {}
+    for (pmid, cwid), (pos, names) in per_person.items():
+        out.setdefault(pmid, []).append((cwid, pos, tuple(names)))
     return out
 
 

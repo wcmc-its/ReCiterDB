@@ -153,37 +153,98 @@ def _trunc(s, n):
     return s[:n] if isinstance(s, str) and len(s) > n else s
 
 
-def _already_curated(top, attributed_cwids=()):
+def _byline(au):
+    """The author's name as PubMed printed it -- what lands in `wcm_author`."""
+    return " ".join(x for x in (au.get("fore"), au.get("last")) if x) \
+        or au.get("initials") or au.get("last")
+
+
+def _byline_owner(byline, attributed):
+    """The already-attributed cwid that this BYLINE names, or None. `attributed` is one
+    pmid's entry from gate.attributions().
+
+    Match is deliberately strict: the person's surname must be the tail of the byline AND
+    the byline's first token must be their whole given name, no initials on either side.
+    'Tony Rosen' vs Tony Rosen = suppress; 'J Kim' vs Junbum Kim = do not. The loose
+    first-initial tier was measured on the live queue and rejected -- 19 extra rows for a
+    predicate that matches half a surname cohort.
+
+    Homonyms are handled upstream, not here: gate.attributions() has already dropped any
+    spelling two or more WCM people answer to, so a name this function can match belongs
+    to exactly one person on the roster. Measured, that withholds 90 of the 479 byline
+    matches; signal 1 covers 10 of them anyway, so 80 rows stay in the queue that the
+    unguarded predicate would have closed -- 16.5% of the 485. It is the deliberate trade,
+    and the asymmetry decides it: an authorship suppressed here is never WRITTEN, so no
+    curator can notice the mistake, while one left open is only noise. The measured case
+    is id 7896, byline 'David J Chung': lrz9005 (David H Chung, Psychiatry) holds that
+    pmid at 100/ACCEPTED, and WCM also employs djc2004 (David J Chung, Medicine) and
+    dic2022 (David I Chung, Pediatrics). Suppressing on 'David Chung' would have buried
+    the likelier reading of that byline.
+
+    ponytail: position would break some of those ties -- the anchor row and its holder are
+    both 'last'. It is not available as a general guard and this does not try:
+    analysis_summary_author.authorPosition is NULL on 321,533 of 554,581 rows (58%) and
+    only ever takes 'first'/'last', while 9,770 of the 12,293 open PubMed rows are
+    'middle'. Upgrade path if that column is ever filled in: spare an ambiguous byline
+    only when both sides carry a position and they disagree."""
+    b = matcher.name_tokens(byline)
+    if not b:
+        return None
+    for cwid, _pos, names in attributed or ():
+        for first, last in names:
+            f, l = matcher.name_tokens(first), matcher.name_tokens(last)
+            if not f or not l or len(b) <= len(l) or b[-len(l):] != l:
+                continue                               # surname is not the byline's tail
+            if b[0] == f[0] and len(b[0]) > 1:         # equal on both sides, not initials
+                return cwid
+    return None
+
+
+def _already_curated(top, attributed=(), byline=None):
     """This authorship is already resolved, so it is not a curation record. Three sites
     decide this -- the DB sink, the CSV sink, and the run log -- and they must never
     disagree, so they all call here.
 
-    Two signals, and the order matters:
+    Three signals, and the order matters:
 
-    1. `attributed_cwids` -- reciterdb's OWN per-authorship attribution for this pmid,
-       from gate.attributions() over analysis_summary_author. Authoritative: if reciterdb
-       says this cwid holds this article, it is curated, full stop.
-    2. `final_score >= STORAGE_THRESHOLD` -- aar_matcher's score for the pair. This is a
+    1. `attributed` -- reciterdb's OWN per-authorship attribution for this pmid, from
+       gate.attributions() over analysis_summary_author. Authoritative: if reciterdb says
+       this cwid holds this article, it is curated, full stop.
+    2. THE BYLINE'S OWNER (issue #174). Signal 1 asks whether the candidate this run
+       PROPOSED is attributed, which is the wrong question whenever the matcher proposed
+       the wrong person -- and it cannot be right, because a row only exists when nobody
+       obvious was found. The anchor: byline 'Tony Rosen', proposed ltr4001 'Leah Teresa
+       Rosen' off a middle-initial fallback, while aer2006 (Tony Rosen, Emergency
+       Medicine) had held that pmid at 100/ACCEPTED for 44 days before the row was even
+       created. Asking "is this byline attributed, to ANYONE?" fires on 389 of the 12,293
+       open PubMed rows, 212 of which no other signal reaches; every one of the 389 names
+       a holder whose person_article row is userAssertion='ACCEPTED'. The other 177 are
+       cwids signal 1 should already have caught -- they are open only because _recheck
+       resolves the CSV ledger and never reaches reciterdb.authorship_review.
+    3. `final_score >= STORAGE_THRESHOLD` -- aar_matcher's score for the pair. This is a
        LOCAL rescore (det._score runs pinned XGBoost + isotonic over production's S3
        feature vectors), not a value read back from production, so it can be None on any
        S3 or scoring failure: NoSuchKey, cold-storage InvalidObjectState, an empty or
-       malformed artifact, a scoring exception. Signal 1 exists precisely because of
-       that: without it a transient S3 failure would silently reclassify an attributed
+       malformed artifact, a scoring exception. Signals 1 and 2 exist precisely because of
+       that: without them a transient S3 failure would silently reclassify an attributed
        authorship as `absent` and push a spurious row into the curator queue -- a hole
-       that could not exist before #160, when attributed articles were never exploded."""
+       that could not exist before #160, when attributed articles were never exploded.
+       The anchor row's top_fg_score is NULL, so it took this fail-open path."""
     if top is None:
         return False
-    if attributed_cwids and top.get("cwid") in attributed_cwids:
+    if attributed and any(cwid == top.get("cwid") for cwid, _pos, _names in attributed):
+        return True
+    if _byline_owner(byline, attributed):
         return True
     fg = top.get("final_score")
     return fg is not None and fg >= gate.STORAGE_THRESHOLD
 
 
-def _db_rows(resolved_auth, run_date, attr_cwids_by_pmid=None):
+def _db_rows(resolved_auth, run_date, attr_by_pmid=None):
     """authorship_review rows for matched authorships, classified PER-AUTHORSHIP:
     absent (top candidate never scored) / buried (FG<30). An authorship _already_curated
     is skipped entirely rather than hidden behind a PM filter -- see that function for
-    the two signals and why reciterdb's own attribution leads. (Was
+    the three signals and why reciterdb's own attribution leads. (Was
     previously written and left for PM to display; per product decision 2026-08-19
     that is wrong -- don't create a queue record for something already resolved.)
     Unmatched authorships (no candidate to assign) are also skipped. single_candidate
@@ -194,7 +255,7 @@ def _db_rows(resolved_auth, run_date, attr_cwids_by_pmid=None):
     authorship's own candidates by aar_db.dup_uid_for_authorship — a co-author's
     already-added authorship must not flag this one (issue #158). See those
     functions' docstrings."""
-    attr_cwids_by_pmid = attr_cwids_by_pmid or {}
+    attr_by_pmid = attr_by_pmid or {}
     dois = {a.get("doi") for a, i, n, au, cands, top in resolved_auth if a.get("doi")}
     dup_map = aar_db.dup_flags_by_doi(dois) if dois else {}
     out = []
@@ -202,7 +263,8 @@ def _db_rows(resolved_auth, run_date, attr_cwids_by_pmid=None):
         if top is None:
             continue                                   # unmatched: nothing to assign
         fg = top.get("final_score")
-        if _already_curated(top, attr_cwids_by_pmid.get(a["pmid"], ())):
+        byline = _byline(au)
+        if _already_curated(top, attr_by_pmid.get(a["pmid"], ()), byline):
             continue                                   # already curated -- not a queue record
         cls = "absent" if fg is None else "buried"
         cohort = top.get("cohort_size")
@@ -214,8 +276,7 @@ def _db_rows(resolved_auth, run_date, attr_cwids_by_pmid=None):
             "author_key": f"{a['pmid']}:{i}",
             "author_position": i + 1,
             "author_position_label": _position_label(i, n),
-            "wcm_author": _trunc(" ".join(x for x in (au.get("fore"), au.get("last")) if x)
-                                 or au.get("initials") or au.get("last"), 255),
+            "wcm_author": _trunc(byline, 255),
             "author_affiliation": " | ".join(au.get("affiliations") or []),
             "entrez_date": a["entrez_date"], "title": a["title"],
             "journal": _trunc(a["journal"], 512), "doi": _trunc(a["doi"], 255),
@@ -307,13 +368,14 @@ def run(date_from, date_to, state_dir, export_dir, run_date, workers=16, max_rec
     # attribution lookups (attr_who).
     log("[2/6] Gating new pmids against reciterdb (analysis_summary_author) ...")
     attributed = gate.attributed_pmids(new_pmids) if new_pmids else set()
-    # Per-authorship attribution (pmid -> {cwid}) for the same set. gate.attributed_pmids
-    # answers "is this ARTICLE attributed"; this answers "to WHOM", which is what the
+    # Per-authorship attribution for the same set. gate.attributed_pmids answers "is this
+    # ARTICLE attributed"; this answers "to WHOM, and under what name", which is what the
     # per-authorship gate below actually needs and what makes the skip authoritative
     # rather than dependent on a local rescore that can fail open. One batched query.
-    attr_cwids_by_pmid = ({p: {w[0] for w in who}
-                           for p, who in gate.attributions(sorted(attributed)).items()}
-                          if attributed else {})
+    # The name half is not decoration: narrowing this to a bare cwid set (what it did
+    # before #174) is what let a byline whose real owner was attributed pass the gate,
+    # because the only cwid tested was the one this run happened to propose.
+    attr_by_pmid = gate.attributions(sorted(attributed)) if attributed else {}
     orphan_pmids = [p for p in new_pmids if p not in attributed]  # metric only now
     log(f"      {len(attributed)} of {len(new_pmids)} new pmids have >=1 WCM co-author "
         f"already attributed (article-level label; ALL still get exploded below)")
@@ -367,7 +429,7 @@ def run(date_from, date_to, state_dir, export_dir, run_date, workers=16, max_rec
         resolved_auth.append((a, i, n, au, cands, top))
     n_row_suggested = sum(
         1 for a, i, n, au, cands, top in resolved_auth
-        if _already_curated(top, attr_cwids_by_pmid.get(a["pmid"], ())))
+        if _already_curated(top, attr_by_pmid.get(a["pmid"], ()), _byline(au)))
     log(f"      {len(suggested_pmids)} articles have >=1 authorship already SUGGESTED "
         f"(article-level, informational); {n_row_suggested}/{len(resolved_auth)} individual "
         f"authorships are SUGGESTED and excluded from the curator queue below, "
@@ -378,21 +440,20 @@ def run(date_from, date_to, state_dir, export_dir, run_date, workers=16, max_rec
     # already curated, so _db_rows skips it rather than writing it for PM to filter.
     # Curator status on existing rows is preserved.
     if write_db:
-        db_rows = _db_rows(resolved_auth, run_date, attr_cwids_by_pmid)
+        db_rows = _db_rows(resolved_auth, run_date, attr_by_pmid)
         aar_db.upsert(db_rows)
         log(f"      upserted {len(db_rows)} matched authorships -> reciterdb.authorship_review")
 
     new_rows = []
     for a, i, n, au, cands, top in resolved_auth:
-        if _already_curated(top, attr_cwids_by_pmid.get(a["pmid"], ())):
+        if _already_curated(top, attr_by_pmid.get(a["pmid"], ()), _byline(au)):
             continue                                  # THIS authorship is already suggested/covered
         new_rows.append({
             "pmid": a["pmid"],
             "author_key": f"{a['pmid']}:{i}",
             "author_position": i + 1,
             "author_position_label": _position_label(i, n),
-            "wcm_author": " ".join(x for x in (au.get("fore"), au.get("last")) if x)
-                          or au.get("initials") or au.get("last"),
+            "wcm_author": _byline(au),
             "author_affiliation": " | ".join(au.get("affiliations") or []),
             "entrez_date": a["entrez_date"], "title": a["title"],
             "journal": a["journal"], "doi": a["doi"],
@@ -495,6 +556,14 @@ def _recheck(store, run_date):
     # forever. The conflation bug being fixed here is specifically "the row named
     # candidates and none of them is the attributed one", which presupposes candidates,
     # so candidate-less rows keep the old article-level signal.
+    #
+    # That narrowing carried the SAME blind spot as the emission gate (issue #174): it
+    # only ever tested cwids this row proposed, so a row whose byline belongs to somebody
+    # the matcher never considered stayed open forever. _byline_owner closes it, and is
+    # tried before the candidate-less fallback because it names the person the byline
+    # actually is rather than an arbitrary attributed co-author. Of a dated 80-row sample
+    # of anchor-shaped rows, 23 became attributed AFTER the row was created, so they are
+    # unreachable from the emission gate and only this path can resolve them.
     for j in open_idx:
         row = led.loc[j]
         pmid = int(row["pmid"])
@@ -502,9 +571,10 @@ def _recheck(store, run_date):
         accept_cwid = next((c for c in cc if pmid in gs.get(c, (set(), set()))[0]), None)
         reject_cwid = next((c for c in cc if pmid in gs.get(c, (set(), set()))[1]), None)
         attr_hits = attr_who.get(pmid, []) if pmid in attr else []
-        attr_cwid = next((c for c in cc if c in {w[0] for w in attr_hits}), None)
+        attr_cwid = next((c for c in cc if c in {w[0] for w in attr_hits}), None) \
+            or _byline_owner(row.get("wcm_author"), attr_hits)
         if not cc and attr_hits:                       # candidate-less row: article-level only
-            attr_cwid = attr_hits[0][0]
+            attr_cwid = attr_cwid or attr_hits[0][0]
         if accept_cwid:
             _resolve(led, j, "resolved_accepted", accept_cwid, run_date)
             counts["accepted"] += 1
@@ -637,8 +707,8 @@ def run_tiled(date_from, date_to, state_dir, export_dir, run_date, workers=16,
 
 
 def _selftest():
-    """Offline checks for the per-authorship gate (issue #160). No network, no DB:
-    every article here has doi=None so _db_rows never calls aar_db.dup_flags_by_doi,
+    """Offline checks for the per-authorship gate (issues #160 and #174). No network, no
+    DB: every article here has doi=None so _db_rows never calls aar_db.dup_flags_by_doi,
     and _recheck's gate/GoldStandard lookups are stubbed."""
     ok = True
 
@@ -649,14 +719,14 @@ def _selftest():
 
     T = gate.STORAGE_THRESHOLD
 
-    def auth(fg, cwid="aaa1001"):
+    def auth(fg, cwid="aaa1001", fore="F", last="N"):
         art = {"pmid": 1, "entrez_date": "2026-01-01", "title": "t", "journal": "j",
                "doi": None, "authors": [], "pub_year": 2026}
         top = {"cwid": cwid, "name": "N", "person_type": "p", "dept": "d",
                "final_score": fg, "io_score": 5.0, "confidence": "high",
                "years_after_wcm": None, "cohort_size": 1, "given_match": 1,
                "affil_dept_match": True}
-        return (art, 0, 1, {"last": "N", "fore": "F", "affiliations": []}, [top], top)
+        return (art, 0, 1, {"last": last, "fore": fore, "affiliations": []}, [top], top)
 
     rows = _db_rows([auth(T + 1), auth(None), auth(T - 1)], "2026-01-01")
     check("_db_rows skips an authorship already curated at FG>=threshold",
@@ -677,18 +747,68 @@ def _selftest():
     check("_db_rows skips it once reciterdb says that cwid holds the article, even with "
           "no score at all",
           _db_rows([auth(None, cwid="aaa1001")], "2026-01-01",
-                   {1: {"aaa1001"}}) == [])
-    check("reciterdb attribution for a DIFFERENT cwid does not suppress this authorship",
+                   {1: [("aaa1001", None, ())]}) == [])
+    check("reciterdb attribution for a DIFFERENT cwid, whose name is not this byline, "
+          "does not suppress this authorship",
           [r["classification"] for r in
-           _db_rows([auth(None, cwid="aaa1001")], "2026-01-01", {1: {"bbb2002"}})]
+           _db_rows([auth(None, cwid="aaa1001")], "2026-01-01",
+                    {1: [("bbb2002", None, (("Jane", "Doe"),))]})]
           == ["absent"])
+
+    # ---- issue #174: the byline's OWNER, not the proposed candidate ---------
+    # The anchor. Byline "Tony Rosen"; the matcher proposed ltr4001 ("Leah Teresa Rosen",
+    # middle-initial fallback); aer2006 has held the pmid at 100/ACCEPTED since 44 days
+    # before the row existed. Under the two-signal gate every check missed it: aer2006 is
+    # not the proposed cwid, and top_fg_score is NULL so the score check failed open.
+    rosen = ("aer2006", "last", (("Tony", "Rosen"), ("Anthony", "Rosen")))
+    check("a byline whose real owner is attributed is suppressed even though the "
+          "PROPOSED candidate is someone else",
+          _db_rows([auth(None, cwid="ltr4001", fore="Tony", last="Rosen")],
+                   "2026-01-01", {1: [rosen]}) == [])
+    check("the HR legal name alone would NOT have caught the anchor -- publishing name "
+          "and legal name disagree, which is why all three sources are returned",
+          [r["classification"] for r in
+           _db_rows([auth(None, cwid="ltr4001", fore="Tony", last="Rosen")],
+                    "2026-01-01", {1: [("aer2006", "last", (("Anthony", "Rosen"),))]})]
+          == ["absent"])
+    check("a genuinely unattributed byline is still written -- the attributed co-author "
+          "shares the pmid, not the name",
+          [r["classification"] for r in
+           _db_rows([auth(None, cwid="ltr4001", fore="Tony", last="Rosen")],
+                    "2026-01-01",
+                    {1: [("klh4011", None, (("Kristin", "Lees Haggerty"),))]})]
+          == ["absent"])
+    check("the first-initial tier is NOT shipped: byline 'J Kim' does not match "
+          "Junbum Kim (19 rows, and it matches half a surname cohort)",
+          [r["classification"] for r in
+           _db_rows([auth(None, cwid="jyk9001", fore="J", last="Kim")], "2026-01-01",
+                    {1: [("jbk9001", None, (("Junbum", "Kim"),))]})]
+          == ["absent"])
+
+    # The homonym decision, both halves. gate._identifying_name is the census key, so a
+    # spelling 2+ WCM people answer to never reaches here -- the holder arrives with an
+    # empty `names` and the row stays open. 80 rows of the 485 pay for it; see
+    # _byline_owner for why that trade is the safe direction.
+    check("a homonym-ambiguous byline is SPARED: the gate withholds the shared spelling, "
+          "so nothing matches and the authorship stays in the queue",
+          [r["classification"] for r in
+           _db_rows([auth(None, cwid="acl2007", fore="Andrew", last="Lee")],
+                    "2026-01-01", {1: [("agl2003", None, ())]})]
+          == ["absent"])
+    check("the census key is (given token, surname tokens), so 'Han-Jo' and 'Han Jo' "
+          "collide and a bare initial is not a key at all",
+          gate._identifying_name("Han-Jo", "Kim") == ("han", ("kim",))
+          and gate._identifying_name("Han Jo", "Kim") == ("han", ("kim",))
+          and gate._identifying_name("J", "Kim") is None)
 
     # _recheck: an open row must resolve only when ITS OWN cwid is attributed.
     led = pd.DataFrame([
         {"pmid": 99, "top_cwid": "mine001", "candidate_cwids_json": "[]",
-         "status": "open", "snooze_until": None, "last_checked": None},
+         "wcm_author": "Mine One", "status": "open", "snooze_until": None,
+         "last_checked": None},
         {"pmid": 99, "top_cwid": "other02", "candidate_cwids_json": "[]",
-         "status": "open", "snooze_until": None, "last_checked": None},
+         "wcm_author": "Other Two", "status": "open", "snooze_until": None,
+         "last_checked": None},
     ])
     for c in LEDGER_COLS:
         if c not in led.columns:
@@ -698,7 +818,7 @@ def _selftest():
                                                       for c in PROCESSED_COLS})})()
     g_attr, g_who, g_gs = gate.attributed_pmids, gate.attributions, _batch_gold_standard
     gate.attributed_pmids = lambda ps: {99}
-    gate.attributions = lambda ps: {99: [("mine001", None)]}
+    gate.attributions = lambda ps: {99: [("mine001", None, ())]}
     globals()["_batch_gold_standard"] = lambda cwids: {}
     try:
         counts = _recheck(store, "2026-01-02")
@@ -714,7 +834,8 @@ def _selftest():
     # A row that names no candidate at all has nothing to narrow to; it must still close
     # on article-level attribution, or 1,336 of prod's 1,923 open rows never resolve.
     led2 = pd.DataFrame([{"pmid": 99, "top_cwid": None, "candidate_cwids_json": "[]",
-                          "status": "open", "snooze_until": None, "last_checked": None}])
+                          "wcm_author": None, "status": "open", "snooze_until": None,
+                          "last_checked": None}])
     for c in LEDGER_COLS:
         if c not in led2.columns:
             led2[c] = pd.NA
@@ -722,7 +843,7 @@ def _selftest():
                             "processed": pd.DataFrame({c: pd.Series(dtype="object")
                                                        for c in PROCESSED_COLS})})()
     gate.attributed_pmids = lambda ps: {99}
-    gate.attributions = lambda ps: {99: [("someone1", None)]}
+    gate.attributions = lambda ps: {99: [("someone1", None, ())]}
     globals()["_batch_gold_standard"] = lambda cwids: {}
     try:
         c2 = _recheck(store2, "2026-01-02")
@@ -733,6 +854,40 @@ def _selftest():
           "article-level attribution",
           c2["attributed"] == 1
           and store2.ledger["status"].iloc[0] == "resolved_attributed")
+
+    # #174 in the recheck path. 23 of a dated 80-row anchor-shape sample became attributed
+    # AFTER the row was created, so the emission gate can never see them; the row names
+    # ltr4001, nobody attributes ltr4001, and only the byline closes it. The second row is
+    # the control: same pmid, same run, a byline nobody holds stays open.
+    led3 = pd.DataFrame([
+        {"pmid": 99, "top_cwid": "ltr4001", "candidate_cwids_json": "[]",
+         "wcm_author": "Tony Rosen", "status": "open", "snooze_until": None,
+         "last_checked": None},
+        {"pmid": 99, "top_cwid": "xyz1234", "candidate_cwids_json": "[]",
+         "wcm_author": "Dana Vance", "status": "open", "snooze_until": None,
+         "last_checked": None},
+    ])
+    for c in LEDGER_COLS:
+        if c not in led3.columns:
+            led3[c] = pd.NA
+    store3 = type("S", (), {"ledger": led3[LEDGER_COLS],
+                            "processed": pd.DataFrame({c: pd.Series(dtype="object")
+                                                       for c in PROCESSED_COLS})})()
+    gate.attributed_pmids = lambda ps: {99}
+    gate.attributions = lambda ps: {99: [rosen]}
+    globals()["_batch_gold_standard"] = lambda cwids: {}
+    try:
+        c3 = _recheck(store3, "2026-01-02")
+    finally:
+        gate.attributed_pmids, gate.attributions = g_attr, g_who
+        globals()["_batch_gold_standard"] = g_gs
+    check("_recheck closes a row on the BYLINE's owner and credits that owner, not the "
+          "candidate the matcher proposed",
+          c3["attributed"] == 1
+          and store3.ledger["status"].iloc[0] == "resolved_attributed"
+          and store3.ledger["resolution_cwid"].iloc[0] == "aer2006")
+    check("_recheck leaves a different byline on the same attributed pmid OPEN",
+          store3.ledger["status"].iloc[1] == "open")
 
     print("SELFTEST", "PASS" if ok else "FAIL")
     return ok
@@ -826,8 +981,7 @@ def run_backfill(state_dir, run_date, workers=16, batch_size=500, limit=None, wr
             top = cands[0] if cands else None
             resolved_auth.append((a, j, n, au, cands, top))
         if write_db:
-            chunk_attr = {p: {w[0] for w in who}
-                          for p, who in gate.attributions(chunk).items()} if chunk else {}
+            chunk_attr = gate.attributions(chunk) if chunk else {}
             db_rows = _db_rows(resolved_auth, run_date, chunk_attr)
             aar_db.upsert(db_rows)
             total_rows += len(db_rows)
