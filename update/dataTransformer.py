@@ -1064,7 +1064,13 @@ def process_person_person_type(identities, output_path):
         for identity in identities:
             person_identifier = sanitize_field(identity.get('uid', ''))
             try:
-                person_types = identity.get('identity', {}).get('personTypes', [])
+                # Same NULL trap as process_person_temp (#168): a DynamoDB NULL attribute
+                # deserializes to None with the key PRESENT, so the .get() default never fires
+                # and the loop below raises. 2,448 live identities carry personTypes: NULL, so
+                # this throws 2,448 swallowed exceptions a night. No rows are lost — those
+                # people genuinely have no person types to emit — but the noise buries real
+                # errors in error.txt, which is the only place log_error writes.
+                person_types = (identity.get('identity') or {}).get('personTypes') or []
                 for person_type in person_types:
                     rows.append([person_identifier, sanitize_field(person_type)])
             except Exception as e:
