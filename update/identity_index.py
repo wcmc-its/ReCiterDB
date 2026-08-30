@@ -214,17 +214,42 @@ class IdentityIndex:
             # An adopted/preferred first name is sometimes recorded in middleName
             # rather than givenName in the HR-sourced identity table (legal name in
             # givenName, adopted Western first name in middleName); PubMed/Scopus
-            # bylines use the preferred name, so try middleName as an alternate
-            # given-name source whenever givenName alone doesn't match.
-            middle_norm = _norm(rec["middle"])
-            name_sources = [n for n in (rec["given_norm"], middle_norm) if n]
-            if author_init and name_sources:
-                if author_given and any(n == author_given for n in name_sources):
+            # bylines use the preferred name, so middleName is an alternate
+            # given-name source -- EXACT ONLY, and per token (issue #173).
+            #
+            # It used to feed the INITIAL tier too, and that is where nearly all of its
+            # output came from. Measured against curator resolutions: top picks reached
+            # through a givenName initial were accepted as proposed 91.7% of the time
+            # (11,360/12,388), middleName-only picks 26.4% (29/110), and all 16
+            # accepted-but-overridden rows in the whole ledger were middleName-only
+            # picks. Sharing an initial with someone's middle name is not evidence, it
+            # is a ~1-in-20 coincidence, and the surname pool is already the homonym
+            # set. This tier is what proposed Leah *T*eresa Rosen (Alumni MD, cohort of
+            # one) for a byline reading "Tony Rosen" on pmid 42424133 -- a paper aer2006
+            # had already held at score 100.0 ACCEPTED for 44 days when the row opened.
+            #
+            # Per TOKEN because _norm() over the whole field collapses "Wing Guinevere"
+            # to "wingguinevere", which matches no byline, so only the first token's
+            # name was ever reachable; 910 of 35,371 identity rows carry a multi-token
+            # middleName. The whole-field form stays in the set so a byline that spells
+            # every middle name out still matches as it did -- the full tier only gains.
+            #
+            # ponytail: this gives up the adopted-name case where the byline carries
+            # only an initial ("J Zhong" for Hua Judy Zhong). Recovering that wants a
+            # PUBLISHING-name source, not a looser test on the legal one -- that is
+            # `person.firstName` (issue #171 / PR #172), which is exact-only for the
+            # same reason.
+            middle_forms = {_norm(t) for t in (rec["middle"] or "").split()}
+            middle_forms.add(_norm(rec["middle"]))
+            middle_forms.discard("")
+            if author_init and (rec["given_norm"] or middle_forms):
+                if author_given and (author_given == rec["given_norm"]
+                                     or author_given in middle_forms):
                     given_match = "full"
-                elif any(n[0] == author_init for n in name_sources):
+                elif rec["given_norm"][:1] == author_init:
                     given_match = "initial"
                 else:
-                    continue                       # initial mismatch on both fields -> not this person
+                    continue                       # no exact name, no givenName initial -> not this person
             else:
                 given_match = "unknown"            # no usable given on either side
             cohort.append((rec, given_match))
@@ -282,8 +307,9 @@ class IdentityIndex:
 # ---- offline self-test ------------------------------------------------------
 def _selftest():
     """Builds an IdentityIndex from hand-built records (no DB) to prove the
-    middleName-as-alternate-given-name fix (Judy/Hua Zhong, PMID 40681448) and the
-    temporal-plausibility penalty (issue #159)."""
+    middleName-as-alternate-given-name fix (Judy/Hua Zhong, PMID 40681448), its
+    narrowing to exact-token-only (issue #173), and the temporal-plausibility
+    penalty (issue #159)."""
     def rec(given, middle, surname, end_year=None, cwid=None):
         return {
             "cwid": cwid or f"{given or middle}_{surname}".lower(),
@@ -314,6 +340,53 @@ def _selftest():
                     "xiu_zhong" not in by_cwid))
     checks.append(("cohort_size counts only the two initial-matching records",
                     cohort_size == 2))
+
+    # --- middleName is exact-token-only (issue #173) -------------------------
+    # The anchor case. Byline "Tony Rosen" (pmid 42424133) against Leah *T*eresa
+    # Rosen, a cohort of one, whose only tie to the byline is a shared middle
+    # initial. The initial tier used to hand her the row at confidence 0.55 while
+    # the real author already held the paper at score 100.
+    rosens = IdentityIndex([rec("Leah", "Teresa", "Rosen", cwid="ltr4001")])
+    tony, tony_cohort = rosens.candidates("Rosen", "Tony", "T")
+    # ...and the same person under a byline that DOES carry her name, to prove the
+    # exclusion is about the initial tier and not about middleName as such.
+    leah, _ = rosens.candidates("Rosen", "Teresa", "T")
+    checks += [
+        ("a shared middleName INITIAL no longer admits a candidate ('Tony Rosen' "
+         "vs Leah Teresa Rosen)", tony == [] and tony_cohort == 0),
+        ("...while the exact middleName still does, at given_match=full",
+         len(leah) == 1 and leah[0]["given_match"] == "full"),
+    ]
+
+    # Multi-token middleName. _norm over the whole field collapses "Wing Guinevere"
+    # to "wingguinevere", which matches no byline; 910 identity rows are shaped like
+    # this. Matching per token reaches the second one.
+    lees = IdentityIndex([rec("Qi", "Wing Guinevere", "Lee", cwid="gul4001")])
+    guin, _ = lees.candidates("Lee", "Guinevere", "G")
+    wing, _ = lees.candidates("Lee", "Wing", "W")
+    spelled, _ = lees.candidates("Lee", "Wing Guinevere", "WG")
+    initial_only, _ = lees.candidates("Lee", "Gwen", "G")
+    checks += [
+        ("multi-token middleName matches on its SECOND token ('Guinevere Q Lee')",
+         len(guin) == 1 and guin[0]["given_match"] == "full"),
+        ("...and still on its first", len(wing) == 1 and wing[0]["given_match"] == "full"),
+        ("...and the whole field is kept as a form too, so a byline that spells "
+         "every middle name out matches exactly as it did before",
+         len(spelled) == 1 and spelled[0]["given_match"] == "full"),
+        ("...but a token INITIAL is not enough ('Gwen Lee' does not reach her)",
+         initial_only == []),
+    ]
+
+    # givenName keeps BOTH tiers, untouched: nothing above may narrow it.
+    kims = IdentityIndex([rec("John", "Andrew", "Kim", cwid="jak")])
+    checks += [
+        ("givenName full tier intact",
+         kims.candidates("Kim", "John", "J")[0][0]["given_match"] == "full"),
+        ("givenName initial tier intact",
+         kims.candidates("Kim", "Jonathan", "J")[0][0]["given_match"] == "initial"),
+        ("a givenName initial match is not disturbed by a mismatched middleName",
+         kims.candidates("Kim", "Jonathan", "J")[1] == 1),
+    ]
 
     # --- temporal plausibility (issue #159) ---------------------------------
     # Three Smiths who all match "J Smith" equally on name; only the WCM end year
