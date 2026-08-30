@@ -215,7 +215,7 @@ class IdentityIndex:
             # rather than givenName in the HR-sourced identity table (legal name in
             # givenName, adopted Western first name in middleName); PubMed/Scopus
             # bylines use the preferred name, so middleName is an alternate
-            # given-name source -- EXACT ONLY, and per token (issue #173).
+            # given-name source -- EXACT ONLY, on the whole field (issue #173).
             #
             # It used to feed the INITIAL tier too, and that is where nearly all of its
             # output came from. Measured against curator resolutions: top picks reached
@@ -228,23 +228,28 @@ class IdentityIndex:
             # one) for a byline reading "Tony Rosen" on pmid 42424133 -- a paper aer2006
             # had already held at score 100.0 ACCEPTED for 44 days when the row opened.
             #
-            # Per TOKEN because _norm() over the whole field collapses "Wing Guinevere"
-            # to "wingguinevere", which matches no byline, so only the first token's
-            # name was ever reachable; 910 of 35,371 identity rows carry a multi-token
-            # middleName. The whole-field form stays in the set so a byline that spells
-            # every middle name out still matches as it did -- the full tier only gains.
+            # The WHOLE normalised field, not its tokens. Splitting on whitespace was
+            # tried and reverted: it promotes junk into the `full` tier, and `full` is the
+            # LEAD term of the sort below, so a spurious full match displaces a correct
+            # pick rather than merely joining it. 392 of the 910 multi-token middleNames
+            # are comma-joined concatenations of separately recorded names, and 222 yield
+            # a token of <=2 characters -- so "Keith Richards,Keith Richards" offers a bare
+            # "keith", and a middleName of "L." offers "l", each an EXACT first-name match.
+            # Measured over all 11,668 curator-resolved rows, tokenising bought zero
+            # correct top picks and zero extra reachability on either lane while flipping
+            # 7 curator-ACCEPTED scopus rows to the wrong person (byline "Keith Jamison",
+            # resolution kwj2001, displaced by jaj7021 on exactly that concatenation).
             #
-            # ponytail: this gives up the adopted-name case where the byline carries
-            # only an initial ("J Zhong" for Hua Judy Zhong). Recovering that wants a
-            # PUBLISHING-name source, not a looser test on the legal one -- that is
-            # `person.firstName` (issue #171 / PR #172), which is exact-only for the
-            # same reason.
-            middle_forms = {_norm(t) for t in (rec["middle"] or "").split()}
-            middle_forms.add(_norm(rec["middle"]))
-            middle_forms.discard("")
-            if author_init and (rec["given_norm"] or middle_forms):
+            # ponytail: whole field only. This gives up the adopted-name case where the
+            # byline carries only an initial ("J Zhong" for Hua Judy Zhong) AND the case
+            # where the adopted name is a non-leading token of a multi-token middleName.
+            # Both want a PUBLISHING-name source rather than a looser test on the legal
+            # one -- that is `person.firstName` (issue #171 / PR #172), exact-only for the
+            # same reason this is.
+            middle_norm = _norm(rec["middle"])
+            if author_init and (rec["given_norm"] or middle_norm):
                 if author_given and (author_given == rec["given_norm"]
-                                     or author_given in middle_forms):
+                                     or author_given == middle_norm):
                     given_match = "full"
                 elif rec["given_norm"][:1] == author_init:
                     given_match = "initial"
@@ -308,7 +313,7 @@ class IdentityIndex:
 def _selftest():
     """Builds an IdentityIndex from hand-built records (no DB) to prove the
     middleName-as-alternate-given-name fix (Judy/Hua Zhong, PMID 40681448), its
-    narrowing to exact-token-only (issue #173), and the temporal-plausibility
+    narrowing to exact-match-only (issue #173), and the temporal-plausibility
     penalty (issue #159)."""
     def rec(given, middle, surname, end_year=None, cwid=None):
         return {
@@ -341,7 +346,7 @@ def _selftest():
     checks.append(("cohort_size counts only the two initial-matching records",
                     cohort_size == 2))
 
-    # --- middleName is exact-token-only (issue #173) -------------------------
+    # --- middleName is exact-match-only (issue #173) --------------------------
     # The anchor case. Byline "Tony Rosen" (pmid 42424133) against Leah *T*eresa
     # Rosen, a cohort of one, whose only tie to the byline is a shared middle
     # initial. The initial tier used to hand her the row at confidence 0.55 while
@@ -358,23 +363,27 @@ def _selftest():
          len(leah) == 1 and leah[0]["given_match"] == "full"),
     ]
 
-    # Multi-token middleName. _norm over the whole field collapses "Wing Guinevere"
-    # to "wingguinevere", which matches no byline; 910 identity rows are shaped like
-    # this. Matching per token reaches the second one.
+    # Multi-token middleName is deliberately NOT split. _norm over the whole field
+    # collapses "Wing Guinevere" to "wingguinevere", so only a byline spelling every
+    # middle name out reaches her -- 910 identity rows are shaped like this and this
+    # change does not help them. Splitting was implemented, measured and reverted:
+    # `full` leads the sort, 392 of those 910 fields are comma-joined concatenations
+    # and 222 yield a <=2-char token, so tokenising promotes junk to the top of the
+    # ranking. It flipped 7 curator-ACCEPTED scopus rows to the wrong person and won
+    # nothing anywhere in the ledger. gul4001's real fix is person.firstName (PR #172),
+    # where the mirror already holds "Guinevere".
     lees = IdentityIndex([rec("Qi", "Wing Guinevere", "Lee", cwid="gul4001")])
-    guin, _ = lees.candidates("Lee", "Guinevere", "G")
-    wing, _ = lees.candidates("Lee", "Wing", "W")
     spelled, _ = lees.candidates("Lee", "Wing Guinevere", "WG")
-    initial_only, _ = lees.candidates("Lee", "Gwen", "G")
+    second_token, _ = lees.candidates("Lee", "Guinevere", "G")
+    junk = IdentityIndex([rec("Jonathan", "Keith Richards,Keith Richards", "J", cwid="jaj7021")])
     checks += [
-        ("multi-token middleName matches on its SECOND token ('Guinevere Q Lee')",
-         len(guin) == 1 and guin[0]["given_match"] == "full"),
-        ("...and still on its first", len(wing) == 1 and wing[0]["given_match"] == "full"),
-        ("...and the whole field is kept as a form too, so a byline that spells "
-         "every middle name out matches exactly as it did before",
+        ("a byline spelling the whole middleName out matches at full",
          len(spelled) == 1 and spelled[0]["given_match"] == "full"),
-        ("...but a token INITIAL is not enough ('Gwen Lee' does not reach her)",
-         initial_only == []),
+        ("a multi-token middleName is NOT split -- its second token alone does not match",
+         second_token == []),
+        ("...which is what keeps a comma-joined concatenation from offering a bare "
+         "first name ('Keith' out of 'Keith Richards,Keith Richards')",
+         junk.candidates("J", "Keith", "K")[0] == []),
     ]
 
     # givenName keeps BOTH tiers, untouched: nothing above may narrow it.
