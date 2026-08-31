@@ -295,7 +295,7 @@ def _selftest():
     # one of his scored pmids is accepted -- and a permanently-skipped case carries
     # no more signal than the permanently-red one #178 replaced.
     buried_uid = buried_pmid = None
-    for candidate in ("stw2006", "meb7002"):
+    for candidate in ("stw2006", "meb7002", "ltr4001"):
         known_c, rejected_c = r._gold(candidate)
         _, scores_c = r._final(candidate)
         pmid = next((p for p, s in scores_c.items()
@@ -317,7 +317,7 @@ def _selftest():
         cases.insert(0, (buried_uid, buried_pmid, "buried"))
         print(f"buried case supplied by {buried_uid}")
     else:
-        print("SKIP: no currently-buried pmid for stw2006 or meb7002 "
+        print("SKIP: no currently-buried pmid for stw2006, meb7002 or ltr4001 "
               "(every scored pmid is now accepted/rejected/>=30)")
     print(f"{'uid':9} {'pmid':10} {'expect':16} {'got':16} score")
     ok = True
