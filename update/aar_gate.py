@@ -287,25 +287,37 @@ class AttributionResolver:
 
 def _selftest():
     r = AttributionResolver()
+    # a currently-buried pmid: scored sub-threshold, in neither gold list. Derived,
+    # not named -- naming one is exactly what rotted this selftest (issue #178): a
+    # curator accepting or rejecting the named pmid flips its status out from under
+    # the fixture. Tried over a short list of uids, in order, because the uid that
+    # supplied this case originally (stw2006, the Worgall case) now has zero -- every
+    # one of his scored pmids is accepted -- and a permanently-skipped case carries
+    # no more signal than the permanently-red one #178 replaced.
+    buried_uid = buried_pmid = None
+    for candidate in ("stw2006", "meb7002"):
+        known_c, rejected_c = r._gold(candidate)
+        _, scores_c = r._final(candidate)
+        pmid = next((p for p, s in scores_c.items()
+                     if s < STORAGE_THRESHOLD and p not in known_c and p not in rejected_c),
+                    None)
+        if pmid is not None:
+            buried_uid, buried_pmid = candidate, pmid
+            break
+
     # an accepted pmid for stw2006 (first in his knownpmids)
-    known, rejected = r._gold("stw2006")
+    known, _ = r._gold("stw2006")
     accepted_pmid = next(iter(known))
-    # a currently-buried pmid for stw2006: scored sub-threshold, in neither gold
-    # list. Derived the same way as accepted_pmid above, not named -- naming one
-    # is exactly what rotted this selftest (issue #178): a curator accepting or
-    # rejecting the named pmid flips its status out from under the fixture.
-    _, scores = r._final("stw2006")
-    buried_pmid = next((p for p, s in scores.items()
-                         if s < STORAGE_THRESHOLD and p not in known and p not in rejected),
-                        None)
+
     cases = [
         ("stw2006", accepted_pmid, "accepted"),
         ("stw2006", 99999999, "absent"),
     ]
     if buried_pmid is not None:
-        cases.insert(0, ("stw2006", buried_pmid, "buried"))
+        cases.insert(0, (buried_uid, buried_pmid, "buried"))
+        print(f"buried case supplied by {buried_uid}")
     else:
-        print("SKIP: no currently-buried pmid for stw2006 "
+        print("SKIP: no currently-buried pmid for stw2006 or meb7002 "
               "(every scored pmid is now accepted/rejected/>=30)")
     print(f"{'uid':9} {'pmid':10} {'expect':16} {'got':16} score")
     ok = True
@@ -315,9 +327,11 @@ def _selftest():
         ok &= st == exp
         print(f"{uid:9} {pmid:<10} {exp:16} {st:16} {sc}  {flag}")
     if buried_pmid is not None:
-        print("\ngate(%d,[stw2006]) ->" % buried_pmid, r.gate(buried_pmid, ["stw2006"]))
+        print("\ngate(%d,[%s]) ->" % (buried_pmid, buried_uid),
+              r.gate(buried_pmid, [buried_uid]))
     print("gate(%d,[stw2006]) ->" % accepted_pmid, r.gate(accepted_pmid, ["stw2006"]))
     print("\nSELFTEST", "PASS" if ok else "FAIL")
+    return ok
 
 
 def main():
@@ -327,7 +341,7 @@ def main():
     ap.add_argument("--uids", nargs="*", default=[])
     args = ap.parse_args()
     if args.selftest:
-        _selftest()
+        sys.exit(0 if _selftest() else 1)
     elif args.pmid and args.uids:
         print(json.dumps(AttributionResolver().gate(args.pmid, args.uids), indent=2))
     else:
