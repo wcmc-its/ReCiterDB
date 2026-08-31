@@ -21,6 +21,8 @@ invalid_pmids.txt
 invalid_pmids.sql
 reporting_abstracts_corrupt_backup_*.sql
 aar_sweep_stale_ledger.jsonl
+*_changed_picks.csv
+*_changed_picks.jsonl
 
 # Legacy ML models (unused)
 update/*.keras
