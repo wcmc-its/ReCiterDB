@@ -288,14 +288,25 @@ class AttributionResolver:
 def _selftest():
     r = AttributionResolver()
     # an accepted pmid for stw2006 (first in his knownpmids)
-    known, _ = r._gold("stw2006")
+    known, rejected = r._gold("stw2006")
     accepted_pmid = next(iter(known))
+    # a currently-buried pmid for stw2006: scored sub-threshold, in neither gold
+    # list. Derived the same way as accepted_pmid above, not named -- naming one
+    # is exactly what rotted this selftest (issue #178): a curator accepting or
+    # rejecting the named pmid flips its status out from under the fixture.
+    _, scores = r._final("stw2006")
+    buried_pmid = next((p for p, s in scores.items()
+                         if s < STORAGE_THRESHOLD and p not in known and p not in rejected),
+                        None)
     cases = [
-        ("stw2006", 42220538, "buried"),       # the Worgall paper
-        ("stw2006", 41891022, "buried"),       # second buried Worgall paper
         ("stw2006", accepted_pmid, "accepted"),
         ("stw2006", 99999999, "absent"),
     ]
+    if buried_pmid is not None:
+        cases.insert(0, ("stw2006", buried_pmid, "buried"))
+    else:
+        print("SKIP: no currently-buried pmid for stw2006 "
+              "(every scored pmid is now accepted/rejected/>=30)")
     print(f"{'uid':9} {'pmid':10} {'expect':16} {'got':16} score")
     ok = True
     for uid, pmid, exp in cases:
@@ -303,7 +314,8 @@ def _selftest():
         flag = "OK" if st == exp else "** MISMATCH"
         ok &= st == exp
         print(f"{uid:9} {pmid:<10} {exp:16} {st:16} {sc}  {flag}")
-    print("\ngate(42220538,[stw2006]) ->", r.gate(42220538, ["stw2006"]))
+    if buried_pmid is not None:
+        print("\ngate(%d,[stw2006]) ->" % buried_pmid, r.gate(buried_pmid, ["stw2006"]))
     print("gate(%d,[stw2006]) ->" % accepted_pmid, r.gate(accepted_pmid, ["stw2006"]))
     print("\nSELFTEST", "PASS" if ok else "FAIL")
 
