@@ -64,6 +64,33 @@ FIDELITY: re-fetches, does not reconstruct from stored columns
   or whose author_position no longer lines up (retraction, author-list correction), is
   reported separately as "unresolvable" and is never touched.
 
+  This bounds the NULLED set honestly: every row this script actually writes to has
+  been checked against a live, freshly re-fetched document (pubmed always; scopus only
+  after the live re-verify above), so there is no path from "still matches" to "nulled"
+  that skips a real document -- the NULLED set cannot contain a false null, only an
+  undercount of true staleness.
+
+  The RETAINED set does NOT carry that same guarantee for scopus. A row the
+  reconstruction pre-filter calls `matched` (see `_classify_scopus`) is trusted on the
+  split alone and is NEVER live re-verified -- only rows the pre-filter calls
+  `candidate_stale` make a live Scopus call. `_split_byline` takes the LAST whitespace
+  token as the surname; a genuinely multi-token surname (e.g. "Robert St John" ->
+  surname "John", forename "Robert St") is misread, and if that wrong surname's
+  candidate pool happens to still yield an initials-tier hit, the row is filed
+  `matched` and a truly stale row silently survives the sweep, forever, with no
+  downstream check catching it. This is one-directional in the same safe sense as
+  above (it can only leave a row in the RETAINED set that current matching would
+  actually clear -- it can never produce a bad null), but it means "stale=0 this run"
+  is not the same claim as "the current matcher has a candidate for every retained
+  scopus row." Measured 2026-08-30 (read-only, no live calls): of the 4,886 scopus
+  rows the pre-filter retained as `matched` in that run, 3,207 have a wcm_author with
+  more than two whitespace tokens (the shape where a multi-token surname could hide --
+  most of these are actually "Fore MI. Last" and split correctly, so this is a loose
+  upper bound on exposure, not a defect count); narrowing to rows with a common
+  surname-particle token (bin/Al/El/von/... ) in the middle position finds 6. See the
+  `ponytail:` note at the `matched.append(r)` call in `_classify_scopus` for the
+  upgrade path.
+
 SYS.PATH FORK TRAP
   A stale, pre-#171/#173/#174 copy of these producer modules lives at
   "~/Dropbox/Projects/ReCiter Research/scripts/" (superseded; the live producer is
@@ -200,12 +227,22 @@ def _classify_scopus(rows, idx, limit=None):
         affils = [a for a in (r["author_affiliation"] or "").split(" | ") if a]
         cands, _cohort = idx.candidates(last, fore, None, affils, top_k=5)
         if cands:
+            # ponytail: trusted on the split alone -- this row is NEVER live re-
+            # verified below. `_split_byline` reads the LAST token as the surname, so
+            # a genuinely multi-token surname ("Robert St John") is misread; if that
+            # wrong surname's pool still happens to yield an initials-tier candidate,
+            # a truly stale row lands here and silently survives the sweep for good.
+            # Undercount-only (never a false null -- this path never nulls anything).
+            # Measured 2026-08-30: 3,207 of 4,886 rows retained here have a >2-token
+            # wcm_author (loose upper bound; see the FIDELITY note in the module
+            # docstring). Upgrade: drop this pre-filter and live-verify every open
+            # scopus row (removes the Scopus-quota rationale it exists for).
             matched.append(r)
         else:
             candidate_stale.append(r)
     print(f"      reconstruction pre-filter: {len(candidate_stale)} candidate-stale "
-          f"(need live re-verify), {len(matched)} already confirmed still-matching",
-          flush=True)
+          f"(need live re-verify), {len(matched)} retained as still-matching "
+          f"(not live re-verified)", flush=True)
 
     stale, unresolvable = [], []
     for i, r in enumerate(candidate_stale, 1):

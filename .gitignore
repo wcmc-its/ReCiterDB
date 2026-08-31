@@ -14,12 +14,13 @@ update/retrieveNIH.log
 update/temp/
 retrieveNIH.log
 
-# One-shot audit / repair artifacts (contain prod abstract text; never commit)
+# One-shot audit / repair artifacts (contain prod data; never commit)
 audit_abstracts.csv
 audit_abstracts_dump.txt
 invalid_pmids.txt
 invalid_pmids.sql
 reporting_abstracts_corrupt_backup_*.sql
+aar_sweep_stale_ledger.jsonl
 
 # Legacy ML models (unused)
 update/*.keras
