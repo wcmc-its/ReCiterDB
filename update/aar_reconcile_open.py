@@ -296,8 +296,9 @@ def _apply_class_a(engine, hits, run_ts):
         for i in range(0, len(ids), 500):
             chunk = ids[i:i + 500]
             params = [{"id": rid, "ts": run_ts, "reason": h["reason"]} for rid, h in chunk]
-            c.execute(stmt, params)
-            n += len(chunk)
+            # rowcount, not len(chunk): a row a curator resolved between the SELECT and
+            # here is correctly skipped by the status='open' guard, and must not be counted.
+            n += c.execute(stmt, params).rowcount
     return n
 
 
@@ -453,8 +454,9 @@ def _apply_class_b(engine, entries, run_ts):
                 p = dict(e["after"])
                 p["id"] = e["id"]
                 params.append(p)
-            c.execute(stmt, params)
-            n += len(chunk)
+            # rowcount, not len(chunk): a row a curator resolved between the SELECT and
+            # here is correctly skipped by the status='open' guard, and must not be counted.
+            n += c.execute(stmt, params).rowcount
     return n
 
 
