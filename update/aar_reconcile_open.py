@@ -659,7 +659,10 @@ def main():
 
     if args.apply:
         na = _apply_class_a(engine, class_a, run_ts)
-        nb = _apply_class_b(engine, write_set, run_ts)
+        # _apply_class_b consumes ledger-shaped entries (e["after"] is the exact
+        # 9-column payload the ledger promises), NOT raw write_set records (#189).
+        nb = _apply_class_b(engine, [e for e in ledger_entries if e["class"] == "B"],
+                            run_ts)
         print(f"\n  APPLIED: {na} rows dismissed (class A), {nb} rows refreshed (class B)")
     else:
         print(f"\n  DRY RUN -- 0 rows written. Re-run with --apply to write these "
@@ -731,6 +734,20 @@ def _selftest():
           set(payload.keys()) == set(REFRESH_COLS))
     check("write_payload's top_affil_match is coerced to 0/1",
           payload["top_affil_match"] == 1)
+
+    # apply-wiring contract (#189): main() feeds _apply_class_b the class-B slice of
+    # ledger_entries, and _apply_class_b consumes exactly e["id"] + e["after"][col]
+    # for every REFRESH_COL. The first live --apply crashed (KeyError: 'after')
+    # because it was handed raw write_set records instead.
+    full_rec = dict(good_rec, tier_move="stronger", pmid=1, external_id=None,
+                    wcm_author="Jane Doe")
+    entry = _class_b_ledger_entry(full_rec, "2026-01-01 00:00:00", applied=False,
+                                  before={c: None for c in REFRESH_COLS})
+    b_slice = [e for e in [entry] if e["class"] == "B"]
+    check("class-B ledger entry survives main()'s apply-slice filter", len(b_slice) == 1)
+    check("ledger entry carries id + a complete 9-column 'after' payload "
+          "(what _apply_class_b consumes)",
+          "id" in entry and set(REFRESH_COLS) <= set(entry["after"].keys()))
 
     print("\nSELFTEST", "PASS" if ok else "FAIL")
     return ok
