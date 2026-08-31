@@ -353,8 +353,7 @@ def main():
                     help="where the CSV/JSONL of CHANGED rows lands (default: this "
                          "file's own directory, same convention as aar_sweep_stale.py's "
                          "--ledger default -- gitignored, real prod row content, never "
-                         "committed; analysis/adversarial_attribution_review/ does not "
-                         "exist in this repo, the S3-backed ledger superseded it)")
+                         "committed)")
     args = ap.parse_args()
 
     run_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
