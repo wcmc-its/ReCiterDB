@@ -166,14 +166,20 @@ class IdentityIndex:
             f"mysql+pymysql://{os.environ['DB_USERNAME']}:{os.environ['DB_PASSWORD']}"
             f"@{os.environ['DB_HOST']}/{os.environ['DB_NAME']}",
             connect_args={"connect_timeout": 15}, pool_pre_ping=True)
-        cols = ("cwid, givenName, middleName, surname, primaryAcademicDepartment, "
-                "primaryAcademicDivision, primaryTitle, primaryProgram, "
-                "endDateWCMFaculty, endDateWCMStudent, "
-                + ", ".join(_PTYPE_COLS))
+        cols = ("i." + ", i.".join(
+            ["cwid", "givenName", "middleName", "surname", "primaryAcademicDepartment",
+             "primaryAcademicDivision", "primaryTitle", "primaryProgram",
+             "endDateWCMFaculty", "endDateWCMStudent"] + _PTYPE_COLS))
+        # `identity` is HR/LDAP: it carries the LEGAL name. `person` mirrors DynamoDB
+        # Identity.primaryName, which is the name the person actually publishes under.
+        # Both cwid columns are utf8mb4_unicode_ci, so this join needs no COLLATE (the
+        # 1267 trap is on authorship_review.top_cwid, which is general_ci — not here).
         with eng.connect() as c:
             rows = c.execute(text(
-                f"SELECT {cols} FROM identity "
-                "WHERE surname IS NOT NULL AND surname <> ''")).mappings().all()
+                f"SELECT {cols}, p.firstName AS prefFirstName "
+                "FROM identity i "
+                "LEFT JOIN person p ON p.personIdentifier = i.cwid "
+                "WHERE i.surname IS NOT NULL AND i.surname <> ''")).mappings().all()
         return cls([cls._record(r) for r in rows])
 
     @staticmethod
@@ -194,6 +200,7 @@ class IdentityIndex:
             "cwid": r["cwid"],
             "given": given, "middle": r["middleName"] or "", "surname": r["surname"] or "",
             "given_norm": _norm(given), "surname_norm": _norm(r["surname"]),
+            "pref_norm": _norm(r.get("prefFirstName")),
             "dept": r["primaryAcademicDepartment"] or "",
             "division": r["primaryAcademicDivision"] or "",
             "program": r["primaryProgram"] or "",
@@ -267,7 +274,20 @@ class IdentityIndex:
             # one -- that is `person.firstName` (issue #171 / PR #172), exact-only for the
             # same reason this is.
             middle_norm = _norm(rec["middle"])
-            if author_init and (rec["given_norm"] or middle_norm):
+            # The person mirror's first name is the one the byline actually uses. It
+            # disagrees with identity.givenName on the FIRST INITIAL for 143 cwids
+            # (Anthony->Tony, Xiaoxuan->Emily, Ho-Yee->Tommy), and the initial test below
+            # drops every one of them outright however obviously they wrote the paper.
+            #
+            # EXACT matches only, and ahead of the rest so a byline that names the person
+            # outright wins. The mirror does NOT widen the initial tier. That tier is
+            # givenName-only as of issue #173, which removed middleName from it after it
+            # scored 26% curator precision there against givenName's 92%; adding a second
+            # loose source now would rebuild exactly what that change tore out.
+            # ponytail: full tier only. Widen to initials only if a precision run says so.
+            if author_given and rec.get("pref_norm") == author_given:
+                given_match = "full"
+            elif author_init and (rec["given_norm"] or middle_norm):
                 if author_given and (author_given == rec["given_norm"]
                                      or author_given == middle_norm):
                     given_match = "full"
@@ -333,13 +353,14 @@ class IdentityIndex:
 def _selftest():
     """Builds an IdentityIndex from hand-built records (no DB) to prove the
     middleName-as-alternate-given-name fix (Judy/Hua Zhong, PMID 40681448), its
-    narrowing to exact-match-only (issue #173), and the temporal-plausibility
-    penalty (issue #159)."""
-    def rec(given, middle, surname, end_year=None, cwid=None):
+    narrowing to exact-match-only (issue #173), the person-mirror publishing name
+    (issue #171), and the temporal-plausibility penalty (issue #159)."""
+    def rec(given, middle, surname, end_year=None, cwid=None, pref_first=None):
         return {
             "cwid": cwid or f"{given or middle}_{surname}".lower(),
             "given": given, "middle": middle, "surname": surname,
             "given_norm": _norm(given), "surname_norm": _norm(surname),
+            "pref_norm": _norm(pref_first),
             "dept": "", "division": "", "program": "", "title": "",
             "person_type": "Full-Time Faculty", "historical": False,
             "end_year": end_year,
@@ -416,6 +437,53 @@ def _selftest():
         ("a givenName initial match is not disturbed by a mismatched middleName",
          kims.candidates("Kim", "Jonathan", "J")[1] == 1),
     ]
+
+    # --- preferred publishing name from the person mirror (issue #171) -------
+    # The live anchor: authorship_review 70797, pmid 42424133, byline "Tony Rosen".
+    # identity has aer2006 as Anthony Ehren Rosen, so the initial test drops him ('t'
+    # matches neither 'a' nor 'e') and the producer proposed Leah *T*eresa Rosen
+    # instead -- on an article aer2006 already holds ACCEPTED at 100.
+    #
+    # Since #173, ltr4001 is not a candidate for this byline either: her only tie was
+    # the shared middle initial. So the two changes cover different halves of the same
+    # row -- #173 stops the wrong name being offered, #171 supplies the right one --
+    # and neither is sufficient alone. Ordering the mirror FIRST is what makes aer2006
+    # a `full` match rather than nothing at all.
+    rosens = IdentityIndex([
+        rec("Anthony", "Ehren", "Rosen", cwid="aer2006", pref_first="Tony"),
+        rec("Leah", "Teresa", "Rosen", cwid="ltr4001"),        # middleName-initial match only
+        rec("Neal", "", "Rosen", cwid="ner2007"),              # unrelated, must stay out
+    ])
+    ranked, rosen_cohort = rosens.candidates("Rosen", "Tony", "T")
+    by_rosen = {c["cwid"]: c for c in ranked}
+    checks += [
+        ("byline 'Tony Rosen' reaches aer2006 via the person mirror, as a FULL match",
+         by_rosen.get("aer2006", {}).get("given_match") == "full"),
+        ("aer2006 is the top pick for the byline that names him",
+         [c["cwid"] for c in ranked][0] == "aer2006"),
+        ("the middleName-initial match he was losing to is gone (issue #173), so this "
+         "byline now yields exactly one candidate",
+         "ltr4001" not in by_rosen and rosen_cohort == 1),
+        ("an unrelated Rosen is still excluded", "ner2007" not in by_rosen),
+    ]
+
+    # The mirror must not widen the INITIAL tier: a preferred name that merely shares
+    # the byline's first letter earns nothing, or it repeats the middleName mistake.
+    tims = IdentityIndex([rec("Robert", "", "Ng", cwid="rob1", pref_first="Tim")])
+    initial_only, _ = tims.candidates("Ng", "Tony", "T")
+    checks.append(("a mirror name sharing only the INITIAL does not create a candidate",
+                   initial_only == []))
+
+    # The pool is still keyed on identity.surname ALONE. Also indexing under
+    # person.lastName would reach 7 more open rows (zhp4001 "Pan" publishing as "Poon"),
+    # but it enlarges cohorts enough to reshuffle 44 initial-tier top picks that no new
+    # evidence favours -- 44 rewritten curator-facing rows to gain 7. Measured
+    # 2026-08-30 by replaying all 12,171 open pubmed rows through both indexes.
+    # ponytail: one surname source. Revisit if the byline-surname miss is ever the
+    # dominant cause of a wrong proposal; it is not today.
+    poons = IdentityIndex([rec("Zhi-Lin", "", "Pan", cwid="zhp4001", pref_first="Chi-Lam")])
+    checks.append(("a mirror-only SURNAME is deliberately not indexed",
+                   poons.candidates("Poon", "Chi-Lam", "C") == ([], 0)))
 
     # --- temporal plausibility (issue #159) ---------------------------------
     # Three Smiths who all match "J Smith" equally on name; only the WCM end year
