@@ -87,6 +87,30 @@ def _first_initial(fore, initials):
     return ""
 
 
+def _byline_first_name(fore):
+    """The byline forename's FIRST name token, for the `full` given-name tier -- but
+    ONLY when every trailing token is a bare initial, i.e. the "Gregory W" shape
+    (issue #185). Returns "" for every other shape, which leaves ranking exactly as
+    it was.
+
+    Whitespace split ONLY, deliberately NOT `name_tokens()`: that helper also splits
+    on hyphens -- right for surname variants ('Han-Jo'/'Han Jo'), wrong here, where it
+    would hand compound given names a false exact first name ('Chung-Han' -> 'chung').
+    And the trailing-initial requirement is what keeps multi-token given names that
+    are NOT First+Initial out ('Soo Young', 'Ana Paula' -- measured live, 12 of 1,136
+    single-candidate flagged rows already hold a correct full-tier pick that a bare
+    first-token split would introduce a false rival for). A single-token forename
+    returns "" too: `_norm` over the whole field already covers it exactly."""
+    if not isinstance(fore, str):
+        return ""
+    toks = [t for t in (_norm(w) for w in fore.split()) if t]
+    if len(toks) < 2 or len(toks[0]) < 2:
+        return ""
+    if all(len(t) == 1 for t in toks[1:]):
+        return toks[0]
+    return ""
+
+
 # ---- temporal plausibility -------------------------------------------------
 # A paper carrying a WCM affiliation was written by someone who WAS at WCM when it
 # was published, so a candidate whose appointment ended long before the paper is
@@ -234,6 +258,19 @@ class IdentityIndex:
             return [], 0
         author_init = _first_initial(fore, initials)
         author_given = _norm(fore)
+        # The whole-field blob above can never carry a middle initial to the `full`
+        # tier: _norm("Gregory W") is "gregoryw", which equals nobody's first name, so
+        # the dominant PubMed byline shape used to stall at `initial` and tie with
+        # non-matching first names (issue #185). `author_first` is the byline's own
+        # first name for exactly that shape ("" otherwise -- see _byline_first_name),
+        # and below it is tested against given_norm and pref_norm ONLY. NEVER against
+        # middleName: admitting it through the byline side reopens #173's measured
+        # 26.4%-precision pattern by another door -- replayed over the curator-resolved
+        # ledger it flipped 10 curator-ACCEPTED rows to the wrong person (byline first
+        # token matching a rival's middle name, then a generic dept-substring
+        # affiliation key displacing the correct pick), while this restricted form
+        # flipped zero in both measurement methodologies.
+        author_first = _byline_first_name(fore)
         affil_blob = " ".join(_norm(a) for a in (affiliations or []))
 
         cohort = []
@@ -285,11 +322,15 @@ class IdentityIndex:
             # scored 26% curator precision there against givenName's 92%; adding a second
             # loose source now would rebuild exactly what that change tore out.
             # ponytail: full tier only. Widen to initials only if a precision run says so.
-            if author_given and rec.get("pref_norm") == author_given:
+            if author_given and (rec.get("pref_norm") == author_given
+                                 or (author_first
+                                     and author_first == rec.get("pref_norm"))):
                 given_match = "full"
             elif author_init and (rec["given_norm"] or middle_norm):
                 if author_given and (author_given == rec["given_norm"]
-                                     or author_given == middle_norm):
+                                     or author_given == middle_norm
+                                     or (author_first
+                                         and author_first == rec["given_norm"])):
                     given_match = "full"
                 elif rec["given_norm"][:1] == author_init:
                     given_match = "initial"
@@ -436,6 +477,69 @@ def _selftest():
          kims.candidates("Kim", "Jonathan", "J")[0][0]["given_match"] == "initial"),
         ("a givenName initial match is not disturbed by a mismatched middleName",
          kims.candidates("Kim", "Jonathan", "J")[1] == 1),
+    ]
+
+    # --- byline middle initial reaches the full tier (issue #185) -------------
+    # The anchor: pmid 40935722, byline "Gregory W Fischer" against Gregory Walter
+    # Fischer. _norm("Gregory W") is "gregoryw", which equals nobody's first name, so
+    # the row stalled at `initial` and tied 0.70 with a non-matching first name.
+    fischers = IdentityIndex([
+        rec("Gregory", "Walter", "Fischer", cwid="gwf2001"),
+        rec("Brett", "Gilman", "Fischer", cwid="brf9036"),
+    ])
+    greg, greg_cohort = fischers.candidates("Fischer", "Gregory W", "GW")
+    by_fischer = {c["cwid"]: c for c in greg}
+    checks += [
+        ("byline 'Gregory W' reaches given_norm 'Gregory' at given_match=full (#185)",
+         by_fischer.get("gwf2001", {}).get("given_match") == "full"),
+        ("...and leads the ranking", greg and greg[0]["cwid"] == "gwf2001"),
+        ("a non-matching first name is still excluded ('Brett' vs author initial 'g')",
+         "brf9036" not in by_fischer and greg_cohort == 1),
+    ]
+
+    # The byline's first token must NEVER be tested against middleName -- that is the
+    # naive variant, measured at 10 curator-ACCEPTED regressions (byline first token
+    # matching a rival's MIDDLE name, then a generic affiliation key displacing the
+    # correct pick). Identity Jonathan Keith Jamison vs byline "Keith R": first token
+    # 'keith' equals his middle name exactly, and he must still be excluded outright
+    # (author initial 'k' matches neither 'j' nor the whole-field blob).
+    jamisons = IdentityIndex([rec("Jonathan", "Keith", "Jamison", cwid="jaj7021")])
+    checks.append(("byline first token matching only a MIDDLE name admits nobody "
+                   "('Keith R' vs Jonathan Keith Jamison)",
+                   jamisons.candidates("Jamison", "Keith R", "KR") == ([], 0)))
+
+    # Trailing token must be a bare initial, or the byline is a compound given name
+    # ('Soo Young', 'Ana Paula') and its first token is NOT the person's first name --
+    # 12 measured open rows hold a correct full-tier pick this shape would rival.
+    soos = IdentityIndex([rec("Soo", "", "Kim", cwid="soo1")])
+    soo_cands, _ = soos.candidates("Kim", "Soo Young", "SY")
+    checks.append(("compound given name 'Soo Young' does NOT full-match given name "
+                   "'Soo' (trailing token is not an initial) -- stays at initial tier",
+                   len(soo_cands) == 1 and soo_cands[0]["given_match"] == "initial"))
+
+    # Hyphens do not split (whitespace only): 'Chung-Han' offers no bare 'chung'.
+    chungs = IdentityIndex([rec("Chung", "", "Lee", cwid="chu1")])
+    ch_cands, _ = chungs.candidates("Lee", "Chung-Han", "CH")
+    checks.append(("hyphenated 'Chung-Han' does NOT full-match given name 'Chung' -- "
+                   "whitespace split only",
+                   len(ch_cands) == 1 and ch_cands[0]["given_match"] == "initial"))
+
+    # First token vs the person mirror's publishing name, same restricted shape:
+    # 'Tony E' names Anthony (Tony) Rosen as surely as 'Tony' does.
+    tonys = IdentityIndex([rec("Anthony", "Ehren", "Rosen", cwid="aer2006",
+                               pref_first="Tony")])
+    tony_mi, _ = tonys.candidates("Rosen", "Tony E", "TE")
+    checks.append(("byline 'Tony E' reaches the preferred name 'Tony' at full",
+                   len(tony_mi) == 1 and tony_mi[0]["given_match"] == "full"))
+
+    # Several trailing initials still qualify; a trailing full word still does not.
+    quincys = IdentityIndex([rec("John", "", "Adams", cwid="jqa")])
+    checks += [
+        ("multiple trailing initials qualify: 'John Q P' full-matches 'John'",
+         quincys.candidates("Adams", "John Q P", "JQP")[0][0]["given_match"] == "full"),
+        ("'Mary Jane' shape stays at initial ('John Quincy' vs 'John')",
+         quincys.candidates("Adams", "John Quincy", "JQ")[0][0]["given_match"]
+         == "initial"),
     ]
 
     # --- preferred publishing name from the person mirror (issue #171) -------
