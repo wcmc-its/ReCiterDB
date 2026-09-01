@@ -22,7 +22,7 @@
 --
 -- WHAT HAPPENS NEXT: once reopened, these rows are ordinary open Scopus rows again
 -- (status='open' AND matched_pmid IS NULL) -- the next Sunday recheck_open_scopus()
--- SELECT (update/aar_universe_scopus.py:550, no date window) picks every one of them
+-- SELECT (update/aar_universe_scopus.py:550 as of #191, no date window) picks every one of them
 -- up, stamps matched_pmid/matched_pmid_source='title'/matched_pmid_at, and leaves them
 -- open, moving them into PM's duplicates/adjudication view for a curator's verdict.
 --
@@ -30,7 +30,7 @@
 -- a re-run reopens 0 rows.
 --
 -- Apply with:
---   mysql -h "$DB_HOST" -u "$DB_USERNAME" -p "$DB_NAME" \
+--   MYSQL_PWD="$DB_PASSWORD" mysql -h "$DB_HOST" -u "$DB_USERNAME" "$DB_NAME" \
 --     < setup/fix_authorship_review_reopen_title_dismissed_v2.8.sql
 -- =============================================================================
 
