@@ -16,6 +16,12 @@ reporting export — it must be excluded from the reciterdb nightly-rebuild drop
 so curator decisions survive. `create_table()` is CREATE TABLE IF NOT EXISTS, so a
 re-run is a no-op if it already exists.
 
+NOTE (v2.7, #951 Layer 1): the `DDL` string and `_INSERT_COLS` below carry
+matched_pmid/matched_pmid_source/matched_pmid_at, which prod does not have until
+setup/alter_authorship_review_add_matched_pmid_v2.7.sql is applied BY HAND. That
+migration must run BEFORE this branch is merged — a ReCiterDB merge auto-deploys the
+image, and an INSERT naming a column the live table lacks fails outright.
+
 Usage:
   python aar_db.py --create        # create the table + indexes (idempotent)
   python aar_db.py --describe      # show columns + row count
@@ -37,8 +43,18 @@ _REFRESH_COLS = [
     "top_given_match", "top_affil_match", "n_candidates", "single_candidate",
     "candidate_cwids_json", "dup_flag", "dup_reason", "last_refreshed",
 ]
-# full insert column set (curator columns default on first insert)
+# matched_pmid / matched_pmid_source / matched_pmid_at (v2.7, #951 Layer 1): the Scopus
+# lane's DOI/title PubMed-match candidate. In _INSERT_COLS only -- NEVER _REFRESH_COLS.
+# Set on first insert by aar_universe_scopus._build_row (title-heuristic hits only --
+# DOI hits are dropped before a row exists) and maintained afterwards ONLY by
+# recheck_open_scopus's own targeted UPDATE. A rolling window overlaps run to run, so
+# the SAME document is re-upserted roughly 11x over its lifetime in the queue -- if
+# these were in _REFRESH_COLS, that routine re-upsert would clobber a flag/PMID the
+# producer (or a curator, via matched_pmid_verdict) already set. matched_pmid_verdict
+# is curator-owned like `status` and appears in NEITHER list -- Publication Manager
+# writes it directly, never this module.
 _INSERT_COLS = ["pmid", "author_key"] + _REFRESH_COLS + [
+    "matched_pmid", "matched_pmid_source", "matched_pmid_at",
     "status", "first_seen", "last_checked"]
 
 _ENGINE = None
@@ -91,6 +107,10 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
   candidate_cwids_json   LONGTEXT     NULL,
   dup_flag               TINYINT(1)   NOT NULL DEFAULT 0,
   dup_reason             VARCHAR(255) NULL,
+  matched_pmid           BIGINT       NULL,
+  matched_pmid_source    ENUM('scopus','doi','title') NULL,
+  matched_pmid_at        DATETIME     NULL,
+  matched_pmid_verdict   ENUM('same','distinct') NULL,
   status                 ENUM('open','assigned','accepted','rejected','dismissed','snoozed')
                                       NOT NULL DEFAULT 'open',
   resolution_cwid        VARCHAR(32)  NULL,
@@ -110,8 +130,10 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
   KEY ix_single_candidate (single_candidate),
   KEY ix_top_io_score (top_io_score),
   KEY ix_entrez_date (entrez_date),
-  KEY ix_top_cwid (top_cwid)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  KEY ix_top_cwid (top_cwid),
+  KEY ix_matched_pmid (matched_pmid),
+  KEY ix_doi (doi)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 """
 
 
