@@ -48,6 +48,40 @@ RUN PLAN
      dropped as expected. This script performs no counting beyond a single run;
      the recount is just re-running enumeration and reading the new totals.
 
+OUTCOMES (see plan_row / classify_write_outcome; the `outcome` field in every
+ledger line and in the per-cohort x per-source x per-outcome counts)
+------------------------------------------------------------------------------
+  fixed / would_fix -- new_len >= 1 and new_len > old_len; would_fix in dry-run,
+    fixed once the --apply write actually succeeds.
+  verified_single_author -- old_len == 1, live/DB lookup independently confirms
+    exactly 1 author; row is left untouched (never rewritten).
+  not_found -- Scopus total 0 on both the EID query and the DOI fallback (or no
+    DOI to fall back to).
+  no_authors -- the Scopus document was found but its author[] entries (or the
+    authors_json entries) yielded zero non-empty names. Never falls back to
+    dc:creator.
+  lookup_failed -- a Scopus HTTP call raised/timed out/returned non-JSON. Counted
+    and causes a non-zero exit; never silently treated as not_found.
+  doi_mismatch -- the DOI fallback found A document, but its dc:identifier is not
+    `SCOPUS_ID:<external_id>` -- i.e. the DOI resolved to a different Scopus
+    record than the one this row is enumerated for. Row is NOT written; ledgered
+    with source='scopus_doi' and the mismatched resolved_id, and listed with the
+    other problem rows in dry-run output.
+  attempting -- --apply mode only, ledger-before-write: written and flushed
+    immediately before the DynamoDB update_item call for a 'fixed'-planned row,
+    so a crash mid-write still leaves a durable trace. Superseded by that same
+    row's final outcome line (fixed / skipped_condition / failed) once the call
+    returns.
+  skipped_condition -- ConditionalCheckFailedException on the conditional
+    update_item (benign, --apply only). Two causes, both survivable: (1) the row
+    was deleted from ExternalArticle since the reciterdb projection ran, so
+    attribute_exists(uid) correctly refuses to resurrect a ghost item; (2) a
+    concurrent write already grew `authors` past old_len (a real byline landed
+    between enumeration and this script's attempt) and this write correctly
+    backs off rather than clobbering it.
+  failed -- update_item raised a ClientError other than ConditionalCheckFailed,
+    or a BotoCoreError. Counted; does not stop the run.
+
 CREDENTIALS
 -----------
   --apply requires `dynamodb:UpdateItem` on the `ExternalArticle` table (us-east-1,
@@ -85,6 +119,19 @@ DDB_TABLE = "ExternalArticle"
 SEARCH_PATH = "/scopus/search/query"
 REQUEST_TIMEOUT = 30
 SLEEP_BETWEEN_CALLS = 0.2
+
+# Ghost-item guard: `attribute_exists(uid) AND (...)` is required in front of the
+# original three-way OR. UpdateItem upserts by default, and `attribute_not_exists(authors)`
+# is true both for a real row whose authors attribute is genuinely absent AND for an
+# item that has been DELETED since the nightly reciterdb projection ran (a delete makes
+# every attribute "not exist", including uid). Without the attribute_exists(uid) guard,
+# a delete-since-projection would make this script's UpdateItem resurrect a ghost
+# {uid, articleId, authors} item instead of failing closed.
+CONDITION_EXPRESSION = (
+    "attribute_exists(uid) AND ("
+    "attribute_not_exists(authors) OR attribute_type(authors, :nul) "
+    "OR size(authors) <= :n)"
+)
 
 # Enumeration SELECT. Uses MAX() rather than ANY_VALUE() for the two
 # single-value-per-group columns: tested directly against prod reciterdb
@@ -201,14 +248,17 @@ def classify_write_outcome(old_len, new_len):
 
 def plan_row(row, live_lookup_fn):
     """Pure orchestration of the per-row decision, given an injectable
-    live_lookup_fn(external_id, doi) -> (status, author_list) so this is fully
-    testable under --selfcheck without any network call. status is one of
-    'ok' | 'not_found' | 'failed'.
+    live_lookup_fn(external_id, doi) -> (status, author_list, via, resolved_id) so
+    this is fully testable under --selfcheck without any network call. status is
+    one of 'ok' | 'not_found' | 'failed'; via is 'eid' | 'doi'.
 
-    Returns dict: {source, new_len, outcome, names}
-      source: 'authors_json' | 'scopus'
-      outcome: 'fixed' | 'verified_single_author' | 'not_found' | 'no_authors' | 'lookup_failed'
-      names: list[str], only meaningful when outcome == 'fixed'
+    Returns dict: {source, new_len, outcome, names, resolved_id}
+      source: 'authors_json' | 'scopus' | 'scopus_doi'
+      outcome: 'fixed' | 'verified_single_author' | 'not_found' | 'no_authors'
+               | 'lookup_failed' | 'doi_mismatch'
+      names: list[str], only meaningful when outcome in ('fixed', 'verified_single_author')
+      resolved_id: the entry's dc:identifier, only set when source == 'scopus_doi'
+        (i.e. the DOI fallback produced a hit) -- else None
     """
     old_len = row["old_len"]
     db_names = names_from_authors_json(row.get("authors_json"))
@@ -218,22 +268,38 @@ def plan_row(row, live_lookup_fn):
             "new_len": len(db_names),
             "outcome": classify_write_outcome(old_len, len(db_names)),
             "names": db_names,
+            "resolved_id": None,
         }
 
-    status, author_list = live_lookup_fn(row["external_id"], row.get("doi"))
+    status, author_list, via, resolved_id = live_lookup_fn(row["external_id"], row.get("doi"))
     if status == "failed":
-        return {"source": "scopus", "new_len": None, "outcome": "lookup_failed", "names": []}
+        return {"source": "scopus", "new_len": None, "outcome": "lookup_failed", "names": [], "resolved_id": None}
     if status == "not_found":
-        return {"source": "scopus", "new_len": None, "outcome": "not_found", "names": []}
+        return {"source": "scopus", "new_len": None, "outcome": "not_found", "names": [], "resolved_id": None}
+
+    # status == "ok". A DOI-fallback hit must be confirmed as the SAME Scopus
+    # document as external_id before it's trusted -- a DOI search can resolve to
+    # a different indexed record (e.g. a preprint sharing a DOI with the version
+    # of record). An EID hit needs no such check: it was looked up BY that id.
+    if via == "doi":
+        expected_id = f"SCOPUS_ID:{row['external_id']}"
+        if resolved_id != expected_id:
+            return {"source": "scopus_doi", "new_len": None, "outcome": "doi_mismatch",
+                     "names": [], "resolved_id": resolved_id}
+        source = "scopus_doi"
+    else:
+        source = "scopus"
 
     live_names = names_from_scopus_authors(author_list)
     if not live_names:
-        return {"source": "scopus", "new_len": 0, "outcome": "no_authors", "names": []}
+        return {"source": source, "new_len": 0, "outcome": "no_authors", "names": [],
+                 "resolved_id": resolved_id if source == "scopus_doi" else None}
     return {
-        "source": "scopus",
+        "source": source,
         "new_len": len(live_names),
         "outcome": classify_write_outcome(old_len, len(live_names)),
         "names": live_names,
+        "resolved_id": resolved_id if source == "scopus_doi" else None,
     }
 
 
@@ -277,22 +343,30 @@ def make_live_lookup_fn(session, base_url):
     """Bind session/base_url into a live_lookup_fn(external_id, doi) for plan_row.
     EID first; DOI fallback ONLY when EID comes back not_found AND a DOI is present
     (never on a network failure -- that stays 'failed' so it surfaces as lookup_failed,
-    not a silently-different not_found)."""
+    not a silently-different not_found).
+
+    Returns (status, author_list, via, resolved_id):
+      status: 'ok' | 'not_found' | 'failed'
+      via: 'eid' | 'doi' -- which query produced this result
+      resolved_id: entry['dc:identifier'] when status == 'ok', else None. Only
+        meaningful on the 'doi' path, where plan_row uses it to confirm the DOI
+        search actually resolved to the SAME Scopus document as external_id
+        (a DOI can legitimately map to more than one indexed record)."""
 
     def _lookup(external_id, doi):
         status, entry = _scopus_search(session, base_url, f"EID(2-s2.0-{external_id})")
         if status == "ok":
-            return ("ok", entry.get("author"))
+            return ("ok", entry.get("author"), "eid", entry.get("dc:identifier"))
         if status == "failed":
-            return ("failed", None)
+            return ("failed", None, "eid", None)
         # not_found -- try DOI fallback if we have one
         doi = (doi or "").strip()
         if not doi:
-            return ("not_found", None)
+            return ("not_found", None, "eid", None)
         status2, entry2 = _scopus_search(session, base_url, f"DOI({doi})")
         if status2 == "ok":
-            return ("ok", entry2.get("author"))
-        return (status2, None)  # 'not_found' or 'failed'
+            return ("ok", entry2.get("author"), "doi", entry2.get("dc:identifier"))
+        return (status2, None, "doi", None)  # 'not_found' or 'failed'
 
     return _lookup
 
@@ -306,15 +380,15 @@ def apply_update(table, key, names, old_len):
     starting states this backfill targets -- attribute entirely absent, present as
     DynamoDB NULL, or present as a list whose size hasn't grown past old_len since
     enumeration -- so a concurrent write of a REAL (bigger) authors list is never
-    clobbered. Raises botocore.exceptions.ClientError (including
-    ConditionalCheckFailedException) or BotoCoreError on failure; caller classifies."""
+    clobbered, AND requires attribute_exists(uid) so a row deleted since the
+    reciterdb projection ran (which is also "authors not exists") fails closed
+    instead of upserting a ghost item. Raises botocore.exceptions.ClientError
+    (including ConditionalCheckFailedException, expected when either cause fires --
+    caller classifies as 'skipped_condition') or BotoCoreError on failure."""
     table.update_item(
         Key=key,
         UpdateExpression="SET authors = :a",
-        ConditionExpression=(
-            "attribute_not_exists(authors) OR attribute_type(authors, :nul) "
-            "OR size(authors) <= :n"
-        ),
+        ConditionExpression=CONDITION_EXPRESSION,
         ExpressionAttributeValues={":a": names, ":nul": "NULL", ":n": old_len},
     )
 
@@ -382,34 +456,58 @@ def main():
     lookup_failed_count = 0
     write_failed_count = 0
 
+    # Every ledger write is flushed immediately after it (explicit .flush() below,
+    # on both the ledger-before-write "attempting" line and every row's final
+    # outcome line) rather than opening the file line-buffered -- either satisfies
+    # "flush immediately"; this script uses explicit flush() so the guarantee holds
+    # regardless of the platform's line-buffering behavior on text-mode files.
     with open(args.ledger, "a", encoding="utf-8") as ledger_f:
         for row in rows:
             cohort = row_cohort(row["old_len"])
             plan = plan_row(row, live_lookup_fn)
-            source, new_len, outcome, names = plan["source"], plan["new_len"], plan["outcome"], plan["names"]
+            source, new_len, outcome, names, resolved_id = (
+                plan["source"], plan["new_len"], plan["outcome"], plan["names"], plan.get("resolved_id"),
+            )
 
-            # ponytail: one ledger line per row, written once the row's final outcome
-            # is known, rather than a separate "attempt intent" line before every
-            # DynamoDB call plus a second "result" line after it. A row that never
-            # reaches a write (verified_single_author / not_found / no_authors /
-            # lookup_failed) has nothing for a second line to add; a row that DOES
-            # write is logged right after that single update_item call resolves, so
-            # the line is written "before" any further processing and IS the "after
-            # the write attempt" record for that write -- one line satisfies both
-            # halves of the spec without a redundant duplicate per row.
             final_outcome = outcome
             if outcome == "fixed":
                 if not args.apply:
                     final_outcome = "would_fix"
                 else:
+                    # Ledger-before-write: record intent to attempt this write BEFORE
+                    # calling apply_update, flushed immediately -- so a killed/crashed
+                    # process still leaves a durable trace of which row was mid-write,
+                    # not just silence between the previous row's outcome line and
+                    # whatever DynamoDB ended up doing. "attempting" lines therefore
+                    # only appear in --apply mode, and only for rows that reach a
+                    # write attempt (verified_single_author / not_found / no_authors /
+                    # lookup_failed / doi_mismatch never call apply_update).
+                    attempt_entry = {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "mode": mode,
+                        "uid": row["uid"],
+                        "articleId": row["article_id"],
+                        "cohort": cohort,
+                        "source": source,
+                        "old_len": row["old_len"],
+                        "new_len": new_len,
+                        "outcome": "attempting",
+                        "names": names,
+                    }
+                    if resolved_id is not None:
+                        attempt_entry["resolved_id"] = resolved_id
+                    ledger_f.write(json.dumps(attempt_entry) + "\n")
+                    ledger_f.flush()
+
                     key = {name: (row["uid"] if name == "uid" else row["article_id"]) for name in key_names}
                     try:
                         apply_update(table, key, names, row["old_len"])
                         final_outcome = "fixed"
                     except ClientError as e:
                         if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                            final_outcome = "skipped_race"
-                            logger.info(f"  skipped_race (benign): uid={row['uid']} articleId={row['article_id']}")
+                            final_outcome = "skipped_condition"
+                            logger.info(f"  skipped_condition (benign -- item deleted since projection, or a "
+                                        f"concurrent write of a real byline): uid={row['uid']} articleId={row['article_id']}")
                         else:
                             final_outcome = "failed"
                             write_failed_count += 1
@@ -435,12 +533,16 @@ def main():
             }
             if final_outcome in ("fixed", "would_fix"):
                 ledger_entry["names"] = names
+            if resolved_id is not None:
+                ledger_entry["resolved_id"] = resolved_id
             ledger_f.write(json.dumps(ledger_entry) + "\n")
+            ledger_f.flush()
 
             if final_outcome in ("fixed", "would_fix") and len(fixed_preview) < 10:
                 fixed_preview.append((row["uid"], row["article_id"], row["old_len"], new_len, names[:3]))
-            if final_outcome in ("not_found", "no_authors", "lookup_failed"):
-                problem_rows.append((final_outcome, row["uid"], row["article_id"], row["external_id"], row.get("doi")))
+            if final_outcome in ("not_found", "no_authors", "lookup_failed", "doi_mismatch"):
+                problem_rows.append((final_outcome, row["uid"], row["article_id"], row["external_id"],
+                                      row.get("doi"), resolved_id))
                 if final_outcome == "lookup_failed":
                     lookup_failed_count += 1
 
@@ -452,9 +554,10 @@ def main():
     for uid, article_id, old_len, new_len, sample_names in fixed_preview:
         logger.info(f"  uid={uid} articleId={article_id} {old_len}->{new_len} names={sample_names}")
 
-    logger.info(f"==== every not_found / no_authors / lookup_failed row ({len(problem_rows)}) ====")
-    for outcome, uid, article_id, external_id, doi in problem_rows:
-        logger.info(f"  {outcome}: uid={uid} articleId={article_id} external_id={external_id} doi={doi}")
+    logger.info(f"==== every not_found / no_authors / lookup_failed / doi_mismatch row ({len(problem_rows)}) ====")
+    for outcome, uid, article_id, external_id, doi, resolved_id in problem_rows:
+        suffix = f" resolved_id={resolved_id}" if resolved_id is not None else ""
+        logger.info(f"  {outcome}: uid={uid} articleId={article_id} external_id={external_id} doi={doi}{suffix}")
 
     logger.info("==== summary ====")
     logger.info(f"  rows processed: {len(rows)}")
@@ -509,30 +612,57 @@ def _selfcheck():
     row_a1 = {"old_len": 0, "authors_json": '[{"given":"A","surname":"B"},{"given":"C","surname":"D"}]',
               "external_id": "1", "doi": None}
     p = plan_row(row_a1, _boom)
-    assert p == {"source": "authors_json", "new_len": 2, "outcome": "fixed", "names": ["A B", "C D"]}, p
+    assert p == {"source": "authors_json", "new_len": 2, "outcome": "fixed", "names": ["A B", "C D"],
+                 "resolved_id": None}, p
 
-    # -- plan_row, cohort A: authors_json has 1 name -> live lookup used, 3 authors found -> fixed --
+    # -- plan_row, cohort A: authors_json has 1 name -> live lookup used (EID hit), 3 authors found -> fixed --
     row_a2 = {"old_len": 0, "authors_json": '[{"given":"A","surname":"B"}]', "external_id": "1", "doi": None}
     p = plan_row(row_a2, lambda ext, doi: ("ok", [{"given-name": "X", "surname": "Y"},
-                                                    {"given-name": "Z", "surname": "W"}]))
-    assert p == {"source": "scopus", "new_len": 2, "outcome": "fixed", "names": ["X Y", "Z W"]}, p
+                                                    {"given-name": "Z", "surname": "W"}], "eid", "SCOPUS_ID:1"))
+    assert p == {"source": "scopus", "new_len": 2, "outcome": "fixed", "names": ["X Y", "Z W"],
+                 "resolved_id": None}, p
 
-    # -- plan_row, cohort B: old_len 1, live lookup confirms 1 author -> verified_single_author, untouched --
+    # -- plan_row, cohort B: old_len 1, live lookup (EID) confirms 1 author -> verified_single_author, untouched --
     row_b1 = {"old_len": 1, "authors_json": None, "external_id": "1", "doi": None}
-    p = plan_row(row_b1, lambda ext, doi: ("ok", [{"given-name": "X", "surname": "Y"}]))
+    p = plan_row(row_b1, lambda ext, doi: ("ok", [{"given-name": "X", "surname": "Y"}], "eid", "SCOPUS_ID:1"))
     assert p["outcome"] == "verified_single_author" and p["new_len"] == 1, p
 
-    # -- plan_row: live lookup not_found --
-    p = plan_row(row_b1, lambda ext, doi: ("not_found", None))
-    assert p == {"source": "scopus", "new_len": None, "outcome": "not_found", "names": []}, p
+    # -- plan_row: live lookup not_found (both EID and, if tried, DOI came back empty) --
+    p = plan_row(row_b1, lambda ext, doi: ("not_found", None, "eid", None))
+    assert p == {"source": "scopus", "new_len": None, "outcome": "not_found", "names": [],
+                 "resolved_id": None}, p
 
     # -- plan_row: live lookup failed (network) --
-    p = plan_row(row_b1, lambda ext, doi: ("failed", None))
-    assert p == {"source": "scopus", "new_len": None, "outcome": "lookup_failed", "names": []}, p
+    p = plan_row(row_b1, lambda ext, doi: ("failed", None, "eid", None))
+    assert p == {"source": "scopus", "new_len": None, "outcome": "lookup_failed", "names": [],
+                 "resolved_id": None}, p
 
     # -- plan_row: document found but zero author names -- no_authors, never falls back --
-    p = plan_row(row_b1, lambda ext, doi: ("ok", []))
-    assert p == {"source": "scopus", "new_len": 0, "outcome": "no_authors", "names": []}, p
+    p = plan_row(row_b1, lambda ext, doi: ("ok", [], "eid", "SCOPUS_ID:1"))
+    assert p == {"source": "scopus", "new_len": 0, "outcome": "no_authors", "names": [],
+                 "resolved_id": None}, p
+
+    # -- Amendment 2 (ghost-item guard): CONDITION_EXPRESSION must gate the whole
+    # original OR behind attribute_exists(uid), so a row deleted since the
+    # reciterdb projection (making authors "not exists" too) fails closed instead
+    # of resurrecting a ghost item. --
+    assert "attribute_exists(uid) AND (" in CONDITION_EXPRESSION, CONDITION_EXPRESSION
+
+    # -- Amendment 3 (DOI-fallback identity check): a DOI-fallback hit whose
+    # dc:identifier does NOT match SCOPUS_ID:<external_id> must not be written --
+    row_doi = {"old_len": 0, "authors_json": None, "external_id": "999", "doi": "10.1/xyz"}
+    p = plan_row(row_doi, lambda ext, doi: ("ok", [{"given-name": "X", "surname": "Y"}],
+                                              "doi", "SCOPUS_ID:12345"))
+    assert p == {"source": "scopus_doi", "new_len": None, "outcome": "doi_mismatch", "names": [],
+                 "resolved_id": "SCOPUS_ID:12345"}, p
+
+    # -- ... while a DOI-fallback hit whose dc:identifier DOES match yields the
+    # normal plan (source scopus_doi, resolved_id carried through, outcome fixed) --
+    p = plan_row(row_doi, lambda ext, doi: ("ok", [{"given-name": "X", "surname": "Y"},
+                                                     {"given-name": "Z", "surname": "W"}],
+                                              "doi", "SCOPUS_ID:999"))
+    assert p == {"source": "scopus_doi", "new_len": 2, "outcome": "fixed", "names": ["X Y", "Z W"],
+                 "resolved_id": "SCOPUS_ID:999"}, p
 
     print("selfcheck OK")
 
