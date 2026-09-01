@@ -79,6 +79,9 @@ CREATE TABLE IF NOT EXISTS `authorship_review` (
   `candidate_cwids_json`   LONGTEXT     NULL,                -- ranked alternates
   `dup_flag`               TINYINT(1)   NOT NULL DEFAULT 0,  -- external_article DOI match, restricted to this authorship's candidates
   `dup_reason`             VARCHAR(255) NULL,                -- e.g. "Already added as ExternalArticle for <uid> (DOI match)"
+  `accept_conflict`        VARCHAR(500) NULL COMMENT 'ExternalArticleDupCheck 409 verdict from a curator/bulk Accept; NULL = never conflicted',  -- PM-owned, never producer-written: ExternalArticleDupCheck's
+                                                             -- title+year collision message when a curator's Accept comes
+                                                             -- back 409, holding the row in PM's "duplicates" queue
   -- matched_pmid* (v2.7, #951 Layer 1): the PubMed record the Scopus-lane producer
   -- believes is the same work as this authorship (DOI or title-heuristic hit).
   -- matched_pmid/_source/_at are producer-owned (aar_db._INSERT_COLS, NOT
@@ -111,5 +114,6 @@ CREATE TABLE IF NOT EXISTS `authorship_review` (
   KEY `ix_entrez_date` (`entrez_date`),
   KEY `ix_top_cwid` (`top_cwid`),
   KEY `ix_matched_pmid` (`matched_pmid`),
-  KEY `ix_doi` (`doi`)
+  KEY `ix_doi` (`doi`),
+  KEY `idx_authorship_review_accept_conflict` (`accept_conflict`(1))  -- 1-char prefix index, as PM's add-authorship-accept-conflict.sql created it on prod
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
