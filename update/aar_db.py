@@ -107,7 +107,7 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
   candidate_cwids_json   LONGTEXT     NULL,
   dup_flag               TINYINT(1)   NOT NULL DEFAULT 0,
   dup_reason             VARCHAR(255) NULL,
-  accept_conflict        VARCHAR(500) NULL,  -- PM-owned, never producer-written: ExternalArticleDupCheck's 409 message
+  accept_conflict        VARCHAR(500) NULL COMMENT 'ExternalArticleDupCheck 409 verdict from a curator/bulk Accept; NULL = never conflicted',  -- PM-owned, never producer-written
   matched_pmid           BIGINT       NULL,
   matched_pmid_source    ENUM('scopus','doi','title') NULL,
   matched_pmid_at        DATETIME     NULL,
@@ -134,7 +134,7 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
   KEY ix_top_cwid (top_cwid),
   KEY ix_matched_pmid (matched_pmid),
   KEY ix_doi (doi),
-  KEY idx_authorship_review_accept_conflict (accept_conflict)
+  KEY idx_authorship_review_accept_conflict (accept_conflict(1))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 """
 
