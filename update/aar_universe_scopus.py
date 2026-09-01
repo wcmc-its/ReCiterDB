@@ -21,10 +21,14 @@ Per-doc pipeline (probe-verified — analysis/.../2026-07-03-scopus-probe/):
   3. Resolve remaining docs against PubMed: [DOI] esearch when a DOI exists, else an
      ISSN pre-filter (Book: ISBN instead — no ISSN) / unquoted title+author esearch
      fallback for the 13.7% with no DOI (live-measured 2026-08-14, not the ~1%
-     originally assumed — see resolve_no_doi). Either hit -> drop.
+     originally assumed — see resolve_no_doi). A DOI hit -> drop (reliable); a no-DOI
+     (title) hit -> KEEP, flagged with the candidate matched_pmid for curator
+     adjudication instead of auto-dismissed (v2.7, #951 Layer 1).
   4. Per-author WCM tagging (afid in the family set) -> match via identity_index.
   5. Upsert via aar_db (source='scopus', external_id=numeric-id|DOI, pmid=NULL).
-  6. Re-check: open scopus rows now in PubMed (DOI, else title) are resolved out.
+  6. Re-check: open scopus rows now in PubMed by DOI are resolved out; a no-DOI
+     (title) hit instead persists matched_pmid and stays open for adjudication
+     (v2.7, #951 Layer 1).
 
 Windowing (in-cluster default): rolling short-lag window (Decision A) — each weekly
 run sweeps ORIG-LOAD-DATE over [today-90d, today-14d]. New Scopus authorships surface
@@ -103,8 +107,31 @@ def _pubmed_count(term):
         return 0
 
 
+def _pubmed_pmid(term):
+    """esearch matched PMID (int) for a PubMed term, or None whenever there is nothing
+    safe to hand back — zero hits, or a malformed/unexpected response (any KeyError/
+    ValueError/TypeError) — same failure-safe direction as _pubmed_count: an
+    unresolved term stays a scopus row and is re-checked next run rather than being
+    matched to something wrong."""
+    j = _pubmed_esearch(term)
+    try:
+        if int(j["count"]) <= 0:
+            return None
+        idlist = j["idlist"]
+        if isinstance(idlist, list) and idlist and str(idlist[0]).isdigit():
+            return int(idlist[0])
+        return None
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
 def doi_in_pubmed(doi):
-    return bool(doi) and _pubmed_count(f'"{doi}"[DOI]') > 0
+    """The PubMed PMID this Scopus DOI resolves to via exact "<doi>"[DOI] esearch, or
+    None when the DOI is missing or PubMed has no match. Truthiness is unchanged from
+    the old bool return — every `if hit:` call site keeps working unmodified — but a
+    caller that wants the PMID itself (recheck_open_scopus) now gets it directly
+    instead of it being discarded."""
+    return _pubmed_pmid(f'"{doi}"[DOI]') if doi else None
 
 
 def title_in_pubmed(title, author_last=None):
@@ -117,14 +144,20 @@ def title_in_pubmed(title, author_last=None):
     (live-verified against the case that motivated this: 0 hits quoted, 1 exact hit
     unquoted). Titles alone are not always unique, so AND in the author's surname
     when known — cuts collision risk for shorter or more generic titles at
-    negligible cost."""
+    negligible cost.
+
+    Returns the matched PMID (int), or None when the title is empty or PubMed has no
+    match — same truthiness as the old bool return. This heuristic is NOT reliable
+    enough to auto-resolve a row on its own (see run() step 3 / recheck_open_scopus):
+    it only ever proposes a candidate matched_pmid for a curator to confirm or
+    reject via matched_pmid_verdict."""
     title = (title or "").strip()
     if not title:
-        return False
+        return None
     term = f"{title}[ti]"
     if author_last:
         term += f" AND {author_last}[au]"
-    return _pubmed_count(term) > 0
+    return _pubmed_pmid(term)
 
 
 def issn_in_pubmed(issn):
@@ -192,25 +225,30 @@ def isbn_in_pubmed(isbns):
 
 
 def resolve_no_doi(title, author_last, pub_type, issn, isbns=None):
-    """Best-effort PubMed resolution for a DOI-less doc, cheapest signal first.
-    - Book: no ISSN (ISBN-keyed, not journal-keyed), so try each ISBN first — a live
-      probe (2026-08-14, n=26) found ISBN resolves 3.8% on its own and title 7.7%,
-      together 11.5% (one book each caught that the other missed — complementary, not
-      redundant). Falls through to title if ISBN comes up empty/unavailable, same as
-      every other type; there's no Book-specific skip left.
+    """Best-effort PubMed resolution for a DOI-less doc. Returns the matched PMID
+    (int) or None — truthiness unchanged from the old bool return, so every
+    `if hit:` call site keeps working unmodified.
+    - Book: isbn_in_pubmed is no longer consulted here (v2.7) — it can only confirm
+      presence, not hand back a PMID, and a bare True is not a valid value for the new
+      matched_pmid BIGINT column. A live probe (2026-08-14, n=26) found ISBN alone used
+      to resolve 3.8% of books that title missed (together 11.5%); that 3.8% is the
+      accepted cost of requiring an actual PMID to persist. `isbns` is still accepted
+      (both call sites pass it) but unused, for signature stability. Book now falls
+      through to the title search exactly like every other pub_type: both of
+      resolve_no_doi's hit-producing return statements are title_in_pubmed(...) — the
+      ISSN pre-filter below is the only other branch, and it only ever short-circuits
+      to None.
     - Non-Book: an ISSN-has-any-presence check is a cheap, high-confidence early exit
       when the whole journal has zero PubMed footprint — a title search would almost
-      certainly miss too. Only short-circuits on a *confirmed* False; unknown/
-      malformed ISSN (None) falls through same as no ISSN at all.
+      certainly miss too. Only short-circuits (to None) on a *confirmed* False;
+      unknown/malformed ISSN (None) falls through same as no ISSN at all.
     - Falls through to the title+author search otherwise (MEDLINE indexing is
       selective even within an indexed journal, so journal-level presence alone
       isn't sufficient)."""
     if pub_type == "Book":
-        if isbn_in_pubmed(isbns):
-            return True
         return title_in_pubmed(title, author_last)
     if issn and issn_in_pubmed(issn) is False:
-        return False
+        return None
     return title_in_pubmed(title, author_last)
 
 
@@ -455,6 +493,14 @@ def _build_row(entry, i, n, author, top, cands, run_ts, dup_map=None):
         "dup_flag": int(bool(dup_uid)),
         "dup_reason": (f"Already added as ExternalArticle for {dup_uid} (DOI match)"
                        if dup_uid else None),
+        # v2.7 (#951 Layer 1): a title-heuristic hit at ingest (run() step 3) stashes
+        # the candidate PMID on the doc as "_matched_pmid" instead of dropping it;
+        # source is always 'title' here -- a DOI hit never reaches _build_row at all
+        # (dropped before a row is built), and 'scopus' is reserved for a future
+        # producer-native Scopus pubmed-id write.
+        "matched_pmid": entry.get("_matched_pmid"),
+        "matched_pmid_source": "title" if entry.get("_matched_pmid") else None,
+        "matched_pmid_at": run_ts if entry.get("_matched_pmid") else None,
         "status": "open", "first_seen": run_ts,
         "last_checked": run_ts, "last_refreshed": run_ts,
     }
@@ -462,51 +508,74 @@ def _build_row(entry, i, n, author, top, cands, run_ts, dup_map=None):
 
 # ---- re-check open scopus rows ----------------------------------------------
 def recheck_open_scopus(run_ts):
-    """Open scopus rows now PubMed-reachable are resolved out — by DOI when present,
-    else delegated to resolve_no_doi (ISSN dead-journal pre-filter / ISBN for Book /
-    title fallback — same logic ingest uses, no more Book-specific branch here). The
-    PubMed lane will surface them if still orphaned. Guarded on status='open' so a
-    curator's accept/reject is never clobbered. (No dedicated 'resolved' ENUM value;
-    dismissed + an auto note is the removal-from-queue state.)
+    """Open scopus rows now PubMed-reachable are handled two different ways, by DOI
+    when present, else delegated to resolve_no_doi (ISSN dead-journal pre-filter /
+    title fallback — same logic ingest uses). A DOI hit is a reliable, unambiguous
+    match: dismissed exactly as before this migration, plus matched_pmid/
+    matched_pmid_source='doi' now persisted alongside the note. A no-DOI (title) hit is
+    NOT dismissed — the title heuristic is not reliable enough to auto-resolve a row on
+    its own (the whole point of #951 Layer 1: persist the candidate PMID and let a
+    curator adjudicate matched_pmid_verdict, instead of the row silently vanishing) —
+    only matched_pmid/matched_pmid_source='title'/matched_pmid_at are set; status and
+    note are left untouched. The PubMed lane will surface a DOI-hit row's canonical
+    version if it is still orphaned there. Guarded on status='open' so a curator's
+    accept/reject is never clobbered. (No dedicated 'resolved' ENUM value; dismissed +
+    an auto note is the removal-from-queue state for the DOI path — the title path
+    instead stays open with matched_pmid set, awaiting a verdict.)
+
+    `matched_pmid IS NULL` in the SELECT excludes two kinds of row on purpose: one
+    already flagged by a prior recheck and awaiting a curator's verdict (re-running the
+    title heuristic on it would waste an esearch call and could overwrite a value
+    mid-review), and one a curator has already set matched_pmid_verdict='distinct' on
+    (a verdict only ever sits on a non-NULL matched_pmid) — the producer must never
+    re-flag either kind.
 
     `issn`/`isbn` reach the backlog two ways: rows upserted after each column shipped
     already have it; older rows stay NULL until their next producer refresh re-upserts
-    them. The recurring cron only sweeps a recent ORIG-LOAD-DATE window, so rows from
-    the 2026-07-05 --mode initial five-year backfill are never revisited by it — they
-    need update/targeted_authors_backfill.py, which looks each document up by its
-    stored doi/external_id and fills the columns in place (see issue #157).
+    them. The recurring cron's INGEST sweep (sweep()/run(), NOT this function) only
+    covers a recent ORIG-LOAD-DATE window, so rows from the 2026-07-05 --mode initial
+    five-year backfill are never revisited by it — they need
+    update/targeted_authors_backfill.py, which looks each document up by its stored
+    doi/external_id and fills the columns in place (see issue #157). This function has
+    no such gap: its own SELECT is source='scopus' AND status='open' (now also
+    matched_pmid IS NULL) with no date filter, so it sweeps every open row regardless
+    of ingest vintage.
 
-    ISBN is passed for every pub_type, exactly as at ingest; resolve_no_doi still only
-    consults it for pub_type='Book'. Measured 2026-08-28 against the live open no-DOI
-    backlog, that narrowness is correct, not a leftover: 0 of 25 sampled Book Chapters
-    and 0 of 10 Editorials hit PubMed on ANY of their ISBNs (the ISBN is the parent
-    book's, and these books are simply not in NLM's catalog). Widening the branch to
-    Book Chapter — 505 of the 729 open no-DOI rows — would have added ~1,160 esearch
-    calls per weekly recheck for a measured zero catches."""
+    ISBN is passed for every pub_type, exactly as at ingest; resolve_no_doi no longer
+    consults it at all (v2.7 — see that function's docstring)."""
     from sqlalchemy import text
     eng = aar_db.engine()
     with eng.connect() as c:
         rows = c.execute(text(
             "SELECT author_key, doi, title, wcm_author, pub_type, issn, isbn FROM authorship_review "
-            "WHERE source='scopus' AND status='open'")).mappings().all()
-    resolved = 0
+            "WHERE source='scopus' AND status='open' AND matched_pmid IS NULL")).mappings().all()
+    dismissed, flagged = 0, 0
     for r in rows:
         if r["doi"]:
             hit = doi_in_pubmed(r["doi"])
+            if hit:
+                with eng.begin() as c:
+                    c.execute(text(
+                        "UPDATE authorship_review SET status='dismissed', resolved_at=:ts, "
+                        "matched_pmid=:p, matched_pmid_source='doi', matched_pmid_at=:ts, "
+                        "note=CONCAT('auto: now in PubMed (', :d, ') PMID ', :p) "
+                        "WHERE author_key=:k AND status='open'"),
+                        {"ts": run_ts, "d": r["doi"], "p": hit, "k": r["author_key"]})
+                dismissed += 1
         else:
             author_last = (r["wcm_author"] or "").split()[-1] if r["wcm_author"] else None
             hit = resolve_no_doi(r["title"], author_last, r["pub_type"], r["issn"],
                                  (r["isbn"] or "").split(","))
-        if hit:
-            with eng.begin() as c:
-                c.execute(text(
-                    "UPDATE authorship_review SET status='dismissed', resolved_at=:ts, "
-                    "note=CONCAT('auto: now in PubMed (', :d, ')') "
-                    "WHERE author_key=:k AND status='open'"),
-                    {"ts": run_ts, "d": r["doi"] or "title match", "k": r["author_key"]})
-            resolved += 1
+            if hit:
+                with eng.begin() as c:
+                    c.execute(text(
+                        "UPDATE authorship_review SET matched_pmid=:p, "
+                        "matched_pmid_source='title', matched_pmid_at=:ts "
+                        "WHERE author_key=:k AND status='open' AND matched_pmid IS NULL"),
+                        {"ts": run_ts, "p": hit, "k": r["author_key"]})
+                flagged += 1
         time.sleep(_PM_SLEEP)
-    return resolved
+    return dismissed, flagged
 
 
 # ---- driver -----------------------------------------------------------------
@@ -524,7 +593,7 @@ def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True,
           f"{len(no_pmid)} no-PMID", flush=True)
 
     print("[3/5] Resolving no-PMID docs against PubMed (DOI, else title) ...", flush=True)
-    scopus_only, resolved, resolved_by_title = [], 0, 0
+    scopus_only, resolved, flagged_by_title = [], 0, 0
     for d in no_pmid:
         doi = d.get("prism:doi")
         if doi:
@@ -541,11 +610,17 @@ def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True,
             hit = resolve_no_doi(d.get("dc:title"), author_last, d.get("subtypeDescription"), issn, isbns)
             time.sleep(_PM_SLEEP)
             if hit:
-                resolved_by_title += 1
-                continue
+                # v2.7 (#951 Layer 1): a title-heuristic hit is too unreliable to
+                # auto-drop the doc -- KEEP it and stash the candidate PMID so
+                # _build_row can persist matched_pmid for curator adjudication,
+                # instead of the row silently vanishing (unchanged: a DOI hit above
+                # is reliable enough to still drop outright).
+                flagged_by_title += 1
+                d["_matched_pmid"] = hit
         scopus_only.append(d)
-    print(f"      {resolved} resolved to PubMed by DOI, {resolved_by_title} by title (dropped); "
-          f"{len(scopus_only)} SCOPUS-ONLY", flush=True)
+    print(f"      {resolved} resolved to PubMed by DOI (dropped); {flagged_by_title} title-matched "
+          f"(kept, flagged with a candidate PMID for adjudication); {len(scopus_only)} SCOPUS-ONLY",
+          flush=True)
 
     print("[4/5] Matching WCM authorships against the identity roster ...", flush=True)
     if idx is None:
@@ -572,13 +647,16 @@ def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True,
         n = aar_db.upsert(rows)
         print(f"[5/5] upserted {n} scopus authorships -> reciterdb.authorship_review", flush=True)
         if recheck:
-            print(f"      re-check: {recheck_open_scopus(run_ts)} open scopus rows resolved out",
+            n_dismissed, n_flagged = recheck_open_scopus(run_ts)
+            print(f"      re-check: {n_dismissed} open scopus rows resolved out (DOI match), "
+                  f"{n_flagged} flagged with a candidate PMID for adjudication (title match)",
                   flush=True)
     else:
         print(f"[5/5] DRY-RUN: {len(rows)} rows NOT written (pass --apply to upsert)", flush=True)
 
     return {"window": {"aft": aft, "bef": bef}, "family_docs": len(docs),
             "no_pmid": len(no_pmid), "doi_resolved_pubmed": resolved,
+            "flagged_by_title": flagged_by_title,
             "scopus_only": len(scopus_only), "matched_rows": len(rows),
             "unmatched": unmatched}
 
@@ -794,6 +872,63 @@ def _selftest():
     check("no-DOI row falls back to numeric scopus id",
           row2["external_id"] == "105037523511"
           and row2["author_key"] == "scopus:105037523511:0")
+
+    # ---- v2.7 (#951 Layer 1): matched-PMID resolution, offline via a monkeypatched
+    # _pubmed_esearch (canned esearchresult dicts keyed by exact term). Restored in
+    # `finally` no matter what fails, so a later selftest run is never left patched.
+    global _pubmed_esearch
+    _real_esearch = _pubmed_esearch
+    canned = {}
+    _pubmed_esearch = lambda term: canned.get(term)
+    try:
+        canned['"10.1/hit"[DOI]'] = {"count": "1", "idlist": ["12345678"]}
+        check("doi_in_pubmed returns the int PMID on a hit",
+              doi_in_pubmed("10.1/hit") == 12345678)
+        canned['"10.1/miss"[DOI]'] = {"count": "0", "idlist": []}
+        check("doi_in_pubmed returns None when count is 0",
+              doi_in_pubmed("10.1/miss") is None)
+        check("doi_in_pubmed returns None for a missing DOI (no lookup)",
+              doi_in_pubmed(None) is None and doi_in_pubmed("") is None)
+
+        canned["empty idlist"] = {"count": "3", "idlist": []}
+        check("_pubmed_pmid returns None when count > 0 but idlist is empty",
+              _pubmed_pmid("empty idlist") is None)
+        canned["malformed idlist"] = {"count": "2", "idlist": ["not-a-pmid"]}
+        check("_pubmed_pmid returns None when count > 0 but idlist is malformed",
+              _pubmed_pmid("malformed idlist") is None)
+        canned["clean hit"] = {"count": "1", "idlist": ["999"]}
+        check("_pubmed_pmid returns the int PMID on a clean hit",
+              _pubmed_pmid("clean hit") == 999)
+
+        canned["T[ti] AND Smith[au]"] = {"count": "1", "idlist": ["42"]}
+        check("title_in_pubmed returns the int PMID on a hit",
+              title_in_pubmed("T", "Smith") == 42)
+        check("title_in_pubmed returns None for an empty title (no lookup)",
+              title_in_pubmed("") is None and title_in_pubmed(None) is None)
+    finally:
+        _pubmed_esearch = _real_esearch
+
+    entry_matched = dict(entry, _matched_pmid=555)
+    row_matched = _build_row(entry_matched, i, n, au, top, [top], "2026-07-03 00:00:00")
+    check("row emits matched_pmid/matched_pmid_source/matched_pmid_at when the entry "
+          "carries a title-heuristic match",
+          row_matched["matched_pmid"] == 555
+          and row_matched["matched_pmid_source"] == "title"
+          and row_matched["matched_pmid_at"] == "2026-07-03 00:00:00")
+    check("row emits None for all three matched_* keys with no title-heuristic match",
+          row["matched_pmid"] is None and row["matched_pmid_source"] is None
+          and row["matched_pmid_at"] is None)
+
+    check("aar_db._INSERT_COLS carries the matched_pmid trio for first-insert only",
+          all(c in aar_db._INSERT_COLS for c in
+              ("matched_pmid", "matched_pmid_source", "matched_pmid_at")))
+    check("aar_db._REFRESH_COLS does NOT carry the matched_pmid trio "
+          "(a re-sweep must never clobber them)",
+          not any(c in aar_db._REFRESH_COLS for c in
+                  ("matched_pmid", "matched_pmid_source", "matched_pmid_at")))
+    check("matched_pmid_verdict is curator-owned: in NEITHER column list",
+          "matched_pmid_verdict" not in aar_db._INSERT_COLS
+          and "matched_pmid_verdict" not in aar_db._REFRESH_COLS)
 
     print("\nSELFTEST", "PASS" if ok else "FAIL")
     return ok

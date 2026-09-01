@@ -79,6 +79,17 @@ CREATE TABLE IF NOT EXISTS `authorship_review` (
   `candidate_cwids_json`   LONGTEXT     NULL,                -- ranked alternates
   `dup_flag`               TINYINT(1)   NOT NULL DEFAULT 0,  -- external_article DOI match, restricted to this authorship's candidates
   `dup_reason`             VARCHAR(255) NULL,                -- e.g. "Already added as ExternalArticle for <uid> (DOI match)"
+  -- matched_pmid* (v2.7, #951 Layer 1): the PubMed record the Scopus-lane producer
+  -- believes is the same work as this authorship (DOI or title-heuristic hit).
+  -- matched_pmid/_source/_at are producer-owned (aar_db._INSERT_COLS, NOT
+  -- _REFRESH_COLS — set once, never clobbered by a later re-sweep). matched_pmid_verdict
+  -- is curator-owned like `status`, set ONLY by Publication Manager: 'same' dismisses
+  -- the row, 'distinct' tells the producer never to re-flag it. See
+  -- setup/alter_authorship_review_add_matched_pmid_v2.7.sql for the full story.
+  `matched_pmid`           BIGINT       NULL,
+  `matched_pmid_source`    ENUM('scopus','doi','title') NULL,
+  `matched_pmid_at`        DATETIME     NULL,
+  `matched_pmid_verdict`   ENUM('same','distinct') NULL,
   `status`                 ENUM('open','assigned','accepted','rejected','dismissed','snoozed')
                                         NOT NULL DEFAULT 'open',   -- curator state
   `resolution_cwid`        VARCHAR(32)  NULL,
@@ -98,5 +109,7 @@ CREATE TABLE IF NOT EXISTS `authorship_review` (
   KEY `ix_single_candidate` (`single_candidate`),
   KEY `ix_top_io_score` (`top_io_score`),
   KEY `ix_entrez_date` (`entrez_date`),
-  KEY `ix_top_cwid` (`top_cwid`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  KEY `ix_top_cwid` (`top_cwid`),
+  KEY `ix_matched_pmid` (`matched_pmid`),
+  KEY `ix_doi` (`doi`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
