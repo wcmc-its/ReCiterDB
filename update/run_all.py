@@ -172,8 +172,11 @@ def run_pubmed_lane_if_due():
         if not (os.getenv("AAR_S3_BUCKET") or os.getenv("S3_BUCKET")):
             logger.warning("PubMed lane: AAR_S3_BUCKET/S3_BUCKET unset (needed for --s3-state) — skipped")
             return
+        # 14400 not 5400: the first Sunday run after the 40-day recency floor was
+        # removed processes ~40 days of new PMIDs (~5-6x a normal week), and a timeout
+        # leaves DB rows written but the S3 ledger un-pushed, so the run repeats.
         run_script("aarPubmedLane", "python3 aar_orchestrator.py --mode recurring --s3-state",
-                   timeout_seconds=int(os.getenv("PUBMED_LANE_TIMEOUT_SECONDS", "5400")))
+                   timeout_seconds=int(os.getenv("PUBMED_LANE_TIMEOUT_SECONDS", "14400")))
     except Exception as e:
         logger.exception(f"PubMed lane failed (ignored — reporting unaffected): {e}")
 
