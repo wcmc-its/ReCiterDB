@@ -18,8 +18,22 @@ What it does:
   4. Filters to the precise parsed-entrez-date window and caches universe.json.
 
 Windows (entrez date):
-  initial   = [today-2y, today-40d]      (one-time backlog clear)
-  recurring = [today-71d, today-40d]     (rolling 31-day slice, monthly cadence)
+  initial   = [today-2y, today]          (one-time backlog clear)
+  recurring = [today-71d, today]         (rolling slice; run_all.py runs it weekly on
+                                          Sundays, the 71-day overlap is the missed-run
+                                          safety net, so no catch-up run is needed)
+
+The PubMed lane has no recency floor (removed 2026-09-03, was today-40d): a WCM article
+can enter /authorships on the first Sunday after NCBI indexes it. Trade-off, measured on
+the 2026-07..08 recurring runs: at the old 40-71 day check ~55% of universe articles were
+already "attributed" (curated, or retrieved and scored high by ReCiter) and suppressed;
+with no floor some of those are emitted before ReCiter gets to them, and NOTHING closes
+such a row later -- _recheck updates only the producer's CSV ledger, never
+reciterdb.authorship_review (see ReCiterDB #186). A DB-side closer must accompany this
+change or those rows stay open until a curator acts. A row whose candidate ReCiter has
+not retrieved simply carries no identity/feedback score. The Scopus lane keeps its own
+14-day floor (aar_universe_scopus.py) because Scopus<->PubMed links and duplicate Scopus
+records need time to settle; PubMed records do not.
 
 Env: PUBMED_API_KEY (read from environment, never logged), NCBI_EMAIL (optional).
 
@@ -237,9 +251,9 @@ def parse_articles(xml_bytes, groups):
 def window_for_mode(mode):
     today = date.today()
     if mode == "initial":
-        return today - timedelta(days=730), today - timedelta(days=40)
+        return today - timedelta(days=730), today
     if mode == "recurring":
-        return today - timedelta(days=71), today - timedelta(days=40)
+        return today - timedelta(days=71), today
     raise ValueError(mode)
 
 
