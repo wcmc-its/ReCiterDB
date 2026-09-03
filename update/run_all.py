@@ -172,8 +172,11 @@ def run_pubmed_lane_if_due():
         if not (os.getenv("AAR_S3_BUCKET") or os.getenv("S3_BUCKET")):
             logger.warning("PubMed lane: AAR_S3_BUCKET/S3_BUCKET unset (needed for --s3-state) — skipped")
             return
+        # 5400 -> 14400 (#186): the first Sunday run after the 40-day recency floor is
+        # removed processes ~40 days of new PMIDs (~5-6x a normal week), and a timeout
+        # leaves DB rows written but the S3 ledger un-pushed, so the run repeats.
         run_script("aarPubmedLane", "python3 aar_orchestrator.py --mode recurring --s3-state",
-                   timeout_seconds=int(os.getenv("PUBMED_LANE_TIMEOUT_SECONDS", "5400")))
+                   timeout_seconds=int(os.getenv("PUBMED_LANE_TIMEOUT_SECONDS", "14400")))
     except Exception as e:
         logger.exception(f"PubMed lane failed (ignored — reporting unaffected): {e}")
 
@@ -193,6 +196,41 @@ def run_external_article_etl():
                    timeout_seconds=int(os.getenv("EXTERNAL_ARTICLE_TIMEOUT_SECONDS", "600")))
     except Exception as e:
         logger.exception(f"External-article ETL failed (ignored — reporting unaffected): {e}")
+
+
+# ------------- AAR nightly closer: dismiss already-attributed open rows (#186) -------------
+def run_aar_close_attributed():
+    """Nightly DB-side closer for open AAR rows ReCiter has already attributed.
+
+    Ships with the PubMed lane's 40-day recency floor removal (aar_universe.py):
+    without a floor, some rows get emitted first and must self-retire later once
+    reciterdb's own ground truth (person_article ACCEPTED / GoldStandard knownpmids)
+    shows the article already attributed. Runs EVERY night, not Sunday-gated, so a
+    row doesn't sit open for up to a week after it's already resolved. Same isolation
+    contract as the lanes: DB-creds-gated (same env names aar_db.py reads), each call
+    wrapped so a failure is logged and can NEVER fail the nightly reporting rebuild.
+
+    Two independent tools, in order (their own docstrings document the write path,
+    the status='open' race guard, the collation trap, and the note/CONCAT_WS 'auto:'
+    reason convention -- ReCiterDB #186):
+      1. aar_reconcile_open.py --class-a-only  -- the row's OWN stored proposal
+         already holds the pmid.
+      2. aar_dismiss_byline_owner.py           -- the BYLINE's real owner already
+         holds the pmid, regardless of what the row proposes."""
+    try:
+        if not (os.getenv("DB_HOST") and os.getenv("DB_NAME")
+                and os.getenv("DB_USERNAME") and os.getenv("DB_PASSWORD")):
+            logger.warning("AAR closer: DB_HOST/DB_NAME/DB_USERNAME/DB_PASSWORD unset — skipped")
+            return
+        timeout = int(os.getenv("AAR_CLOSER_TIMEOUT_SECONDS", "1800"))
+        run_script("aarReconcileOpenClassA",
+                   "python3 aar_reconcile_open.py --apply --class-a-only",
+                   timeout_seconds=timeout)
+        run_script("aarDismissBylineOwner",
+                   "python3 aar_dismiss_byline_owner.py --apply",
+                   timeout_seconds=timeout)
+    except Exception as e:
+        logger.exception(f"AAR closer failed (ignored — reporting unaffected): {e}")
 
 
 # ------------- Main Flow -------------
@@ -228,6 +266,7 @@ def main():
         run_scopus_lane_if_due()              # weekly (Sun): AAR Scopus lane
         run_pubmed_lane_if_due()              # weekly (Sun): AAR PubMed lane
         run_conflicts_refresh_if_due()        # weekly (Sun): refill empty COI rows (#130)
+        run_aar_close_attributed()            # nightly: dismiss already-attributed open AAR rows (#186)
 
     upload_log_to_s3()
 

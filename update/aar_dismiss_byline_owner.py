@@ -8,8 +8,8 @@ row proposes. PM#937 established this population (454 open rows, measured
 fallback while aer2006 -- the person that byline actually names -- had held pmid
 42424133 at 100/ACCEPTED since 2026-07-15).
 
-  Action per eligible row: status='dismissed' + a distinct, greppable reason in
-  dup_reason + resolved_at. Never touches resolution_cwid / reviewer / note /
+  Action per eligible row: status='dismissed' + a distinct, greppable 'auto:' reason
+  appended to note + resolved_at. Never touches resolution_cwid / reviewer /
   snooze_until, and re-checks status='open' at write time, so a row a curator
   resolves between the SELECT and the UPDATE is skipped, not clobbered.
 
@@ -59,14 +59,13 @@ WHY THIS IS NOT aar_reconcile_open.py's CLASS A, AND WHY IT IS MORE DANGEROUS
   a concurrent aar_reconcile_open.py run is impossible: whichever tool dismisses
   first wins, the other's status='open' write guard skips the row.
 
-REASON COLUMN -- same compromise as aar_reconcile_open.py, distinct prefix
-  aar_reconcile_open.py's REASON COLUMN section documents why the reason lands in
-  `dup_reason` (this task's never-touch list includes `note`, the actual 'auto:'
-  convention; dup_reason is the only other free-text producer column) and what the
-  downside is (the PM Sequelize model doesn't select it). Same call here, one
-  prefix apart so the two sweeps stay greppable from each other:
-    "already-attributed-owner (#181): byline '{byline}' resolves to {owner} who
-     already holds pmid {pmid} via {signal}"
+REASON COLUMN -- updated for #186 (see ticket T3), distinct prefix from CLASS A
+  aar_reconcile_open.py's REASON COLUMN section documents the 'auto:' note convention
+  (aar_universe_scopus.recheck_open_scopus precedent) this tool now shares: note=
+  CONCAT_WS(' | ', NULLIF(note, ''), :reason) preserves any curator text already in
+  note. dup_reason is no longer written by this path. One prefix apart from CLASS A's
+  reason so the two sweeps stay greppable from each other:
+    "auto: byline already attributed (#160): {owner} holds pmid {pmid} via {signal}"
 
 COLLATION TRAP -- no SQL join ever crosses it
   authorship_review.top_cwid is utf8mb4_general_ci; person_article.personIdentifier
@@ -86,11 +85,14 @@ COLLATION TRAP -- no SQL join ever crosses it
       (internal tripwire -- would mean orch._byline_owner's semantics changed
       under us, refuse to write anything)
 
-INERT BY DESIGN
-  Dry-run by default; --apply is the only write path. NOT wired into run_all.py
-  and must not be: whether these rows leave the queue at all is the open decision
-  on #181, and this tool exists so that decision can be taken on measured, row-
-  level evidence rather than an aggregate.
+WIRED INTO run_all.py (#186) -- the #181 open decision, now settled
+  Dry-run by default; --apply is the only write path. #181's open question --
+  whether byline-owner hits leave the queue automatically -- is settled: this tool
+  now runs nightly, every day, via --apply from run_all.py's aarCloseAttributed step
+  (positioned after the reporting rebuild and the AAR lanes so it sees today's
+  attributions), alongside aar_reconcile_open.py --class-a-only. Standalone runs
+  (--check, ad hoc dry runs) remain useful for row-level audit independent of the
+  nightly job.
 
 Usage:
   python aar_dismiss_byline_owner.py                  # dry run: report + JSONL ledger
@@ -124,13 +126,17 @@ for _mod in (aar_db, gate, matcher, orch, rcp, idxmod):
 
 _cwid_eq = rcp._cwid_eq
 
-REASON_PREFIX = "already-attributed-owner (#181)"
+REASON_PREFIX = "auto: byline already attributed (#160)"
 
 # The ONLY write this tool ever performs. SET touches exactly status / resolved_at /
-# dup_reason; the status='open' re-check makes a concurrent curator (or concurrent
-# aar_reconcile_open.py --apply) win every race.
+# note (via CONCAT_WS, preserving any curator text already there -- the established
+# 'auto:' convention, aar_universe_scopus.recheck_open_scopus precedent; see the module
+# docstring's REASON COLUMN section, #186); the status='open' re-check makes a
+# concurrent curator (or concurrent aar_reconcile_open.py --apply) win every race.
+# dup_reason is no longer written by this path.
 _UPDATE_SQL = ("UPDATE authorship_review SET status='dismissed', resolved_at=:ts, "
-               "dup_reason=:reason WHERE id=:id AND status='open'")
+               "note=CONCAT_WS(' | ', NULLIF(note, ''), :reason) "
+               "WHERE id=:id AND status='open'")
 
 
 def _die(msg):
@@ -153,7 +159,7 @@ def _open_pool(engine):
     with engine.connect() as c:
         rows = c.execute(text(
             "SELECT id, source, pmid, author_key, wcm_author, top_cwid, top_name, "
-            "dup_reason, resolved_at "
+            "note, resolved_at "
             "FROM authorship_review "
             "WHERE status='open' AND pmid IS NOT NULL AND wcm_author IS NOT NULL "
             "ORDER BY id"
@@ -250,8 +256,11 @@ def _signal(via_pa, via_gold):
 
 
 def _reason(byline, owner, pmid, signal):
-    return (f"{REASON_PREFIX}: byline '{byline}' resolves to {owner} who already "
-            f"holds pmid {pmid} via {signal}")[:255]
+    """The 'auto:' note text (#186 / T3 format). `byline` is kept in the signature for
+    call-site stability but isn't in the short DB text -- the full byline/spelling
+    detail lives in the ledger's byline_match block (see _ledger_entry)."""
+    del byline
+    return f"{REASON_PREFIX}: {owner} holds pmid {pmid} via {signal}"
 
 
 # ============================================================================
@@ -271,7 +280,7 @@ def _ledger_entry(h, run_ts, applied):
         "source": r["source"], "pmid": r["pmid"], "author_key": r["author_key"],
         "wcm_author": r["wcm_author"],
         "before": {"status": "open", "top_cwid": r["top_cwid"], "top_name": r["top_name"],
-                   "dup_reason": r["dup_reason"], "resolved_at": r["resolved_at"]},
+                   "note": r["note"], "resolved_at": r["resolved_at"]},
         "owner": {
             "cwid": h["owner"],
             "proposed_is_owner": bool(r["top_cwid"]) and _cwid_eq(r["top_cwid"], h["owner"]),
@@ -291,7 +300,7 @@ def _ledger_entry(h, run_ts, applied):
             },
         },
         "after": {"status": "dismissed",
-                  "dup_reason": _reason(r["wcm_author"], h["owner"], r["pmid"], signal),
+                  "note_appended": _reason(r["wcm_author"], h["owner"], r["pmid"], signal),
                   "resolved_at": run_ts},
         "swept_at": run_ts, "applied": applied,
     }
@@ -330,7 +339,7 @@ def _apply(engine, eligible, run_ts):
 def _check_ids(engine, ids):
     from sqlalchemy import text, bindparam
     stmt = text("SELECT id, source, pmid, author_key, wcm_author, top_cwid, top_name, "
-                "dup_reason, resolved_at, status FROM authorship_review WHERE id IN :ids") \
+                "note, resolved_at, status FROM authorship_review WHERE id IN :ids") \
         .bindparams(bindparam("ids", expanding=True))
     with engine.connect() as c:
         rows = [dict(r) for r in c.execute(stmt, {"ids": list(ids)}).mappings()]
@@ -550,7 +559,7 @@ def _selftest():
                      "articleAuthorNameLastName": "Rosen"}] if via_pa else [])
         h = {"row": {"id": rid, "pmid": 100, "wcm_author": "Tony Rosen",
                      "author_key": "100:5", "source": "pubmed", "top_cwid": "ltr4001",
-                     "top_name": "Leah Teresa Rosen", "dup_reason": None,
+                     "top_name": "Leah Teresa Rosen", "note": None,
                      "resolved_at": None},
              "owner": "aer2006", "author_position": "last",
              "matched_spelling": ("Tony", "Rosen"), "n_spellings": 2}
@@ -581,17 +590,21 @@ def _selftest():
           and _signal(False, True) == "GoldStandard knownpmids")
 
     r = _reason("X" * 300, "aer2006", 42424133, _signal(True, False))
-    check("reason fits dup_reason VARCHAR(255) and keeps its greppable prefix",
-          len(r) == 255 and r.startswith(REASON_PREFIX + ":"))
+    check("reason keeps its greppable 'auto:' prefix and the byline arg is dropped "
+          "from the short DB text",
+          r == "auto: byline already attributed (#160): aer2006 holds pmid "
+               "42424133 via person_article ACCEPTED"
+          and r.startswith(REASON_PREFIX + ":"))
 
     check("the write statement re-checks status='open' at write time",
           "status='open'" in _UPDATE_SQL)
     set_clause = _UPDATE_SQL.split("WHERE")[0]
-    check("the write statement touches ONLY status/resolved_at/dup_reason -- never "
-          "curator columns",
-          all(col not in set_clause for col in
-              ("note", "resolution_cwid", "reviewer", "snooze_until"))
-          and all(col in set_clause for col in ("status", "resolved_at", "dup_reason")))
+    check("the write statement writes note via CONCAT_WS (preserving curator text), "
+          "no longer writes dup_reason, and never touches other curator columns",
+          "note=CONCAT_WS(' | ', NULLIF(note, ''), :reason)" in set_clause
+          and all(col not in set_clause for col in
+                  ("dup_reason", "resolution_cwid", "reviewer", "snooze_until"))
+          and all(col in set_clause for col in ("status", "resolved_at")))
 
     e = _ledger_entry(hit(1, True, True), "2026-08-31 00:00:00", applied=False)
     check("ledger entry carries the full audit trail: before-state, owner, byline "
