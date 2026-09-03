@@ -40,6 +40,14 @@ COPY update/preprocessing.py ./
 COPY update/aar_models/ ./aar_models/
 COPY update/aar_data/ ./aar_data/
 
+# AAR nightly closer: dismiss open rows ReCiter already attributed (#186, every night,
+# gated in run_all.py). aar_report_changed_picks.py is required at runtime by
+# aar_dismiss_byline_owner.py's own module-level import (for _cwid_eq) -- it cannot be
+# made lazy there, unlike aar_reconcile_open.py's own CLASS-B imports (T2).
+COPY update/aar_report_changed_picks.py ./
+COPY update/aar_reconcile_open.py ./
+COPY update/aar_dismiss_byline_owner.py ./
+
 # Manual reference tool: per-document backfill of producer-owned authorship_review
 # columns (authors_json / issn / isbn) on rows a sweep can no longer revisit. Not run by
 # run_all.py -- invoked by hand as a one-off Job off this image. Its own docstring says it

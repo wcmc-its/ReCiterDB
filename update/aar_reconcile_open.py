@@ -6,8 +6,11 @@ the two staleness classes PR #180 (issue #177, NO_MATCH) does not cover.
   CLASS A (#181) -- the row's STORED top_cwid already holds the pmid, per reciterdb's
     own source of truth. The authorship is already correctly attributed; the row
     should leave the queue entirely.  Action: status='dismissed' + a distinct,
-    greppable reason recorded (see REASON COLUMN below) + resolved_at. Never touches
-    resolution_cwid / reviewer / note / snooze_until.
+    greppable 'auto:' reason appended to note (see REASON COLUMN below) + resolved_at.
+    Never touches resolution_cwid / reviewer / snooze_until. Since #186, --class-a-only
+    runs CLASS A alone, unattended, from run_all.py's nightly aarCloseAttributed step
+    (see T2's design note near _load_class_b_modules() below); CLASS B remains a
+    manual, one-off pass only.
 
   CLASS B (#182) -- a REPLAY of the authorship through the CURRENT matcher proposes a
     DIFFERENT, and given_match-TIER-STRONGER, top_cwid than what is stored. The pick is
@@ -64,31 +67,24 @@ RANKING DECISION -- io-rescored (default) vs --no-io-rescore
   aar_report_changed_picks.py (its `--no-io-rescore --check <ids>`) -- this file does
   not expose that flag itself, and never wires it to --apply.
 
-REASON COLUMN for CLASS A's dismissal (read the DDL + the PM reader first, as asked)
+REASON COLUMN for CLASS A's dismissal (updated for #186 -- see ticket T3)
   aar_db.py's DDL/docstring names status/resolution_cwid/reviewer/note/snooze_until as
-  curator-owned. There IS a live precedent for an AUTOMATED status='dismissed' write
-  with a distinguishable reason on this exact table: aar_universe_scopus.
+  curator-owned, but there IS a live precedent for an AUTOMATED status='dismissed'
+  write with a distinguishable reason on this exact table: aar_universe_scopus.
   recheck_open_scopus() sets status='dismissed', resolved_at=:ts, and
   note=CONCAT('auto: now in PubMed (...)') when a scopus row is auto-resolved out --
   i.e. the established convention for "system, not curator, dismissed this, and here's
-  why" IS `note`, prefixed 'auto:'. This task's own instructions, however, name `note`
-  as never-touch here. Given that explicit instruction, and since dup_reason is the
-  ONLY other free-text, non-curator column on the table, CLASS A instead writes a
-  distinct, greppable reason into `dup_reason` (format below), NOT into `note`.
+  why" IS `note`, prefixed 'auto:'. An earlier revision of this tool wrote `dup_reason`
+  instead, as a workaround for a since-lifted note-never-touch instruction; the PM
+  Sequelize model doesn't select dup_flag/dup_reason at all, so that write was
+  invisible to curators. #186 lifts the restriction: CLASS A now writes the SAME
+  convention recheck_open_scopus already uses, via `note=CONCAT_WS(' | ',
+  NULLIF(note, ''), :reason)` (_CLASS_A_UPDATE_SQL) so any existing curator text in
+  `note` is preserved, not overwritten. dup_reason is no longer written by this path.
 
-  This is a real compromise, not a clean answer, and it has a concrete downside: the
-  Publication Manager Sequelize model (ReCiter-Publication-Manager/src/db/models/
-  AuthorshipReview.ts, checked 2026-08-31) does not declare dup_flag/dup_reason at all
-  -- those columns predate that model file and the PM UI cannot render them today. So a
-  curator looking at a CLASS-A-dismissed row in PM sees status=dismissed with no reason
-  text, even though one exists in the database. `note` is both the actual convention
-  AND the only field PM already renders; `dup_reason` is the only field this tool is
-  allowed to touch. Flagged in `concerns` as a real product gap, not swept under the
-  rug: either lift the note restriction for this one write, or extend the PM model to
-  select dup_flag/dup_reason, or add a dedicated `dismiss_reason` column later.
-
-  Format: "already-attributed (#181): {cwid} already holds pmid {pmid} via {signal}"
-  where {signal} is "person_article ACCEPTED", "GoldStandard knownpmids", or both.
+  Format: "auto: already attributed (#181): {cwid} already holds pmid {pmid} via
+  {signal}" (_class_a_reason) where {signal} is "person_article ACCEPTED",
+  "GoldStandard knownpmids", or both.
 
 DETERMINING ATTRIBUTION (CLASS A) -- reuse, not a new check
   Two signals, both already how aar_gate.py determines attribution elsewhere in this
@@ -186,6 +182,8 @@ SYS.PATH FORK TRAP / COLLATION TRAP: same guards as aar_sweep_stale.py and
 Usage:
   python aar_reconcile_open.py                       # dry run: report + JSONL ledger
   python aar_reconcile_open.py --apply                # perform the writes for real
+  python aar_reconcile_open.py --class-a-only --apply  # CLASS A only, no CLASS B
+                                                        # modules imported (nightly, #186)
   python aar_reconcile_open.py --include-sideways      # (dry run) also queue sideways
                                                         # CLASS-B moves; still needs --apply
                                                         # to write anything
@@ -200,29 +198,76 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)  # must be the LAST insert(0, ...) before these imports -- see
                           # the SYS.PATH FORK TRAP note above.
 import aar_db
-import identity_index as idxmod
-import aar_universe as uni
-import aar_universe_scopus as scop
-import aar_matcher as matcher
 import aar_gate as gate
 import aar_orchestrator as orch          # read-only reuse of _batch_gold_standard/_compact/
                                           # _trunc -- never modified, never runs orch.main()
-import aar_sweep_stale as sweep          # reuse NULL_COLUMNS / _SELECT_COLS / _snapshot
-import aar_report_changed_picks as rcp   # reuse the verified replay -- see REUSE above
-from identity_index import IdentityIndex
 
-# Every module this script trusts must resolve to THIS directory, not the stale
-# ~/Dropbox/Projects/ReCiter Research/scripts/ copy (sys.path fork trap).
-for _mod in (aar_db, idxmod, uni, scop, matcher, gate, orch, sweep, rcp):
+# Every module CLASS A trusts (the only classes --class-a-only needs) must resolve to
+# THIS directory, not the stale ~/Dropbox/Projects/ReCiter Research/scripts/ copy (sys.
+# path fork trap). CLASS B's own modules are trap-checked in _load_class_b_modules()
+# below, at the point they are actually imported.
+for _mod in (aar_db, gate, orch):
     assert os.path.dirname(os.path.abspath(_mod.__file__)) == HERE, (
         f"{_mod.__name__} resolved to {_mod.__file__}, not {HERE} -- "
         "sys.path fork trap: a stale producer copy is winning. Refusing to trust any "
         "replay result computed against it.")
 
-# The exact 9 columns #180 nulls and #182 says need refreshing -- imported, not
-# redefined, so the two tools can never silently diverge on which columns are in play.
-REFRESH_COLS = sweep.NULL_COLUMNS
-_cwid_eq = rcp._cwid_eq
+# CLASS B's own dependencies (identity_index/aar_universe/aar_universe_scopus/
+# aar_matcher/aar_sweep_stale/aar_report_changed_picks) are NOT imported here -- see
+# _load_class_b_modules() below (T2 / #186). --class-a-only never triggers that loader,
+# so it never imports them, never constructs identity_index.IdentityIndex.load()'s DB
+# roster query or aar_matcher.IdentityOnlyScorer(), and never runs CLASS B's io-rescore
+# replay (its own S3 reads). These module-level names stay None until then.
+idxmod = uni = scop = matcher = sweep = rcp = IdentityIndex = None
+REFRESH_COLS = None
+
+
+def _cwid_eq(a, b):
+    """Case-folded cwid comparison -- authorship_review.top_cwid is utf8mb4_general_ci,
+    identity/person/GoldStandard keys are utf8mb4_unicode_ci, both case-insensitive, so a
+    naive Python `==` on differently-cased-but-equal cwids would misreport a match as a
+    miss. This is a deliberate, exact duplicate of aar_report_changed_picks._cwid_eq
+    (checked for drift in _selftest below) -- CLASS A needs this collation-safe compare
+    but must not import rcp's own module chain (aar_matcher -> adversarial_attribution_
+    review) just to get it; see T2 / #186."""
+    if a is None or b is None:
+        return a is b
+    return str(a).strip().lower() == str(b).strip().lower()
+
+
+def _load_class_b_modules():
+    """Lazily import CLASS B's own dependencies, on first use. Called from the default
+    (both-class) run, --check, and _selftest -- but NEVER from the --class-a-only path
+    (see T2 / #186's design note: CLASS A needs only the DB engine, gate.attributions,
+    and _batch_gold_standard). Idempotent; sets the module globals declared above."""
+    global idxmod, uni, scop, matcher, sweep, rcp, IdentityIndex, REFRESH_COLS
+    if rcp is not None:
+        return
+    import identity_index as _idxmod
+    import aar_universe as _uni
+    import aar_universe_scopus as _scop
+    import aar_matcher as _matcher
+    import aar_sweep_stale as _sweep          # reuse NULL_COLUMNS / _SELECT_COLS / _snapshot
+    import aar_report_changed_picks as _rcp   # reuse the verified replay -- see REUSE above
+    from identity_index import IdentityIndex as _IdentityIndex
+
+    for _mod in (_idxmod, _uni, _scop, _matcher, _sweep, _rcp):
+        assert os.path.dirname(os.path.abspath(_mod.__file__)) == HERE, (
+            f"{_mod.__name__} resolved to {_mod.__file__}, not {HERE} -- "
+            "sys.path fork trap: a stale producer copy is winning. Refusing to trust "
+            "any replay result computed against it.")
+    # rcp's own _cwid_eq must agree with the local duplicate above -- a drift here
+    # would mean the two silently disagree on the same collation-safety guarantee.
+    assert _rcp._cwid_eq("ABC", "abc") == _cwid_eq("ABC", "abc") and \
+           _rcp._cwid_eq(None, "x") == _cwid_eq(None, "x"), (
+        "aar_report_changed_picks._cwid_eq disagrees with this module's own "
+        "_cwid_eq duplicate -- one of them changed; refusing to trust CLASS B.")
+
+    idxmod, uni, scop, matcher, sweep, rcp, IdentityIndex = (
+        _idxmod, _uni, _scop, _matcher, _sweep, _rcp, _IdentityIndex)
+    # The exact 9 columns #180 nulls and #182 says need refreshing -- imported, not
+    # redefined, so the two tools can never silently diverge on which columns are in play.
+    REFRESH_COLS = sweep.NULL_COLUMNS
 
 
 # ============================================================================
@@ -237,7 +282,7 @@ def _class_a_candidates(engine):
     from sqlalchemy import text
     with engine.connect() as c:
         rows = c.execute(text(
-            "SELECT id, source, pmid, top_cwid, dup_reason, resolved_at "
+            "SELECT id, source, pmid, top_cwid, note, resolved_at "
             "FROM authorship_review "
             "WHERE status='open' AND pmid IS NOT NULL AND top_cwid IS NOT NULL"
         )).mappings().all()
@@ -264,11 +309,17 @@ def _class_a_candidates(engine):
             continue
         signal = ("person_article ACCEPTED + GoldStandard knownpmids" if via_attr and via_gold
                   else "person_article ACCEPTED" if via_attr else "GoldStandard knownpmids")
-        reason = (f"already-attributed (#181): {r['top_cwid']} already holds pmid "
-                  f"{r['pmid']} via {signal}")[:255]
+        reason = _class_a_reason(r["top_cwid"], r["pmid"], signal)
         hits[r["id"]] = {"row": r, "via_attr": via_attr, "via_gold": via_gold,
                          "reason": reason}
     return hits
+
+
+def _class_a_reason(cwid, pmid, signal):
+    """The 'auto:' note text for a CLASS-A dismissal -- the established convention
+    (aar_universe_scopus.recheck_open_scopus precedent) PM already renders. Factored
+    out so _selftest can assert the exact format without touching the DB."""
+    return f"auto: already attributed (#181): {cwid} already holds pmid {pmid} via {signal}"
 
 
 def _class_a_ledger_entry(hit, run_ts, applied):
@@ -277,19 +328,27 @@ def _class_a_ledger_entry(hit, run_ts, applied):
         "id": r["id"], "class": "A", "rule": "already_attributed",
         "source": r["source"], "pmid": r["pmid"], "top_cwid": r["top_cwid"],
         "via_attr": hit["via_attr"], "via_gold": hit["via_gold"],
-        "before": {"status": "open", "dup_reason": r["dup_reason"],
-                  "resolved_at": r["resolved_at"]},
-        "after": {"status": "dismissed", "dup_reason": hit["reason"], "resolved_at": run_ts},
+        "before": {"status": "open", "note": r["note"], "resolved_at": r["resolved_at"]},
+        "after": {"status": "dismissed", "note_appended": hit["reason"], "resolved_at": run_ts},
         "swept_at": run_ts, "applied": applied,
     }
+
+
+# The ONLY write CLASS A performs. note=CONCAT_WS(...) preserves any curator text
+# already in note (the established 'auto:' convention -- aar_universe_scopus.
+# recheck_open_scopus precedent, see the module docstring's REASON COLUMN section);
+# the status='open' re-check makes a concurrent curator win every race. Module-level
+# so _selftest can assert its shape without touching the DB.
+_CLASS_A_UPDATE_SQL = ("UPDATE authorship_review SET status='dismissed', resolved_at=:ts, "
+                       "note=CONCAT_WS(' | ', NULLIF(note, ''), :reason) "
+                       "WHERE id=:id AND status='open'")
 
 
 def _apply_class_a(engine, hits, run_ts):
     from sqlalchemy import text
     if not hits:
         return 0
-    stmt = text("UPDATE authorship_review SET status='dismissed', resolved_at=:ts, "
-                "dup_reason=:reason WHERE id=:id AND status='open'")
+    stmt = text(_CLASS_A_UPDATE_SQL)
     ids = list(hits.items())
     n = 0
     with engine.begin() as c:
@@ -470,6 +529,7 @@ def _write_ledger(path, entries):
 # --check <ids>
 # ============================================================================
 def _check_ids(engine, idx, io_scorer, ids):
+    _load_class_b_modules()   # --check always reports both CLASS A and CLASS B verdicts
     from sqlalchemy import text
     rows = [dict(r) for r in engine.connect().execute(text(
         "SELECT id, source, pmid, top_cwid, top_name, top_given_match, top_confidence, "
@@ -541,6 +601,11 @@ def main():
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--apply", action="store_true",
                     help="perform the writes for real; default is a read-only dry run")
+    ap.add_argument("--class-a-only", action="store_true",
+                    help="run CLASS A only and skip CLASS B entirely -- no identity "
+                         "roster load, no matcher.IdentityOnlyScorer, no io-rescore "
+                         "replay, and none of CLASS B's own module imports (T2 / #186). "
+                         "This is what run_all.py's nightly aarCloseAttributed step runs.")
     ap.add_argument("--include-sideways", action="store_true",
                     help="also queue CLASS-B SIDEWAYS tier moves (same-tier homonym "
                          "reshuffles, ~2,251 of the ~2,608 CHANGED population). Off by "
@@ -563,17 +628,27 @@ def main():
         sys.exit(0 if _selftest() else 1)
 
     run_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    # --check always reports both classes; --class-a-only skips CLASS B's own modules
+    # entirely (T2 / #186) -- see _load_class_b_modules()'s docstring.
+    need_class_b = bool(args.check) or not args.class_a_only
+    if need_class_b:
+        _load_class_b_modules()
+
     print("Resolved producer modules (must all live under this file's directory):")
-    for _mod in (aar_db, idxmod, uni, scop, matcher, gate, orch, sweep, rcp):
+    resolved_mods = [aar_db, gate, orch] + (
+        [idxmod, uni, scop, matcher, sweep, rcp] if need_class_b else [])
+    for _mod in resolved_mods:
         print(f"  {_mod.__name__:20} {_mod.__file__}")
     print()
 
     engine = aar_db.engine()
-    idx = IdentityIndex.load()
-    n_roster = sum(len(v) for v in idx.by_surname.values())
-    print(f"Identity roster: {n_roster} people\n")
-    io_scorer = matcher.IdentityOnlyScorer()
-    _install_capture(idx)
+    idx = io_scorer = None
+    if need_class_b:
+        idx = IdentityIndex.load()
+        n_roster = sum(len(v) for v in idx.by_surname.values())
+        print(f"Identity roster: {n_roster} people\n")
+        io_scorer = matcher.IdentityOnlyScorer()
+        _install_capture(idx)
 
     if args.check:
         _check_ids(engine, idx, io_scorer, args.check)
@@ -589,6 +664,20 @@ def main():
     print(f"  CLASS A total: {len(class_a)}  (source breakdown: {src_breakdown})")
     print(f"    via person_article ACCEPTED (gate.attributions): {via_attr_n}")
     print(f"    via GoldStandard knownpmids ONLY (attr signal missed it): {via_gold_only_n}")
+
+    if args.class_a_only:
+        # CLASS A summary line printed above lands in the nightly log either way (T2).
+        ledger_entries = [_class_a_ledger_entry(h, run_ts, args.apply) for h in class_a.values()]
+        _write_ledger(args.ledger, ledger_entries)
+        print(f"\n  ledger -> {args.ledger} ({len(ledger_entries)} rows: "
+              f"{len(class_a)} class A)")
+        if args.apply:
+            na = _apply_class_a(engine, class_a, run_ts)
+            print(f"\n  APPLIED: {na} rows dismissed (class A)")
+        else:
+            print(f"\n  DRY RUN -- 0 rows written. Re-run with --apply to write these "
+                  f"{len(class_a)} dismissals for real.")
+        return
 
     print("\n==== CLASS B: stale-pick refresh (io-rescored, unfiltered by CLASS A) ====")
     cb = _class_b_all_changed(engine, idx, io_scorer, args.limit)
@@ -675,13 +764,56 @@ def main():
 def _selftest():
     """Offline: no DB, no network. Proves the pieces that don't need live data:
     column-list identity with #180, the collision-priority filter, the weaker-exclusion
-    rule, and the write-payload assertion tripwire."""
+    rule, the write-payload assertion tripwire, --class-a-only's parsing and its
+    note/CONCAT_WS write shape, and the CLASS-A reason string format (T2/T3 -- #186)."""
     ok = True
 
     def check(label, cond):
         nonlocal ok
         ok &= bool(cond)
         print(f"  [{'OK' if cond else '** FAIL'}] {label}")
+
+    # --class-a-only parses, defaults to off, and is independent of --apply.
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--class-a-only", action="store_true")
+    a1 = ap.parse_args([])
+    a2 = ap.parse_args(["--apply", "--class-a-only"])
+    check("--class-a-only parses and defaults to False", a1.class_a_only is False)
+    check("--apply --class-a-only both parse True together",
+          a2.apply is True and a2.class_a_only is True)
+
+    # CLASS A's reason string format (T3): "auto: ..." into note, not dup_reason.
+    r = _class_a_reason("abc123", 42424133, "person_article ACCEPTED")
+    check("CLASS A reason uses the 'auto:' note convention (#181)",
+          r == "auto: already attributed (#181): abc123 already holds pmid "
+               "42424133 via person_article ACCEPTED")
+
+    # CLASS A's write statement targets note via CONCAT_WS, keeps the status='open'
+    # race guard, and no longer writes dup_reason (T3).
+    check("CLASS A UPDATE re-checks status='open'",
+          "status='open'" in _CLASS_A_UPDATE_SQL)
+    check("CLASS A UPDATE writes note via CONCAT_WS(..., NULLIF(note, ''), :reason), "
+          "preserving curator text", "note=CONCAT_WS(' | ', NULLIF(note, ''), :reason)"
+          in _CLASS_A_UPDATE_SQL)
+    check("CLASS A UPDATE no longer writes dup_reason",
+          "dup_reason" not in _CLASS_A_UPDATE_SQL)
+    set_clause_a = _CLASS_A_UPDATE_SQL.split("WHERE")[0]
+    check("CLASS A UPDATE never touches other curator columns",
+          all(col not in set_clause_a for col in
+              ("resolution_cwid", "reviewer", "snooze_until")))
+
+    # --class-a-only must never import CLASS B's own dependencies (T2): before this
+    # point in a real --class-a-only run, _load_class_b_modules() is never called, so
+    # these stay None. (This selftest itself calls it below to test CLASS B's pieces
+    # too -- that's fine, --selftest is offline and exercises both classes.)
+    check("CLASS B modules are lazy globals, unset until _load_class_b_modules() runs",
+          "idxmod" in globals() and "matcher" in globals())
+
+    _load_class_b_modules()
+    check("_load_class_b_modules's own _cwid_eq duplicate matches "
+          "aar_report_changed_picks._cwid_eq (drift tripwire)",
+          _cwid_eq("ABC123", "abc123") is True and _cwid_eq(None, "x") is False)
 
     check("REFRESH_COLS is exactly aar_sweep_stale.NULL_COLUMNS (imported, not redefined)",
           REFRESH_COLS is sweep.NULL_COLUMNS)
