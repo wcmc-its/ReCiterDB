@@ -200,9 +200,9 @@ def parse_articles(xml_bytes, groups):
 def window_for_mode(mode):
     today = date.today()
     if mode == "initial":
-        return today - timedelta(days=730), today - timedelta(days=40)
+        return today - timedelta(days=730), today
     if mode == "recurring":
-        return today - timedelta(days=71), today - timedelta(days=40)
+        return today - timedelta(days=71), today
     raise ValueError(mode)
 
 
