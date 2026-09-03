@@ -212,12 +212,19 @@ for _mod in (aar_db, gate, orch):
         "sys.path fork trap: a stale producer copy is winning. Refusing to trust any "
         "replay result computed against it.")
 
-# CLASS B's own dependencies (identity_index/aar_universe/aar_universe_scopus/
-# aar_matcher/aar_sweep_stale/aar_report_changed_picks) are NOT imported here -- see
-# _load_class_b_modules() below (T2 / #186). --class-a-only never triggers that loader,
-# so it never imports them, never constructs identity_index.IdentityIndex.load()'s DB
-# roster query or aar_matcher.IdentityOnlyScorer(), and never runs CLASS B's io-rescore
-# replay (its own S3 reads). These module-level names stay None until then.
+# CLASS B's extra dependencies (aar_universe_scopus/aar_sweep_stale/
+# aar_report_changed_picks) are NOT imported here -- see _load_class_b_modules() below
+# (T2 / #186). --class-a-only never triggers that loader, so it never imports those
+# three, never constructs identity_index.IdentityIndex.load()'s DB roster query or
+# aar_matcher.IdentityOnlyScorer(), and never runs CLASS B's io-rescore replay (its own
+# S3 reads). These module-level names stay None until then.
+#
+# What --class-a-only does NOT avoid: the required aar_gate/aar_orchestrator imports
+# above already pull in aar_matcher, aar_universe, identity_index and
+# adversarial_attribution_review, and the latter builds a boto3 S3 client and
+# joblib.loads all six models at import time. So the nightly closer still pays the
+# xgboost/model-load cost -- unavoidable without editing those modules. Do not describe
+# this path as "no xgboost/S3 machinery"; it only skips CLASS B's *additional* work.
 idxmod = uni = scop = matcher = sweep = rcp = IdentityIndex = None
 REFRESH_COLS = None
 
