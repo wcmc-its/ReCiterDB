@@ -261,6 +261,14 @@ def run_aar_reconcile_drift_if_due():
     they were, manual and hand-reviewed. Curator-touched rows are untouched (the UPDATE
     re-checks status='open'), and one JSONL ledger is written per run.
 
+    --lane pubmed, on cost: the pubmed replay is a batched efetch plus a threaded
+    identity-only warm-up, ~15 minutes for the whole open queue. The scopus lane needs a
+    live Scopus GET for every flagged row, and drift flags most of them -- 3,591 of 4,926
+    open rows on 2026-09-04, measured at ~6s each, about six hours. That does not belong
+    in a job that already runs 2.5 hours, and it shares a rate-limited API key with the
+    Sunday Scopus lane. Reconcile the scopus lane by hand instead:
+    `aar_reconcile_open.py --drift-only --lane scopus`, out of hours.
+
     SHIPS OFF (AAR_DRIFT_CADENCE unset or "off"), and this is the point of the env var,
     not an afterthought. The class is safe per row but the BACKLOG is not small: the
     2026-09-04 dry run measured DRIFT_ONLY at ~60% of the open queue, because nothing has
@@ -302,8 +310,8 @@ def run_aar_reconcile_drift_if_due():
                            "re-fetches every open pubmed row's article) — skipped")
             return
         run_script("aarReconcileDrift",
-                   "python3 aar_reconcile_open.py --apply --drift-only",
-                   timeout_seconds=int(os.getenv("AAR_DRIFT_TIMEOUT_SECONDS", "7200")))
+                   "python3 aar_reconcile_open.py --apply --drift-only --lane pubmed",
+                   timeout_seconds=int(os.getenv("AAR_DRIFT_TIMEOUT_SECONDS", "3600")))
     except Exception as e:
         logger.exception(f"AAR drift reconciliation failed (ignored — reporting "
                          f"unaffected): {e}")

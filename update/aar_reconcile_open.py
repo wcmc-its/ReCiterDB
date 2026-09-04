@@ -73,22 +73,37 @@ PRODUCER-COLUMN DRIFT / the DRIFT_ONLY class (#186, option 2)
   WHY IT IS OFF BY DEFAULT, despite being the lowest-risk class here (the proposed
   PERSON never changes -- only the evidence displayed about them). Not risk: VOLUME.
   #203 is the fourth matcher change to strand rows but it is not the only one that ever
-  did, and nothing has ever reconciled the queue against any of them. Every one of the
-  237 DRIFT_ONLY rows in the 2026-09-04 398-row sample attributes to a shipped change,
-  with none left unexplained:
+  did, and nothing has ever reconciled the queue against any of them. Full pubmed-lane
+  dry run, 2026-09-04, live reciterdb: considered=11,624 (1 unresolvable), UNCHANGED=
+  9,594, CHANGED=1,608 (stronger=0, sideways=1,608, weaker=0 -- #201's reordered key
+  emptying the weaker bucket exactly as RANKING DECISION predicts), NO_MATCH=422, and of
+  the UNCHANGED, DRIFT_ONLY=5,308. Columns that moved, most to least: candidate_cwids_
+  json 5,308, top_confidence 4,103, top_given_match 1,478, n_candidates 962,
+  top_affil_match 254, top_person_type 129, top_dept 38, top_name 26.
+
+  Every one of the 237 DRIFT_ONLY rows in a 398-row sample of that population traced to
+  a shipped matcher change, with none left unexplained:
       125  given_match initial -> full     -- #185 (a byline middle initial, "Andrew S
                                               Lee", reaching the full tier) and #201
       190  stored candidate JSON predates #159's temporal penalty (no years_after_wcm)
        28  affil_dept_match True -> False  -- #203
        10  a roster field (dept/person_type/name) moved -- ordinary HR churn
        18  evidence moved only on a NON-top candidate
-  (the buckets overlap; a row can carry several.) That is five generations of debt, and
-  applying it is a one-off catch-up of thousands of rows, not a trickle. So: every dry
-  run REPORTS the class and its column breakdown, and writing it takes an explicit
-  --include-drift (or --drift-only), exactly like --include-sideways. run_all.py's
-  aarReconcileDrift step passes --drift-only but ships with AAR_DRIFT_CADENCE off, so a
-  human runs and reads the catch-up before a cron owns the steady state. The
-  pick-changing classes stay manual and keep their exact previous gating.
+  (the buckets overlap; a row can carry several.) So the population is real, not a
+  comparison bug -- but it is five generations of debt, and applying it is a one-off
+  catch-up of thousands of rows, not a trickle. Hence: every dry run REPORTS the class
+  and its column breakdown, and writing it takes an explicit --include-drift (or
+  --drift-only), exactly like --include-sideways. run_all.py's aarReconcileDrift step
+  passes --drift-only but ships with AAR_DRIFT_CADENCE off, so a human runs and reads
+  the catch-up before a cron owns the steady state. The pick-changing classes stay
+  manual and keep their exact previous gating.
+
+  The scopus lane is the same story at a very different price: its reconstruction
+  pre-filter flagged 3,591 of 4,926 open rows for a live Scopus GET, ~6s each, about six
+  hours for the lane, against ~15 minutes for the whole pubmed lane. On a 200-row sample
+  135 of 144 flagged rows were confirmed drifted or CHANGED once verified, so those are
+  real rows and not pre-filter noise -- they are just expensive to confirm, which is why
+  --lane exists and why the wired step runs `--lane pubmed`.
 
   THE TRAP, and the first thing to check if this ever starts rewriting the whole queue:
   io_score/final_score/io_source are re-read from live S3 scoring inputs the nightly
@@ -100,6 +115,15 @@ PRODUCER-COLUMN DRIFT / the DRIFT_ONLY class (#186, option 2)
   other reason -- trigger and payload are different sets, on purpose. The stability test
   for that is two back-to-back dry runs: a materially moving DRIFT_ONLY count means an
   io-derived field has leaked into the trigger.
+
+  Measured, 2026-09-04, two consecutive full pubmed-lane dry runs: DRIFT_ONLY 5,304 then
+  5,286. Run B's set is a strict SUBSET of run A's -- 0 rows entered it -- and all 5,286
+  rows in both carried a BYTE-IDENTICAL drift column list. The 18 that left were all
+  resolved by a curator between the runs (checked in the DB: 0 of the 18 were still
+  status='open', all rejected/assigned at 19:15-19:17Z), which is the same guarantee
+  _apply_class_b's status='open' re-check enforces, showing up in the measurement. So
+  the trigger is deterministic against a queue whose io scores are moving underneath it,
+  which is exactly what excluding io_score/final_score/io_source is supposed to buy.
 
 RANKING DECISION -- io-rescored (default) vs --no-io-rescore
   Issue #182 flags that the io-rescored CHANGED count wobbles run-to-run (2,394 vs
@@ -497,21 +521,30 @@ def _write_payload(rec):
     }
 
 
-def _class_b_all_changed(engine, idx, io_scorer, limit=None):
+def _class_b_all_changed(engine, idx, io_scorer, limit=None, lane="both"):
     """Replay every open row (both lanes, unfiltered by CLASS A) through the CURRENT
     matcher, io-rescore on (see RANKING DECISION), and return the full CHANGED list
     plus per-lane NO_MATCH/considered totals -- unfiltered, so the caller can measure
     the true CLASS A/B overlap rather than have it hidden by an upfront exclude."""
-    print("[pubmed] loading open rows ...", flush=True)
-    pm_rows = rcp._open_rows(engine, "pubmed")
-    print(f"      {len(pm_rows)} open pubmed rows", flush=True)
-    pm_results, pm_unresolvable = rcp._replay_pubmed(pm_rows, idx, io_scorer, limit,
-                                                      io_rescore=True)
+    pm_results = pm_unresolvable = sc_results = sc_unresolvable = ()
+    if lane in ("both", "pubmed"):
+        print("[pubmed] loading open rows ...", flush=True)
+        pm_rows = rcp._open_rows(engine, "pubmed")
+        print(f"      {len(pm_rows)} open pubmed rows", flush=True)
+        pm_results, pm_unresolvable = rcp._replay_pubmed(pm_rows, idx, io_scorer, limit,
+                                                          io_rescore=True)
+    else:
+        print("[pubmed] skipped (--lane scopus)", flush=True)
 
-    print("\n[scopus] loading open rows ...", flush=True)
-    sc_rows = rcp._open_rows(engine, "scopus")
-    print(f"      {len(sc_rows)} open scopus rows", flush=True)
-    sc_results, sc_unresolvable = rcp._replay_scopus(sc_rows, idx, limit)
+    if lane in ("both", "scopus"):
+        print("\n[scopus] loading open rows ...", flush=True)
+        sc_rows = rcp._open_rows(engine, "scopus")
+        print(f"      {len(sc_rows)} open scopus rows", flush=True)
+        sc_results, sc_unresolvable = rcp._replay_scopus(sc_rows, idx, limit)
+    else:
+        print("\n[scopus] skipped (--lane pubmed)", flush=True)
+    pm_results, sc_results = list(pm_results), list(sc_results)
+    pm_unresolvable, sc_unresolvable = list(pm_unresolvable), list(sc_unresolvable)
 
     all_results = pm_results + sc_results
     by_cls = {}
@@ -748,6 +781,14 @@ def main():
     ap.add_argument("--ledger", default=os.path.join(HERE, "aar_reconcile_open_ledger.jsonl"),
                     help="JSONL before/after output path (written on every run, "
                          "dry-run included)")
+    ap.add_argument("--lane", choices=("both", "pubmed", "scopus"), default="both",
+                    help="restrict the CLASS-B replay to one lane. The two are very "
+                         "differently priced: the pubmed lane is a batched efetch plus "
+                         "a threaded identity-only warm-up (~15 min for the whole open "
+                         "queue), while the scopus lane needs one live Scopus GET per "
+                         "flagged row -- 3,591 of 4,926 open rows on the 2026-09-04 run, "
+                         "measured at ~6s each, so about six hours. CLASS A is pure "
+                         "SQL/DynamoDB and always runs in full, whatever this is set to.")
     ap.add_argument("--limit", type=int, default=None,
                     help="cap rows considered per lane in the CLASS-B replay, before "
                          "any network call (sanity-check runs; does not limit CLASS A, "
@@ -817,13 +858,14 @@ def main():
     include_sideways = args.include_sideways and not args.drift_only
 
     print("\n==== CLASS B: stale-pick refresh (io-rescored, unfiltered by CLASS A) ====")
-    cb = _class_b_all_changed(engine, idx, io_scorer, args.limit)
+    cb = _class_b_all_changed(engine, idx, io_scorer, args.limit, args.lane)
     for label, results in (("pubmed", cb["pm_results"]), ("scopus", cb["sc_results"])):
         by_cls = {}
         for x in results:
             by_cls.setdefault(x["classification"], []).append(x)
         print(f"  {label}: considered={len(results)}"
-              + "".join(f"  {k}={len(v)}" for k, v in sorted(by_cls.items())))
+              + "".join(f"  {k}={len(v)}" for k, v in sorted(by_cls.items()))
+              + f"  DRIFT_ONLY={len(_drift_rows(results))}")
     changed = cb["by_cls"].get("CHANGED", [])
     no_match = cb["by_cls"].get("NO_MATCH", [])
     unchanged = cb["by_cls"].get("UNCHANGED", [])
