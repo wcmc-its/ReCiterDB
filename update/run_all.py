@@ -152,19 +152,30 @@ def run_conflicts_refresh_if_due():
         logger.exception(f"COI refresh failed (ignored — reporting unaffected): {e}")
 
 
-# ------------- AAR PubMed lane (weekly, isolated) -------------
+# ------------- AAR PubMed lane (daily by default, isolated) -------------
 def run_pubmed_lane_if_due():
-    """Weekly PubMed orphan-authorship detector + IO/FB scoring (AAR).
+    """PubMed orphan-authorship detector + IO/FB scoring (AAR).
 
-    Same isolation contract as the Scopus lane: Sunday-gated, keys-gated, wrapped in
+    Runs EVERY night by default. Cadence is env-controlled (AAR_PUBMED_LANE_CADENCE:
+    "daily" default, or "weekly" for the old Sunday-only behaviour) so it can be rolled
+    back with a CronJob env patch instead of a rebuild -- k8-buildspec only does
+    `kubectl set image`, so env set on the live CronJob survives deploys.
+
+    Daily is safe and cheap: overlapping EDAT windows are harmless because the processed
+    log prevents re-gating, per-run new-article work shrinks (~35/day vs ~240/week), and
+    the re-check step makes no PubMed calls at all (DynamoDB BatchGetItem, 100 cwids/call).
+    The 71-day window is kept as missed-run insurance so an outage self-heals.
+
+    Same isolation contract as the Scopus lane: keys-gated, wrapped in
     try/except with a timeout, so any failure is logged and can NEVER fail the nightly
     reporting rebuild. Ledger/processed_log state lives in S3 (--s3-state) because the
     CronJob has no persistent filesystem; upserts land in reciterdb.authorship_review
     (source='pubmed')."""
     try:
         import datetime as _datetime
-        if _datetime.datetime.utcnow().weekday() != 6:   # 6 = Sunday
-            logger.info("PubMed lane: not due (runs weekly on Sundays) — skipped")
+        cadence = (os.getenv("AAR_PUBMED_LANE_CADENCE") or "daily").strip().lower()
+        if cadence == "weekly" and _datetime.datetime.utcnow().weekday() != 6:   # 6 = Sunday
+            logger.info("PubMed lane: not due (cadence=weekly, Sundays only) — skipped")
             return
         if not os.getenv("PUBMED_API_KEY"):
             logger.warning("PubMed lane: PUBMED_API_KEY unset — skipped")
@@ -172,7 +183,7 @@ def run_pubmed_lane_if_due():
         if not (os.getenv("AAR_S3_BUCKET") or os.getenv("S3_BUCKET")):
             logger.warning("PubMed lane: AAR_S3_BUCKET/S3_BUCKET unset (needed for --s3-state) — skipped")
             return
-        # 5400 -> 14400 (#186): the first Sunday run after the 40-day recency floor is
+        # 5400 -> 14400 (#186): the first run after the 40-day recency floor is
         # removed processes ~40 days of new PMIDs (~5-6x a normal week), and a timeout
         # leaves DB rows written but the S3 ledger un-pushed, so the run repeats.
         run_script("aarPubmedLane", "python3 aar_orchestrator.py --mode recurring --s3-state",

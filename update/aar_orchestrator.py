@@ -5,7 +5,8 @@ Adversarial Attribution Review — Step 4: per-run orchestrator + stateful ledge
 Ties Steps 1-3 into one idempotent, en-masse run and maintains the two persistent
 stores (orphan ledger + processed-PMID log) the plan calls for. Designed to clear
 the initial backlog (`--mode initial`, ~2y window) in one batch and then run
-weekly (Sundays, from run_all.py) (`--mode recurring`) over a rolling slice, with
+nightly (from run_all.py, AAR_PUBMED_LANE_CADENCE=daily) (`--mode recurring`) over a
+rolling slice, with
 overlapping windows harmless because the processed log prevents re-gating.
 
 Per run (docs/ADVERSARIAL_ATTRIBUTION_REVIEW_PLAN.md §Per-run algorithm):
@@ -36,7 +37,7 @@ Env: PUBMED_API_KEY (universe), DB_* (reciterdb gate+matcher), S3 + pinned model
 Usage:
   python aar_orchestrator.py --from 2026/05/26 --to 2026/06/02 --state-dir /tmp/aar_test   # test
   python aar_orchestrator.py --mode initial        # one-time backlog clear (long)
-  python aar_orchestrator.py --mode recurring      # weekly (Sundays, from run_all.py) rolling slice
+  python aar_orchestrator.py --mode recurring      # nightly rolling slice (from run_all.py)
   python aar_orchestrator.py --mode backfill --s3-state --before 2026-08-29
                                                    # re-explode the pre-#160 backlog
 """
