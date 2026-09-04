@@ -47,6 +47,12 @@ COPY update/aar_data/ ./aar_data/
 COPY update/aar_report_changed_picks.py ./
 COPY update/aar_reconcile_open.py ./
 COPY update/aar_dismiss_byline_owner.py ./
+# aar_reconcile_open.py's CLASS B imports aar_sweep_stale for NULL_COLUMNS / _SELECT_COLS /
+# _snapshot. That import is lazy (_load_class_b_modules), so CLASS A runs fine without it and
+# the nightly closer never noticed it was absent -- but every CLASS B invocation from this
+# image died on ModuleNotFoundError. Its own deps (aar_db, identity_index, aar_universe,
+# aar_universe_scopus) are all already copied above.
+COPY update/aar_sweep_stale.py ./
 
 # Manual reference tool: per-document backfill of producer-owned authorship_review
 # columns (authors_json / issn / isbn) on rows a sweep can no longer revisit. Not run by
