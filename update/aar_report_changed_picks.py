@@ -30,6 +30,17 @@ WHAT THIS DOES
                only so the three buckets add up to the open total; never double-counted
                against #177's own count, which came from a different run)
 
+  Since #186 each record ALSO carries `drift`: the producer-owned columns the current
+  matcher would write differently even when the top pick itself has not moved (an
+  UNCHANGED row with a non-empty `drift` is aar_reconcile_open's DRIFT_ONLY class). The
+  three classification values above are untouched -- they still partition every row
+  exactly once, and this module's CSV and its >50%-UNCHANGED collation sanity check
+  mean exactly what they meant before. See the block comment above `_drift_cols` for
+  which columns are compared and, crucially, why io_score/final_score/io_source are not.
+  One behavioural consequence on the scopus lane: a row the reconstruction pre-filter
+  flags as drifted now gets the same live Scopus re-verify a CHANGED row gets, because
+  a reconstruction is never a trustworthy basis for a write.
+
   PUBMED fidelity matches _classify_pubmed in aar_sweep_stale.py exactly: re-fetch the
   source article from PubMed by pmid (aar_universe.efetch_by_ids), index into the real
   AuthorList by the row's stored author_position. The new top-1 is computed with
@@ -100,10 +111,17 @@ for _mod in (aar_db, idxmod, uni, scop, matcher):
 
 TIER_RANK = {"unknown": 0, "initial": 1, "full": 2}
 
+# Carries all 9 producer-owned columns (aar_sweep_stale.NULL_COLUMNS) since #186, not
+# just the 4 the CHANGED report prints: _drift_cols() below compares every one of them
+# against what the current matcher would write. top_person_type/top_dept/
+# top_affil_match/n_candidates/candidate_cwids_json ride along unused by this module's
+# own CSV -- they exist so the drift check has something to compare.
 _SELECT_COLS = ["id", "source", "pmid", "external_id", "doi", "author_key",
                 "author_position", "wcm_author", "author_affiliation", "status",
                 "first_seen", "top_cwid", "top_name", "top_given_match",
-                "top_confidence", "classification"]
+                "top_confidence", "classification", "entrez_date",
+                "top_person_type", "top_dept", "top_affil_match",
+                "n_candidates", "candidate_cwids_json"]
 
 
 def _cwid_eq(a, b):
@@ -134,8 +152,169 @@ def _tier_move(old_tier, new_tier):
     return "stronger" if n > o else "weaker" if n < o else "sideways"
 
 
-def _row_result(r, new_top, source):
-    """Common CHANGED/UNCHANGED/NO_MATCH record for either lane."""
+# ---- producer-column drift (ReCiterDB #186) ----------------------------------
+# WHY THIS EXISTS, and why `top_cwid != top_cwid` was never enough.
+#
+# The producer writes a row's proposal once and never revises it, so every matcher
+# tightening strands its predecessors' suggestions. #177/#181/#182 each moved the top
+# PICK, so keying staleness on top_cwid inequality caught them. #203 (affiliation
+# matches must name a department, not the institution) does not: its own replay over
+# all 30,711 authorship_review rows measured 3,970 rows seeing a candidate change but
+# only 203 top picks moving. The other ~3,767 keep an inflated `top_confidence` (a
+# phantom affil match is worth +0.25, the whole gap between a `full` and an `initial`
+# given-name match) and render a "Dept match" chip in the curator UI that the current
+# matcher knows is wrong -- classified UNCHANGED, never rewritten, wrong forever.
+# `tier_move` cannot see it either: #203 never touches `given_match`, so all 203 of the
+# picks that DO move are `sideways`, reachable only by --include-sideways, which drags
+# in ~1,584 unrelated homonym reshuffles to get at them.
+#
+# So: drift is "any producer-owned column the current matcher would write differently",
+# not "the top pick moved".
+#
+# THE IO TRAP -- the single thing that makes this comparison hard.
+# `io_score`/`final_score`/`io_source` are re-read from live S3 scoring inputs the
+# nightly inst-client keeps refreshing. Issue #182 measured the resulting run-to-run
+# wobble directly: CHANGED = 2,394 vs 2,398 on two runs 50 minutes apart, same code,
+# same queue. Those three fields are stored inside candidate_cwids_json (pubmed lane
+# only -- aar_orchestrator._compact keeps them, aar_universe_scopus._compact has no io
+# layer at all). If they were part of the drift TRIGGER, nearly every pubmed row would
+# drift on every run and the pass would degenerate into rewriting the whole open queue
+# nightly. They are therefore excluded from the comparison below -- but they are still
+# WRITTEN, by aar_reconcile_open._write_payload, whenever a refresh fires for some
+# other reason. Trigger and payload are deliberately different sets.
+#
+# The exclusion is safe because the candidate SET is io-independent by construction:
+# `identity_index.candidates()` sorts by (full, affil_dept_match, confidence) -- all
+# identity-derived -- and applies the top_k cut BEFORE `aar_matcher.match_authorship`
+# re-sorts the survivors by io score. io can therefore reorder the stored candidate
+# list but can never change which 5 people are in it. Two consequences the comparison
+# relies on: candidate_cwids_json is compared as an unordered map keyed by cwid (never
+# positionally -- position IS io-dependent), and the top_* columns are safe to compare
+# field-by-field only because the caller has already established that top_cwid did not
+# move, so they all describe the same person.
+#
+# `years_after_wcm` is identity-derived and deterministic, but is deliberately not a
+# trigger either: it reaches the curator only through `confidence` (identity_index's
+# TEMPORAL_PENALTY block: "the single route by which staleness reaches either sort
+# key"), which IS compared, and through the separate top_years_after_wcm column, which
+# is not one of the 9 columns this reconciliation owns.
+_DRIFT_CAND_FIELDS = ("name", "person_type", "dept", "given_match",
+                      "affil_dept_match", "cohort_size", "confidence")
+
+# VARCHAR widths aar_reconcile_open._write_payload truncates to, so a stored value that
+# was cut to fit is not mistaken for drift. (Asserted consistent with _write_payload's
+# own output by aar_reconcile_open._selftest.)
+_DRIFT_TRUNC = {"top_name": 255, "top_person_type": 64, "top_dept": 255}
+
+# `confidence` is round(..., 3) at the source (identity_index._confidence), and
+# `top_confidence` is a 4-byte FLOAT column, so a stored 0.775 reads back as
+# 0.774999976... Half the 0.001 quantum is therefore both far above float32's ~6e-8
+# error on [0,1] and far below the smallest real change -- it cannot manufacture drift,
+# and cannot hide one.
+_CONF_TOL = 5e-4
+
+
+def _norm_txt(v, n=None):
+    """None and '' are the same absence for drift purposes: refreshing a NULL dept to
+    '' would rewrite a row to no visible effect. Truncated to the column width when one
+    is given, so `_trunc`'s own cut never reads as a difference."""
+    if v is None:
+        return None
+    s = str(v)
+    if n is not None:
+        s = s[:n]
+    return s or None
+
+
+def _norm_flag(v):
+    return None if v is None else int(bool(v))
+
+
+def _conf_ne(a, b):
+    if a is None or b is None:
+        return (a is None) != (b is None)
+    return abs(float(a) - float(b)) > _CONF_TOL
+
+
+def _cand_map(cands):
+    """cwid (case-folded, per the collation trap) -> the identity-derived fields only.
+    Unordered on purpose: candidate ORDER is io-dependent on the pubmed lane."""
+    out = {}
+    for c in cands or []:
+        cw = c.get("cwid")
+        if cw is None:
+            continue
+        out[str(cw).strip().lower()] = {f: c.get(f) for f in _DRIFT_CAND_FIELDS}
+    return out
+
+
+def _cands_drifted(stored_json, cands):
+    stored = stored_json
+    if isinstance(stored, str):
+        try:
+            stored = json.loads(stored) if stored.strip() else []
+        except ValueError:
+            return True            # unparseable stored JSON -- rewriting it is the fix
+    old, new = _cand_map(stored), _cand_map(cands)
+    if set(old) != set(new):
+        return True
+    for cw, o in old.items():
+        n = new[cw]
+        if _conf_ne(o.get("confidence"), n.get("confidence")):
+            return True
+        if _norm_flag(o.get("affil_dept_match")) != _norm_flag(n.get("affil_dept_match")):
+            return True
+        if (o.get("cohort_size") is None) != (n.get("cohort_size") is None) or (
+                o.get("cohort_size") is not None
+                and int(o["cohort_size"]) != int(n["cohort_size"])):
+            return True
+        for f in ("name", "person_type", "dept", "given_match"):
+            if _norm_txt(o.get(f)) != _norm_txt(n.get(f)):
+                return True
+    return False
+
+
+def _drift_cols(r, cands):
+    """Which of the 9 producer-owned columns the CURRENT matcher would write
+    differently from what this row already stores. Returns a sorted list of column
+    names; [] means the stored proposal is still exactly what the producer would emit.
+
+    Only meaningful for a row whose top_cwid did NOT move -- top_cwid is the 9th column
+    and its comparison IS the CHANGED/UNCHANGED split in _row_result, so it is not
+    re-tested here. See the block comment above for what is and is not a trigger."""
+    top = (cands or [None])[0]
+    if top is None:
+        return []
+    out = []
+    for col, new in (("top_name", top.get("name")),
+                     ("top_person_type", top.get("person_type")),
+                     ("top_dept", top.get("dept"))):
+        if _norm_txt(r.get(col), _DRIFT_TRUNC[col]) != _norm_txt(new, _DRIFT_TRUNC[col]):
+            out.append(col)
+    if _norm_txt(r.get("top_given_match")) != _norm_txt(top.get("given_match")):
+        out.append("top_given_match")
+    if _norm_flag(r.get("top_affil_match")) != _norm_flag(top.get("affil_dept_match")):
+        out.append("top_affil_match")
+    if _conf_ne(r.get("top_confidence"), top.get("confidence")):
+        out.append("top_confidence")
+    n_old = r.get("n_candidates")
+    if n_old is None or int(n_old) != len(cands):
+        out.append("n_candidates")
+    if _cands_drifted(r.get("candidate_cwids_json"), cands):
+        out.append("candidate_cwids_json")
+    return sorted(out)
+
+
+def _row_result(r, new_top, source, cands=None):
+    """Common CHANGED/UNCHANGED/NO_MATCH record for either lane.
+
+    `cands` is the FULL ranked candidate list the classification was computed from
+    (#186 -- this is the additive hand-off aar_reconcile_open's REUSE note named as the
+    upgrade path out of its monkeypatch). Passing it adds `rec["drift"]`: the
+    producer-owned columns that are stale even though the top PICK is not. The
+    classification VALUE is deliberately unchanged -- UNCHANGED/CHANGED/NO_MATCH still
+    partition every row exactly once, so this module's own CSV, its buckets and its
+    >50%-UNCHANGED collation sanity check all keep their existing meaning."""
     old_cwid = r["top_cwid"]
     if new_top is None:
         cls = "NO_MATCH"
@@ -152,6 +331,7 @@ def _row_result(r, new_top, source):
         "new_name": new_top["name"] if new_top else None,
         "new_given_match": new_top["given_match"] if new_top else None,
         "new_confidence": round(new_top["confidence"], 3) if new_top else None,
+        "drift": _drift_cols(r, cands) if cls == "UNCHANGED" else [],
     }
     if cls == "CHANGED":
         rec["tier_move"] = _tier_move(r["top_given_match"], new_top["given_match"])
@@ -217,7 +397,7 @@ def _replay_pubmed(rows, idx, io_scorer, limit=None, io_rescore=True):
             cands, _c = idx.candidates(au.get("last"), au.get("fore"), au.get("initials"),
                                        au.get("affiliations"), top_k=5, pub_year=pub_year)
             top = cands[0] if cands else None
-            results.append(_row_result(r, top, "pubmed"))
+            results.append(_row_result(r, top, "pubmed", cands))
         return results, unresolvable
 
     print(f"      identity-only pre-warm pool: {len(pool)} distinct candidate cwids "
@@ -240,7 +420,7 @@ def _replay_pubmed(rows, idx, io_scorer, limit=None, io_rescore=True):
         cands = matcher.match_authorship(au, r["pmid"], idx, io_scorer, top_k=5,
                                          pub_year=pub_year)
         top = cands[0] if cands else None
-        results.append(_row_result(r, top, "pubmed"))
+        results.append(_row_result(r, top, "pubmed", cands))
     return results, unresolvable
 
 
@@ -256,6 +436,31 @@ def _split_byline(wcm_author):
     return " ".join(parts[:-1]), parts[-1]
 
 
+def _scopus_pub_year(r):
+    """The paper's own publication year, recovered from the row itself with no network
+    call: aar_universe_scopus._build_row stores Scopus `prism:coverDate` in `entrez_date`
+    ("Scopus has no entrez date; coverDate ~ recency"), and that lane's own _pub_year()
+    is exactly that date's first four characters.
+
+    Passing it makes the reconstruction agree with the producer on the temporal penalty
+    (issue #159). Without it every candidate who has left WCM comes back unpenalised, so
+    a scopus row whose ONLY staleness is that penalty reconstructs to exactly its stored
+    value, reads as un-drifted, is never live-verified and is missed -- the same
+    undercount-only failure the pre-filter's own disclosed limitation describes, now
+    reaching drift as well as CHANGED.
+
+    It is a completeness fix, not a cost saving, and the measurement says so plainly:
+    over the same 200 open scopus rows on 2026-09-04 the pre-filter flagged 147 rows for
+    live re-verify without the year and 144 with it. The flag rate is high because the
+    lane really is stale (135 of those 144 were confirmed drifted or CHANGED by the live
+    re-fetch), not because the reconstruction is guessing badly."""
+    d = r.get("entrez_date")
+    if d is None:
+        return None
+    s = str(d)
+    return int(s[:4]) if s[:4].isdigit() else None
+
+
 def _replay_scopus(rows, idx, limit=None):
     rows = rows[:limit] if limit else rows
     family = scop.load_family_afids()
@@ -265,13 +470,25 @@ def _replay_scopus(rows, idx, limit=None):
     for r in rows:
         fore, last = _split_byline(r["wcm_author"])
         affils = [a for a in (r["author_affiliation"] or "").split(" | ") if a]
-        cands, _cohort = idx.candidates(last, fore, None, affils, top_k=5)
+        cands, _cohort = idx.candidates(last, fore, None, affils, top_k=5,
+                                        pub_year=_scopus_pub_year(r))
         top = cands[0] if cands else None
-        rec = _row_result(r, top, "scopus")
+        rec = _row_result(r, top, "scopus", cands)
         prelim.append((r, rec))
 
-    need_verify = [(r, rec) for r, rec in prelim if rec["classification"] != "UNCHANGED"]
-    kept_unverified = [rec for r, rec in prelim if rec["classification"] == "UNCHANGED"]
+    # `or rec["drift"]` (#186): the reconstruction pass feeds idx.candidates() a byline
+    # split (initials=None) and NO pub_year, so its `confidence` carries no temporal
+    # penalty and its given_match tier can be weaker than the producer's -- a
+    # reconstruction is good enough to FLAG a row but never good enough to write one.
+    # Routing drift suspects through the same live re-fetch CHANGED/NO_MATCH already
+    # get keeps the standing guarantee that no scopus row is ever written from a
+    # reconstruction; the second _row_result call on the live candidates is what
+    # actually decides. Over-inclusive here is free (a wasted verify), under-inclusive
+    # is a permanently stale row, so this filter is the cheap side of the trade.
+    need_verify = [(r, rec) for r, rec in prelim
+                   if rec["classification"] != "UNCHANGED" or rec["drift"]]
+    kept_unverified = [rec for r, rec in prelim
+                       if rec["classification"] == "UNCHANGED" and not rec["drift"]]
     print(f"      reconstruction pre-filter: {len(kept_unverified)} preliminary UNCHANGED "
           f"(not live-verified, same disclosed limitation as aar_sweep_stale.py's "
           f"'matched' bucket) / {len(need_verify)} flagged for live Scopus re-verify",
@@ -301,7 +518,7 @@ def _replay_scopus(rows, idx, limit=None):
                                                 hit["affiliations"], top_k=5,
                                                 pub_year=scop._pub_year(entry))
                 top = cands[0] if cands else None
-                results.append(_row_result(r, top, "scopus"))
+                results.append(_row_result(r, top, "scopus", cands))
         except Exception as e:                          # noqa: BLE001
             print(f"      [{i}/{len(need_verify)}] ERROR {query} (id={r['id']}): {e}",
                   flush=True)

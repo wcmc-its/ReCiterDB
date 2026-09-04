@@ -244,6 +244,79 @@ def run_aar_close_attributed():
         logger.exception(f"AAR closer failed (ignored — reporting unaffected): {e}")
 
 
+# ------------- AAR producer-column drift reconciliation (env-gated, isolated) ---------
+def run_aar_reconcile_drift_if_due():
+    """Keep every OPEN row's stored proposal equal to what the producer would write for
+    that authorship today (ReCiterDB #186, option 2).
+
+    The producer writes a row's proposal once and can never revise it, so each matcher
+    tightening strands its predecessors' suggestions and has needed a bespoke one-shot
+    sweep -- #177, #181, #182, and now #203, whose own replay measured 3,970 rows seeing
+    a candidate change against only 203 top picks moving. This step retires that pattern
+    for the class where it is safe to do so unattended.
+
+    --drift-only, deliberately: it queues ONLY rows whose top_cwid is unchanged and whose
+    stored EVIDENCE columns are stale. No row's proposed PERSON is ever changed on this
+    path -- stronger/sideways tier moves and the weaker hard-exclusion stay exactly where
+    they were, manual and hand-reviewed. Curator-touched rows are untouched (the UPDATE
+    re-checks status='open'), and one JSONL ledger is written per run.
+
+    --lane pubmed, on cost: the pubmed replay is a batched efetch plus a threaded
+    identity-only warm-up, ~15 minutes for the whole open queue. The scopus lane needs a
+    live Scopus GET for every flagged row, and drift flags most of them -- 3,591 of 4,926
+    open rows on 2026-09-04, measured at ~6s each, about six hours. That does not belong
+    in a job that already runs 2.5 hours, and it shares a rate-limited API key with the
+    Sunday Scopus lane. Reconcile the scopus lane by hand instead:
+    `aar_reconcile_open.py --drift-only --lane scopus`, out of hours.
+
+    SHIPS OFF (AAR_DRIFT_CADENCE unset or "off"), and this is the point of the env var,
+    not an afterthought. The class is safe per row but the BACKLOG is not small: the
+    2026-09-04 dry run measured DRIFT_ONLY at ~60% of the open queue, because nothing has
+    ever reconciled it against #159 (temporal penalty), #171/#173/#174, #185, #201 or
+    #203. Turning this on for the first time is a one-off catch-up of thousands of rows
+    and wants a human reading the ledger, not a Sunday cron discovering it. Sequence:
+    run `aar_reconcile_open.py --drift-only` as a dry run, read the ledger, run it with
+    --apply, then patch the CronJob env to AAR_DRIFT_CADENCE=weekly so the far smaller
+    steady-state trickle is picked up automatically. "weekly" (Sundays) or "daily" both
+    work; weekly is the intended setting -- this is the full CLASS-B replay (an efetch of
+    every open pubmed row's article, an identity-only S3 warm-up, and a live Scopus
+    re-verify for flagged rows), where the closer next door is a couple of SQL/DynamoDB
+    batch reads, and a drifted row shows a curator a stale confidence or an obsolete dept
+    chip, never the wrong person. An env patch on the live CronJob survives deploys
+    (k8-buildspec only does `kubectl set image`), same escape hatch as
+    AAR_PUBMED_LANE_CADENCE.
+
+    Same isolation contract as the lanes: gated on cadence, on DB creds and on
+    PUBMED_API_KEY (the replay re-fetches every open pubmed row's article), wrapped so a
+    failure is logged and can NEVER fail the nightly reporting rebuild."""
+    try:
+        import datetime as _datetime
+        cadence = (os.getenv("AAR_DRIFT_CADENCE") or "off").strip().lower()
+        if cadence not in ("daily", "weekly"):
+            logger.info("AAR drift reconciliation: AAR_DRIFT_CADENCE=%s — skipped (set "
+                        "it to weekly once the one-off catch-up pass has been applied "
+                        "and its ledger read; see #186)", cadence)
+            return
+        if cadence == "weekly" and _datetime.datetime.utcnow().weekday() != 6:  # 6 = Sunday
+            logger.info("AAR drift reconciliation: not due (cadence=weekly, Sundays only) — skipped")
+            return
+        if not (os.getenv("DB_HOST") and os.getenv("DB_NAME")
+                and os.getenv("DB_USERNAME") and os.getenv("DB_PASSWORD")):
+            logger.warning("AAR drift reconciliation: DB_HOST/DB_NAME/DB_USERNAME/"
+                           "DB_PASSWORD unset — skipped")
+            return
+        if not os.getenv("PUBMED_API_KEY"):
+            logger.warning("AAR drift reconciliation: PUBMED_API_KEY unset (the replay "
+                           "re-fetches every open pubmed row's article) — skipped")
+            return
+        run_script("aarReconcileDrift",
+                   "python3 aar_reconcile_open.py --apply --drift-only --lane pubmed",
+                   timeout_seconds=int(os.getenv("AAR_DRIFT_TIMEOUT_SECONDS", "3600")))
+    except Exception as e:
+        logger.exception(f"AAR drift reconciliation failed (ignored — reporting "
+                         f"unaffected): {e}")
+
+
 # ------------- Main Flow -------------
 def main():
     scripts = [
@@ -278,6 +351,9 @@ def main():
         run_pubmed_lane_if_due()              # weekly (Sun): AAR PubMed lane
         run_conflicts_refresh_if_due()        # weekly (Sun): refill empty COI rows (#130)
         run_aar_close_attributed()            # nightly: dismiss already-attributed open AAR rows (#186)
+        run_aar_reconcile_drift_if_due()      # OFF unless AAR_DRIFT_CADENCE is set: refresh open AAR
+                                              # rows whose stored evidence columns no longer match
+                                              # what the matcher would write (#186)
 
     upload_log_to_s3()
 
