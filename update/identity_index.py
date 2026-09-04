@@ -111,6 +111,67 @@ def _byline_first_name(fore):
     return ""
 
 
+# ---- affiliation text ------------------------------------------------------
+# The institution's own name is NOT a department. `_norm("Weill Cornell Medicine")` is
+# "weillcornellmedicine", which CONTAINS "medicine", so under the old substring test
+# every WCM affiliation self-matched a department called "Medicine" -- and naming Weill
+# Cornell is this queue's entry condition, so it fired almost everywhere: 4,545
+# identities carry department "Medicine" and 96 carry "Weill Cornell Medicine" itself.
+# Division was looser still, matching on any single >=5-char word: Emergency Medicine
+# (287 people), General Internal Medicine (1,233), Geriatrics and Palliative Medicine,
+# the Englander Institute for Precision Medicine, and Cornell Medical Practice (7, via
+# the word "Cornell") all self-matched a BARE WCM affiliation naming no division at all.
+#
+# These phrases are removed from the affiliation before any dept/division test. The
+# asymmetry is the point: "Weill Cornell Medicine, New York" must stop naming the
+# Department of Medicine, while "Department of Medicine, Weill Cornell Medicine" must
+# still name it. Edit this list freely -- it is re-sorted longest-first below, so a
+# short phrase can never eat part of a longer one ("weill cornell" must not strip
+# "Weill Cornell Medicine" down to a bare, self-matching "medicine").
+INSTITUTION_PHRASES = (
+    "Weill Cornell Medicine",
+    "Weill Cornell Medical College",
+    "Weill Cornell Medical Center",
+    "Weill Medical College of Cornell University",
+    "Weill Cornell Graduate School of Medical Sciences",
+    "NewYork-Presbyterian/Weill Cornell Medical Center",
+    "Cornell University",
+    "Weill Cornell",
+)
+
+
+def _affil_words(s):
+    """One affiliation string -> normalised word tokens.
+
+    Splits on EVERY non-word character, deliberately NOT `name_tokens()`: that helper's
+    split class is name-shaped (whitespace, comma, period, hyphen) and would fuse the
+    slashes, semicolons and parentheses affiliation text is full of into single tokens
+    ('Presbyterian/Weill' -> one word, which then matches no phrase and no department)."""
+    return tuple(t for t in (_norm(w) for w in re.split(r"[\W_]+", str(s))) if t)
+
+
+_INSTITUTION_TOKENS = sorted((_affil_words(p) for p in INSTITUTION_PHRASES),
+                             key=len, reverse=True)
+
+
+def _affil_tokens(affiliations):
+    """Affiliation strings -> one normalised token sequence with the institution's own
+    name removed. Tokens, not a concatenated blob, so `_affil_match` can test on word
+    boundaries: the old blob also matched a division word INSIDE another word --
+    "Vascular" inside "cardiovascular" (live rows 30303/78915, below)."""
+    toks = tuple(t for a in (affiliations or []) if a for t in _affil_words(a))
+    for phrase in _INSTITUTION_TOKENS:
+        n, i, out = len(phrase), 0, []
+        while i < len(toks):
+            if toks[i:i + n] == phrase:
+                i += n
+            else:
+                out.append(toks[i])
+                i += 1
+        toks = tuple(out)
+    return toks
+
+
 # ---- temporal plausibility -------------------------------------------------
 # A paper carrying a WCM affiliation was written by someone who WAS at WCM when it
 # was published, so a candidate whose appointment ended long before the paper is
@@ -277,7 +338,7 @@ class IdentityIndex:
         # affiliation key displacing the correct pick), while this restricted form
         # flipped zero in both measurement methodologies.
         author_first = _byline_first_name(fore)
-        affil_blob = " ".join(_norm(a) for a in (affiliations or []))
+        affil_toks = _affil_tokens(affiliations)
 
         cohort = []
         for rec in pool:
@@ -373,7 +434,7 @@ class IdentityIndex:
         cohort_size = len(cohort)
         out = []
         for rec, given_match in cohort:
-            affil_match, where = self._affil_match(rec, affil_blob)
+            affil_match, where = self._affil_match(rec, affil_toks)
             gap = (pub_year - rec["end_year"]) if (pub_year and rec["end_year"]) else None
             penalty = temporal_penalty(gap)
             out.append({
@@ -393,17 +454,46 @@ class IdentityIndex:
         return out[:top_k], cohort_size
 
     @staticmethod
-    def _affil_match(rec, affil_blob):
-        """Does the affiliation text name the candidate's dept or division?"""
-        if not affil_blob:
+    def _affil_match(rec, affil_toks):
+        """Does the affiliation text name the candidate's dept or division? `affil_toks`
+        comes from `_affil_tokens`, so the institution's own name is already gone.
+
+        Worth +0.25 confidence -- the same size as the WHOLE gap between a `full` and an
+        `initial` given-name match (0.50 vs 0.25), so one phantom affiliation match
+        exactly cancels one real full-name match. That is why this tests WORD BOUNDARIES
+        rather than substrings: a department must appear as consecutive affiliation
+        tokens ("Internal Medicine" needs both words, adjacent, in order) and a division
+        word must EQUAL a token. The old substring test matched a division word inside
+        another word -- live rows 30303/78915, byline "Rayaz A Malik", affiliation
+        "Weill Cornell Medicine-Qatar, Doha, Qatar; Division of Cardiovascular Sciences,
+        University of Manchester, UK.", where ram2045 (dept "Medicine") scored a phantom
+        off the institution name and ram9022 (division "Vascular and Endovascular
+        Surgery") scored one off "Vascular" inside "cardiovascular". Both reached 0.700
+        and tied; the curator resolved both rows to ram2045. Fixing only the institution
+        half makes those rows WORSE -- ram2045 loses its phantom while ram9022 keeps
+        one, flipping the row to the wrong Malik -- so the two halves ship together.
+        Measured that way: an institution-strip-only variant scored 18 fixes / 3 breaks
+        against curator resolutions, and adding word boundaries took it to 18 / 1.
+
+        Replayed over all 30,711 authorship_review rows / 64,972 candidate entries on
+        prod with the post-#201 ranking keys: affiliation matches fall 16,945 -> 11,240,
+        3,970 rows see a candidate change, 203 top picks move, and of the 24 that are
+        curator-resolved this is 18 fixes, 1 break, 5 neutral. Matches CREATED: 0. That
+        zero is the safety argument -- narrowing a match test can only ever REMOVE a
+        match, so this cannot manufacture a new false positive anywhere."""
+        if not affil_toks:
             return False, None
         dept_n = _norm(rec["dept"])
-        if dept_n and len(dept_n) >= 4 and dept_n in affil_blob:
+        dept_toks = name_tokens(rec["dept"])
+        n = len(dept_toks)
+        if dept_n and len(dept_n) >= 4 and n and any(
+                affil_toks[i:i + n] == dept_toks
+                for i in range(len(affil_toks) - n + 1)):
             return True, "dept"
-        # division: any distinctive word (>=5 chars) present in the affiliation
+        # division: any distinctive word (>=5 chars) standing as a whole token
         for word in (rec["division"] or "").replace("&", " ").replace(",", " ").split():
             w = _norm(word)
-            if len(w) >= 5 and w in affil_blob:
+            if len(w) >= 5 and w in affil_toks:
                 return True, "division"
         return False, None
 
@@ -766,6 +856,79 @@ def _selftest():
         ("temporal_penalty: 0 through the grace, then monotone up to the cap",
          [temporal_penalty(g) for g in (None, -20, 0, 5, 6, 10, 20, 70)]
          == [0.0, 0.0, 0.0, 0.0, 0.01, 0.05, 0.15, 0.15]),
+    ]
+
+    # --- affiliation match is word-boundary, institution name removed ---------
+    # An affiliation match is worth +0.25, the whole gap between `full` and `initial`,
+    # so a phantom one exactly cancels a real full-name match. Two false-positive
+    # families, both measured live and both fixed here.
+    bare_wcm = ["Weill Cornell Medicine, New York, NY, USA."]
+    dept_med = IdentityIndex([dict(rec("John", "", "Doe", cwid="med1"), dept="Medicine")])
+    checks += [
+        ("FAMILY 1: a bare 'Weill Cornell Medicine' affiliation no longer names the "
+         "Department of Medicine (4,545 identities carry that department)",
+         dept_med.candidates("Doe", "John", "J", bare_wcm)[0][0]["affil_dept_match"]
+         is False),
+        ("...and the strip is order-safe -- 'Weill Cornell' must not shorten the same "
+         "text to a bare, self-matching 'Medicine'",
+         _affil_tokens(bare_wcm) == ("new", "york", "ny", "usa")),
+        ("...while 'Department of Medicine, Weill Cornell Medicine' still DOES name it "
+         "-- the asymmetry is the point",
+         dept_med.candidates("Doe", "John", "J",
+                             ["Department of Medicine, Weill Cornell Medicine, New York"]
+                             )[0][0]["affil_match_on"] == "dept"),
+    ]
+
+    # The anchor pair: live rows 30303 and 78915, byline "Rayaz A Malik", both resolved
+    # by the curator to ram2045. Each Malik used to collect a phantom off a different
+    # family and the two tied at 0.700. Fixing family 1 ALONE makes these rows worse --
+    # ram2045 loses his phantom while ram9022 keeps one, flipping the row to the wrong
+    # Malik -- which is why both families ship together.
+    malik_affil = ["Weill Cornell Medicine-Qatar, Doha, Qatar; Division of "
+                   "Cardiovascular Sciences, University of Manchester, UK."]
+    maliks = IdentityIndex([
+        dict(rec("Rayaz", "Ahmed", "Malik", cwid="ram2045"), dept="Medicine"),
+        dict(rec("Rajesh", "K", "Malik", cwid="ram9022"),
+             division="Vascular and Endovascular Surgery"),
+    ])
+    mal, _ = maliks.candidates("Malik", "Rayaz A", "RA", malik_affil)
+    by_malik = {c["cwid"]: c for c in mal}
+    checks += [
+        ("both Maliks are still candidates -- this narrows the affiliation test, it "
+         "does not drop anyone from the cohort", set(by_malik) == {"ram2045", "ram9022"}),
+        ("ram2045's dept 'Medicine' no longer matches off the institution name (rows "
+         "30303/78915)", by_malik["ram2045"]["affil_dept_match"] is False),
+        ("FAMILY 2: ram9022's division word 'Vascular' no longer matches INSIDE "
+         "'cardiovascular'", by_malik["ram9022"]["affil_dept_match"] is False),
+        ("...so neither phantom survives and the +0.25 separates neither of them",
+         all(c["affil_dept_match"] is False for c in mal)),
+    ]
+
+    # Positive controls: the narrowing must not cost a genuine match.
+    vasc = IdentityIndex([dict(rec("Ann", "", "Roe", cwid="v1"),
+                               division="Vascular and Endovascular Surgery")])
+    internal = IdentityIndex([dict(rec("Ann", "", "Roe", cwid="i1"),
+                                   dept="Internal Medicine")])
+    cmp_div = IdentityIndex([dict(rec("Ann", "", "Roe", cwid="c1"),
+                                  division="Cornell Medical Practice")])
+    checks += [
+        ("a division word standing as a whole token still matches",
+         vasc.candidates("Roe", "Ann", "A",
+                         ["Division of Vascular Surgery, Weill Cornell Medicine"]
+                         )[0][0]["affil_match_on"] == "division"),
+        ("a multi-word department still matches when its words are consecutive and in "
+         "order", internal.candidates("Roe", "Ann", "A",
+                                      ["Department of Internal Medicine, Weill Cornell "
+                                       "Medicine"])[0][0]["affil_match_on"] == "dept"),
+        ("...but 'Internal Medicine' does NOT match an affiliation naming only "
+         "'Medicine' -- consecutive means both words",
+         internal.candidates("Roe", "Ann", "A",
+                             ["Department of Medicine, Weill Cornell Medicine"]
+                             )[0][0]["affil_dept_match"] is False),
+        ("division 'Cornell Medical Practice' no longer self-matches a bare WCM "
+         "affiliation through the word 'Cornell' (7 people)",
+         cmp_div.candidates("Roe", "Ann", "A", bare_wcm)[0][0]["affil_dept_match"]
+         is False),
     ]
 
     ok = True
