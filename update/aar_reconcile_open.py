@@ -56,14 +56,17 @@ RANKING DECISION -- io-rescored (default) vs --no-io-rescore
   aar_sweep_stale.py's own re-fetch-from-PubMed step, or the producer's nightly run
   itself) -- it is not evidence the write is wrong.
 
-  This also fully explains, and contains, the "weaker" bucket: match_authorship's
-  pre-existing "any io_score beats no score" tie-break (aar_matcher.py:158-160, unrelated
-  to #171/#173/#174) is real production ranking behaviour, not a bug this tool should
-  paper over by picking the other ranking -- but it is also not evidence the identity
-  fixes did anything wrong, and applying a weaker move would demote a good pick on that
-  artifact. So: use the real ranking (io-rescored), but hard-exclude "weaker" from the
-  write set regardless of flags, and show the excluded count so it's never silently
-  dropped. --no-io-rescore stays available as a read-only diagnostic on the sibling
+  This also fully explains, and contains, the "weaker" bucket: match_authorship USED TO
+  lead its sort key with the identity-only score, so "any io_score beats no score"
+  however small (unrelated to #171/#173/#174) -- real production ranking behaviour, not
+  a bug this tool should paper over by picking the other ranking, but not evidence the
+  identity fixes did anything wrong either, and applying a weaker move would demote a
+  good pick on that artifact. So: use the real ranking (io-rescored), but hard-exclude
+  "weaker" from the write set regardless of flags, and show the excluded count so it's
+  never silently dropped. That key now leads with the given-name tier, so the io layer
+  can no longer manufacture a weaker move at all and the bucket should come back empty;
+  the hard-exclusion stays as the guard it always was, and a weaker move that DOES turn
+  up now means the identity data itself moved, which is worth reading before applying. --no-io-rescore stays available as a read-only diagnostic on the sibling
   aar_report_changed_picks.py (its `--no-io-rescore --check <ids>`) -- this file does
   not expose that flag itself, and never wires it to --apply.
 

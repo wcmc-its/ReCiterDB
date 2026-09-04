@@ -161,23 +161,28 @@ def _row_result(r, new_top, source):
 # ---- pubmed lane -------------------------------------------------------------
 def _replay_pubmed(rows, idx, io_scorer, limit=None, io_rescore=True):
     """io_rescore=True (default) is what aar_orchestrator._db_rows would ACTUALLY write
-    if this pmid were reprocessed today -- aar_matcher.match_authorship()'s real ranking,
-    identity-only score first. io_rescore=False reports the identity_index.py ranking
-    alone (given-name tier first, exactly what the scopus lane already does with no IO
-    layer at all), which isolates PRs #172/#173/#174's own effect from a confound this
-    script's own measurement surfaced: match_authorship's tie-break ("any io_score beats
-    no io_score", however small) means a candidate ReCiter's ORDINARY, unrelated ongoing
-    retrieval has since scored -- even at 1-3/100, essentially "not this person" -- now
-    outranks a full given-name match nobody has retrieved yet. That is real production
-    behavior, not a bug, but it is pure elapsed-time churn, unconnected to this task's
-    three PRs, and it is the ENTIRE explanation for every "weaker" tier-move this script
-    finds with io_rescore=True. Measured 2026-08-31 (see the run note this function's
-    caller prints): with the rescore, pubmed CHANGED=2394 including 67 weaker; with it
-    turned off, pubmed CHANGED=3320, stronger=620, sideways=2700, weaker=0 -- exactly
-    zero, on every one of the 12,292 open rows. The identity-index ranking itself (given
-    name tier before confidence) can literally never produce a weaker-tier top pick;
-    only the io-rescore's null-vs-any-score tie-break can, and only via candidates
-    neither #172 nor #173 nor #174 touches."""
+    if this pmid were reprocessed today -- aar_matcher.match_authorship()'s real ranking.
+    io_rescore=False reports the identity_index.py ranking alone (no IO layer at all,
+    exactly what the scopus lane does), which isolates a set of identity PRs from
+    elapsed-time churn in ReCiter's ongoing retrieval.
+
+    HISTORICAL, and the reason the "weaker" bucket below exists at all: match_authorship
+    used to LEAD its key with the identity-only score, so "any io_score beats no
+    io_score" however small -- a candidate ReCiter's ordinary, unrelated ongoing
+    retrieval had since scored, even at 1-3/100 ("not this person"), outranked a full
+    given-name match nobody had retrieved yet. Measured 2026-08-31 (see the run note this
+    function's caller prints): with the rescore, pubmed CHANGED=2394 including 67 weaker;
+    with it turned off, pubmed CHANGED=3320, stronger=620, sideways=2700, weaker=0 --
+    exactly zero, on every one of the 12,292 open rows. That tie-break was the ENTIRE
+    explanation for every weaker tier-move.
+
+    That key now leads with the given-name tier instead (see aar_matcher.match_authorship
+    -- 76 curator-resolved rows fixed, 1 broken, over 19,050 replayed pubmed rows), so
+    NEITHER ranking can produce a weaker-tier top pick from the io layer any more, and
+    the two modes should differ only in which candidate wins WITHIN a tier. A weaker move
+    surviving this replay now means the underlying identity data itself changed, not a
+    tie-break artifact -- worth looking at rather than assuming, though the callers'
+    hard-exclusion of weaker moves stays correct either way."""
     rows = rows[:limit] if limit else rows
     pmids = sorted({r["pmid"] for r in rows if r["pmid"]})
     print(f"      distinct pmids to re-fetch: {len(pmids)}", flush=True)

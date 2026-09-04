@@ -138,6 +138,12 @@ def _byline_first_name(fore):
 # gap is ALSO published per row as `authorship_review.top_years_after_wcm` — a queryable
 # column reaches the stale rows whose cohort is one person, where re-ranking is a no-op.
 #
+# `given_match == "full"` now LEADS both keys (`match_authorship` was reordered to agree
+# with this file's key; see its docstring). That is the same magnitude argument used the
+# other way round and it is deliberate: `full` is a BOOLEAN, so there is no magnitude to
+# ignore, and a byline spelling the person's name out is stronger evidence than any
+# ordering aid computed downstream of it. The penalty is unaffected — it still reaches
+# ranking only through `confidence`, which is still LAST in both keys.
 # Rate and cap measured against the live queue on 2026-08-28 (47,673 candidate entries
 # on open rows, 11,279 of them past the grace, median gap 13y, widest 70y). The cap
 # exists because an uncapped 0.05/yr pinned 1,065 of 2,771 stale top candidates at
@@ -322,6 +328,27 @@ class IdentityIndex:
             # scored 26% curator precision there against givenName's 92%; adding a second
             # loose source now would rebuild exactly what that change tore out.
             # ponytail: full tier only. Widen to initials only if a precision run says so.
+            #
+            # A byline that prints the person's WHOLE legal name -- given plus middle,
+            # the ordinary Hispanic/Filipino compound shape -- matches neither field on
+            # its own: _norm("Eileen Ruth Samson") is "eileenruthsamson" against
+            # givenName "eileenruth" and middleName "samson". Live anchor:
+            # authorship_review 3043, pmid 39629475, first-author byline "Eileen Ruth
+            # Samson Torres". est4003 stalled at `initial` and stored confidence 0.35 --
+            # 0.25 initial + 0.40/2 cohort - 0.10 inactive, "Low match" in the curator UI
+            # -- while an unrelated Torres held top_cwid.
+            #
+            # The two WHOLE normalised fields concatenated, exactly as tight as its
+            # neighbours: no tokenising, for the measured reasons above. Unlike every
+            # other widening tried on this tier, it CANNOT widen the pool.
+            # author_given == given_norm + middle_norm implies author_given STARTS WITH
+            # given_norm, so the byline's first initial always already matched and the
+            # candidate was already in the cohort at `initial`. The clause can only
+            # promote a tier; it can never admit somebody the `continue` below excludes.
+            # Replayed over all 19,050 recoverable pubmed rows it promoted 216 candidates
+            # on 216 rows, moved 7 top picks and disturbed ZERO curator-resolved rows.
+            # Guarded on a non-empty middleName: with an empty one the concatenation is
+            # just given_norm, the test beside it.
             if author_given and (rec.get("pref_norm") == author_given
                                  or (author_first
                                      and author_first == rec.get("pref_norm"))):
@@ -329,6 +356,9 @@ class IdentityIndex:
             elif author_init and (rec["given_norm"] or middle_norm):
                 if author_given and (author_given == rec["given_norm"]
                                      or author_given == middle_norm
+                                     or (middle_norm
+                                         and author_given
+                                         == rec["given_norm"] + middle_norm)
                                      or (author_first
                                          and author_first == rec["given_norm"])):
                     given_match = "full"
@@ -495,6 +525,54 @@ def _selftest():
         ("...and leads the ranking", greg and greg[0]["cwid"] == "gwf2001"),
         ("a non-matching first name is still excluded ('Brett' vs author initial 'g')",
          "brf9036" not in by_fischer and greg_cohort == 1),
+    ]
+
+    # --- byline spelling givenName + middleName out reaches the full tier ----
+    # Live anchor: authorship_review 3043, pmid 39629475, first-author byline "Eileen
+    # Ruth Samson Torres". est4003 is givenName "Eileen Ruth" + middleName "Samson", so
+    # _norm of the byline forename ("eileenruthsamson") equals neither field alone and
+    # the row stalled at `initial`, confidence 0.35 -- "Low match" in the curator UI --
+    # while eft4002 ("Emily Fujika Torres"), who shares only the initial, held top_cwid.
+    torres = IdentityIndex([
+        rec("Eileen Ruth", "Samson", "Torres", cwid="est4003"),
+        rec("Emily", "Fujika", "Torres", cwid="eft4002"),
+    ])
+    torr, torr_cohort = torres.candidates("Torres", "Eileen Ruth Samson", "ERS")
+    by_torres = {c["cwid"]: c for c in torr}
+    checks += [
+        ("byline 'Eileen Ruth Samson' reaches givenName+middleName at given_match=full "
+         "(pmid 39629475)", by_torres.get("est4003", {}).get("given_match") == "full"),
+        ("...and leads the ranking over the rival Torres",
+         torr and torr[0]["cwid"] == "est4003"),
+        ("the rival, who shares only the byline's INITIAL, stays at `initial` -- the "
+         "concatenation promotes a tier, it does not hand one out",
+         by_torres.get("eft4002", {}).get("given_match") == "initial"
+         and torr_cohort == 2),
+    ]
+
+    # NON-WIDENING. Matching given_norm + middle_norm means the byline forename starts
+    # with given_norm, so its first initial matched too and the candidate was already in
+    # the cohort at `initial`. The clause promotes; it never admits. A byline naming the
+    # same two words in the OTHER order shares neither the concatenation nor the initial
+    # and must still be excluded outright, exactly as before.
+    ngs = IdentityIndex([rec("Bao", "Ling", "Ng", cwid="bal9001")])
+    checks.append(("given+middle concatenation does not widen the pool: 'Ling Bao' vs "
+                   "Bao Ling Ng is still excluded (wrong order, wrong initial)",
+                   ngs.candidates("Ng", "Ling Bao", "LB") == ([], 0)))
+
+    # An EMPTY middleName leaves the clause inert -- given_norm + "" is given_norm, the
+    # test beside it -- so nothing about a middle-less identity changes. The 'John Q P' /
+    # 'John Quincy' Adams pair above is the live proof and must keep passing verbatim;
+    # assert the degenerate shape outright too, so a future edit cannot quietly turn the
+    # concatenation into a prefix test.
+    empties = IdentityIndex([rec("John", "", "Adams", cwid="jqa2")])
+    checks += [
+        ("empty middleName: an exact given name is still full",
+         empties.candidates("Adams", "John", "J")[0][0]["given_match"] == "full"),
+        ("empty middleName: a LONGER byline forename is not promoted by the "
+         "concatenation ('Johnquincy' vs 'John' + '')",
+         empties.candidates("Adams", "Johnquincy", "J")[0][0]["given_match"]
+         == "initial"),
     ]
 
     # The byline's first token must NEVER be tested against middleName -- that is the
