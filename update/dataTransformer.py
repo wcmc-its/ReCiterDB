@@ -15,7 +15,12 @@ def log_error(person_identifier, error_message):
 
 def sanitize_field(value):
     """Sanitize field by handling special characters for CSV."""
-    if value is None or value == 'NULL' or (isinstance(value, str) and value.strip() == ''):
+    # ReCiterDB #197: the upstream JSON stringifies absent values inconsistently --
+    # 'NULL' from some paths, lowercase 'null' from others (Java/Jackson). Match any
+    # casing. Deliberately NOT swept: 'N/A', 'none', '-', and real corpus values like
+    # 'Suppl', 'Spec No', 'IX', 'PP', 'IV', 'XXIX', 'DECIPHeR' -- a looser rule eats
+    # legitimate volume/issue/pages data. See update/test_sanitize_field.py.
+    if value is None or (isinstance(value, str) and value.strip().upper() in ('', 'NULL')):
         return ''  # Blank for null or empty fields
     # Convert non-string values to strings
     value = str(value)
