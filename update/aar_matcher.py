@@ -19,9 +19,10 @@ Pipeline per authorship:
      input via the Step-0 engine. Candidates ReCiter retrieved-but-buried get a real
      score; never-retrieved / cold-storage ones fall back to matcher confidence.
 
-Ranking key per candidate: (identity-only score desc, full>initial given match,
-confidence desc). The orchestrator (next step) calls `match_authorship()` for each
-WCM authorship on each orphan article and writes the ranked candidates to the ledger.
+Ranking key per candidate: (full>initial given match, identity-only score desc,
+confidence desc) — the same order `identity_index.candidates()` already uses, which this
+module used to contradict. The orchestrator (next step) calls `match_authorship()` for
+each WCM authorship on each orphan article and writes the ranked candidates to the ledger.
 
 Temporal plausibility (issue #159) reaches that key ONLY through `confidence`. A
 WCM-affiliated paper was written by someone who was at WCM when it was published, so a
@@ -140,12 +141,26 @@ def match_authorship(author, pmid, idx, io_scorer, top_k=5, pub_year=None):
     ranking). Returns the ranked candidate list; each candidate gains:
       io_score  (float 0-100 | None)   ReCiter identity-only score for this pmid
       io_source ("retrieved" | "not_retrieved")
-    Ranking: identity-only score desc (nulls last) -> full given match -> confidence.
+    Ranking: full given match -> identity-only score desc (nulls last) -> confidence.
+
+    The given-name tier LEADS, as it already does in `identity_index.candidates()` three
+    lines away. Leading with the io score instead meant any non-null score outranked a
+    null one however small, so a byline naming one person outright lost to a rival scored
+    0.62 out of 100 — the model saying "not this person" — purely because ReCiter had
+    never retrieved the pmid for the right one. Live anchor: authorship_review 3043, pmid
+    39629475, byline "Eileen Ruth Samson Torres", where eft4002 ("Emily Fujika Torres",
+    io 0.62) took top_cwid from est4003 (io None). Measured by replaying all 19,050
+    recoverable pubmed rows: 528 top picks move, 76 curator-resolved rows are fixed and
+    1 breaks (row 70284, pmid 42270866, byline "April Chiu" — awc9002 and aechiu both
+    reach `full`, so dropping io as the lead term leaves confidence to break a genuine
+    homonym tie and it breaks it the other way). A real cost, taken for the 76.
+
     The temporal penalty is inside `confidence` (issue #159) and is deliberately NOT a
     term of its own: leading the key with it would let a one-year-past-grace gap
     outrank a 50-point identity-only score, and would sink the penalised candidate out
-    of `candidates()`'s top_k altogether. So on this lane it moves the top pick only
-    among candidates otherwise tied — in practice the ones production never scored."""
+    of `candidates()`'s top_k altogether. `confidence` therefore keeps its LAST position
+    here, unchanged by the reorder above. So on this lane the penalty moves the top pick
+    only among candidates otherwise tied — in practice the ones production never scored."""
     cands, cohort = idx.candidates(
         author.get("last"), author.get("fore"), author.get("initials"),
         author.get("affiliations"), top_k=top_k, pub_year=pub_year)
@@ -155,8 +170,9 @@ def match_authorship(author, pmid, idx, io_scorer, top_k=5, pub_year=None):
         c["final_score"] = round(v[1], 2) if v else None   # production final (>=30 == suggested)
         c["io_source"] = "retrieved" if v else "not_retrieved"
     cands.sort(key=lambda d: (
+        d["given_match"] == "full",
         d["io_score"] if d["io_score"] is not None else -1.0,
-        d["given_match"] == "full", d["confidence"]), reverse=True)
+        d["confidence"]), reverse=True)
     return cands
 
 
@@ -180,7 +196,11 @@ def _rank_selftest():
     """Offline (no DB, no S3): the temporal penalty rides inside `confidence` and must
     stay BEHIND the identity-only score and the given-name match in this module's
     re-sort (issue #159). Two Lees who both match "K Lee", plus the live Weiss row that
-    a penalty-leading sort key got wrong."""
+    a penalty-leading sort key got wrong — and the Torres row that an io-leading one did.
+
+    All three Lee/Weiss cases below tie on `given_match`, so promoting the tier to the
+    front of the key leaves every one of them decided exactly as before; that is the
+    point of the Torres and same-tier cases that follow them."""
     def rec(given, surname, end_year, cwid):
         return {"cwid": cwid, "given": given, "middle": "", "surname": surname,
                 "given_norm": _norm(given), "surname_norm": _norm(surname),
@@ -226,6 +246,42 @@ def _rank_selftest():
     wr = match_authorship({"last": "Weiss", "fore": None, "initials": "R",
                            "affiliations": []}, 99, weiss, _WeissIO(), pub_year=2024)
 
+    # --- given-name tier leads the key --------------------------------------
+    # Live anchor: authorship_review 3043, pmid 39629475, byline "Eileen Ruth Samson
+    # Torres". est4003 IS that byline spelled out (givenName "Eileen Ruth", middleName
+    # "Samson") but ReCiter never retrieved the pmid for her, so io is None. eft4002
+    # ("Emily Fujika Torres") carries io 0.62 -- 0.62 out of 100, the model saying "not
+    # this person" -- and under the old io-leading key a 0.62 beat a null and took
+    # top_cwid outright. Needs BOTH halves of this change: without the givenName+
+    # middleName clause in identity_index, est4003 is not `full` and the tier cannot
+    # rescue her; without the reorder, `full` never gets to speak.
+    torres = IdentityIndex([
+        dict(rec("Eileen Ruth", "Torres", 2024, "est4003"), middle="Samson"),
+        rec("Emily", "Torres", 2030, "eft4002"),
+    ])
+
+    class _TorresIO:
+        def scores(self, cwid):
+            return {99: (0.62, 0.0)} if cwid == "eft4002" else {}
+
+    tor = match_authorship({"last": "Torres", "fore": "Eileen Ruth Samson",
+                            "initials": "ERS", "affiliations": []},
+                           99, torres, _TorresIO())
+
+    # ...but this is a TIER-FIRST key, not an io-blind one. Two candidates at the SAME
+    # tier are still separated by the identity-only score, exactly as before -- which is
+    # what keeps the Weiss regression above meaningful and is the whole reason io stays
+    # in the key rather than being dropped for confidence.
+    same_tier = IdentityIndex([rec("Robert", "Weiss", 2030, "scored"),
+                               rec("Robert", "Weiss", 2030, "unscored")])
+
+    class _OneScoredIO:
+        def scores(self, cwid):
+            return {99: (50.61, 0.0)} if cwid == "scored" else {}
+
+    st = match_authorship({"last": "Weiss", "fore": "Robert", "initials": "R",
+                           "affiliations": []}, 99, same_tier, _OneScoredIO())
+
     checks = [
         ("pre-#159 (no pub_year): io_score alone puts the departed Lee on top",
          before[0]["cwid"] == "departed" and before[0]["io_score"] == 95.0),
@@ -241,6 +297,16 @@ def _rank_selftest():
          len(after) == 2 and len(tie) == 2),
         ("a synthetic 6-year gap does not promote a 1.47 io_score over a 50.61 one "
          "(shape of live row 60896, whose real gap is 35y)", wr[0]["cwid"] == "weissro"),
+        ("a FULL given match carrying NO identity-only score now outranks an "
+         "initial-tier rival scored 0.62/100 (pmid 39629475, row 3043)",
+         tor[0]["cwid"] == "est4003" and tor[0]["given_match"] == "full"
+         and tor[0]["io_score"] is None),
+        ("...and the rival is not dropped, just ranked below with its score intact",
+         len(tor) == 2 and tor[1]["cwid"] == "eft4002"
+         and tor[1]["given_match"] == "initial" and tor[1]["io_score"] == 0.62),
+        ("tier-FIRST, not io-blind: within one tier the identity-only score still "
+         "decides", [c["cwid"] for c in st] == ["scored", "unscored"]
+         and st[0]["given_match"] == st[1]["given_match"] == "full"),
     ]
     ok = True
     for label, passed in checks:
