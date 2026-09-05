@@ -234,8 +234,12 @@ def run_aar_close_attributed():
             logger.warning("AAR closer: DB_HOST/DB_NAME/DB_USERNAME/DB_PASSWORD unset — skipped")
             return
         timeout = int(os.getenv("AAR_CLOSER_TIMEOUT_SECONDS", "1800"))
+        # Explicit --ledger per invocation: aar_reconcile_open's default path is one
+        # file, and _write_ledger truncates, so the drift step below would destroy this
+        # run's ledger on any night both fire.
         run_script("aarReconcileOpenClassA",
-                   "python3 aar_reconcile_open.py --apply --class-a-only",
+                   "python3 aar_reconcile_open.py --apply --class-a-only "
+                   "--ledger aar_reconcile_class_a_ledger.jsonl",
                    timeout_seconds=timeout)
         run_script("aarDismissBylineOwner",
                    "python3 aar_dismiss_byline_owner.py --apply",
@@ -309,8 +313,11 @@ def run_aar_reconcile_drift_if_due():
             logger.warning("AAR drift reconciliation: PUBMED_API_KEY unset (the replay "
                            "re-fetches every open pubmed row's article) — skipped")
             return
+        # Its own --ledger, not the shared default: the nightly closer next door runs
+        # the same script and _write_ledger truncates.
         run_script("aarReconcileDrift",
-                   "python3 aar_reconcile_open.py --apply --drift-only --lane pubmed",
+                   "python3 aar_reconcile_open.py --apply --drift-only --lane pubmed "
+                   "--ledger aar_reconcile_drift_ledger.jsonl",
                    timeout_seconds=int(os.getenv("AAR_DRIFT_TIMEOUT_SECONDS", "3600")))
     except Exception as e:
         logger.exception(f"AAR drift reconciliation failed (ignored — reporting "
