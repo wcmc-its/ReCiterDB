@@ -1,0 +1,63 @@
+# Nightly build of reciterdb.identity from ED (LDAP) + ASMS (MSSQL).
+# Replaces the Splunk saved search "reciter identity update".
+#
+# APPLY THIS BY HAND, ONCE. The ReCiterDB CodeBuild pipeline auto-deploys the
+# IMAGE only -- it does not apply manifests. Do not `kubectl apply` the other
+# cronjob manifest in this directory (k8-cronjob.yaml): it has drifted from the
+# live object (batch/v1beta1, schedule "30 17 * * *" vs the live "30 14 * * *")
+# and applying it would clobber the live schedule.
+#
+# Scheduled at 12:00 UTC so it lands before the reciterdb cronjob at 14:30 UTC,
+# which reads identity.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: reciterdb-identity
+  namespace: reciter
+  labels:
+    app: reciterdb-identity
+    tier: backend
+spec:
+  schedule: "0 12 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # A build that dies halfway leaves identity_staging behind but never
+      # touches identity -- the upsert is the last thing that runs, in one
+      # transaction. Retrying is always safe.
+      backoffLimit: 2
+      template:
+        spec:
+          containers:
+          - name: reciterdb-identity
+            image: CONTAINER_IMAGE
+            command: ["python3", "buildIdentity.py"]
+            envFrom:
+            # DB_USERNAME / DB_PASSWORD, and DB_HOST / DB_NAME from the configmap.
+            - secretRef:
+                name: reciterdb-secrets
+            - configMapRef:
+                name: reciterdb-configmap
+            # LDAP_BIND_PASSWORD and MSSQL_DB_PASSWORD already live here for
+            # reciter-inst-client; this job needs no new secrets.
+            - secretRef:
+                name: reciter-inst-secrets
+            - configMapRef:
+                name: reciter-inst-client-configmap
+            # LDAP_URL, LDAP_BIND_DN and the five base DNs default correctly in
+            # buildIdentity.py (taken from the institutional client's own config).
+            # Do NOT re-add them here as empty strings -- os.environ.get returns
+            # "" for a var set to empty, which would override the good defaults.
+            # Set one only to actually change it.
+            resources:
+              requests:
+                memory: 2G
+                cpu: 1
+              limits:
+                memory: 2G
+                cpu: 1
+          nodeSelector:
+            lifecycle: Ec2Spot
+          restartPolicy: OnFailure
