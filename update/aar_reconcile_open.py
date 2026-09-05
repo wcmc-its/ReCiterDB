@@ -887,10 +887,11 @@ def main():
                          "least one stored producer column is no longer what the "
                          "matcher would write. Off by default for the same reason "
                          "--include-sideways is -- not risk (the proposed PERSON never "
-                         "changes) but VOLUME: measured 2026-09-04 it is roughly three "
-                         "fifths of the open queue, five matcher generations of "
-                         "never-reconciled backlog. Every dry run REPORTS the class and "
-                         "its column breakdown whether or not this flag is set.")
+                         "changes) but VOLUME: measured on the pubmed lane 2026-09-04 "
+                         "at 5,308 of 11,624 open rows and re-measured the same day at "
+                         "5,222 of 11,335, i.e. about 46%% -- five matcher generations "
+                         "of never-reconciled backlog. Every dry run REPORTS the class "
+                         "and its column breakdown whether or not this flag is set.")
     ap.add_argument("--drift-only", action="store_true",
                     help="CLASS B queues DRIFT_ONLY rows and nothing else -- no "
                          "stronger, no sideways, no weaker, i.e. no row's proposed "
