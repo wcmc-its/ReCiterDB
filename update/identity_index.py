@@ -154,12 +154,30 @@ _INSTITUTION_TOKENS = sorted((_affil_words(p) for p in INSTITUTION_PHRASES),
                              key=len, reverse=True)
 
 
+# Boundary token between two affiliation strings. `_norm` keeps [a-z0-9] only, so no
+# department, division or institution-phrase token can ever equal it -- which is the
+# whole point: an n-gram window containing it matches nothing, so no dept phrase, no
+# division word and no institution phrase can span the seam between two unrelated
+# affiliations. Between #203 and this, `_affil_tokens` flattened every affiliation into
+# one boundary-less tuple, so a person in "Internal Medicine" matched the byline
+# ["Weill Cornell Internal", "Medicine Institute of Something Else, Chicago, IL"] --
+# a phantom +0.25 assembled from two different institutions. 1,948 open PubMed and 1,841
+# open Scopus rows carry more than one affiliation string. Pre-#203 the strings were
+# joined with a space and the test was a substring one, so this could not arise.
+_AFFIL_SEP = "|"
+assert not _AFFIL_SEP.isalnum(), "_AFFIL_SEP must be unreachable by _norm's [a-z0-9]"
+
+
 def _affil_tokens(affiliations):
-    """Affiliation strings -> one normalised token sequence with the institution's own
-    name removed. Tokens, not a concatenated blob, so `_affil_match` can test on word
-    boundaries: the old blob also matched a division word INSIDE another word --
-    "Vascular" inside "cardiovascular" (live rows 30303/78915, below)."""
-    toks = tuple(t for a in (affiliations or []) if a for t in _affil_words(a))
+    """Affiliation strings -> one normalised token sequence, `_AFFIL_SEP` between
+    strings, with the institution's own name removed. Tokens, not a concatenated blob,
+    so `_affil_match` can test on word boundaries: the old blob also matched a division
+    word INSIDE another word -- "Vascular" inside "cardiovascular" (live rows
+    30303/78915, below)."""
+    parts = [_affil_words(a) for a in (affiliations or []) if a]
+    toks = ()
+    for i, part in enumerate(parts):
+        toks += ((_AFFIL_SEP,) if i else ()) + part
     for phrase in _INSTITUTION_TOKENS:
         n, i, out = len(phrase), 0, []
         while i < len(toks):
@@ -478,9 +496,22 @@ class IdentityIndex:
         Replayed over all 30,711 authorship_review rows / 64,972 candidate entries on
         prod with the post-#201 ranking keys: affiliation matches fall 16,945 -> 11,240,
         3,970 rows see a candidate change, 203 top picks move, and of the 24 that are
-        curator-resolved this is 18 fixes, 1 break, 5 neutral. Matches CREATED: 0. That
-        zero is the safety argument -- narrowing a match test can only ever REMOVE a
-        match, so this cannot manufacture a new false positive anywhere."""
+        curator-resolved this is 18 fixes, 1 break, 5 neutral. Matches CREATED: 0.
+
+        That zero is the safety argument, and the claim it supports is a scoped one:
+        WITHIN a single affiliation string, the word-boundary test is a strict SUBSET of
+        the old substring test, so it can only ever remove a match. It is not an
+        unconditional "this cannot manufacture a false positive anywhere" -- and between
+        #203 and the `_AFFIL_SEP` boundary token, the per-affiliation qualifier did not
+        hold. `_affil_tokens` flattened every affiliation string's tokens into one
+        boundary-less tuple, so a multi-word department (and the institution-phrase strip
+        with it) could match ACROSS two unrelated affiliations: dept "Internal Medicine"
+        matched the byline ["Weill Cornell Internal", "Medicine Institute of Something
+        Else, Chicago, IL"], which the pre-#203 space-joined substring test never did.
+        1,948 open PubMed and 1,841 open Scopus rows carry more than one affiliation
+        string. The sentinel restores the qualifier -- every n-gram window that spans a
+        seam contains a token no dept, division or phrase token can equal -- and the
+        selftest below holds that byline at False."""
         if not affil_toks:
             return False, None
         dept_n = _norm(rec["dept"])
@@ -929,6 +960,40 @@ def _selftest():
          "affiliation through the word 'Cornell' (7 people)",
          cmp_div.candidates("Roe", "Ann", "A", bare_wcm)[0][0]["affil_dept_match"]
          is False),
+    ]
+
+    # --- the seam between two affiliation strings ----------------------------
+    # Post-#203 regression, live between #203 and _AFFIL_SEP: _affil_tokens flattened
+    # every affiliation's tokens into ONE boundary-less tuple, so a multi-word dept --
+    # and the institution-phrase strip with it -- could match across two unrelated
+    # affiliations. 1,948 open PubMed and 1,841 open Scopus rows carry more than one
+    # affiliation string. The pre-#203 code joined them with a space and tested a
+    # substring, so this shape could not arise there.
+    seam = ["Weill Cornell Internal",
+            "Medicine Institute of Something Else, Chicago, IL"]
+    checks += [
+        ("a multi-word department does NOT match across the seam between two "
+         "affiliation strings ('...Internal' | 'Medicine...')",
+         internal.candidates("Roe", "Ann", "A", seam)[0][0]["affil_dept_match"]
+         is False),
+        ("...because a boundary token sits between them",
+         _affil_tokens(seam) == ("internal", _AFFIL_SEP, "medicine", "institute", "of",
+                                 "something", "else", "chicago", "il")),
+        ("...while the same department still matches WITHIN one affiliation when a "
+         "second, unrelated one is present alongside it",
+         internal.candidates("Roe", "Ann", "A",
+                             ["Department of Internal Medicine, Weill Cornell Medicine",
+                              "Institute of Something Else, Chicago, IL"]
+                             )[0][0]["affil_match_on"] == "dept"),
+        ("the institution-phrase strip cannot span the seam either -- 'Weill' and "
+         "'Cornell' in two different strings are not the phrase 'Weill Cornell'",
+         _affil_tokens(["Some Place Weill", "Cornell Medicine, New York"])
+         == ("some", "place", "weill", _AFFIL_SEP, "cornell", "medicine", "new",
+             "york")),
+        ("nor can a division word ever BE the boundary token: _norm keeps [a-z0-9] "
+         "only, so no dept/division/phrase token can equal it",
+         _norm(_AFFIL_SEP) == "" and _AFFIL_SEP not in name_tokens("Vascular | Surgery")
+         and all(_AFFIL_SEP not in p for p in _INSTITUTION_TOKENS)),
     ]
 
     ok = True
