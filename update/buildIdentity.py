@@ -178,7 +178,7 @@ def ldap_conn():
     return _conn
 
 
-def ldap_search(domain, search_filter, attrs):
+def ldap_search(domain, search_filter, attrs, limit=None):
     """Paged search against one SA-ldapsearch domain alias.
 
     Paging is not optional: ED holds 30k+ people and the server-side size limit
@@ -196,9 +196,31 @@ def ldap_search(domain, search_filter, attrs):
     ):
         if entry.get("type") != "searchResEntry":
             continue
-        rows.append({k: _flatten(v) for k, v in entry["attributes"].items()})
+        rows.append(_Row((k, _flatten(v)) for k, v in entry["attributes"].items()))
+        if limit and len(rows) >= limit:
+            break          # probe path only; a real source never passes limit
     logger.info("ldap %s: %d entries", domain, len(rows))
     return rows
+
+
+class _Row(dict):
+    """LDAP attribute descriptions are case-insensitive (RFC 4512), options
+    included, and ED does not return them in the casing the SPL wrote. The live
+    directory returns `labeledURI;onlinedirectory`; the SPL asked for
+    `labeledURI;onlineDirectory`. A plain dict lookup misses on that and silently
+    nulls the column -- exactly the failure mode this port exists to remove. Keys
+    are stored lowercased and looked up lowercased, so call sites keep the
+    readable spelling and casing can never drop a value.
+    """
+
+    def __init__(self, items):
+        super().__init__((k.lower(), v) for k, v in items)
+
+    def get(self, key, default=""):
+        return super().get(key.lower(), default)
+
+    def __getitem__(self, key):
+        return super().__getitem__(key.lower())
 
 
 def _flatten(value):
@@ -379,7 +401,7 @@ def ed_people_main():
 def _org_lookup():
     """ed-organizations `o` -> `cn`, the SPL's `join o type=left`."""
     rows = ldap_search("ed-organizations", "(o=*)", ["o", "cn"])
-    return {r["o"]: r.get("cn", "") for r in rows if r.get("o")}
+    return {r.get("o"): r.get("cn") for r in rows if r.get("o")}
 
 
 @source
@@ -870,7 +892,7 @@ def spike():
     failed = []
     for domain, flt in probes:
         try:
-            rows = ldap_search(domain, flt, ["*"])[:3]
+            rows = ldap_search(domain, flt, ["*"], limit=3)
         except Exception as exc:                     # noqa: BLE001 - report all
             logger.error("%-18s FAIL base=%s: %s", domain, BASE_DN[domain], exc)
             failed.append(domain)
@@ -921,6 +943,13 @@ def demo():
     assert _mssql_target("jdbc:sqlserver://asms.db:1433;databaseName=ASMS") == ("asms.db", 1433)
     assert _mssql_target("asms.db") == ("asms.db", 1433)
     assert _mssql_target("sqlserver://asms.db:1500") == ("asms.db", 1500)
+
+    # ED returns `labeledURI;onlinedirectory`; the SPL spelled it
+    # `labeledURI;onlineDirectory`. Neither casing may miss.
+    row = _Row([("labeledURI;onlinedirectory", "http://d"), ("weillCornellEduCWID", "abc1001")])
+    assert row.get("labeledURI;onlineDirectory") == "http://d", "attr option casing"
+    assert row.get("weillcornelleducwid") == "abc1001", "attr name casing"
+    assert row.get("nosuchattr") == "", "missing attr defaults to empty string"
     print("demo ok")
 
 

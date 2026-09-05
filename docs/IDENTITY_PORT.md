@@ -27,11 +27,26 @@ verbatim so the first diff is empty. Both are follow-ups, not fixes for round on
 
 ## Cutover
 
-1. Confirm the five LDAP base DNs — every one in `BASE_DN` is a guess until this
-   passes. Run in-cluster; ED is not reachable from a laptop:
-   ```
-   kubectl -n reciter run identity-spike --rm -it --restart=Never \
-     --image=<reciterdb image> --env-from=... -- python3 buildIdentity.py --spike
+1. ~~Confirm the five LDAP base DNs.~~ **Done 2026-09-05** — all five resolve
+   against live ED. Four came from the institutional client's own config
+   (`application.properties` `ldap.base.dn`, and the `ldapSources` block in
+   `k8-scheduling-default.yaml`); `ed-organizations` was inferred and the spike
+   confirmed it. Splunk's `ldap.conf` was never needed.
+
+   To re-run the spike (the deployed image carries neither the script nor
+   `ldap3`, so the file is copied in and the dep installed at runtime):
+   ```bash
+   IMG=$(kubectl -n reciter get cronjob reciterdb \
+     -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].image}')
+   kubectl -n reciter run identity-spike --restart=Never --image="$IMG" \
+     --overrides='{"spec":{"containers":[{"name":"identity-spike","image":"'"$IMG"'",
+       "command":["sleep","1800"],"envFrom":[{"secretRef":{"name":"reciter-inst-secrets"}},
+       {"configMapRef":{"name":"reciter-inst-client-configmap"}}]}]}}'
+   kubectl -n reciter wait --for=condition=Ready pod/identity-spike --timeout=180s
+   kubectl -n reciter cp update/buildIdentity.py identity-spike:/usr/src/app/buildIdentity.py
+   kubectl -n reciter exec identity-spike -- pip install --quiet ldap3
+   kubectl -n reciter exec identity-spike -- python3 /usr/src/app/buildIdentity.py --spike
+   kubectl -n reciter delete pod identity-spike
    ```
 2. Apply `setup/table_identity.sql`, then the `uq_identity_cwid` ALTER it
    documents. The upsert cannot work without that unique key.
@@ -73,9 +88,19 @@ FROM identity_staging s JOIN identity i ON i.cwid = s.cwid;
 those are the cumulative residue rows the SPL's final `where` no longer emits.
 "Only in port" should be near zero — investigate any row there.
 
+## ED returns attribute names lowercased
+
+Confirmed live: ED answers with `weillcornelleducwid`, `labeleduri;onlinedirectory`
+and so on, regardless of the casing requested. LDAP attribute descriptions are
+case-insensitive by RFC 4512, so this is correct server behaviour, but it means a
+plain `dict.get("weillCornellEduCWID")` misses every time. `_Row` stores and looks
+up keys lowercased. Do not replace it with a plain dict.
+
+`labeledURI;pops` and `labeledURI;vivo` are present on roughly a third of
+full-time faculty; that is real sparsity, not a query fault.
+
 ## Open
 
-- [ ] Five LDAP base DNs, from `SA-ldapsearch/local/ldap.conf` (blocks everything)
 - [ ] What writes `notes` and `alumniResidentNYP`?
 - [ ] `varchar(128)` truncation on profile URLs and `primaryTitle` — widen after
       the diff is clean; `--dry-run` logs each truncation
