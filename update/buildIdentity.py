@@ -39,6 +39,7 @@ any source said yes, else empty". That is what the final `where` clause needs.
 The diff harness is what proves it; see docs/IDENTITY_PORT.md.
 """
 
+import collections
 import logging
 import os
 import sys
@@ -528,6 +529,36 @@ def ed_sors_student_end_date():
     return {c: {"endDateWCMStudent": v[:4]} for c, v in best.items() if v}
 
 
+# ED is migrating department/departmentCode to orgUnit/orgUnitCode (tagged
+# ;level1, ;level2, ...). Measured 2026-09-05 the old attributes are still
+# strictly more complete -- PrimaryDepartment 100% vs PrimaryOrgUnit;level1 93%,
+# and zero records carry a new attribute without the old one -- so this job still
+# reads the old model. The two are NOT equivalent: level1 is an org-chart
+# reporting line, and 9% of values differ substantively (Orthopaedic Surgery ->
+# Hospital for Special Surgery, Library -> Information Technologies and
+# Services). Switching is a business decision about which hierarchy the
+# reporting table should express, not a mechanical rename.
+#
+# This counter is the early warning: when ED starts retiring the old attributes,
+# old coverage falls and new coverage rises, and --dry-run will say so before
+# anything breaks. Division stays on ASMS -- orgUnit;level2 covers only ~7%.
+ORGUNIT_MIGRATION_WATCH = [
+    ("weillCornellEduPrimaryDepartment", "weillCornellEduPrimaryOrgUnit;level1"),
+    ("weillCornellEduDepartment", "weillCornellEduOrgUnit;level1"),
+]
+
+_migration_counts = collections.Counter()
+
+
+def _watch_orgunit_migration(rows):
+    for old, new in ORGUNIT_MIGRATION_WATCH:
+        for r in rows:
+            if r.get(old):
+                _migration_counts[old] += 1
+            if r.get(new):
+                _migration_counts[new] += 1
+
+
 @source
 def ed_sors_primary_department():
     """Faculty primary department, else the cleaned NYP department."""
@@ -535,7 +566,11 @@ def ed_sors_primary_department():
         "ed-sors",
         """(&(objectClass=weillCornellEduSORRecord)(ou=faculty)
             (weillCornellEduPersonTypeCode=academic))""",
-        ["weillCornellEduCWID", "weillCornellEduPrimaryDepartment"])
+        ["weillCornellEduCWID", "weillCornellEduPrimaryDepartment",
+         # requested only to measure the migration; not read into any column
+         "weillCornellEduPrimaryOrgUnit;level1", "weillCornellEduOrgUnit;level1",
+         "weillCornellEduDepartment"])
+    _watch_orgunit_migration(faculty)
     nyp = ldap_search(
         "ed-sors",
         """(&(objectClass=weillCornellEduSORRecord)(ou=nyp affiliates)
@@ -871,6 +906,9 @@ def main(dry_run=False):
                     "surname", "primaryOrg"):
             filled = sum(1 for r in rows if r.get(col))
             logger.info("  %s populated on %d/%d rows", col, filled, len(rows))
+        for old, new in ORGUNIT_MIGRATION_WATCH:
+            logger.info("  ED migration: %s=%d  %s=%d",
+                        old, _migration_counts[old], new, _migration_counts[new])
         return
     write(rows)
 

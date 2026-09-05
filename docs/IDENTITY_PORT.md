@@ -167,3 +167,41 @@ with a second saved search doing `| inputlookup reciterIdentity | dbxoutput
 output=ReCiter-Identity`. The DB Connect output stanza behind that name is UI-only
 config and is **not** captured here — if it can be exported, it belongs beside
 this file.
+
+## ED's department to orgUnit migration
+
+ED is moving `department`/`departmentCode` to `orgUnit`/`orgUnitCode`, tagged by
+level (`;level1`, `;level2`, ...). This job still reads the old model. Measured
+against live ED 2026-09-05:
+
+| comparison | both | agree | differ | only old | only new |
+|---|---:|---:|---:|---:|---:|
+| `PrimaryDepartment` vs `PrimaryOrgUnit;level1` | 1,426 | 1,383 (97%) | 43 | 74 | **0** |
+| `Department` vs `OrgUnit;level1` | 1,495 | 1,356 (91%) | 139 (9%) | 5 | **0** |
+
+Three reasons the port did not switch:
+
+1. **The old attributes are strictly more complete.** `PrimaryDepartment` 100% vs
+   `PrimaryOrgUnit;level1` 93%; `Department` 100% vs `OrgUnit;level1` 91%. Zero
+   records carry a new attribute without the old one, so nothing is currently
+   reachable only through the new model and there is no data-loss pressure.
+2. **It is not a rename.** `OrgUnit;level1` is an org-chart reporting line, not a
+   department: `Orthopaedic Surgery` becomes `Hospital for Special Surgery`,
+   `Library` becomes `Information Technologies and Services`. Which hierarchy the
+   reporting table should express is a business decision.
+3. **It would land inside the one clean diff.** The Splunk comparison is the only
+   correctness oracle for 37 columns of undocumented business rules. Changing
+   3-9% of values during the port spends it for nothing.
+
+Division stays on ASMS. `OrgUnit;level2` covers ~7% of faculty records, against
+ASMS's full coverage, so sourcing division from ED would be a large regression.
+Dropping the ASMS dependency is the biggest durability win available here and is
+worth revisiting once level2 fills in — but not yet.
+
+`--dry-run` prints old and new attribute coverage each run
+(`ORGUNIT_MIGRATION_WATCH`). When old coverage starts falling, that is the signal
+to plan the switch, with time in hand rather than after a breakage.
+
+Sampling caveat: the figures above come from the first 400-1,500 entries LDAP
+returned, not a random sample. Rerun over the full population before acting on
+the 9%.
