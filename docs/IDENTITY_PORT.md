@@ -158,7 +158,8 @@ ED 2026-09-05 by running each source with the flag both ways:
 | column | cwids | changed | blanked |
 |---|---:|---:|---:|
 | `primaryAcademicDepartment` | 11,213 | 523 | **0** |
-| `inactiveDepartment` | 24,631 | 2,472 | **0** |
+| `inactiveDepartment` | 24,631 | 761 | **0** |
+| `primaryAcademicDivision` (backfill) | 24,631 | +2,090 gained | **0** |
 | `primaryProgram` | 1,309 | 169 | **0** |
 | `program` | 5,638 | 428 | **0** |
 
@@ -167,11 +168,31 @@ L2 the actual unit: Library sits at L2 under an L1 of "Information Technologies
 and Services", so taking L1 would file every librarian under ITS. Where L2
 exists, the old department matched L1 in 0 of 299 records.
 
-`inactiveDepartment` gains the most: 2,472 formerly-umbrella values become
-specific divisions (`Medicine` -> `General Internal Medicine` / `Hematology and
-Medical Oncology` / `Infectious Diseases`, `Biochemistry` -> `Biochemistry and
-Biophysics`). Check `Psychiatry` -> `Hospital Programs` (225) before accepting --
-it is the one mapping that looks less specific, not more.
+**The inactive path SPLITS the levels instead of flattening them.** Role records
+carry the hierarchy that SOR records mostly lack -- L2 on ~37% of expired role
+records against 3.4% of faculty SOR records -- so L1 becomes the department and
+L2 the division, which is the same shape ASMS gives an active colleague:
+
+    L1 -> inactiveDepartment       "Medicine"
+    L2 -> primaryAcademicDivision  "Infectious Diseases"
+
+Flattening to deepest would have put a division in the department column and
+made expired faculty the only cohort whose `primaryAcademicDepartment` means
+something different from everyone else's.
+
+The 761 department changes that remain are genuine historical renames --
+`Healthcare Policy and Research` -> `Population Health Sciences`, `Biochemistry`
+-> `Biochemistry and Biophysics`, `Physiology and Biophysics` -> `Systems and
+Computational Biomedicine`. `Psychiatry` -> `Hospital Programs`, which looked
+like a downgrade under flattening, is now correctly a division.
+
+The division half is a real backfill: 2,090 expired faculty gain a division they
+have never had, in ASMS's own vocabulary (`General Internal Medicine` 309,
+`Hematology and Medical Oncology` 214, `Cardiology` 109, `Infectious Diseases`
+101). ASMS cannot supply these -- its query requires a live appointment, which is
+why 72% of the table has no division. ASMS still wins wherever it has a value:
+`asms_division` is registered first in `SOURCES` and `merge()` keeps the first
+non-empty.
 
 Students read `orgUnit;level2` and normalise through the existing
 `PROGRAM_OVERRIDE` table; ED's L2 spellings were added to it rather than a

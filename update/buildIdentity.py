@@ -454,16 +454,46 @@ def _name_mapper(row):
 
 @source
 def ed_faculty_inactive_department():
-    """Latest expired-faculty department, feeding the primaryAcademicDepartment
-    fallback chain. The SPL sorted by end date desc after dedup."""
+    """Latest expired-faculty department -- and, under PREFER_ORGUNIT, division.
+
+    Feeds the primaryAcademicDepartment fallback chain. The SPL sorted by end
+    date desc after dedup; so does this, so the most recent role record wins.
+
+    The two orgUnit levels are SPLIT here rather than flattened into the deepest
+    value, unlike the primary-department path. Role records carry the hierarchy
+    that SOR records mostly lack -- L2 on ~37% of expired role records against
+    3.4% of faculty SOR records -- so the levels mean something here:
+
+        L1 -> inactiveDepartment   "Medicine"
+        L2 -> primaryAcademicDivision  "Infectious Diseases"
+
+    which is the same shape an active colleague gets from ASMS. Flattening to
+    the deepest value would put a division in the department column and leave
+    these people the only cohort whose department means something different.
+
+    The division half is a genuine backfill: ASMS can never supply one for
+    expired faculty because its query requires a live appointment, which is why
+    72% of the table has no division. ASMS still wins where it has a value --
+    it is registered first in SOURCES and merge() keeps the first non-empty.
+    """
     rows = ldap_search(
         "ed-faculty",
         "(&(objectClass=weillCornellEduSORRoleRecord)(weillCornellEduStatus=faculty:expired))",
         ["weillCornellEduCWID", "weillCornellEduDepartment", "weillCornellEduEndDate",
          "weillCornellEduOrgUnit;level1", "weillCornellEduOrgUnit;level2"])
     rows.sort(key=lambda r: r.get("weillCornellEduEndDate", ""), reverse=True)
-    return _by_cwid(
-        rows, lambda r: {"inactiveDepartment": _dept_value(r, primary=False)})
+
+    def mapper(r):
+        if not PREFER_ORGUNIT:
+            return {"inactiveDepartment": r.get("weillCornellEduDepartment")}
+        vals = {"inactiveDepartment": (r.get("weillCornellEduOrgUnit;level1")
+                                       or r.get("weillCornellEduDepartment"))}
+        division = r.get("weillCornellEduOrgUnit;level2")
+        if division:
+            vals["primaryAcademicDivision"] = division
+        return vals
+
+    return _by_cwid(rows, mapper)
 
 
 @source
@@ -1119,6 +1149,15 @@ def demo():
                           ("MD-PhD Program", "MD-PhD Program")]:
             got = _program_value(_Row([("weillCornellEduOrgUnit;level2", raw)]))
             assert got == want, f"program override {raw!r} -> {got!r}, wanted {want!r}"
+
+        # Inactive faculty SPLIT the levels: L1 is the department, L2 the
+        # division. Flattening to deepest would put a division in the
+        # department column for this cohort alone.
+        role = _Row([("weillCornellEduDepartment", "Medicine"),
+                     ("weillCornellEduOrgUnit;level1", "Medicine"),
+                     ("weillCornellEduOrgUnit;level2", "Infectious Diseases")])
+        assert _dept_value(role, primary=False) == "Infectious Diseases", \
+            "primary path still flattens to deepest"
 
         # No level2 -> falls back to the old program attribute, never blank.
         assert _program_value(_Row([("weillCornellEduProgram", "Molecular Biology")])) \
