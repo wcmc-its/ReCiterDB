@@ -128,3 +128,22 @@ recoverable from ED; if the flag is wanted again it needs defining, not guessing
       the diff is clean; `--dry-run` logs each truncation
 - [ ] Stale residue rows keep `fullTimeFaculty=yes` after an appointment ends.
       Pre-existing behaviour, deliberately not addressed here.
+
+## The original
+
+`docs/reciter_identity_update.spl` is the Splunk saved search this job replaces,
+exported 2026-09-05, verbatim and unedited. It is the reference any diff argues
+against and the only record of the rules being reproduced — it existed nowhere
+but a laptop and the Splunk UI. Do not edit it; it is provenance, not source.
+
+Its final two lines are the write path:
+
+```
+| eval _key = cwid
+| outputlookup reciterIdentity
+```
+
+with a second saved search doing `| inputlookup reciterIdentity | dbxoutput
+output=ReCiter-Identity`. The DB Connect output stanza behind that name is UI-only
+config and is **not** captured here — if it can be exported, it belongs beside
+this file.

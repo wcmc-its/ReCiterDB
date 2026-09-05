@@ -1,0 +1,260 @@
+| dbxquery connection=ASMS query="select
+distinct cwid,
+d2.title as primaryAcademicDivision,
+CONVERT(VARCHAR(10), a.appt_end_date, 120) AS weillCornellEduEndDate,
+a.done_date AS Done_Date
+from wcmc_person p
+ join fc_appointment a on a.person_id = p.id
+ join wcmc_department d ON d.id = a.department_id
+ join fc_appointment_priority r on r.id = a.priority_id
+ join fc_appointment_action c on c.id = a.action_id
+ JOIN wcmc_division d2 ON d2.id = a.division_id
+ join wcmc_institution i on i.id = a.institution_id
+where d2.title not in ('NO DIVISION','EDUCATION','Administration','Other','General','Research','Chairman')
+    and (i.id = 3592711 or i.id = 10000141)
+and r.title = 'Primary'
+and cwid is not null
+and cwid != ''
+and a.id NOT IN
+  (SELECT a.id
+      FROM wcmc_person
+      join fc_appointment a ON p.id = a.person_id
+      join fc_appointment_action c ON c.id = a.action_id
+   WHERE a.done_date is null and
+      c.title <> 'Reappt') 
+order by weillCornellEduEndDate desc      
+"
+| rename cwid as weillCornellEduCWID
+| dedup weillCornellEduCWID
+
+| append [| ldapsearch domain=ed-people search="(&(objectClass=weillCornellEduPerson)(|(weillCornellEduPersonTypeCode=affiliate-nyp-resident)(weillCornellEduPersonTypeCode=academic)(weillCornellEduPersonTypeCode=student-md*)(weillCornellEduPersonTypeCode=student-phd-*)))" attrs="*"
+| spath
+| rename labeledURI;onlineDirectory{} as directoryProfile
+| rename labeledURI;pops{} as popsProfile
+| rename labeledURI;vivo{} as vivoProfile
+| rename weillCornellEduPrimaryOrganization;faculty{} as o1
+| rename weillCornellEduPrimaryOrganization;student{} as o2
+| eval o = case(
+o1 != "" and isnotnull(o1),o1,
+o2 != "" and isnotnull(o2),o2,
+weillCornellEduPersonTypeCode = "affiliate-nyp-resident","NYP",
+1=1,""
+)
+| eval facultyRank = case(
+weillCornellEduPersonTypeCode = "academic-faculty-fullprofessor","Full Professor",
+weillCornellEduPersonTypeCode = "academic-faculty-associate","Associate Professor",
+weillCornellEduPersonTypeCode = "academic-faculty-assistant","Assistant Professor",
+weillCornellEduPersonTypeCode = "academic-faculty-instructor" OR weillCornellEduPersonTypeCode = "academic-faculty-lecturer","Instructor or Lecturer"
+)
+| table weillCornellEduCWID,weillCornellEduPersonTypeCode,weillCornellEduPrimaryTitle,popsProfile, directoryProfile, vivoProfile, o, facultyRank
+| join o type=left [| ldapsearch domain=ed-organizations search="(o=*)"  attrs="o,cn"
+| table o, cn | rename cn as primaryOrg]
+
+| eval fullTimeFaculty = if(weillCornellEduPersonTypeCode = "academic-faculty-weillfulltime","yes","")
+| eval studentMDNYC = if(weillCornellEduPersonTypeCode = "student-md-new-york","yes","")
+| eval studentMDQatar = if(weillCornellEduPersonTypeCode = "student-md-qatar","yes","")
+| eval studentMDPhD = if(weillCornellEduPersonTypeCode = "student-md-phd-tri-i","yes","")
+| eval studentPhDTriI = if(weillCornellEduPersonTypeCode = "student-phd-tri-i","yes","")
+| eval studentPhDWeill = if(weillCornellEduPersonTypeCode = "student-phd-weill","yes","")
+| eval partTimeFaculty = if(weillCornellEduPersonTypeCode="academic-faculty-weillparttime","yes","")
+| eval voluntaryFaculty = if(weillCornellEduPersonTypeCode="academic-faculty-voluntary","yes","")
+| eval emeritusFaculty = if(weillCornellEduPersonTypeCode="academic-faculty-emeritus","yes","")
+| eval adjunctFaculty = if(weillCornellEduPersonTypeCode="academic-faculty-adjunct","yes","")
+| eval fellow = if(weillCornellEduPersonTypeCode="academic-nonfaculty-postdoc-fellow","yes","")
+| eval postdoc = if(weillCornellEduPersonTypeCode="academic-nonfaculty-postdoc","yes","")
+| eval faculty = if(weillCornellEduPersonTypeCode="academic-faculty","yes","")
+| eval nonFaculty = if(weillCornellEduPersonTypeCode="academic-nonfaculty","yes","")
+| eval residentNYP = if(weillCornellEduPersonTypeCode="affiliate-nyp-resident","yes","")
+
+]
+
+| append [| ldapsearch domain=ed-faculty search="(&(objectClass=weillCornellEduSORRecord)(weillCornellEduStatus=faculty:expired))" attrs="weillCornellEduCWID" 
+| eval inactiveFaculty = "yes"]
+
+| append [| ldapsearch domain=ed-sors search="(&(objectClass=weillCornellEduSORRecord)(|(ou=faculty)(ou=students)))" attrs="weillCornellEduCWID,sn,givenName,weillCornellEduMiddleName" 
+| dedup weillCornellEduCWID
+]
+
+| append [| ldapsearch domain=ed-sors search="(&(objectClass=weillCornellEduSORRecord)(ou=nyp affiliates)(weillCornellEduPersonTypeCode=affiliate-nyp-resident))" attrs="weillCornellEduCWID,sn,givenName,weillCornellEduMiddleName" 
+| dedup weillCornellEduCWID
+]
+
+
+| append [| ldapsearch domain=ed-faculty search="(&(objectClass=weillCornellEduSORRoleRecord)(weillCornellEduStatus=faculty:expired))" attrs="weillCornellEduCWID,weillCornellEduDepartment,weillCornellEduEndDate" 
+| table weillCornellEduCWID,weillCornellEduDepartment,weillCornellEduEndDate
+| dedup weillCornellEduCWID 
+| sort -weillCornellEduEndDate
+| rename weillCornellEduDepartment as inactiveDepartment
+| table weillCornellEduCWID, inactiveDepartment
+]
+
+| append [| ldapsearch domain=ed-students search="(&(objectClass=weillCornellEduSORRoleRecord)(weillCornellEduDegreeDate=*)(weillCornellEduDegreeCode=MD))" attrs="weillCornellEduCWID,sn,givenName" 
+| table weillCornellEduCWID,sn,givenName
+| eval alumniMD = "yes"]
+
+
+| append [
+| ldapsearch domain=ed-students search="(&(objectClass=weillCornellEduSORRecord))" attrs="weillCornellEduCWID,sn,givenName" 
+| append [| ldapsearch domain=ed-students search="(&(objectClass=weillCornellEduSORRoleRecord)(weillCornellEduExitReason=Graduated)(weillCornellEduDegreeCode=MD))" attrs="weillCornellEduCWID,weillCornellEduDegree"]
+| append [| ldapsearch domain=ed-students search="(&(objectClass=weillCornellEduSORRoleRecord)(weillCornellEduExitReason=Graduated)(weillCornellEduDegreeCode=PHD))" attrs="weillCornellEduCWID,weillCornellEduDegreeCode"]
+| stats list(sn) as sn, list(givenName) as givenName, list(weillCornellEduDegree) as weillCornellEduDegree, list(weillCornellEduDegreeCode) as weillCornellEduDegreeCode by weillCornellEduCWID
+| where isnotnull(weillCornellEduDegree) and isnotnull(weillCornellEduDegreeCode) and isnotnull(sn) 
+| eval alumniMDPHD = "yes"
+| table weillCornellEduCWID, sn, givenName, alumniMDPHD
+]
+
+| append [| ldapsearch domain=ed-students search="(&(objectClass=weillCornellEduSORRoleRecord)(weillCornellEduDegreeDate=*)(weillCornellEduDegreeCode=PHD))" attrs="weillCornellEduCWID,sn,givenName" 
+| table weillCornellEduCWID,sn,givenName
+| eval alumniPHD = "yes"]
+
+| append [| ldapsearch domain=ed-sors search="(&(ou=students)(objectClass=weillCornellEduSORRoleRecord)(|(weillCornellEduDegreeCode=MD)(weillCornellEduDegreeCode=MDPHD)(weillCornellEduDegreeCode=PHD)))" attrs="weillCornellEduCWID,weillCornellEduDegreeDate,weillCornellEduEndDate,weillCornellEduExpectedGradYear"
+| stats max(weillCornellEduDegreeDate) as weillCornellEduDegreeDate, max(weillCornellEduEndDate) as weillCornellEduEndDate , max(weillCornellEduExpectedGradYear) as weillCornellEduExpectedGradYear by weillCornellEduCWID
+| eval endDateWCMStudent = substr(max(weillCornellEduDegreeDate,weillCornellEduEndDate,weillCornellEduExpectedGradYear),1,4)
+| table weillCornellEduCWID, endDateWCMStudent]
+
+
+| append [
+| ldapsearch domain=ed-sors search="(&(objectClass=weillCornellEduSORRecord)(ou=faculty)(weillCornellEduPersonTypeCode=academic))" attrs="weillCornellEduCWID,weillCornellEduPrimaryDepartment" 
+| rename weillCornellEduPrimaryDepartment as primaryFacultyDepartment
+| append [| ldapsearch domain=ed-sors search="(&(objectClass=weillCornellEduSORRecord)(ou=nyp affiliates)(weillCornellEduPersonTypeCode=affiliate-nyp-resident))" attrs="weillCornellEduCWID,weillCornellEduDepartment,weillCornellEduPrimaryDepartment" 
+| eval nypDepartment = replace(replace(replace(coalesce(weillCornellEduPrimaryDepartment,weillCornellEduDepartment),"&&Weill Cornell GME",""),"Blank_dept",""),".GME","")
+| table weillCornellEduCWID, nypDepartment
+]
+| stats list(nypDepartment) as nypDepartment, list(primaryFacultyDepartment) as primaryFacultyDepartment by weillCornellEduCWID
+| eval primaryAcademicDepartment = coalesce(primaryFacultyDepartment,nypDepartment)
+| table weillCornellEduCWID, primaryAcademicDepartment
+]
+| append [| ldapsearch domain=ed-students search="(&(objectClass=weillCornellEduSORRecord)(|(weillCornellEduPersonTypeCode=student-md-*)(weillCornellEduPersonTypeCode=student-md-phd-tri-i)(weillCornellEduPersonTypeCode=student-md-phd-tri-i)(weillCornellEduPersonTypeCode=student-phd-weill)(weillCornellEduPersonTypeCode=student-phd-tri-i))(weillCornellEduStatus=student:active))" attrs="weillCornellEduCWID,weillCornellEduPrimaryProgram" 
+| rename weillCornellEduPrimaryProgram as primaryProgram
+| table weillCornellEduCWID, primaryProgram
+]
+| rename sn as surname 
+| rename weillCornellEduMiddleName as middleName
+| rename weillCornellEduPrimaryTitle as primaryTitle
+
+| append [| ldapsearch domain=ed-faculty search="(&(ou=faculty)(objectClass=weillCornellEduSORRoleRecord))" attrs="weillCornellEduCWID,weillCornellEduStartDate" 
+| stats min(weillCornellEduStartDate) as startDateWCM  by weillCornellEduCWID
+| eval startDateWCMFaculty = substr(startDateWCM,1,4)
+]
+
+| append [| ldapsearch domain=ed-faculty search="(&(ou=faculty)(objectClass=weillCornellEduSORRoleRecord))" attrs="weillCornellEduCWID,weillCornellEduEndDate" 
+| stats max(weillCornellEduEndDate) as endDateWCM by weillCornellEduCWID
+| eval endDateWCMFaculty = substr(endDateWCM,1,4)
+]
+
+| append [| ldapsearch domain=ed-sors search="(&(ou=students)(objectClass=weillCornellEduSORRoleRecord))" attrs="weillCornellEduCWID,weillCornellEduStartDate" 
+| stats min(weillCornellEduStartDate) as startDateWCM  by weillCornellEduCWID
+| eval startDateWCMStudent = substr(startDateWCM,1,4)
+]
+
+| append [| ldapsearch domain=ed-people search="(&(objectClass=weillCornellEduPerson)(!(weillCornellEduPersonTypeCode=affiliate-alumni))(weillCornellEduStatus=student:expired))" attrs="weillCornellEduCWID" 
+| eval inactiveNonAlumniStudent = "yes"
+]
+
+| append [| ldapsearch domain=ed-students
+    search="(&(objectClass=weillCornellEduSORRoleRecord)
+             (|(weillCornellEduDegreeCode=PHD)
+               (weillCornellEduDegreeCode=MDPHD)
+               (weillCornellEduDegreeCode=MD)))"
+    attrs="weillCornellEduCWID,weillCornellEduProgram"
+    
+| eval program_override = case(
+    weillCornellEduProgram=="Biochemistry & Structural Biology",                  "Biochemistry & Structural Biology",
+    weillCornellEduProgram=="Biochemistry, Cell & Molecular Biology",             "Biochemistry, Cell & Molecular Biology",
+    weillCornellEduProgram=="Cell & Developmental Biology",                       "Cell & Developmental Biology",
+    weillCornellEduProgram=="Immunology & Microbial Pathogenesis",                "Immunology & Microbial Pathogenesis",
+    weillCornellEduProgram=="Molecular Biology",                                  "Molecular Biology",
+    weillCornellEduProgram=="Neuroscience",                                       "Neuroscience",
+    weillCornellEduProgram=="Pharmacology",                                       "Pharmacology",
+    weillCornellEduProgram=="Physiology, Biophysics & Systems Biology",           "Physiology, Biophysics & Systems Biology",
+    weillCornellEduProgram=="Population Health Sciences",                         "Population Health Sciences",
+    weillCornellEduProgram=="Qatar Doctor of Medicine",                           "Qatar Doctor of Medicine",
+    weillCornellEduProgram=="Doctor of Medicine",                                 "Doctor of Medicine",
+    
+    weillCornellEduProgram=="MD-PhD WGS Biochemistry & Structural Biology",       "Biochemistry & Structural Biology",
+    weillCornellEduProgram=="MD-PhD WGS Cell & Developmental Biology",            "Cell & Developmental Biology",
+    weillCornellEduProgram=="MD-PhD WGS Immunology & Microbial Pathogenesis",     "Immunology & Microbial Pathogenesis",
+    weillCornellEduProgram=="MD-PhD WGS Neuroscience",                            "Neuroscience",
+    weillCornellEduProgram=="MD-PhD WGS Pharmacology",                            "Pharmacology",
+    weillCornellEduProgram=="MD-PhD WGS Physiology, Biophysics & System Biology", "Physiology, Biophysics & Systems Biology",
+    
+    weillCornellEduProgram=="Tri-I Program in Computational Biology & Medicine",  "Computational Biology & Medicine",
+    weillCornellEduProgram=="Tri-I Program in Chemical Biology",                  "Chemical Biology",
+    
+    weillCornellEduProgram=="MD-PhD Rockefeller University Major",               "MD-PhD Program",
+    weillCornellEduProgram=="MD-PhD Gerstner Sloan-Kettering",                   "MD-PhD Program",
+    weillCornellEduProgram=="MD-PhD Program",                                    "MD-PhD Program",
+    
+    true(),                                                                      weillCornellEduProgram
+  )
+  
+| eval priority = tonumber(
+    case(
+      program_override=="Biochemistry & Structural Biology",                  1,
+      program_override=="Biochemistry, Cell & Molecular Biology",             2,
+      program_override=="Cell & Developmental Biology",                       3,
+      program_override=="Immunology & Microbial Pathogenesis",                4,
+      program_override=="Molecular Biology",                                  5,
+      program_override=="Neuroscience",                                       6,
+      program_override=="Pharmacology",                                       7,
+      program_override=="Physiology, Biophysics & Systems Biology",           8,
+      program_override=="Computational Biology & Medicine",                  15,
+      program_override=="Chemical Biology",                                  16,
+      program_override=="Population Health Sciences",                        17,
+      program_override=="Qatar Doctor of Medicine",                          18,
+      program_override=="Doctor of Medicine",                                19,
+      program_override=="MD-PhD Program",                                    20,
+      true(),                                                              999
+    )
+  )
+
+
+| sort 0 weillCornellEduCWID priority
+| dedup weillCornellEduCWID
+
+| rename program_override AS weillCornellEduProgram
+| table weillCornellEduCWID, weillCornellEduProgram
+]
+
+
+| stats max(surname) as surname, list(middleName) as middleName, max(givenName) as givenName, list(primaryTitle) as primaryTitle, list(primaryAcademicDepartment) as primaryAcademicDepartment, list(inactiveDepartment) as inactiveDepartment, list(primaryAcademicDivision) as primaryAcademicDivision, list(primaryProgram) as primaryProgram, list(weillCornellEduProgram) as program, list(startDateWCMStudent) as startDateWCMStudent, list(endDateWCMStudent) as endDateWCMStudent,  list(startDateWCMFaculty) as startDateWCMFaculty,  max(endDateWCMFaculty) as endDateWCMFaculty, list(fullTimeFaculty) as fullTimeFaculty, list(studentMDNYC) as studentMDNYC, list(studentMDQatar) as studentMDQatar, list(studentMDPhD) as studentMDPhD, list(studentPhDTriI) as studentPhDTriI, list(studentPhDWeill) as studentPhDWeill, list(partTimeFaculty) as partTimeFaculty,  list(voluntaryFaculty) as voluntaryFaculty, list(emeritusFaculty) as emeritusFaculty,  list(adjunctFaculty) as adjunctFaculty, list(fellow) as fellow, list(postdoc) as postdoc, list(residentNYP) as residentNYP, list(faculty) as faculty, list(nonFaculty) as nonFaculty, list(inactiveFaculty) as inactiveFaculty, list(alumniMD) as alumniMD, list(alumniMDPHD) as alumniMDPHD, list(alumniPHD) as alumniPHD, list(popsProfile) as popsProfile, list(directoryProfile) as directoryProfile, list(vivoProfile) as vivoProfile, list(facultyRank) as facultyRank, list(primaryOrg) as primaryOrg, list(inactiveNonAlumniStudent) as inactiveNonAlumniStudent by weillCornellEduCWID
+
+
+| eval alumniMD=if(alumniMDPHD=="yes", "", alumniMD), alumniPHD=if(alumniMDPHD=="yes", "", alumniPHD)
+
+| eval primaryAcademicDepartment = case(
+primaryAcademicDepartment != "",primaryAcademicDepartment,
+program != "",program,
+inactiveDepartment != "",inactiveDepartment
+)
+| rename weillCornellEduCWID as cwid
+| table cwid, surname, middleName, givenName, primaryTitle, primaryAcademicDepartment, primaryAcademicDivision, primaryProgram, fullTimeFaculty, studentMDNYC, studentMDQatar, studentMDPhD, studentPhDTriI, studentPhDWeill, partTimeFaculty,  voluntaryFaculty, emeritusFaculty,  adjunctFaculty, fellow, postdoc, faculty, nonFaculty, residentNYP, inactiveFaculty, alumniMD, alumniMDPHD, alumniPHD, startDateWCMFaculty, endDateWCMFaculty, startDateWCMStudent, endDateWCMStudent, popsProfile, directoryProfile, vivoProfile, facultyRank, primaryOrg, inactiveNonAlumniStudent
+| eval fullTimeFaculty = replace(fullTimeFaculty," ","")
+| eval studentMDNYC = replace(studentMDNYC," ","")
+| eval studentMDQatar = replace(studentMDQatar," ","")
+| eval studentMDPhD = replace(studentMDPhD," ","")
+| eval studentPhDTriI = replace(studentPhDTriI," ","")
+| eval studentPhDWeill = replace(studentPhDWeill," ","")
+| eval alumniMD = replace(alumniMD," ","")
+| eval alumniMDPHD = replace(alumniMDPHD," ","")
+| eval alumniPHD = replace(alumniPHD," ","")
+| eval partTimeFaculty = replace(partTimeFaculty," ","")
+| eval voluntaryFaculty = replace(voluntaryFaculty," ","") 
+| eval emeritusFaculty = replace(emeritusFaculty," ","")
+| eval adjunctFaculty = replace(adjunctFaculty," ","") 
+| eval fellow = replace(fellow," ","")
+| eval postdoc = replace(postdoc," ","") 
+| eval faculty = replace(faculty," ","") 
+| eval nonFaculty = replace(nonFaculty," ","")
+| eval residentNYP = replace(residentNYP," ","")
+| eval inactiveNonAlumniStudent = replace(inactiveNonAlumniStudent," ","")
+
+| where isnotnull(primaryAcademicDepartment) or isnotnull(primaryProgram) or isnotnull(nonFaculty) or isnotnull(faculty) or isnotnull(inactiveFaculty) or isnotnull(alumniMDPHD) or isnotnull(alumniMD) or isnotnull(alumniPHD) or isnotnull(residentNYP)
+
+| where cwid != "act4001" and cwid != "adz4001" and cwid != "alm4016" and cwid != "alp4016" and cwid != "anp3012" and cwid != "ant4017" and cwid != "ars4011" and cwid != "brw4008" and cwid != "chi4001" and cwid != "daa4014" and cwid != "das9200" and cwid != "dds4001" and cwid != "doz4001" and cwid != "eem4001" and cwid != "ehj4001" and cwid != "fke4001" and cwid != "hae4001" and cwid != "hbs4001" and cwid != "hrf4001" and cwid != "hrw4001" and cwid != "jes4023" and cwid != "jfb4001" and cwid != "kdf4001" and cwid != "kiw4002" and cwid != "kjz4001" and cwid != "kms4002" and cwid != "kvc4002" and cwid != "luz4002" and cwid != "mal4027" and cwid != "mmc4001" and cwid != "mrd4002" and cwid != "mur4003" and cwid != "nmk4001" and cwid != "oaf4001" and cwid != "olt4001" and cwid != "pan4004" and cwid != "pas4007" and cwid != "rgs4002" and cwid != "ses4004" and cwid != "shd4007" and cwid != "smg4003" and cwid != "ssh4002" and cwid != "vsa4001" 
+
+| where (fullTimeFaculty = "yes" or postdoc = "yes" or partTimeFaculty = "yes" or voluntaryFaculty = "yes" or emeritusFaculty = "yes" or adjunctFaculty = "yes" or residentNYP = "yes" or fellow = "yes" or faculty = "yes" or nonFaculty = "yes" or inactiveFaculty = "yes" or alumniMD = "yes" or alumniMDPHD = "yes" or alumniPHD = "yes") or (startDateWCMStudent != endDateWCMStudent and isnotnull(startDateWCMStudent))
+
+| eval _key = cwid 
+
+| outputlookup reciterIdentity
