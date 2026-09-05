@@ -54,7 +54,10 @@ verbatim so the first diff is empty. Both are follow-ups, not fixes for round on
 4. Diff (below). Iterate until empty.
 5. Apply `kubernetes/k8-cronjob-identity.yaml` by hand. Never `kubectl apply`
    `k8-cronjob.yaml` — it has drifted from the live object.
-6. Run both for a week, then disable the Splunk search.
+6. Run both for a week, then disable the Splunk search. Keep the cron job on
+   `--dry-run` for the whole parallel period -- it writes only
+   `identity_staging`, leaving Splunk the sole writer to `identity` while the
+   diff is reconciled. Drop `--dry-run` only at the switch.
 
 ## Diff
 
@@ -117,8 +120,25 @@ recoverable from ED; if the flag is wanted again it needs defining, not guessing
 
 ## Open
 
-- [ ] Is there a second Splunk saved search with a `dbxoutput` to
-      `ReCiter-Identity`? Needed before the Splunk job can be switched off.
+- [x] ~~Is there a second Splunk writer?~~ **No.** Confirmed 2026-09-05 via
+      `| rest`: exactly one saved search contains `dbxoutput` ("ReCiter - output
+      identity to db", the two known lines), and `conf-db_outputs` holds one
+      stanza -- `ReCiter-Identity`, connection `reciter`, table
+      `` `reciterdb`.`identity` ``. The Splunk side is fully accounted for:
+      one search builds the lookup, one output writes it.
+- [ ] DB Connect's write mode was never read from config -- the field name in the
+      `| rest` query was a guess and came back empty. It is inferred from
+      behaviour instead: 35,448 rows, zero duplicate cwids, createTimestamps
+      surviving from 2021, 1-3 new rows a day. That reads as update-in-place on
+      cwid, which is what this port implements. Confirm with
+      `| rest ... conf-db_outputs | search title="ReCiter-Identity" | transpose`
+      if it ever matters.
+- [ ] `uq_identity_cwid` was applied 2026-09-05 to a table with a live writer
+      whose mode was never confirmed. Zero duplicates across ~229 nightly runs
+      says DB Connect has never attempted a duplicate insert, so the constraint
+      should be inert -- but the first Splunk run under it had not yet happened
+      when this was written. If that job errors, this is why; rollback is
+      `ALTER TABLE identity DROP INDEX uq_identity_cwid;`
 - [ ] ed-sors lists 3,080 current NYP residents; ed-people shows 1,146. The
       `residentNYP` flag comes from ed-people, so ~1,900 people appear in the
       name and department sources but never get flagged and fall out at the
