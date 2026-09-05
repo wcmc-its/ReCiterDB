@@ -99,9 +99,31 @@ up keys lowercased. Do not replace it with a plain dict.
 `labeledURI;pops` and `labeledURI;vivo` are present on roughly a third of
 full-time faculty; that is real sparsity, not a query fault.
 
+## The two columns this job does not write
+
+`notes` is written by hand (Drew). It is preserved because the table is never
+deleted from and the column is absent from `UPSERT_COLUMNS`.
+
+`alumniResidentNYP` is **dead**. Measured 2026-09-05: 778 rows carry it, the
+newest created 2025-01-22, and only 18 are currently `residentNYP`. New rows have
+been inserted continuously since (1-3/day) and none is ever flagged, so whatever
+set it stopped by early 2025. It appears nowhere in the Splunk job.
+
+Nine candidate definitions were probed against live ED looking for a rule that
+yields 778 -- current NYP residents (3,080), NYP-resident type in ed-people
+(1,146), in ed-sors but not active in ed-people (1,935), affiliate-alumni
+(5,232), and the intersections (218 / 110 / 108). None matches. The rule is not
+recoverable from ED; if the flag is wanted again it needs defining, not guessing.
+
 ## Open
 
-- [ ] What writes `notes` and `alumniResidentNYP`?
+- [ ] Is there a second Splunk saved search with a `dbxoutput` to
+      `ReCiter-Identity`? Needed before the Splunk job can be switched off.
+- [ ] ed-sors lists 3,080 current NYP residents; ed-people shows 1,146. The
+      `residentNYP` flag comes from ed-people, so ~1,900 people appear in the
+      name and department sources but never get flagged and fall out at the
+      final filter. Faithful to the SPL -- a pre-existing population gap, not
+      introduced here.
 - [ ] `varchar(128)` truncation on profile URLs and `primaryTitle` — widen after
       the diff is clean; `--dry-run` logs each truncation
 - [ ] Stale residue rows keep `fullTimeFaculty=yes` after an appointment ends.
