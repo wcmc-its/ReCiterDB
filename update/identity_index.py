@@ -281,6 +281,71 @@ def temporal_penalty(years_after_wcm):
                      TEMPORAL_PENALTY_CAP), 3)
 
 
+# ---- candidate label -------------------------------------------------------
+def _display_name(rec):
+    """The label a curator reads for a candidate: PUBLISHING name first, HR legal
+    name in parentheses behind it.
+
+    This is display ONLY. Nothing the matcher reads is derived from it, and it is
+    computed after the cohort is fixed, so it cannot touch given_match, confidence,
+    cohort_size or the sort.
+
+    WHY the publishing name leads. `person.firstName` mirrors DynamoDB
+    Identity.primaryName -- the name the person actually publishes under -- and since
+    issue #171 it is a first-class route to the `full` given-name tier: a byline can
+    match on it ALONE, with identity.givenName agreeing on nothing, not even the first
+    initial. Labelling that candidate with the legal name shows the curator a name the
+    byline does not contain and hides the one it does. Live anchor: pmid 42670968,
+    byline "Mila Sun", mis4060, given_match `full` off pref_norm -- and the queue
+    printed "Shuo Sun", the legal name, which appears on none of her publications. The
+    row reads as a mismatch the curator should reject; the match is correct.
+
+    WHY the legal name stays. It is the name in the HR record, the directory and the
+    curator's other systems, and for the compound-surname / adopted-name population it
+    is the only string that joins the two. Dropping it would trade one confusion for
+    another, so both are shown and the parenthetical says which is which.
+
+    WHEN it fires -- both guards must pass, and each one kills a distinct false
+    positive measured on prod (24,132 identity x person rows, 2026-09-05):
+
+      1. The first names must actually disagree, normalised. Gating on the RENDERED
+         strings instead fires on 13,027 cwids / 16,110 authorship_review rows,
+         because a publishing name simply DROPS the middle name: "John Smith
+         (HR: John Michael Smith)" on thousands of rows that were never confusing.
+         577 cwids differ on the raw first name; `_norm` equality then absorbs 54 more
+         that differ only in case, accents or punctuation (lcai "Li-Qun"/"Liqun",
+         leg9067 "Leigh Ann"/"Leigh ann").
+      2. The rendered strings must differ too. Otherwise the degenerate case where the
+         publishing name has already absorbed the middle name prints itself twice --
+         dpc2003, givenName "Diany", middleName "Paola", firstName "Diany Paola",
+         would render "Diany Paola Calderon (HR: Diany Paola Calderon)". 88 cwids.
+
+    435 cwids survive both, reaching 460 of the 30,711 authorship_review rows carrying
+    a top_cwid (205 open / 148 accepted / 47 rejected / 45 dismissed / 15 assigned).
+    Longest result on prod is 84 characters against top_name VARCHAR(255); every write
+    site truncates to 255 anyway (aar_orchestrator, aar_universe_scopus,
+    aar_reconcile_open, aar_report_changed_picks).
+
+    Fires on the WHOLE disagreeing population, NOT only where the first INITIAL also
+    differs. The initial is not the discriminator the confusion follows: jog4030 is
+    "Joseph Gardella" in HR and publishes as "Jae Gardella" -- same initial, and the
+    label is exactly as unreadable as mis4060's. So are kal4054 (Kai-Lin/Katherine),
+    jiy4011 (Jie/Jennifer), ahc2004 (Ah Yeon/Alice), mek4005 (Melanie/Mindy) and 53
+    more. Restricting to a differing initial covers 181 of the 460 rows and leaves 279
+    -- Gardella among them -- printing a name the byline does not contain.
+
+    Returns today's exact string, byte for byte, whenever either guard fails."""
+    legal = " ".join(x for x in (rec.get("given"), rec.get("middle"),
+                                 rec.get("surname")) if x)
+    pref = (rec.get("pref") or "").strip()
+    if not pref or _norm(pref) == _norm(rec.get("given")):
+        return legal
+    publishing = " ".join(x for x in (pref, rec.get("surname")) if x)
+    if _norm(publishing) == _norm(legal):
+        return legal
+    return f"{publishing} (HR: {legal})"
+
+
 # ---- identity index --------------------------------------------------------
 class IdentityIndex:
     """In-memory index of reciterdb `identity`, keyed by normalised surname."""
@@ -331,6 +396,12 @@ class IdentityIndex:
             "given": given, "middle": r["middleName"] or "", "surname": r["surname"] or "",
             "given_norm": _norm(given), "surname_norm": _norm(r["surname"]),
             "pref_norm": _norm(r.get("prefFirstName")),
+            # The publishing name kept RAW, for `_display_name` only. pref_norm is
+            # lossy by construction (lowercased, unpunctuated) so the matched name was
+            # unavailable to print, which is the whole reason the label fell back to
+            # the legal one. The matcher must keep reading pref_norm and only
+            # pref_norm -- nothing below this line tests `pref`.
+            "pref": (r.get("prefFirstName") or "").strip(),
             "dept": r["primaryAcademicDepartment"] or "",
             "division": r["primaryAcademicDivision"] or "",
             "program": r["primaryProgram"] or "",
@@ -478,7 +549,7 @@ class IdentityIndex:
             penalty = temporal_penalty(gap)
             out.append({
                 "cwid": rec["cwid"],
-                "name": " ".join(x for x in (rec["given"], rec["middle"], rec["surname"]) if x),
+                "name": _display_name(rec),
                 "dept": rec["dept"], "division": rec["division"],
                 "person_type": rec["person_type"], "title": rec["title"],
                 "given_match": given_match,
@@ -574,6 +645,7 @@ def _selftest():
             "given": given, "middle": middle, "surname": surname,
             "given_norm": _norm(given), "surname_norm": _norm(surname),
             "pref_norm": _norm(pref_first),
+            "pref": (pref_first or "").strip(),
             "dept": "", "division": "", "program": "", "title": "",
             "person_type": "Full-Time Faculty", "historical": False,
             "end_year": end_year,
@@ -808,6 +880,80 @@ def _selftest():
     poons = IdentityIndex([rec("Zhi-Lin", "", "Pan", cwid="zhp4001", pref_first="Chi-Lam")])
     checks.append(("a mirror-only SURNAME is deliberately not indexed",
                    poons.candidates("Poon", "Chi-Lam", "C") == ([], 0)))
+
+    # --- the candidate LABEL (`name`) ----------------------------------------
+    # The publishing name is what the byline carries and, since #171, what can earn
+    # the `full` tier on its own; the legal name follows in parentheses. Every case
+    # where the two agree -- or where there is no publishing name at all -- must come
+    # out byte-identical to the pre-patch join, because that string is stored as
+    # authorship_review.top_name on 30,251 rows this must not churn.
+    legal_join = (lambda r: " ".join(x for x in (r["given"], r["middle"], r["surname"])
+                                     if x))
+    mila = rec("Shuo", "", "Sun", cwid="mis4060", pref_first="Mila")
+    tony = rec("Anthony", "Ehren", "Rosen", cwid="aer2006", pref_first="Tony")
+    jae = rec("Joseph", "", "Gardella", cwid="jog4030", pref_first="Jae")
+    agree = rec("Jane", "Q", "Doe", cwid="agree", pref_first="Jane")
+    nopref = rec("Jane", "Q", "Doe", cwid="nopref")
+    blankpref = rec("Jane", "Q", "Doe", cwid="blank", pref_first="   ")
+    casediff = rec("Leigh", "Ann", "Griffin", cwid="leg9067", pref_first="leigh")
+    punct = rec("Li-Qun", "", "Cai", cwid="lcai", pref_first="Liqun")
+    absorbed = rec("Diany", "Paola", "Calderon", cwid="dpc2003",
+                   pref_first="Diany Paola")
+    nomiddle = rec("Xiaoxuan", "", "Chen", cwid="xic4004", pref_first="Emily")
+    checks += [
+        ("the live anchor prints the publishing name first (pmid 42670968, mis4060)",
+         _display_name(mila) == "Mila Sun (HR: Shuo Sun)"),
+        ("a dropped middleName is preserved inside the parenthetical",
+         _display_name(tony) == "Tony Rosen (HR: Anthony Ehren Rosen)"),
+        ("a SAME-INITIAL disagreement fires too -- this is why the fix is not gated "
+         "on the first initial (jog4030 publishes as Jae, HR says Joseph)",
+         _display_name(jae) == "Jae Gardella (HR: Joseph Gardella)"),
+        ("no middleName, differing first name -> plain two-name parenthetical",
+         _display_name(nomiddle) == "Emily Chen (HR: Xiaoxuan Chen)"),
+        ("names that AGREE fall through byte-identical to the old join",
+         _display_name(agree) == legal_join(agree) == "Jane Q Doe"),
+        ("an ABSENT publishing name falls through byte-identical",
+         _display_name(nopref) == legal_join(nopref) == "Jane Q Doe"),
+        ("a whitespace-only publishing name falls through byte-identical "
+         "(5 such rows on prod, where SQL <> '' does not catch them)",
+         _display_name(blankpref) == legal_join(blankpref) == "Jane Q Doe"),
+        ("a case-only difference is not a difference (_norm equality)",
+         _display_name(casediff) == legal_join(casediff) == "Leigh Ann Griffin"),
+        ("nor is a punctuation-only one (Li-Qun / Liqun)",
+         _display_name(punct) == legal_join(punct) == "Li-Qun Cai"),
+        ("a publishing name that has ABSORBED the middleName does not print itself "
+         "twice (dpc2003: 'Diany' + 'Paola' vs 'Diany Paola')",
+         _display_name(absorbed) == legal_join(absorbed) == "Diany Paola Calderon"),
+        ("an empty middleName never leaves a double space in either branch",
+         "  " not in _display_name(mila) and "  " not in _display_name(nomiddle)
+         and "  " not in _display_name(rec("Jane", "", "Doe", cwid="nm"))),
+    ]
+
+    # The label is downstream of the match: relabelling must not move given_match,
+    # confidence, cohort_size or the ranking. Same index, scored with and without the
+    # raw publishing name present.
+    lbl = IdentityIndex([mila, rec("Yuqing", "", "Sun", cwid="yus9035",
+                                   pref_first="Erica")])
+    with_pref, coh_with = lbl.candidates("Sun", "Mila", "M")
+    stripped = IdentityIndex([{**mila, "pref": ""},
+                              {**rec("Yuqing", "", "Sun", cwid="yus9035",
+                                     pref_first="Erica"), "pref": ""}])
+    no_pref, coh_no = stripped.candidates("Sun", "Mila", "M")
+    keys = ("cwid", "given_match", "confidence", "cohort_size", "affil_dept_match",
+            "person_type", "dept", "years_after_wcm")
+    checks += [
+        ("dropping the RAW publishing name changes nothing the matcher reads -- "
+         "cwid, given_match, confidence, cohort_size and order are identical",
+         [tuple(c[k] for k in keys) for c in with_pref]
+         == [tuple(c[k] for k in keys) for c in no_pref] and coh_with == coh_no),
+        ("...and `name` is the ONLY field that moved",
+         [c["name"] for c in with_pref] != [c["name"] for c in no_pref]
+         and with_pref[0]["name"] == "Mila Sun (HR: Shuo Sun)"
+         and no_pref[0]["name"] == "Shuo Sun"),
+        ("the anchor still reaches the `full` tier through pref_norm",
+         with_pref[0]["cwid"] == "mis4060"
+         and with_pref[0]["given_match"] == "full"),
+    ]
 
     # --- temporal plausibility (issue #159) ---------------------------------
     # Three Smiths who all match "J Smith" equally on name; only the WCM end year
