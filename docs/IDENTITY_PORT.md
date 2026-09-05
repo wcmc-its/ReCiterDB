@@ -149,6 +149,47 @@ recoverable from ED; if the flag is wanted again it needs defining, not guessing
 - [ ] Stale residue rows keep `fullTimeFaculty=yes` after an appointment ends.
       Pre-existing behaviour, deliberately not addressed here.
 
+## PREFER_ORGUNIT
+
+Ships `False`, so the first Splunk diff is empty. Flipping it to `True` moves
+departments and student programs onto ED's orgUnit model. Verified against live
+ED 2026-09-05 by running each source with the flag both ways:
+
+| column | cwids | changed | blanked |
+|---|---:|---:|---:|
+| `primaryAcademicDepartment` | 11,213 | 523 | **0** |
+| `inactiveDepartment` | 24,631 | 2,472 | **0** |
+| `primaryProgram` | 1,309 | 169 | **0** |
+| `program` | 5,638 | 428 | **0** |
+
+**Deepest level wins** -- `coalesce(L2, L1, department)`. L1 is the parent org and
+L2 the actual unit: Library sits at L2 under an L1 of "Information Technologies
+and Services", so taking L1 would file every librarian under ITS. Where L2
+exists, the old department matched L1 in 0 of 299 records.
+
+`inactiveDepartment` gains the most: 2,472 formerly-umbrella values become
+specific divisions (`Medicine` -> `General Internal Medicine` / `Hematology and
+Medical Oncology` / `Infectious Diseases`, `Biochemistry` -> `Biochemistry and
+Biophysics`). Check `Psychiatry` -> `Hospital Programs` (225) before accepting --
+it is the one mapping that looks less specific, not more.
+
+Students read `orgUnit;level2` and normalise through the existing
+`PROGRAM_OVERRIDE` table; ED's L2 spellings were added to it rather than a
+second mechanism being built. Note ED's quirks: `TriI` without the hyphen,
+`System Biology` without the plural.
+
+Two behaviour changes beyond the source swap, both deliberate:
+
+- `primaryProgram` was never normalised before. Under the flag it goes through
+  the same override table as `program`, so the two columns cannot disagree.
+  That is why 87 `Tri-I Program in Computational Biology & Medicine` become
+  `Computational Biology & Medicine`.
+- 62 MD-PhD students move from the generic `MD-PhD Program` to their specific
+  field (`Neuroscience`, `Immunology & Microbial Pathogenesis`, ...) because L2
+  names the field where the old attribute did not. This regroups them, it does
+  not merely rename them, and `program` feeds the
+  `primaryAcademicDepartment` fallback chain.
+
 ## The original
 
 `docs/reciter_identity_update.spl` is the Splunk saved search this job replaces,

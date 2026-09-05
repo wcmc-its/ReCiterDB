@@ -40,6 +40,7 @@ The diff harness is what proves it; see docs/IDENTITY_PORT.md.
 """
 
 import collections
+import datetime
 import logging
 import os
 import sys
@@ -225,13 +226,23 @@ class _Row(dict):
 
 
 def _flatten(value):
-    """ldap3 returns lists for every attribute. Take the first non-empty."""
+    """ldap3 returns lists for every attribute. Take the first non-empty.
+
+    Values are normalised to str here. ldap3 parses GeneralizedTime attributes
+    into datetime objects when they are populated, while an absent one comes
+    back as "" -- sorting or comparing that mix raises
+    `TypeError: '<' not supported between instances of 'str' and
+    'datetime.datetime'`. Normalising at the boundary means no comparison
+    downstream can hit it. ISO format also slices correctly for the [:4] year
+    extractions.
+    """
     if isinstance(value, list):
-        for v in value:
-            if v not in (None, ""):
-                return v
+        value = next((v for v in value if v not in (None, "")), "")
+    if value is None or value == "":
         return ""
-    return "" if value is None else value
+    if isinstance(value, (datetime.datetime, datetime.date)):
+        return value.isoformat()
+    return value if isinstance(value, str) else str(value)
 
 
 def _cwid(row):
@@ -448,10 +459,11 @@ def ed_faculty_inactive_department():
     rows = ldap_search(
         "ed-faculty",
         "(&(objectClass=weillCornellEduSORRoleRecord)(weillCornellEduStatus=faculty:expired))",
-        ["weillCornellEduCWID", "weillCornellEduDepartment", "weillCornellEduEndDate"])
+        ["weillCornellEduCWID", "weillCornellEduDepartment", "weillCornellEduEndDate",
+         "weillCornellEduOrgUnit;level1", "weillCornellEduOrgUnit;level2"])
     rows.sort(key=lambda r: r.get("weillCornellEduEndDate", ""), reverse=True)
     return _by_cwid(
-        rows, lambda r: {"inactiveDepartment": r.get("weillCornellEduDepartment", "")})
+        rows, lambda r: {"inactiveDepartment": _dept_value(r, primary=False)})
 
 
 @source
@@ -542,12 +554,72 @@ def ed_sors_student_end_date():
 # This counter is the early warning: when ED starts retiring the old attributes,
 # old coverage falls and new coverage rises, and --dry-run will say so before
 # anything breaks. Division stays on ASMS -- orgUnit;level2 covers only ~7%.
+# Prefer ED's new orgUnit model over the old department attributes, falling back
+# to the old value when ED has no orgUnit for that person -- coalesce, never a
+# hard switch, so nobody is blanked. Measured 2026-09-05 over all 8,765 faculty
+# SOR records, flipping this to True changes exactly 241 rows across four
+# mappings and blanks nobody:
+#
+#     125  Otolaryngology - Head and Neck Surgery -> Otolaryngology Head and Neck Surgery
+#     113  Brain and Mind Research Institute      -> Brain and Mind Research
+#       2  Orthopaedic Surgery                    -> Hospital for Special Surgery
+#       1  Administration                         -> Administration & Finance
+#
+# 391 people have a department and no orgUnit; the fallback keeps their value,
+# which matters because identity_index feeds this column into affiliation
+# matching (affil_dept_match) -- a blank dept silently removes that signal.
+#
+# Ships False so the first diff against Splunk is empty. Flip to True once that
+# diff is clean: the delta is fully predicted, so it stays verifiable.
+# ponytail: a boolean, not a strategy class. Delete it once the old attributes go.
+PREFER_ORGUNIT = False
+
 ORGUNIT_MIGRATION_WATCH = [
     ("weillCornellEduPrimaryDepartment", "weillCornellEduPrimaryOrgUnit;level1"),
     ("weillCornellEduDepartment", "weillCornellEduOrgUnit;level1"),
 ]
 
 _migration_counts = collections.Counter()
+
+
+def _dept_value(row, primary=True):
+    """Department for one record, honouring PREFER_ORGUNIT.
+
+    `primary` picks which attribute pair applies: the person's primary
+    department (ed-sors faculty SOR records) or their role department
+    (ed-faculty role records, and the NYP fallback).
+    """
+    pre = "weillCornellEduPrimary" if primary else "weillCornellEdu"
+    old = pre + "Department"
+    if PREFER_ORGUNIT:
+        # DEEPEST level wins. L1 is the parent org, L2 is the actual unit:
+        # Library sits at L2 under an L1 of "Information Technologies and
+        # Services", and taking L1 would file every librarian under ITS. Where
+        # L2 exists the old department matched L1 in 0 of 299 records.
+        return (row.get(f"{pre}OrgUnit;level2")
+                or row.get(f"{pre}OrgUnit;level1")
+                or row.get(old))
+    return row.get(old)
+
+
+def _program_value(row, primary=False):
+    """Program for one record, honouring PREFER_ORGUNIT, normalised through
+    PROGRAM_OVERRIDE.
+
+    orgUnit;level2 carries the program name directly (1,938/1,998 doctoral role
+    records; 1,309/1,309 active-student SOR records), which is the way off
+    weillCornellEduProgramCode. The override table is reused rather than
+    replaced -- it already collapses the MD-PhD variants, and ED's L2 spellings
+    were added to it rather than a second mechanism being introduced.
+    """
+    pre = "weillCornellEduPrimary" if primary else "weillCornellEdu"
+    old = row.get(pre + "Program")
+    raw = (row.get(f"{pre}OrgUnit;level2") or old) if PREFER_ORGUNIT else old
+    if not raw:
+        return ""
+    # primaryProgram was never normalised before; under the flag both program
+    # columns go through the same table so they cannot disagree.
+    return PROGRAM_OVERRIDE.get(raw, raw) if PREFER_ORGUNIT else raw
 
 
 def _watch_orgunit_migration(rows):
@@ -569,6 +641,7 @@ def ed_sors_primary_department():
         ["weillCornellEduCWID", "weillCornellEduPrimaryDepartment",
          # requested only to measure the migration; not read into any column
          "weillCornellEduPrimaryOrgUnit;level1", "weillCornellEduOrgUnit;level1",
+         "weillCornellEduPrimaryOrgUnit;level2", "weillCornellEduOrgUnit;level2",
          "weillCornellEduDepartment"])
     _watch_orgunit_migration(faculty)
     nyp = ldap_search(
@@ -576,19 +649,20 @@ def ed_sors_primary_department():
         """(&(objectClass=weillCornellEduSORRecord)(ou=nyp affiliates)
             (weillCornellEduPersonTypeCode=affiliate-nyp-resident))""",
         ["weillCornellEduCWID", "weillCornellEduDepartment",
-         "weillCornellEduPrimaryDepartment"])
+         "weillCornellEduPrimaryDepartment",
+         "weillCornellEduOrgUnit;level1", "weillCornellEduPrimaryOrgUnit;level1",
+         "weillCornellEduOrgUnit;level2", "weillCornellEduPrimaryOrgUnit;level2"])
 
     out = {}
     for row in faculty:
-        cwid, dept = _cwid(row), row.get("weillCornellEduPrimaryDepartment", "")
+        cwid, dept = _cwid(row), _dept_value(row)
         if cwid and dept and cwid not in out:
             out[cwid] = {"primaryAcademicDepartment": dept}
     for row in nyp:
         cwid = _cwid(row)
         if not cwid or cwid in out:
             continue
-        dept = (row.get("weillCornellEduPrimaryDepartment")
-                or row.get("weillCornellEduDepartment") or "")
+        dept = _dept_value(row) or _dept_value(row, primary=False) or ""
         for old, new in (("&&Weill Cornell GME", ""), ("Blank_dept", ""), (".GME", "")):
             dept = dept.replace(old, new)
         if dept:
@@ -606,9 +680,9 @@ def ed_students_primary_program():
               (weillCornellEduPersonTypeCode=student-phd-weill)
               (weillCornellEduPersonTypeCode=student-phd-tri-i))
             (weillCornellEduStatus=student:active))""",
-        ["weillCornellEduCWID", "weillCornellEduPrimaryProgram"])
-    return _by_cwid(
-        rows, lambda r: {"primaryProgram": r.get("weillCornellEduPrimaryProgram", "")})
+        ["weillCornellEduCWID", "weillCornellEduPrimaryProgram",
+         "weillCornellEduPrimaryOrgUnit;level2"])
+    return _by_cwid(rows, lambda r: {"primaryProgram": _program_value(r, primary=True)})
 
 
 @source
@@ -677,6 +751,21 @@ PROGRAM_OVERRIDE = {
     "MD-PhD WGS Physiology, Biophysics & System Biology": "Physiology, Biophysics & Systems Biology",
     "Tri-I Program in Computational Biology & Medicine": "Computational Biology & Medicine",
     "Tri-I Program in Chemical Biology": "Chemical Biology",
+    # ED's orgUnit;level2 spells these "MD-PhD <X>" where the old program
+    # attribute said "MD-PhD WGS <X>". Same programs, so they collapse to the
+    # same names -- Paul's call 2026-09-05: "Neuroscience" over "MD-PhD
+    # Neuroscience". Note ED's own quirks: "TriI" without the hyphen, and
+    # "System Biology" without the plural. Taken from the live L2 vocabulary,
+    # not guessed.
+    "MD-PhD Neuroscience": "Neuroscience",
+    "MD-PhD Immunology & Microbial Pathogenesis": "Immunology & Microbial Pathogenesis",
+    "MD-PhD Cell & Developmental Biology": "Cell & Developmental Biology",
+    "MD-PhD Biochemistry & Structural Biology": "Biochemistry & Structural Biology",
+    "MD-PhD Pharmacology": "Pharmacology",
+    "MD-PhD Molecular Biology": "Molecular Biology",
+    "MD-PhD Physiology, Biophysics & System Biology": "Physiology, Biophysics & Systems Biology",
+    "MD-PhD TriI Computational Biology & Medicine": "Computational Biology & Medicine",
+
     "MD-PhD Rockefeller University Major": "MD-PhD Program",
     "MD-PhD Gerstner Sloan-Kettering": "MD-PhD Program",
 }
@@ -707,14 +796,14 @@ def ed_students_program():
         """(&(objectClass=weillCornellEduSORRoleRecord)
             (|(weillCornellEduDegreeCode=PHD)(weillCornellEduDegreeCode=MDPHD)
               (weillCornellEduDegreeCode=MD)))""",
-        ["weillCornellEduCWID", "weillCornellEduProgram"])
+        ["weillCornellEduCWID", "weillCornellEduProgram",
+         "weillCornellEduOrgUnit;level2"])
     best = {}
     for row in rows:
         cwid = _cwid(row)
         if not cwid:
             continue
-        raw = row.get("weillCornellEduProgram", "")
-        program = PROGRAM_OVERRIDE.get(raw, raw)
+        program = _program_value(row)
         priority = PROGRAM_PRIORITY.get(program, 999)
         if cwid not in best or priority < best[cwid][0]:
             best[cwid] = (priority, program)
@@ -988,6 +1077,58 @@ def demo():
     assert row.get("labeledURI;onlineDirectory") == "http://d", "attr option casing"
     assert row.get("weillcornelleducwid") == "abc1001", "attr name casing"
     assert row.get("nosuchattr") == "", "missing attr defaults to empty string"
+
+    # ldap3 hands back datetimes for populated GeneralizedTime attributes and ""
+    # for absent ones; sorting that mix used to raise TypeError.
+    assert _flatten(datetime.datetime(2019, 5, 15)).startswith("2019-05-15")
+    assert _flatten([]) == "" and _flatten(None) == ""
+    assert sorted([_flatten(datetime.datetime(2019, 5, 15)), _flatten("")]) == \
+        ["", "2019-05-15T00:00:00"], "mixed date/empty must sort"
+    assert _flatten(datetime.datetime(2019, 5, 15))[:4] == "2019", "year slice"
+
+    # PREFER_ORGUNIT is a coalesce, never a hard switch: the old value survives
+    # wherever ED has no orgUnit, so flipping the flag can blank nobody.
+    # NB: mutate globals() directly. `import buildIdentity` from __main__ creates
+    # a SECOND module object, so setting the flag there would not affect the one
+    # _dept_value actually reads.
+    has_both = _Row([("weillCornellEduPrimaryDepartment", "Brain and Mind Research Institute"),
+                     ("weillCornellEduPrimaryOrgUnit;level1", "Brain and Mind Research")])
+    old_only = _Row([("weillCornellEduPrimaryDepartment", "Pediatrics")])
+    was = PREFER_ORGUNIT
+    try:
+        globals()["PREFER_ORGUNIT"] = False
+        assert _dept_value(has_both) == "Brain and Mind Research Institute"
+        assert _dept_value(old_only) == "Pediatrics"
+        globals()["PREFER_ORGUNIT"] = True
+        assert _dept_value(has_both) == "Brain and Mind Research", "prefers orgUnit"
+        assert _dept_value(old_only) == "Pediatrics", "falls back, never blanks"
+
+        # DEEPEST level, not L1 -- otherwise every librarian files under ITS.
+        lib = _Row([("weillCornellEduPrimaryDepartment", "Library"),
+                    ("weillCornellEduPrimaryOrgUnit;level1", "Information Technologies and Services"),
+                    ("weillCornellEduPrimaryOrgUnit;level2", "Library")])
+        assert _dept_value(lib) == "Library", "L2 beats L1"
+
+        # ED's L2 spellings collapse through the same override table.
+        for raw, want in [("MD-PhD Neuroscience", "Neuroscience"),
+                          ("MD-PhD TriI Computational Biology & Medicine",
+                           "Computational Biology & Medicine"),
+                          ("MD-PhD Physiology, Biophysics & System Biology",
+                           "Physiology, Biophysics & Systems Biology"),
+                          ("Pharmacology", "Pharmacology"),
+                          ("MD-PhD Program", "MD-PhD Program")]:
+            got = _program_value(_Row([("weillCornellEduOrgUnit;level2", raw)]))
+            assert got == want, f"program override {raw!r} -> {got!r}, wanted {want!r}"
+
+        # No level2 -> falls back to the old program attribute, never blank.
+        assert _program_value(_Row([("weillCornellEduProgram", "Molecular Biology")])) \
+            == "Molecular Biology", "program falls back"
+    finally:
+        globals()["PREFER_ORGUNIT"] = was
+
+    # Flag off: both columns keep the old attribute verbatim, unnormalised.
+    assert _program_value(_Row([("weillCornellEduPrimaryProgram", "MD-PhD WGS Neuroscience")],),
+                          primary=True) == "MD-PhD WGS Neuroscience", "verbatim when off"
     print("demo ok")
 
 
