@@ -515,9 +515,12 @@ def _replay_scopus(rows, idx, limit=None):
         prelim.append((r, rec))
 
     # `or rec["drift"]` (#186): the reconstruction pass feeds idx.candidates() a byline
-    # split (initials=None) and NO pub_year, so its `confidence` carries no temporal
-    # penalty and its given_match tier can be weaker than the producer's -- a
-    # reconstruction is good enough to FLAG a row but never good enough to write one.
+    # split (initials=None), so its given_match tier can be weaker than the producer's
+    # -- a reconstruction is good enough to FLAG a row but never good enough to write
+    # one. (It DOES pass a pub_year, recovered from the row's own stored coverDate by
+    # _scopus_pub_year above, so #159's temporal penalty is in its `confidence`; that
+    # was added with this filter and is why a row stale only in that penalty is flagged
+    # rather than missed. See _scopus_pub_year's docstring for the measurement.)
     # Routing drift suspects through the same live re-fetch CHANGED/NO_MATCH already
     # get keeps the standing guarantee that no scopus row is ever written from a
     # reconstruction; the second _row_result call on the live candidates is what
