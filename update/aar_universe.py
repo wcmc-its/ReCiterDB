@@ -43,7 +43,7 @@ Usage:
   python aar_universe.py --mode initial
   python aar_universe.py --from 2026/05/05 --to 2026/05/20 --out /tmp/u.json   # custom/test
 """
-import argparse, json, os, sys, time, xml.etree.ElementTree as ET
+import argparse, json, os, re, sys, time, xml.etree.ElementTree as ET
 from datetime import date, timedelta
 
 import requests
@@ -138,6 +138,40 @@ def _req(method, path, **params):
     raise RuntimeError(f"E-utilities {path} failed after retries")
 
 
+_PMID_RE = re.compile(rb"<PMID[^>]*>(\d+)</PMID>")
+
+
+def _fetch_and_parse(fetch_fn, groups, pmid_hint=None, max_retries=2):
+    """Run `fetch_fn` (a no-arg thunk that issues the `_req` call and returns the raw
+    response bytes) and parse it, re-issuing the *whole request* up to `max_retries`
+    more times when the body is truncated. `_req` already retries HTTP-level failures
+    (non-200s, connection errors) with backoff, but a truncated body rides in on a
+    plain 200 and passes `raise_for_status()` clean — the failure only shows up as an
+    `ET.ParseError` deep in `parse_articles`. Same backoff style as `_req` (1.5s *
+    attempt). `pmid_hint`, when the caller already knows the requested chunk's
+    (first, last) PMID, is used verbatim in the final error; otherwise it's read off
+    the raw bytes on a best-effort basis, since a truncated document may still be
+    unparseable by ET but still contain readable <PMID> tags."""
+    xml_bytes = None
+    last_exc = None
+    for attempt in range(1 + max_retries):
+        xml_bytes = fetch_fn()
+        try:
+            return parse_articles(xml_bytes, groups)
+        except ET.ParseError as e:
+            last_exc = e
+            if attempt < max_retries:
+                time.sleep(1.5 * (attempt + 1))
+    if pmid_hint:
+        first, last = pmid_hint
+    else:
+        found = _PMID_RE.findall(xml_bytes or b"")
+        first, last = (int(found[0]), int(found[-1])) if found else ("unknown", "unknown")
+    raise ET.ParseError(
+        f"efetch chunk pmid {first}..{last} still truncated/unparseable after "
+        f"{1 + max_retries} attempts: {last_exc}")
+
+
 def efetch_by_ids(pmids, groups):
     """EFetch a specific PMID list (not an ESearch/date window) and parse them the same
     way pull_universe() does. Used by the orchestrator's backfill path to re-fetch full
@@ -148,9 +182,11 @@ def efetch_by_ids(pmids, groups):
     out = []
     for i in range(0, len(pmids), EFETCH_BATCH):
         chunk = pmids[i:i + EFETCH_BATCH]
-        r = _req("POST", "efetch.fcgi", db="pubmed",
-                 id=",".join(str(p) for p in chunk), retmode="xml")
-        out.extend(parse_articles(r.content, groups))
+        out.extend(_fetch_and_parse(
+            lambda chunk=chunk: _req(
+                "POST", "efetch.fcgi", db="pubmed",
+                id=",".join(str(p) for p in chunk), retmode="xml").content,
+            groups, pmid_hint=(chunk[0], chunk[-1])))
         time.sleep(SLEEP)
     return out
 
@@ -272,8 +308,9 @@ def pull_universe(date_from, date_to, max_records=None, progress=True):
     articles = []
     for start in range(0, total, EFETCH_BATCH):
         retmax = min(EFETCH_BATCH, total - start)
-        xml = efetch_batch(webenv, query_key, start, retmax)
-        articles.extend(parse_articles(xml, groups))
+        articles.extend(_fetch_and_parse(
+            lambda start=start, retmax=retmax: efetch_batch(webenv, query_key, start, retmax),
+            groups))
         if progress:
             print(f"  fetched {min(start + retmax, total)}/{total}", flush=True)
         time.sleep(SLEEP)
@@ -295,7 +332,7 @@ def pull_universe(date_from, date_to, max_records=None, progress=True):
 def _selftest():
     """Offline (no network) checks for `_pub_year` — the publication-year parser the
     temporal-plausibility penalty depends on (issue #159), on the larger of the two
-    lanes. Nothing else in this module asserted it."""
+    lanes — plus `_fetch_and_parse`'s retry of a truncated EFetch body (issue #207)."""
     ok = True
 
     def check(label, cond):
@@ -318,6 +355,58 @@ def _selftest():
     check("_pub_year is None when the record carries no year at all "
           "(absent case -> the penalty is simply off, pre-#159 ranking)",
           _pub_year(art("<PubDate/>")) is None and _pub_year(art("")) is None)
+
+    # ---- _fetch_and_parse retry on a truncated EFetch body (issue #207) ----
+    global _req
+    orig_req, orig_sleep = _req, time.sleep
+    time.sleep = lambda s: None  # skip the real backoff delay during selftest
+
+    class _FakeResp:
+        def __init__(self, content):
+            self.content = content
+
+    TRUNCATED = b"<PubmedArticleSet><PubmedArticle><MedlineCitation><PMID>555</PMID>"
+    VALID = (
+        b"<PubmedArticleSet><PubmedArticle><MedlineCitation><PMID>555</PMID>"
+        b"<Article><ArticleTitle>T</ArticleTitle><Journal><Title>J</Title>"
+        b"<JournalIssue><PubDate><Year>2020</Year></PubDate></JournalIssue></Journal>"
+        b"<AuthorList><Author><LastName>Doe</LastName><ForeName>Jane</ForeName>"
+        b"<Initials>J</Initials></Author></AuthorList></Article></MedlineCitation>"
+        b"<PubmedData><History></History><ArticleIdList></ArticleIdList></PubmedData>"
+        b"</PubmedArticle></PubmedArticleSet>")
+
+    try:
+        calls = {"n": 0}
+
+        def _req_once_truncated(method, path, **params):
+            calls["n"] += 1
+            return _FakeResp(TRUNCATED if calls["n"] == 1 else VALID)
+
+        _req = _req_once_truncated
+        result = efetch_by_ids([555], [])
+        check("efetch_by_ids retries a truncated EFetch body and returns the parsed "
+              "article on the second attempt (issue #207)",
+              calls["n"] == 2 and len(result) == 1 and result[0]["pmid"] == 555)
+
+        calls["n"] = 0
+
+        def _req_always_truncated(method, path, **params):
+            calls["n"] += 1
+            return _FakeResp(TRUNCATED)
+
+        _req = _req_always_truncated
+        raised = None
+        try:
+            efetch_by_ids([555], [])
+        except ET.ParseError as e:
+            raised = str(e)
+        check("efetch_by_ids gives up after 3 attempts and names the chunk's pmid "
+              "range in the error",
+              calls["n"] == 3 and raised is not None
+              and "555..555" in raised and "3 attempts" in raised)
+    finally:
+        _req, time.sleep = orig_req, orig_sleep
+
     print("SELFTEST", "PASS" if ok else "FAIL")
     return ok
 
