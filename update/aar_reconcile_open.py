@@ -13,10 +13,13 @@ the two staleness classes PR #180 (issue #177, NO_MATCH) does not cover.
     manual, one-off pass only.
 
   CLASS B (#182, #203) -- a REPLAY of the authorship through the CURRENT matcher would
-    write something DIFFERENT from what is stored. Action: refresh the same 9 producer-
-    owned columns aar_sweep_stale.py (#180) nulls: top_cwid, top_name, top_person_type,
+    write something DIFFERENT from what is stored. Action: refresh the 9 producer-owned
+    columns aar_sweep_stale.py (#180) nulls -- top_cwid, top_name, top_person_type,
     top_dept, top_given_match, top_affil_match, top_confidence, candidate_cwids_json,
-    n_candidates. Two sub-classes, by what moved:
+    n_candidates -- plus the three row-level columns the producer writes from the same
+    candidate list and #180 deliberately leaves alone: top_cohort_size,
+    single_candidate, last_refreshed (#205; see _write_payload for why they are written
+    but are not drift TRIGGERS). Two sub-classes, by what moved:
 
       PICK_CHANGE  the replay proposes a different top_cwid. A curator is looking at the
         wrong NAME. Gated by given_match tier move -- stronger applied, sideways behind
@@ -243,7 +246,8 @@ REUSE, NOT A FOURTH MATCHING PATH
   measurement used, unmodified on disk. That replay's own output shape (`_row_result`)
   keeps only the trimmed old/new cwid+name+given_match+confidence fields it needs for
   its CSV -- not the full candidate dict (person_type, dept, affil_dept_match,
-  candidate list) this tool needs to actually WRITE the 9 columns. Rather than adding a
+  candidate list) this tool needs to actually WRITE the refresh columns. Rather than
+  adding a
   second, parallel re-implementation of the fetch+match loop (a real "fourth path",
   and a real risk of quietly drifting from what #182 measured), this module installs a
   transparent, in-process capture around aar_report_changed_picks._row_result: the
@@ -369,18 +373,49 @@ def _load_class_b_modules():
 
     idxmod, uni, scop, matcher, sweep, rcp, IdentityIndex = (
         _idxmod, _uni, _scop, _matcher, _sweep, _rcp, _IdentityIndex)
-    # The exact 9 columns #180 nulls and #182 says need refreshing -- imported, not
-    # redefined, so the two tools can never silently diverge on which columns are in play.
-    REFRESH_COLS = sweep.NULL_COLUMNS
-    # ...and the drift TRIGGER is that same set minus top_cwid, whose comparison is the
+    # #180's 9 columns, imported not redefined, PLUS the three row-level columns the
+    # producer writes from the same candidate list and #180 deliberately leaves alone.
+    #
+    # WHY NOT JUST EXTEND aar_sweep_stale.NULL_COLUMNS. Because that list is a list of
+    # columns to NULL, and `last_refreshed` must never be nulled: it is the producer's
+    # own "when was this row last written" timestamp, and a NULL there says the producer
+    # has never touched the row, which is false for a swept one and misleads every
+    # freshness query (including this pass's own applied-confirmation below). Since one
+    # of the three cannot join that list, the list cannot be the single source for all
+    # three anyway -- and moving the other two would change what aar_sweep_stale's own
+    # shipped UPDATE nulls on a matches-nobody row, a behaviour change to a different,
+    # already-run tool. So: the sweep's list, plus three, with the relationship asserted.
+    #
+    # These three are PAYLOAD ONLY, never drift TRIGGERS -- top_cohort_size and
+    # single_candidate are derived from the top candidate's cohort_size, which IS a
+    # trigger through the candidate entries, so a row that needs them rewritten is
+    # already caught by candidate_cwids_json; last_refreshed changes on every write by
+    # definition and would make every row drift forever.
+    REFRESH_COLS = list(sweep.NULL_COLUMNS) + [
+        "top_cohort_size", "single_candidate", "last_refreshed"]
+    _EXTRA = [c for c in REFRESH_COLS if c not in sweep.NULL_COLUMNS]
+    assert set(sweep.NULL_COLUMNS) <= set(REFRESH_COLS) and _EXTRA == [
+        "top_cohort_size", "single_candidate", "last_refreshed"], (
+        f"REFRESH_COLS is not aar_sweep_stale.NULL_COLUMNS plus exactly the three "
+        f"row-level producer columns: {REFRESH_COLS}")
+    assert all(c in aar_db._REFRESH_COLS for c in REFRESH_COLS), (
+        f"REFRESH_COLS names a column the producer itself does not refresh: "
+        f"{[c for c in REFRESH_COLS if c not in aar_db._REFRESH_COLS]}")
+    assert not (set(REFRESH_COLS) & {"status", "resolution_cwid", "reviewer", "note",
+                                     "snooze_until"}), (
+        "REFRESH_COLS names a curator-owned column -- CLASS B must never write one")
+    # ...and the drift TRIGGER is #180's 9 minus top_cwid, whose comparison is the
     # CHANGED/UNCHANGED split itself. Asserted here rather than hand-synced (#205): a
-    # column added to the refresh set but not to rcp._DRIFT_COLS would be rewritten on
-    # every refresh yet never able to CAUSE one, so a row stale in that column alone
-    # would sit unreconciled forever.
-    assert set(_rcp._DRIFT_COLS) | {"top_cwid"} == set(REFRESH_COLS), (
-        f"drift trigger {sorted(_rcp._DRIFT_COLS)} + top_cwid != refresh set "
-        f"{sorted(REFRESH_COLS)} -- aar_report_changed_picks._DRIFT_COLS and "
+    # column added to the trigger but not to the refresh set could cause a rewrite that
+    # never fixes it, and one added to #180's list but not the trigger would be
+    # rewritten on every refresh yet never able to CAUSE one, so a row stale in that
+    # column alone would sit unreconciled forever.
+    assert set(_rcp._DRIFT_COLS) | {"top_cwid"} == set(sweep.NULL_COLUMNS), (
+        f"drift trigger {sorted(_rcp._DRIFT_COLS)} + top_cwid != #180's null set "
+        f"{sorted(sweep.NULL_COLUMNS)} -- aar_report_changed_picks._DRIFT_COLS and "
         "aar_sweep_stale.NULL_COLUMNS have diverged (#205).")
+    assert set(_rcp._DRIFT_COLS) < set(REFRESH_COLS), (
+        "every drift trigger must also be written by the refresh it triggers")
 
 
 # ============================================================================
@@ -502,10 +537,22 @@ def _install_capture():
     rcp._row_result = _row_result_capture
 
 
-def _write_payload(rec):
-    """The 9-column refresh payload for one CLASS-B CHANGED record, built from the
-    captured full candidate list -- asserted against what the replay itself classified
-    before being trusted (see REUSE)."""
+def _write_payload(rec, run_ts):
+    """The refresh payload for one CLASS-B record, built from the captured full
+    candidate list -- asserted against what the replay itself classified before being
+    trusted (see REUSE).
+
+    Every column in REFRESH_COLS, not just #180's nine. top_cohort_size,
+    single_candidate and last_refreshed are row-level columns the producer writes from
+    this same candidate list (aar_orchestrator._db_rows: `top_cohort_size = cohort`,
+    `single_candidate = int(cohort == 1)`, `last_refreshed = run_date`), and cohort_size
+    IS a drift trigger through the candidate entries -- so before #205 a refreshed row
+    could carry a brand-new candidate list beside a cohort size from a previous matcher
+    generation, and Publication Manager keys its single-candidate bulk actions and its
+    "choose among N homonyms" copy on exactly those two columns. `if cohort else None`
+    mirrors aar_universe_scopus._build_row; a row only ever reaches here with a top
+    candidate, so cohort is always >= 1 and this agrees with the pubmed producer's
+    unconditional int() as well."""
     cands = FULL_CANDS_BY_ID.get(rec["id"])
     if not cands:
         raise AssertionError(f"row {rec['id']}: no captured candidate list -- capture "
@@ -517,6 +564,7 @@ def _write_payload(rec):
         "actually classify. See the capture ponytail note.")
     compact = orch._compact if rec["source"] == "pubmed" else scop._compact
     trunc = orch._trunc
+    cohort = top.get("cohort_size")
     return {
         "top_cwid": top["cwid"],
         "top_name": trunc(top["name"], 255),
@@ -527,6 +575,9 @@ def _write_payload(rec):
         "top_confidence": top["confidence"],
         "candidate_cwids_json": json.dumps(compact(cands)),
         "n_candidates": len(cands),
+        "top_cohort_size": cohort,
+        "single_candidate": int(cohort == 1) if cohort else None,
+        "last_refreshed": run_ts,
     }
 
 
@@ -609,10 +660,11 @@ def _drift_col_counts(drift):
 
 
 def _full_before_snapshots(engine, ids):
-    """Real pre-write values for all 9 refresh columns, for the given row ids -- not
+    """Real pre-write values for every REFRESH_COLS column, for the given row ids -- not
     just the 4 fields aar_report_changed_picks._row_result happens to carry (old_cwid/
-    old_name/old_given_match/old_confidence). Reuses aar_sweep_stale's own column list
-    and snapshot helper so the ledger's 'before' is a genuine, reversible record.
+    old_name/old_given_match/old_confidence). Reads exactly the columns the write
+    touches, so the ledger's 'before' is a genuine, reversible record (#205: it read
+    aar_sweep_stale.NULL_COLUMNS, which is now three columns short of the write).
 
     Chunked since #186: DRIFT_ONLY is a thousands-of-rows class, not the low hundreds
     the tier-move classes are, and a single expanding IN list that wide is a needlessly
@@ -621,19 +673,19 @@ def _full_before_snapshots(engine, ids):
     ids = list(ids)
     if not ids:
         return {}
-    cols = ", ".join(["id"] + sweep.NULL_COLUMNS)
+    cols = ", ".join(["id"] + REFRESH_COLS)
     stmt = text(f"SELECT {cols} FROM authorship_review WHERE id IN :ids") \
         .bindparams(bindparam("ids", expanding=True))
     out = {}
     with engine.connect() as c:
         for i in range(0, len(ids), 1000):
             for r in c.execute(stmt, {"ids": ids[i:i + 1000]}).mappings().all():
-                out[r["id"]] = sweep._snapshot(r)
+                out[r["id"]] = {col: r[col] for col in REFRESH_COLS}
     return out
 
 
 def _class_b_ledger_entry(rec, run_ts, applied, before):
-    payload = _write_payload(rec)
+    payload = _write_payload(rec, run_ts)
     return {
         # `rule` is the greppable class: a tier_move for a pick change, "drift" for a
         # DRIFT_ONLY refresh (same person, stale evidence), with the columns that
@@ -959,7 +1011,7 @@ def main():
     if args.apply:
         na = _apply_class_a(engine, class_a, run_ts)
         # _apply_class_b consumes ledger-shaped entries (e["after"] is the exact
-        # 9-column payload the ledger promises), NOT raw write_set records (#189).
+        # REFRESH_COLS payload the ledger promises), NOT raw write_set records (#189).
         nb = _apply_class_b(engine, [e for e in ledger_entries if e["class"] == "B"],
                             run_ts)
         print(f"\n  APPLIED: {na} rows dismissed (class A), {nb} rows refreshed (class B)")
@@ -977,6 +1029,7 @@ def _selftest():
     rule, the write-payload assertion tripwire, --class-a-only's parsing and its
     note/CONCAT_WS write shape, and the CLASS-A reason string format (T2/T3 -- #186)."""
     ok = True
+    RUN_TS = "2026-01-01 00:00:00"
 
     def check(label, cond):
         nonlocal ok
@@ -1025,12 +1078,18 @@ def _selftest():
           "aar_report_changed_picks._cwid_eq (drift tripwire)",
           _cwid_eq("ABC123", "abc123") is True and _cwid_eq(None, "x") is False)
 
-    check("REFRESH_COLS is exactly aar_sweep_stale.NULL_COLUMNS (imported, not redefined)",
-          REFRESH_COLS is sweep.NULL_COLUMNS)
-    check("REFRESH_COLS is the issue's 9 columns",
+    check("REFRESH_COLS is aar_sweep_stale.NULL_COLUMNS (imported, not redefined) plus "
+          "the three row-level producer columns #180 leaves alone (#205)",
           REFRESH_COLS == ["top_cwid", "top_name", "top_person_type", "top_dept",
                            "top_given_match", "top_affil_match", "top_confidence",
-                           "candidate_cwids_json", "n_candidates"])
+                           "candidate_cwids_json", "n_candidates",
+                           "top_cohort_size", "single_candidate", "last_refreshed"])
+    check("...and #180's own nine are still exactly its nine, untouched by that",
+          sweep.NULL_COLUMNS == ["top_cwid", "top_name", "top_person_type", "top_dept",
+                                 "top_given_match", "top_affil_match", "top_confidence",
+                                 "candidate_cwids_json", "n_candidates"])
+    check("every REFRESH_COLS column is one the producer itself refreshes",
+          all(c in aar_db._REFRESH_COLS for c in REFRESH_COLS))
 
     changed = [
         {"id": 1, "classification": "CHANGED", "tier_move": "stronger"},
@@ -1057,11 +1116,11 @@ def _selftest():
     # replay's own classification must refuse to write, not write the wrong value.
     FULL_CANDS_BY_ID[999] = [{"cwid": "WRONG", "name": "x", "person_type": "y", "dept": "z",
                              "given_match": "full", "affil_dept_match": False,
-                             "confidence": 0.9}]
+                             "cohort_size": 1, "confidence": 0.9}]
     bad_rec = {"id": 999, "source": "pubmed", "new_cwid": "expected_cwid"}
     raised = False
     try:
-        _write_payload(bad_rec)
+        _write_payload(bad_rec, RUN_TS)
     except AssertionError:
         raised = True
     check("write_payload refuses a captured/classified cwid mismatch instead of "
@@ -1069,13 +1128,32 @@ def _selftest():
 
     FULL_CANDS_BY_ID[1000] = [{"cwid": "abc123", "name": "Jane Doe", "person_type": "Faculty",
                               "dept": "Medicine", "given_match": "full",
-                              "affil_dept_match": True, "confidence": 0.87}]
+                              "affil_dept_match": True, "cohort_size": 1,
+                              "confidence": 0.87}]
     good_rec = {"id": 1000, "source": "pubmed", "new_cwid": "abc123"}
-    payload = _write_payload(good_rec)
-    check("write_payload builds all 9 columns for a matching capture",
+    payload = _write_payload(good_rec, RUN_TS)
+    check("write_payload builds every REFRESH_COLS column for a matching capture",
           set(payload.keys()) == set(REFRESH_COLS))
     check("write_payload's top_affil_match is coerced to 0/1",
           payload["top_affil_match"] == 1)
+
+    # #205: the refresh used to rewrite candidate_cwids_json and n_candidates while
+    # leaving top_cohort_size and single_candidate at whatever a previous matcher
+    # generation wrote -- and cohort_size IS a drift trigger via the candidate entries,
+    # so a refreshed row could carry a new candidate list beside an old cohort size.
+    # Publication Manager keys its single-candidate bulk actions and its "choose among N
+    # homonyms" copy on exactly those two columns.
+    check("write_payload sets top_cohort_size from the top candidate's cohort_size, as "
+          "the producer does",
+          payload["top_cohort_size"] == 1)
+    check("...and single_candidate = int(cohort == 1) from that same value",
+          payload["single_candidate"] == 1)
+    check("...and last_refreshed to this run's timestamp",
+          payload["last_refreshed"] == RUN_TS)
+    FULL_CANDS_BY_ID[1002] = [dict(FULL_CANDS_BY_ID[1000][0], cohort_size=4)]
+    multi = _write_payload({"id": 1002, "source": "pubmed", "new_cwid": "abc123"}, RUN_TS)
+    check("a cohort of 4 writes top_cohort_size=4 and single_candidate=0",
+          multi["top_cohort_size"] == 4 and multi["single_candidate"] == 0)
 
     # #205: _write_payload's truncation widths and rcp._DRIFT_TRUNC were two hand-synced
     # copies of the same VARCHAR widths. If they part company, a value _write_payload
@@ -1085,12 +1163,18 @@ def _selftest():
                                "person_type": "P" * 100, "dept": "D" * 300,
                                "given_match": "full", "affil_dept_match": True,
                                "cohort_size": 1, "confidence": 0.87}]
-    long_payload = _write_payload({"id": 1001, "source": "pubmed", "new_cwid": "abc123"})
+    long_payload = _write_payload({"id": 1001, "source": "pubmed", "new_cwid": "abc123"},
+                                  RUN_TS)
     check("write_payload truncates to exactly rcp._DRIFT_TRUNC's widths",
           all(len(long_payload[c]) == w for c, w in rcp._DRIFT_TRUNC.items()))
-    check("the drift trigger is the refresh set minus top_cwid (asserted at import in "
+    check("the drift trigger is #180's null set minus top_cwid (asserted at import in "
           "_load_class_b_modules too)",
-          set(rcp._DRIFT_COLS) | {"top_cwid"} == set(REFRESH_COLS))
+          set(rcp._DRIFT_COLS) | {"top_cwid"} == set(sweep.NULL_COLUMNS))
+    check("...and every trigger column is written by the refresh it triggers, while "
+          "the three #205 added are payload-only and never trigger",
+          set(rcp._DRIFT_COLS) < set(REFRESH_COLS)
+          and set(REFRESH_COLS) - set(rcp._DRIFT_COLS) - {"top_cwid"}
+          == {"top_cohort_size", "single_candidate", "last_refreshed"})
 
     # apply-wiring contract (#189): main() feeds _apply_class_b the class-B slice of
     # ledger_entries, and _apply_class_b consumes exactly e["id"] + e["after"][col]
@@ -1098,11 +1182,11 @@ def _selftest():
     # because it was handed raw write_set records instead.
     full_rec = dict(good_rec, tier_move="stronger", pmid=1, external_id=None,
                     wcm_author="Jane Doe")
-    entry = _class_b_ledger_entry(full_rec, "2026-01-01 00:00:00", applied=False,
+    entry = _class_b_ledger_entry(full_rec, RUN_TS, applied=False,
                                   before={c: None for c in REFRESH_COLS})
     b_slice = [e for e in [entry] if e["class"] == "B"]
     check("class-B ledger entry survives main()'s apply-slice filter", len(b_slice) == 1)
-    check("ledger entry carries id + a complete 9-column 'after' payload "
+    check("ledger entry carries id + a complete REFRESH_COLS 'after' payload "
           "(what _apply_class_b consumes)",
           "id" in entry and set(REFRESH_COLS) <= set(entry["after"].keys()))
 
@@ -1118,8 +1202,12 @@ def _selftest():
     check("CLASS B UPDATE never touches curator columns",
           all(col not in set_clause_b for col in
               ("status", "resolution_cwid", "reviewer", "note", "snooze_until")))
-    check("CLASS B UPDATE writes exactly the 9 producer-owned columns",
+    check("CLASS B UPDATE writes exactly the REFRESH_COLS producer-owned columns",
           all(f"{c}=:{c}" in set_clause_b for c in REFRESH_COLS))
+    check("...including the three #205 added, which the refresh used to leave stale "
+          "beside a freshly-rewritten candidate list",
+          all(f"{c}=:{c}" in set_clause_b for c in
+              ("top_cohort_size", "single_candidate", "last_refreshed")))
 
     def _cand(cwid, **kw):
         c = {"cwid": cwid, "name": "Jane Q Doe", "person_type": "Full-Time Faculty",
@@ -1136,7 +1224,8 @@ def _selftest():
                affil_dept_match=False, affil_match_on=None, confidence=0.383)
     stored_cands = [c1, c2, c3]
     FULL_CANDS_BY_ID[2001] = stored_cands
-    stored_payload = _write_payload({"id": 2001, "source": "pubmed", "new_cwid": "abc123"})
+    stored_payload = _write_payload({"id": 2001, "source": "pubmed", "new_cwid": "abc123"},
+                                    RUN_TS)
     # The row exactly as the producer wrote it -- built FROM _write_payload, so this
     # doubles as the cross-module tripwire that rcp._drift_cols and _write_payload agree
     # on truncation, 0/1 coercion and JSON shape. If they ever diverge, every row in the
