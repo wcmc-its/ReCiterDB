@@ -33,13 +33,10 @@ spec:
           containers:
           - name: reciterdb-identity
             image: CONTAINER_IMAGE
-            # --dry-run stages into identity_staging and records the run in
-            # identity_build_log WITHOUT upserting, so the new job can be judged
-            # against Splunk's output while Splunk stays the only writer to
-            # identity. Applied to the cluster this way on 2026-09-05. GOING
-            # LIVE IS THIS ONE EDIT: drop "--dry-run", re-apply, and only then
-            # disable the Splunk search. See docs/IDENTITY_PORT.md.
-            command: ["python3", "buildIdentity.py", "--dry-run"]
+            # Live. Add "--dry-run" to stage into identity_staging and record
+            # the run in identity_build_log without upserting -- that is how this
+            # job was validated before the Splunk search was retired.
+            command: ["python3", "buildIdentity.py"]
             envFrom:
             # DB_USERNAME / DB_PASSWORD, and DB_HOST / DB_NAME from the configmap.
             - secretRef:
