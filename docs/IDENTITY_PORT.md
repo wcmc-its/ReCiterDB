@@ -211,6 +211,63 @@ Two behaviour changes beyond the source swap, both deliberate:
   not merely rename them, and `program` feeds the
   `primaryAcademicDepartment` fallback chain.
 
+## First full dry-run, 2026-09-05
+
+All 16 sources against live ED and ASMS, in-cluster. `asms_division` returned
+9,752 cwids -- its first execution ever, against 9,737 divisions in the live
+table. Build: 50,033 cwids merged, 33,388 after filters, staged.
+
+| | rows |
+|---|---:|
+| in both | 32,971 |
+| only in port | 417 |
+| only in Splunk (cumulative residue, untouched by the upsert) | 2,477 |
+
+Column differences across the 32,971 shared rows:
+
+| column | differing |
+|---|---:|
+| `givenName` | 0 |
+| `surname` | 1 |
+| `primaryAcademicDivision` | 1 |
+| `primaryProgram` | 244 |
+| `primaryTitle` | 266 |
+| `primaryOrg` | 263 |
+| `primaryAcademicDepartment` | 12,495 gained, 0 lost, 343 changed |
+
+Six defects the dry run caught that inspection had not:
+
+1. **Staging silently rolled back.** pymysql opens an implicit transaction; a
+   stage-only run returned before any commit and `conn.close()` discarded the
+   rows. `DROP`/`CREATE` implicitly commit, so the empty table looked real.
+2. **Every person-type flag empty.** `weillCornellEduPersonTypeCode` is
+   multi-valued (up to 17 values); `get()` returns the first, always the least
+   specific `academic`. Fixed with `_Row.all()`. This alone moved 8,916 people
+   through the final filter.
+3. **`""` written where the live table uses `NULL`**, inflating every column
+   diff to ~90%.
+4. **`program` normalisation skipped when `PREFER_ORGUNIT` was off** -- a
+   regression from refactoring onto `_program_value`. The SPL's `case()` ran
+   unconditionally.
+5. **Priority ranking broken by (4)**: `PROGRAM_PRIORITY` is keyed on normalised
+   names, so `MD-PhD WGS Neuroscience` scored 999 instead of 6 and lost to
+   `MD-PhD Program`.
+6. **The floor gate baselined on a cumulative table.** A healthy build stages
+   33,388 rows against 35,448 live -- 93%, already under a naive 95% floor, and
+   the residue only grows. Now baselined on prior builds via
+   `identity_build_log`.
+
+(2), (4) and (5) are pinned by assertions in `--demo`.
+
+### Historical flags survive the upsert
+
+`residentNYP` is `yes` on 2,194 live rows and 1,146 staged. **1,040 of the
+difference are absent from staging entirely**, so the upsert never touches those
+rows and the historical value persists; only 8 would change, and those are people
+in the current build who are no longer residents. `fullTimeFaculty` and
+`inactiveFaculty`: zero would be cleared. Upserting only what you rebuild is what
+makes the cumulative table safe.
+
 ## The original
 
 `docs/reciter_identity_update.spl` is the Splunk saved search this job replaces,

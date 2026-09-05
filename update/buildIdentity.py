@@ -148,7 +148,14 @@ YEAR_COLUMNS = {
     "startDateWCMStudent", "endDateWCMStudent",
 }
 
-MIN_ROWS_FLOOR = 0.95  # refuse to write if the build shrinks by more than 5%
+# Refuse to write if a build comes back more than 5% smaller than recent ones.
+# The baseline is PRIOR BUILDS, not the row count of `identity`: that table is
+# cumulative and its residue only grows, so any fixed fraction of it drifts out
+# of reach and would eventually refuse every run. Measured 2026-09-05, a healthy
+# build stages 33,388 rows against 35,448 live -- 93%, already under a naive
+# floor. The first run has no history and is allowed through with a warning.
+MIN_ROWS_FLOOR = 0.95
+BUILD_LOG_WINDOW_DAYS = 30
 
 SOURCES = {}
 
@@ -198,7 +205,9 @@ def ldap_search(domain, search_filter, attrs, limit=None):
     ):
         if entry.get("type") != "searchResEntry":
             continue
-        rows.append(_Row((k, _flatten(v)) for k, v in entry["attributes"].items()))
+        # Raw values are kept: _Row.get() flattens on access and _Row.all()
+        # exposes every value of a multi-valued attribute.
+        rows.append(_Row(entry["attributes"].items()))
         if limit and len(rows) >= limit:
             break          # probe path only; a real source never passes limit
     logger.info("ldap %s: %d entries", domain, len(rows))
@@ -219,10 +228,26 @@ class _Row(dict):
         super().__init__((k.lower(), v) for k, v in items)
 
     def get(self, key, default=""):
-        return super().get(key.lower(), default)
+        return _flatten(super().get(key.lower(), "")) or default
+
+    def all(self, key):
+        """Every value of a multi-valued attribute.
+
+        weillCornellEduPersonTypeCode carries up to 17 values per person --
+        ['academic', 'academic-faculty', 'academic-faculty-assistant',
+         'academic-faculty-voluntary', 'affiliate', 'affiliate-nyp', ...].
+        Splunk's `field = "x"` matches if ANY value equals x, while get()
+        returns only the first, which is always the least specific one
+        ('academic'). Reading person types through get() silently emptied every
+        flag, facultyRank, and the NYP org default.
+        """
+        value = super().get(key.lower(), "")
+        if isinstance(value, list):
+            return [_flatten(v) for v in value if v not in (None, "")]
+        return [_flatten(value)] if value not in (None, "") else []
 
     def __getitem__(self, key):
-        return super().__getitem__(key.lower())
+        return self.get(key)
 
 
 def _flatten(value):
@@ -390,21 +415,26 @@ def ed_people_main():
     )
 
     def mapper(row):
-        ptype = row.get("weillCornellEduPersonTypeCode", "")
+        # EVERY person type, not just the first -- see _Row.all().
+        ptypes = set(row.all("weillCornellEduPersonTypeCode"))
         org = (row.get("weillCornellEduPrimaryOrganization;faculty")
                or row.get("weillCornellEduPrimaryOrganization;student")
-               or ("NYP" if ptype == "affiliate-nyp-resident" else ""))
+               or ("NYP" if "affiliate-nyp-resident" in ptypes else ""))
         vals = {
             "primaryTitle": row.get("weillCornellEduPrimaryTitle", ""),
             "popsProfile": row.get("labeledURI;pops", ""),
             "directoryProfile": row.get("labeledURI;onlineDirectory", ""),
             "vivoProfile": row.get("labeledURI;vivo", ""),
-            "facultyRank": FACULTY_RANK.get(ptype, ""),
+            # FACULTY_RANK is ordered most senior first, matching the SPL's
+            # case(), which returns its first matching branch.
+            "facultyRank": next(
+                (v for k, v in FACULTY_RANK.items() if k in ptypes), ""),
             "primaryOrg": orgs.get(org, ""),
         }
-        flag = PERSON_TYPE_FLAGS.get(ptype)
-        if flag:
-            vals[flag] = "yes"
+        for ptype in ptypes:
+            flag = PERSON_TYPE_FLAGS.get(ptype)
+            if flag:
+                vals[flag] = "yes"
         return vals
 
     return _by_cwid(rows, mapper)
@@ -647,9 +677,14 @@ def _program_value(row, primary=False):
     raw = (row.get(f"{pre}OrgUnit;level2") or old) if PREFER_ORGUNIT else old
     if not raw:
         return ""
-    # primaryProgram was never normalised before; under the flag both program
-    # columns go through the same table so they cannot disagree.
-    return PROGRAM_OVERRIDE.get(raw, raw) if PREFER_ORGUNIT else raw
+    # `program` was ALWAYS normalised -- the SPL's case() ran unconditionally,
+    # and PROGRAM_PRIORITY is keyed on the normalised names, so skipping it also
+    # breaks the ranking ("MD-PhD WGS Neuroscience" scores 999 instead of 6 and
+    # loses to "MD-PhD Program"). Only primaryProgram was left raw by the SPL,
+    # and only until PREFER_ORGUNIT makes the two columns consistent.
+    if primary and not PREFER_ORGUNIT:
+        return raw
+    return PROGRAM_OVERRIDE.get(raw, raw)
 
 
 def _watch_orgunit_migration(rows):
@@ -921,7 +956,10 @@ def _coerce(r):
             logger.warning("truncating %s for %s (%d chars)", col, r["cwid"], len(val))
             row[col] = val[:128]
         else:
-            row[col] = val
+            # The live table stores NULL for an absent value, not "". Writing ""
+            # made every column look changed in the diff and is a different
+            # value to any consumer testing IS NULL.
+            row[col] = val if val != "" else None
     return row
 
 
@@ -944,7 +982,7 @@ def db_conn():
     )
 
 
-def write(rows):
+def write(rows, stage_only=False):
     """Stage, gate on row count, then upsert in one transaction.
 
     Staging is not a shadow table for a swap -- identity is cumulative and rows
@@ -964,29 +1002,62 @@ def write(rows):
                 f"INSERT INTO identity_staging ({cols}) VALUES ({placeholders})",
                 [[r[c] for c in UPSERT_COLUMNS] for r in rows])
 
+            # pymysql opens an implicit transaction and does not autocommit.
+            # Commit the staging load here: without it, a stage-only run returns
+            # before any commit and conn.close() silently rolls the rows back,
+            # leaving an empty table that DDL made look real.
+            conn.commit()
+
             cur.execute("SELECT COUNT(*) FROM identity_staging")
             staged = cur.fetchone()[0]
             cur.execute("SELECT COUNT(*) FROM identity")
             live = cur.fetchone()[0]
             logger.info("staged %d rows against %d live", staged, live)
 
-            # The live table is cumulative, so it is legitimately larger than any
-            # single build. Gate on the count of live rows this build actually
-            # covers, not on the whole table.
+            cur.execute("""CREATE TABLE IF NOT EXISTS identity_build_log (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    run_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    staged_rows INT NOT NULL,
+                    upserted TINYINT(1) NOT NULL DEFAULT 0,
+                    KEY idx_run_at (run_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
             cur.execute(
-                "SELECT COUNT(*) FROM identity i "
-                "JOIN identity_staging s ON s.cwid = i.cwid")
-            covered = cur.fetchone()[0]
-            if covered < live * MIN_ROWS_FLOOR and live:
+                "SELECT MAX(staged_rows) FROM identity_build_log "
+                "WHERE upserted = 1 AND run_at > NOW() - INTERVAL %s DAY",
+                (BUILD_LOG_WINDOW_DAYS,))
+            baseline = cur.fetchone()[0]
+            if baseline:
+                short = staged < baseline * MIN_ROWS_FLOOR
+                logger.info("baseline %d rows from the last %d days",
+                            baseline, BUILD_LOG_WINDOW_DAYS)
+            else:
+                short = False
+                logger.warning("no prior build in the last %d days - "
+                               "floor not enforced on this run",
+                               BUILD_LOG_WINDOW_DAYS)
+            if short and not stage_only:
                 raise SystemExit(
-                    f"build covers {covered} of {live} live rows "
+                    f"staged {staged} rows against a recent best of {baseline} "
                     f"(<{MIN_ROWS_FLOOR:.0%}) - refusing to write")
+            if stage_only:
+                # Staged and stopped. identity is untouched, so the diff queries
+                # in docs/IDENTITY_PORT.md can compare the two side by side.
+                # The floor is reported rather than enforced -- a dry run should
+                # always finish and show its numbers.
+                cur.execute("INSERT INTO identity_build_log (staged_rows, "
+                            "upserted) VALUES (%s, 0)", (staged,))
+                conn.commit()
+                logger.info("--dry-run: %d rows staged, identity untouched%s",
+                            staged, "  [BELOW FLOOR]" if short else "")
+                return
 
             conn.begin()
             cur.execute(
                 f"INSERT INTO identity ({cols}) "
                 f"SELECT {cols} FROM identity_staging "
                 f"ON DUPLICATE KEY UPDATE {updates}")
+            cur.execute("INSERT INTO identity_build_log (staged_rows, upserted) "
+                        "VALUES (%s, 1)", (staged,))
             conn.commit()
             logger.info("upserted %d rows into identity", staged)
     finally:
@@ -1018,9 +1089,6 @@ def build():
 def main(dry_run=False):
     rows = build()
     if dry_run:
-        # Stage only. Diff identity_staging against the live table (or against
-        # the Splunk lookup) before letting a real run upsert.
-        logger.info("--dry-run: %d rows built, nothing written", len(rows))
         for col in ("primaryAcademicDepartment", "primaryAcademicDivision",
                     "surname", "primaryOrg"):
             filled = sum(1 for r in rows if r.get(col))
@@ -1028,8 +1096,7 @@ def main(dry_run=False):
         for old, new in ORGUNIT_MIGRATION_WATCH:
             logger.info("  ED migration: %s=%d  %s=%d",
                         old, _migration_counts[old], new, _migration_counts[new])
-        return
-    write(rows)
+    write(rows, stage_only=dry_run)
 
 
 def spike():
@@ -1091,8 +1158,12 @@ def demo():
 
     assert rows["abc1001"]["surname"] == "Zeta", "max() tie-break across sources"
     assert rows["abc1001"]["primaryTitle"] == "Professor", "first non-empty wins"
-    assert rows["xyz2002"]["alumniMD"] == "", "MD-PhD suppresses standalone MD"
-    assert rows["xyz2002"]["alumniPHD"] == "", "MD-PhD suppresses standalone PhD"
+    # Absent values are written as NULL, not "" -- the live table uses NULL and
+    # every consumer tests `= 'yes'`, so the two behave identically. Splunk wrote
+    # "" for rows its main append touched and NULL for the rest; that split is a
+    # Splunk artifact and is deliberately not reproduced.
+    assert rows["xyz2002"]["alumniMD"] is None, "MD-PhD suppresses standalone MD"
+    assert rows["xyz2002"]["alumniPHD"] is None, "MD-PhD suppresses standalone PhD"
     assert "exc0001" not in rows, "excluded cwid dropped"
     assert "nob0003" not in rows, "no role and no department - filtered out"
     assert rows["abc1001"]["startDateWCMFaculty"] is None, "empty year is NULL not 0"
@@ -1107,6 +1178,17 @@ def demo():
     assert row.get("labeledURI;onlineDirectory") == "http://d", "attr option casing"
     assert row.get("weillcornelleducwid") == "abc1001", "attr name casing"
     assert row.get("nosuchattr") == "", "missing attr defaults to empty string"
+
+    # Multi-valued attributes: get() returns the first, all() returns every one.
+    # Person types arrive least-specific-first, so reading them through get()
+    # silently emptied every flag.
+    multi = _Row([("weillCornellEduPersonTypeCode",
+                   ["academic", "academic-faculty", "academic-faculty-weillfulltime"])])
+    assert multi.get("weillCornellEduPersonTypeCode") == "academic", "get() takes first"
+    assert "academic-faculty-weillfulltime" in multi.all("weillCornellEduPersonTypeCode")
+    assert len(multi.all("weillCornellEduPersonTypeCode")) == 3
+    assert _Row([("x", "solo")]).all("x") == ["solo"], "scalar wraps to a list"
+    assert _Row([("x", "")]).all("x") == [], "empty yields nothing"
 
     # ldap3 hands back datetimes for populated GeneralizedTime attributes and ""
     # for absent ones; sorting that mix used to raise TypeError.
@@ -1165,9 +1247,17 @@ def demo():
     finally:
         globals()["PREFER_ORGUNIT"] = was
 
-    # Flag off: both columns keep the old attribute verbatim, unnormalised.
-    assert _program_value(_Row([("weillCornellEduPrimaryProgram", "MD-PhD WGS Neuroscience")],),
-                          primary=True) == "MD-PhD WGS Neuroscience", "verbatim when off"
+    # Flag off: `program` is STILL normalised -- the SPL's case() ran
+    # unconditionally, and PROGRAM_PRIORITY is keyed on the normalised names, so
+    # skipping it also breaks the ranking. Only primaryProgram stays raw.
+    assert _program_value(_Row([("weillCornellEduPrimaryProgram", "MD-PhD WGS Neuroscience")]),
+                          primary=True) == "MD-PhD WGS Neuroscience", "primaryProgram raw when off"
+    assert _program_value(_Row([("weillCornellEduProgram",
+                                 "Tri-I Program in Chemical Biology")])) == "Chemical Biology", \
+        "program normalised even when off"
+    assert PROGRAM_PRIORITY[_program_value(_Row([("weillCornellEduProgram",
+                                                  "MD-PhD WGS Neuroscience")]))] == 6, \
+        "normalised name must score in PROGRAM_PRIORITY, not fall to 999"
     print("demo ok")
 
 
