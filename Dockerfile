@@ -38,7 +38,11 @@ COPY update/adversarial_attribution_review.py ./
 COPY update/aar_orchestrator.py ./
 COPY update/preprocessing.py ./
 COPY update/aar_models/ ./aar_models/
-COPY update/aar_data/ ./aar_data/
+# name_frequency.json must land at ./data/ -- that is the FIRST path
+# preprocessing.py:_load_name_frequency() resolves (Path(__file__).parent / 'data').
+# If it is not there the module silently returns an empty table and every
+# firstNameFrequencyScore becomes 0.0 with no error. Do not rename this dir.
+COPY update/data/ ./data/
 
 # AAR nightly closer: dismiss open rows ReCiter already attributed (#186, every night,
 # gated in run_all.py). aar_report_changed_picks.py is required at runtime by

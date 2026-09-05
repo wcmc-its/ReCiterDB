@@ -3,12 +3,17 @@
 preprocessing.py - Shared feature computation for ReCiter scoring models.
 
 This module contains:
-- Feature column definitions for both model types
+- Feature column definitions for both model types (v3.2: 72 feedback, 47 identity-only)
 - Wilson score interval calculation
 - Derived feature computation (confidence-aware features)
 
-Used by: feedbackIdentityCreateModel_*.py, identityOnlyCreateModel_*.py,
-         and their corresponding inference scripts.
+Used by: verify_setup.py (inference pipeline), main.py (Lambda handler)
+
+v3.2 changes from v3.1:
+- Feedback model: same 72 total features, different composition (removed 9 zero-weight,
+  added 9 new: 5 BibCoupling/textSim interactions, 2 evidence extensions, 2 identity interactions)
+- Identity-only model: 47 features (was 42), added 5 identity-specific derived features
+- No ablation mechanism (hardcoded per-model feature lists)
 """
 
 import os
@@ -35,12 +40,10 @@ STRONG_AFFIL = float(os.getenv("STRONG_AFFIL", "0.95"))
 # These features have 0% negative values in ACCEPTED articles but significant
 # negative values in REJECTED articles, creating a perfect separation at zero.
 # Without clipping, the model learns a hard binary threshold: any negative
-# value → reject with maximum confidence, regardless of all other evidence.
+# value -> reject with maximum confidence, regardless of all other evidence.
 #
 # Clipping removes the cliff while preserving positive-value signal. The
 # absence signal is captured instead by informedAbsenceCount/Intensity.
-#
-# See informed_absence_results/CLIFF_EFFECT_ANALYSIS.md for full analysis.
 CLIP_AT_ZERO_FEATURES = [
     'feedbackScoreCoAuthorName',     # 0.00% acc negative, 62.66% rej negative
     'feedbackScoreYear',             # 0.00% acc negative, 17.94% rej negative
@@ -57,10 +60,10 @@ _log = logging.getLogger(__name__)
 def _load_name_frequency():
     """Load name frequency table from data/name_frequency.json.
     Returns (table_dict, median_score) or ({}, 0.0) if unavailable."""
-    freq_path = Path(__file__).parent.parent / 'data' / 'name_frequency.json'
+    # Container path first (/var/task/data/), then local dev path (../data/)
+    freq_path = Path(__file__).parent / 'data' / 'name_frequency.json'
     if not freq_path.exists():
-        # In-cluster / vendored: baked next to this module at aar_data/ (see Dockerfile).
-        freq_path = Path(__file__).parent / 'aar_data' / 'name_frequency.json'
+        freq_path = Path(__file__).parent.parent / 'data' / 'name_frequency.json'
     if freq_path.exists():
         with open(freq_path, 'r') as f:
             table = json.load(f)
@@ -183,29 +186,33 @@ def _jaro_winkler_similarity(s1: str, s2: str, p: float = 0.1) -> float:
 
 
 # =============================================================================
-# FEATURE COLUMN DEFINITIONS
+# FEATURE COLUMN DEFINITIONS (v3.2 - hardcoded per-model lists)
 # =============================================================================
 
-# Feedback + Identity model: 34 base features
+# Feedback + Identity model: 32 base features
+# (feedbackScoreEmail, feedbackScoreYear, grantMatchScore excluded -- zero-weight in v3.2)
 FEEDBACK_IDENTITY_BASE_FEATURES = [
-    # 15 feedback score features (per-person learned patterns)
-    'feedbackScoreCites', 'feedbackScoreCoAuthorName', 'feedbackScoreEmail',
+    # 13 feedback score features
+    'feedbackScoreCites', 'feedbackScoreCoAuthorName',
     'feedbackScoreInstitution', 'feedbackScoreJournal', 'feedbackScoreJournalSubField',
     'feedbackScoreKeyword', 'feedbackScoreTextSimilarity', 'feedbackScoreJournalTitleSimilarity',
     'feedbackScoreOrcid', 'feedbackScoreOrcidCoAuthor',
-    'feedbackScoreOrganization', 'feedbackScoreTargetAuthorName', 'feedbackScoreYear',
+    'feedbackScoreOrganization', 'feedbackScoreTargetAuthorName',
     'feedbackScoreBibliographicCoupling',
-    # 19 identity/matching features
+    # 17 identity features (grantMatchScore excluded from feedback model)
     'articleCountScore', 'authorCountScore', 'discrepancyDegreeYearScore', 'emailMatchScore',
-    'genderScoreIdentityArticleDiscrepancy', 'grantMatchScore', 'journalSubfieldScore',
+    'genderScoreIdentityArticleDiscrepancy', 'journalSubfieldScore',
     'nameMatchFirstScore', 'nameMatchLastScore', 'nameMatchMiddleScore', 'nameMatchModifierScore',
     'organizationalUnitMatchingScore', 'scopusNonTargetAuthorInstitutionalAffiliationScore',
-    'targetAuthorInstitutionalAffiliationMatchTypeScore', 'pubmedTargetAuthorInstitutionalAffiliationMatchTypeScore',
+    'targetAuthorInstitutionalAffiliationMatchTypeScore',
+    'pubmedTargetAuthorInstitutionalAffiliationMatchTypeScore',
     'relationshipPositiveMatchScore', 'relationshipNegativeMatchScore', 'relationshipIdentityCount',
-    'countAccepted', 'countRejected'
+    # Feedback history
+    'countAccepted', 'countRejected',
 ]
 
 # Identity-Only model: 18 base features (no feedback scores, no countAccepted/countRejected)
+# NOTE: grantMatchScore is INCLUDED here (active in identity-only model)
 IDENTITY_ONLY_BASE_FEATURES = [
     'articleCountScore', 'authorCountScore', 'discrepancyDegreeYearScore', 'emailMatchScore',
     'genderScoreIdentityArticleDiscrepancy', 'grantMatchScore', 'journalSubfieldScore',
@@ -214,58 +221,101 @@ IDENTITY_ONLY_BASE_FEATURES = [
     'scopusNonTargetAuthorInstitutionalAffiliationScore',
     'targetAuthorInstitutionalAffiliationMatchTypeScore',
     'pubmedTargetAuthorInstitutionalAffiliationMatchTypeScore',
-    'relationshipPositiveMatchScore', 'relationshipNegativeMatchScore', 'relationshipIdentityCount'
-    # NOTE: countAccepted and countRejected excluded - this model is blind to feedback history
+    'relationshipPositiveMatchScore', 'relationshipNegativeMatchScore', 'relationshipIdentityCount',
 ]
 
-# Derived identity features shared by both models
-DERIVED_FEATURES_IDENTITY_SHARED = [
-    'identityStrength',            # Combined strength of identity signals (continuous)
-    'netEvidenceCount',            # Positive identity signals minus negative ones
-    'ambiguityRisk',               # articleCountScore * (1 - identityStrength) — common name + weak identity
-    'nameInstitutionInteraction',  # nameMatchFirst * bestAffiliation — name AND institution agree
-    'worstSingleEvidence',         # Min of key identity features — no damning evidence against
-    'nameQualityMin',              # Min of first/last/middle name scores — all name parts match
-    'firstNameFrequencyScore',     # IDF-like score: rare names → high, common names → low (person-level)
-    'nameGenderConflict',          # |nameFirst| * |min(0,genderDiscrepancy)| when both negative — wrong name + wrong gender
-    'firstNameLength',             # Character count of identity first name — short names are inherently ambiguous
-    'nameFrequencyMatchInteraction',  # nameMatchFirstScore × firstNameFrequencyScore — rare name match = strong signal
-    'nameLengthMatchInteraction',  # nameMatchFirstScore × log1p(firstNameLength) — long name match = more information
-    'firstMiddleMatchInteraction', # nameMatchFirstScore × nameMatchMiddleScore — amplifies concordant, dampens discordant
-    'nameMatchMiddleAgreement',    # sign(first) × sign(middle) — clean +1/-1/0 concordance indicator
-    'nameJaroWinkler',             # Jaro-Winkler similarity between identity and article first names (0-1)
-    'nameEditDistanceNorm',        # 1 - levenshtein/max(len) — continuous 0-1 similarity
-    'forenameLengthRatio',         # len(articleFirst)/max(len(identityFirst),1) — detects PubMed ForeName concatenation
-    'firstMiddleCoverage',         # len(identityFirst+identityMiddle)/max(len(articleFirst),1) — ForeName explained
-    'nameMatchTypeOrdinal',        # Ordinal encoding of nameMatchFirstType (0-5)
-    'hasEmail',                    # 1 if identity has email data (score != 0), 0 if absent
-    'hasDegreeYear',               # 1 if identity has degree year (score != 0), 0 if absent
-    'hasGrants',                   # 1 if identity has grant data (score != 0), 0 if absent or no match
-    'hasRelationships',            # 1 if identity has known relationships (count > 0), 0 if absent
-    'hasGender',                   # 1 if identity has gender data (score != 0), 0 if absent
-    'hasOrgUnit',                  # 1 if identity has org unit data (score != 0), 0 if absent or no match
-]
-
-# Derived features for Feedback+Identity model (uses feedback counts)
+# Derived features for Feedback+Identity model (18 feedback-only + 22 identity-shared = 40 total)
 DERIVED_FEATURES_FEEDBACK = [
-    'acceptanceRateLowerBound',   # Wilson score interval LB - confidence-adjusted
-    'feedbackConfidence',          # How much feedback data we have (log-scaled)
-    'uncertainRejectionRisk',      # Continuous risk score for uncertain high-rejection cases
-    'feedbackDensity',             # Fraction of 15 feedback features that are non-zero
-    'feedbackIdentityInteraction', # feedbackDensity * identityStrength
-    'informedAbsenceCount',        # Number of zero-valued feedback dimensions where ca > 0
-    'informedAbsenceIntensity',    # informedAbsenceCount * log1p(countAccepted) — scales with history depth
-    'nameConflictConfirmed',       # |nameFirst| * |min(0,targetAuthorName)| when both negative — identity + feedback agree name is wrong
-] + DERIVED_FEATURES_IDENTITY_SHARED
+    # 18 feedback-only derived features
+    'acceptanceRateLowerBound',
+    'feedbackConfidence',
+    'uncertainRejectionRisk',
+    'feedbackDensity',
+    'feedbackIdentityInteraction',
+    'informedAbsenceCount',
+    'informedAbsenceIntensity',
+    'nameConflictConfirmed',
+    # TextSimilarity interaction features (5)
+    'hasTextEvidence',
+    'textSimNoCoauthorInteraction',
+    'textSimNewJournalInteraction',
+    'textSimFeedbackConfInteraction',
+    'textSimAffilGapInteraction',
+    # BibCoupling interaction features (3)
+    'bibCouplingFeedbackConfInteraction',
+    'bibCouplingHighConfOnly',
+    'hasBibCouplingSignal',
+    # Extended evidence aggregation features (2)
+    'worstSingleEvidenceExtended',
+    'netEvidenceCountExtended',
+    # 22 identity-shared features included in feedback model
+    'identityStrength',
+    'netEvidenceCount',
+    'ambiguityRisk',
+    'nameInstitutionInteraction',
+    'worstSingleEvidence',
+    'nameQualityMin',
+    'firstNameFrequencyScore',
+    'firstNameLength',
+    'nameFrequencyMatchInteraction',
+    'nameLengthMatchInteraction',
+    'firstMiddleMatchInteraction',
+    'nameMatchMiddleAgreement',
+    'nameJaroWinkler',
+    'nameEditDistanceNorm',
+    'forenameLengthRatio',
+    'firstMiddleCoverage',
+    'nameMatchTypeOrdinal',
+    'hasEmail',
+    'hasGender',
+    'hasOrgUnit',
+    'nameAffilStrength',
+    'evidenceConsistency',
+]
 
-# Derived features for Identity-Only model (no feedback-based features)
-DERIVED_FEATURES_IDENTITY_ONLY = list(DERIVED_FEATURES_IDENTITY_SHARED)
-    # NOTE: No acceptanceRateLowerBound, feedbackConfidence, uncertainRejectionRisk
-    # because those require countAccepted/countRejected
+# Derived features for Identity-Only model (29 identity-shared features)
+DERIVED_FEATURES_IDENTITY_ONLY = [
+    'identityStrength',
+    'netEvidenceCount',
+    'ambiguityRisk',
+    'nameInstitutionInteraction',
+    'worstSingleEvidence',
+    'nameQualityMin',
+    'firstNameFrequencyScore',
+    'nameGenderConflict',
+    'firstNameLength',
+    'nameFrequencyMatchInteraction',
+    'nameLengthMatchInteraction',
+    'firstMiddleMatchInteraction',
+    'nameMatchMiddleAgreement',
+    'nameJaroWinkler',
+    'nameEditDistanceNorm',
+    'forenameLengthRatio',
+    'firstMiddleCoverage',
+    'nameMatchTypeOrdinal',
+    'hasEmail',
+    'hasDegreeYear',
+    'hasGrants',
+    'hasRelationships',
+    'hasGender',
+    'hasOrgUnit',
+    'nameAffilStrength',
+    'evidenceConsistency',
+    # Phase 9 Round 2 identity-specific interactions (3)
+    'nameMatchConsistency',
+    'affilRelationshipInteraction',
+    'scopusPubmedAffilAgreement',
+]
 
-# Complete feature lists
+# Complete feature lists (direct concatenation, no filter)
 FEEDBACK_IDENTITY_FEATURES = FEEDBACK_IDENTITY_BASE_FEATURES + DERIVED_FEATURES_FEEDBACK
 IDENTITY_ONLY_FEATURES = IDENTITY_ONLY_BASE_FEATURES + DERIVED_FEATURES_IDENTITY_ONLY
+
+# Module-level assertions to catch feature count drift
+assert len(FEEDBACK_IDENTITY_FEATURES) == 72, \
+    f"Expected 72 feedback features, got {len(FEEDBACK_IDENTITY_FEATURES)}"
+assert len(IDENTITY_ONLY_FEATURES) == 47, \
+    f"Expected 47 identity-only features, got {len(IDENTITY_ONLY_FEATURES)}"
 
 # Backward compatibility alias
 DERIVED_FEATURES = DERIVED_FEATURES_FEEDBACK
@@ -284,14 +334,6 @@ def wilson_lower_bound(successes: float, failures: float, confidence: float = 0.
     - With small samples: pulls toward 0.5 (low confidence)
     - With large samples: approaches raw proportion (high confidence)
     - No arbitrary thresholds or cliff effects
-
-    Examples:
-        >>> wilson_lower_bound(0, 0)      # No data
-        0.5
-        >>> wilson_lower_bound(4, 1)      # 80% but small sample
-        0.376...  # Pulled toward 0.5
-        >>> wilson_lower_bound(100, 25)   # 80% with large sample
-        0.717...  # Close to true 0.80
 
     Args:
         successes: Number of successes (acceptances)
@@ -345,17 +387,25 @@ _WORST_EVIDENCE_FEATURES = [
     'discrepancyDegreeYearScore', 'genderScoreIdentityArticleDiscrepancy',
 ]
 
+# Extended evidence lists for netEvidenceCountExtended (Phase 9).
+# Adds textSimilarity and bibCoupling to the positive/negative signal count.
+_EXTENDED_POSITIVE_EVIDENCE_FEATURES = list(_POSITIVE_EVIDENCE_FEATURES) + [
+    'feedbackScoreTextSimilarity',
+    'feedbackScoreBibliographicCoupling',
+]
+_EXTENDED_NEGATIVE_EVIDENCE_FEATURES = list(_NEGATIVE_EVIDENCE_FEATURES) + [
+    'feedbackScoreTextSimilarity',
+    'feedbackScoreBibliographicCoupling',
+]
+
 
 def _compute_identity_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute engineered identity features shared by both models.
 
-    These features synthesize raw identity signals into higher-level concepts:
-    - netEvidenceCount: breadth of supporting vs contradicting evidence
-    - ambiguityRisk: common name + weak identity = danger zone
-    - nameInstitutionInteraction: name AND institution agree
-    - worstSingleEvidence: no single feature is strongly against
-    - nameQualityMin: all name parts match (weakest-link)
+    These features synthesize raw identity signals into higher-level concepts.
+    All features are computed regardless of which model will use them --
+    extra columns are harmless; the feature list controls what goes to the scaler.
 
     Requires 'identityStrength' to already be computed on df.
     """
@@ -391,82 +441,64 @@ def _compute_identity_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
     ])
 
     # 6. firstNameFrequencyScore: IDF-like score from name frequency table (person-level)
-    #    Requires 'identityFirstName' column (added by Java Feature Generator).
-    #    Rare names get high scores (strong identity signal), common names get low scores.
     if _NAME_FREQ_TABLE and 'identityFirstName' in df.columns:
         df['firstNameFrequencyScore'] = df['identityFirstName'].map(_name_frequency_score)
     else:
         df['firstNameFrequencyScore'] = 0.0
 
-    # 7. nameGenderConflict: wrong first name AND wrong gender.
-    #    Near-certain signal of different person (e.g., female identity "Evelyn"
-    #    matched to male article author "Edward"). Uses only identity features,
-    #    so available in both feedback and identity-only models.
+    # 7. nameGenderConflict: wrong first name AND wrong gender
     nf_shared = df['nameMatchFirstScore']
     gd_shared = df['genderScoreIdentityArticleDiscrepancy']
     name_gender_both = (nf_shared < -2.0) & (gd_shared < 0)
     df['nameGenderConflict'] = np.where(name_gender_both, nf_shared.abs() * gd_shared.clip(upper=0).abs(), 0.0)
 
-    # 8. firstNameLength: raw character count of identity first name.
-    #    Short names (2-3 chars) are inherently ambiguous — "Yi" matching "Yin"
-    #    is weak evidence compared to "Christopher" matching "Christophe".
+    # 8. firstNameLength: raw character count of identity first name
     if 'identityFirstName' in df.columns:
         df['firstNameLength'] = df['identityFirstName'].map(_first_name_length)
     else:
         df['firstNameLength'] = 0.0
 
-    # 9. nameFrequencyMatchInteraction: match score weighted by name rarity.
-    #    Rare name match = strong signal; common name match = weak signal.
+    # 9. nameFrequencyMatchInteraction: match score weighted by name rarity
     df['nameFrequencyMatchInteraction'] = (
         df['nameMatchFirstScore'] * df['firstNameFrequencyScore']
     )
 
-    # 10. nameLengthMatchInteraction: match score weighted by name length.
-    #     Long name match = more information; short name match = less.
+    # 10. nameLengthMatchInteraction: match score weighted by name length
     df['nameLengthMatchInteraction'] = (
         df['nameMatchFirstScore'] * np.log1p(df['firstNameLength'])
     )
 
-    # 11. firstMiddleMatchInteraction: first × middle name score product.
-    #     Amplifies concordant signals (both positive or both negative),
-    #     dampens discordant ones (one positive, one negative).
-    #     Captures the 75pp acceptance rate spread within the 1.852 bucket.
+    # 11. firstMiddleMatchInteraction: first x middle name score product
     df['firstMiddleMatchInteraction'] = (
         df['nameMatchFirstScore'] * df['nameMatchMiddleScore']
     )
 
-    # 12. nameMatchMiddleAgreement: sign concordance indicator.
-    #     +1 when first and middle scores agree in sign, -1 when they disagree,
-    #     0 when either is zero. Clean split point for XGBoost.
+    # 12. nameMatchMiddleAgreement: sign concordance indicator
     df['nameMatchMiddleAgreement'] = (
         np.sign(df['nameMatchFirstScore']) * np.sign(df['nameMatchMiddleScore'])
     )
 
-    # --- Phase B: Continuous name similarity features ---
-    # These require new Java-exported fields (articleAuthorFirstName, identityMiddleName,
-    # nameMatchFirstType). All default to 0.0 when fields are absent (backward compatible).
-
+    # --- Continuous name similarity features ---
     has_article_first = 'articleAuthorFirstName' in df.columns
     has_identity_middle = 'identityMiddleName' in df.columns
     has_match_type = 'nameMatchFirstType' in df.columns
 
     if has_article_first and 'identityFirstName' in df.columns:
-        # Normalize names for comparison
         id_first = df['identityFirstName'].fillna('').astype(str).str.strip().str.lower()
         art_first = df['articleAuthorFirstName'].fillna('').astype(str).str.strip().str.lower()
 
-        # 13. nameJaroWinkler: Jaro-Winkler similarity between identity and article first names
+        # 13. nameJaroWinkler
         df['nameJaroWinkler'] = [
             _jaro_winkler_similarity(a, b) for a, b in zip(id_first, art_first)
         ]
 
-        # 14. nameEditDistanceNorm: normalized edit distance similarity
+        # 14. nameEditDistanceNorm
         df['nameEditDistanceNorm'] = [
             1.0 - _levenshtein_distance(a, b) / max(len(a), len(b), 1)
             for a, b in zip(id_first, art_first)
         ]
 
-        # 15. forenameLengthRatio: article first name length / identity first name length
+        # 15. forenameLengthRatio
         id_len = id_first.str.len().clip(lower=1)
         art_len = art_first.str.len()
         df['forenameLengthRatio'] = art_len / id_len
@@ -475,7 +507,7 @@ def _compute_identity_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
         df['nameEditDistanceNorm'] = 0.0
         df['forenameLengthRatio'] = 0.0
 
-    # 16. firstMiddleCoverage: how much of PubMed ForeName is explained by identity first+middle
+    # 16. firstMiddleCoverage
     if has_article_first and 'identityFirstName' in df.columns and has_identity_middle:
         id_first = df['identityFirstName'].fillna('').astype(str).str.strip().str.lower()
         id_middle = df['identityMiddleName'].fillna('').astype(str).str.strip().str.lower()
@@ -486,7 +518,7 @@ def _compute_identity_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df['firstMiddleCoverage'] = 0.0
 
-    # 17. nameMatchTypeOrdinal: ordinal encoding of nameMatchFirstType
+    # 17. nameMatchTypeOrdinal
     if has_match_type:
         _MATCH_TYPE_MAP = {
             'full-exact': 5, 'inferredInitials-exact': 4, 'full-fuzzy': 3,
@@ -498,15 +530,45 @@ def _compute_identity_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df['nameMatchTypeOrdinal'] = 0.0
 
-    # 18-23. Sparse identity indicators.
-    #    Java outputs 0.0 for both "no data on file" and (in some cases) "checked, no match."
-    #    These binary indicators let the model distinguish "data exists" from "absent."
+    # 18-23. Sparse identity indicators
     df['hasEmail'] = (df['emailMatchScore'] != 0).astype(float)
     df['hasDegreeYear'] = (df['discrepancyDegreeYearScore'] != 0).astype(float)
     df['hasGrants'] = (df['grantMatchScore'] != 0).astype(float)
     df['hasRelationships'] = (df['relationshipIdentityCount'] > 0).astype(float)
     df['hasGender'] = (df['genderScoreIdentityArticleDiscrepancy'] != 0).astype(float)
     df['hasOrgUnit'] = (df['organizationalUnitMatchingScore'] != 0).astype(float)
+
+    # --- Phase 9 candidate features (identity-shared) ---
+
+    # 24. nameAffilStrength: name match weighted by overall identity strength
+    df['nameAffilStrength'] = df['nameMatchFirstScore'] * df['identityStrength']
+
+    # 25. evidenceConsistency: std dev of positive evidence features
+    df['evidenceConsistency'] = df[_POSITIVE_EVIDENCE_FEATURES].std(axis=1)
+
+    # --- Phase 9 Round 2 identity-specific interactions ---
+    # These are used by the identity-only model but computed for both
+    # (extra columns are harmless).
+
+    # 26. nameMatchConsistency: product of all three name components
+    df['nameMatchConsistency'] = (
+        df['nameMatchFirstScore'] * df['nameMatchLastScore'] * df['nameMatchMiddleScore']
+    )
+
+    # 27. affilRelationshipInteraction: best affiliation * relationship positive
+    best_affil_r2 = np.maximum(
+        df['targetAuthorInstitutionalAffiliationMatchTypeScore'],
+        df['pubmedTargetAuthorInstitutionalAffiliationMatchTypeScore']
+    )
+    df['affilRelationshipInteraction'] = (
+        best_affil_r2.clip(lower=0) * df['relationshipPositiveMatchScore'].clip(lower=0)
+    )
+
+    # 28. scopusPubmedAffilAgreement: both affiliation sources agree
+    df['scopusPubmedAffilAgreement'] = (
+        df['scopusNonTargetAuthorInstitutionalAffiliationScore'].clip(lower=0)
+        * df['pubmedTargetAuthorInstitutionalAffiliationMatchTypeScore'].clip(lower=0)
+    )
 
     return df
 
@@ -589,14 +651,62 @@ def compute_derived_features_feedback_identity(df: pd.DataFrame) -> pd.DataFrame
     # 8. Informed Absence Intensity: scales absence count by researcher history depth
     df['informedAbsenceIntensity'] = df['informedAbsenceCount'] * np.log1p(ca)
 
-    # 9. Name Conflict Confirmed: identity name matching AND feedback name pattern
-    #    both agree the first name is wrong. Strong signal of different person.
-    #    Zero when either feature is non-negative (i.e., no conflict or only one signal).
-    #    Feedback-only feature (uses feedbackScoreTargetAuthorName).
+    # 9. Name Conflict Confirmed: identity name matching AND feedback name pattern agree
     nf = df['nameMatchFirstScore']
     ta = df['feedbackScoreTargetAuthorName']
     both_negative = (nf < -2.0) & (ta < 0)
     df['nameConflictConfirmed'] = np.where(both_negative, nf.abs() * ta.clip(upper=0).abs(), 0.0)
+
+    # --- TextSimilarity interaction features ---
+    text_sim = df['feedbackScoreTextSimilarity']
+
+    # 10. hasTextEvidence: binary indicator
+    df['hasTextEvidence'] = (text_sim != 0).astype(float)
+
+    # 11. textSimNoCoauthorInteraction: text fills the gap when no coauthor evidence
+    df['textSimNoCoauthorInteraction'] = text_sim * (df['feedbackScoreCoAuthorName'] == 0).astype(float)
+
+    # 12. textSimNewJournalInteraction: text fills the gap when journal is unknown
+    df['textSimNewJournalInteraction'] = text_sim * (df['feedbackScoreJournal'] == 0).astype(float)
+
+    # 13. textSimFeedbackConfInteraction: more feedback = more reliable centroid
+    df['textSimFeedbackConfInteraction'] = text_sim * df['feedbackConfidence']
+
+    # 14. textSimAffilGapInteraction: text fills affiliation gap
+    best_affil = np.maximum(
+        df['targetAuthorInstitutionalAffiliationMatchTypeScore'],
+        df['pubmedTargetAuthorInstitutionalAffiliationMatchTypeScore']
+    )
+    df['textSimAffilGapInteraction'] = text_sim * (1 - best_affil.clip(0, 1))
+
+    # --- Phase 9 BibCoupling interaction features ---
+    bib_coupling = df['feedbackScoreBibliographicCoupling']
+
+    # 15. bibCouplingFeedbackConfInteraction
+    df['bibCouplingFeedbackConfInteraction'] = bib_coupling * df['feedbackConfidence']
+
+    # 16. bibCouplingHighConfOnly: gated by minimum feedback threshold
+    df['bibCouplingHighConfOnly'] = (
+        bib_coupling * (df['feedbackConfidence'] > np.log1p(10)).astype(float)
+    )
+
+    # 17. hasBibCouplingSignal: binary presence indicator
+    df['hasBibCouplingSignal'] = (bib_coupling != 0).astype(float)
+
+    # 18. worstSingleEvidenceExtended: expanded with textSim dimension
+    df['worstSingleEvidenceExtended'] = np.minimum(
+        df['worstSingleEvidence'],
+        np.where(text_sim != 0, text_sim, df['worstSingleEvidence'])
+    )
+
+    # 19. netEvidenceCountExtended: expanded evidence count with textSim + bibCoupling
+    ext_pos_count = sum(
+        (df[f] > 0).astype(int) for f in _EXTENDED_POSITIVE_EVIDENCE_FEATURES
+    )
+    ext_neg_count = sum(
+        (df[f] < 0).astype(int) for f in _EXTENDED_NEGATIVE_EVIDENCE_FEATURES
+    )
+    df['netEvidenceCountExtended'] = ext_pos_count - ext_neg_count
 
     return df
 
@@ -612,7 +722,7 @@ def compute_derived_features_identity_only(df: pd.DataFrame) -> pd.DataFrame:
         df: DataFrame with base features already filled (NaN -> 0)
 
     Returns:
-        DataFrame with identityStrength added
+        DataFrame with derived features added
     """
     df = df.copy()
 
@@ -633,70 +743,6 @@ def compute_derived_features_identity_only(df: pd.DataFrame) -> pd.DataFrame:
 
     # NOTE: No acceptanceRateLowerBound, feedbackConfidence, or uncertainRejectionRisk
     # because this model is blind to feedback history (countAccepted/countRejected)
-
-    return df
-
-
-# =============================================================================
-# PREPROCESSING PIPELINES
-# =============================================================================
-
-def preprocess_feedback_identity(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Full preprocessing pipeline for Feedback + Identity model.
-
-    Args:
-        df: Raw DataFrame from database with required columns
-
-    Returns:
-        Preprocessed DataFrame ready for model training/inference
-    """
-    df = df.copy()
-
-    required = set(FEEDBACK_IDENTITY_BASE_FEATURES + ["articleId", "personIdentifier", "pmid", "userAssertion"])
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}")
-
-    # Create label from userAssertion
-    df["label"] = df["userAssertion"].map({"ACCEPTED": 1, "REJECTED": 0})
-    df = df[~df["label"].isna()]
-
-    # Fill missing base features with 0
-    df[FEEDBACK_IDENTITY_BASE_FEATURES] = df[FEEDBACK_IDENTITY_BASE_FEATURES].fillna(0)
-
-    # Compute derived features
-    df = compute_derived_features_feedback_identity(df)
-
-    return df
-
-
-def preprocess_identity_only(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Full preprocessing pipeline for Identity-Only model.
-
-    Args:
-        df: Raw DataFrame from database with required columns
-
-    Returns:
-        Preprocessed DataFrame ready for model training/inference
-    """
-    df = df.copy()
-
-    required = set(IDENTITY_ONLY_BASE_FEATURES + ["articleId", "personIdentifier", "pmid", "userAssertion"])
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}")
-
-    # Create label from userAssertion
-    df["label"] = df["userAssertion"].map({"ACCEPTED": 1, "REJECTED": 0})
-    df = df[~df["label"].isna()]
-
-    # Fill missing base features with 0
-    df[IDENTITY_ONLY_BASE_FEATURES] = df[IDENTITY_ONLY_BASE_FEATURES].fillna(0)
-
-    # Compute derived features
-    df = compute_derived_features_identity_only(df)
 
     return df
 
