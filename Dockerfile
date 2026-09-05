@@ -24,6 +24,11 @@ COPY update/executeFeatureGenerator.py ./
 COPY update/retrieveExternalArticles.py ./
 COPY update/run_all.py ./
 
+# Nightly identity build from ED (LDAP) + ASMS (MSSQL). Replaces the Splunk
+# saved search "reciter identity update". Own CronJob (k8-cronjob-identity.yaml),
+# runs at 12:00 UTC ahead of the reciterdb job -- deliberately NOT in run_all.py.
+COPY update/buildIdentity.py ./
+
 # AAR Scopus lane (not-in-PubMed WCM authorship detector — weekly, gated in run_all.py)
 COPY update/identity_index.py ./
 COPY update/aar_db.py ./

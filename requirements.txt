@@ -1,5 +1,7 @@
 ###### Requirements without Version Specifiers ######
 PyMySQL
+ldap3
+pymssql
 boto3==1.35.40
 dynamodb-json
 requests
