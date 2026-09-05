@@ -25,6 +25,25 @@ phases:
         - sed -i.bak -e 's@CONTAINER_IMAGE@'"$REPOSITORY_URI:$TAG"'@' kubernetes/k8-cronjob.yaml
         - echo "${CODEBUILD_WEBHOOK_HEAD_REF}"
         - echo "${BRANCH}"
+
+        # Deploying (push + repoint the live cronjob) is allowed ONLY for builds the
+        # CodePipeline started. BRANCH and CRON_JOB_NAME are set by the pipeline's Build
+        # action, NOT by the project: the project-level default is BRANCH=dev with no
+        # CRON_JOB_NAME at all. So a manual `aws codebuild start-build --source-version
+        # <any-branch>` used to inherit BRANCH=dev, satisfy the ".*dev" test below, and
+        # push an image built from that branch into the PROD ECR repo under a dev-* tag.
+        # Gate on the initiator so a manual start can never reach a push or a kubectl.
+        - |
+          case "$CODEBUILD_INITIATOR" in
+            codepipeline/*) DEPLOY=yes ;;
+            *)              DEPLOY=no ;;
+          esac
+          if [ "$DEPLOY" = yes ]; then
+            expr "${BRANCH}" : ".*master" >/dev/null || expr "${BRANCH}" : ".*dev" >/dev/null || DEPLOY=no
+            [ -n "${CRON_JOB_NAME}" ] || { echo "CRON_JOB_NAME is empty -- refusing to deploy"; DEPLOY=no; }
+          fi
+          echo "initiator=${CODEBUILD_INITIATOR} branch=${BRANCH} cronjob=${CRON_JOB_NAME:-<unset>} deploy=${DEPLOY}"
+          export DEPLOY
         - echo $REPOSITORY_URI
         - echo "${AWS_REGION}"
         
@@ -32,17 +51,19 @@ phases:
         - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $REPOSITORY_URI
   build:
     commands:
-      - |
-        if expr "${BRANCH}" : ".*master" >/dev/null || expr "${BRANCH}" : ".*dev" >/dev/null; then
-          docker build --tag $REPOSITORY_URI:$TAG .
-        fi
+      # Always build. It has no side effects, and it is the only real validation this
+      # buildspec performs -- a manual start-build is now a genuine image dry-run.
+      - docker build --tag $REPOSITORY_URI:$TAG .
   post_build:
     commands:
       - |
-        if expr "${BRANCH}" : ".*master" >/dev/null || expr "${BRANCH}" : ".*dev" >/dev/null; then
+        if [ "$DEPLOY" = yes ]; then
           docker push $REPOSITORY_URI:$TAG
           # Log out from the Docker registry to clear credentials
           docker logout $REPOSITORY_URI
           aws eks update-kubeconfig --name $EKS_CLUSTER_NAME --region us-east-1 --role-arn $EKS_KUBECTL_ROLE_ARN
           kubectl set image cronjob/$CRON_JOB_NAME $CRON_JOB_NAME=$REPOSITORY_URI:$TAG -n reciter
+        else
+          echo "Not a pipeline-initiated deploy (initiator=${CODEBUILD_INITIATOR}, branch=${BRANCH})."
+          echo "Image built and discarded; nothing pushed, cronjob untouched."
         fi
