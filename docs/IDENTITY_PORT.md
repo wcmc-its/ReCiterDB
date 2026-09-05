@@ -268,6 +268,41 @@ in the current build who are no longer residents. `fullTimeFaculty` and
 `inactiveFaculty`: zero would be cleared. Upserting only what you rebuild is what
 makes the cumulative table safe.
 
+## What the upsert actually changes
+
+Comparing raw `identity_staging` against `identity` overstates the change: the
+upsert is `COALESCE(VALUES(col), col)`, so a NULL never overwrites. Measure with
+COALESCE semantics to see the real change set:
+
+```sql
+SELECT SUM(NOT (COALESCE(s.primaryProgram, i.primaryProgram) <=> i.primaryProgram))
+FROM identity i JOIN identity_staging s ON s.cwid = i.cwid;
+```
+
+| column | raw diff | actually changes |
+|---|---:|---:|
+| `givenName` | 0 | 0 |
+| `fullTimeFaculty` | 8,543 | **0** |
+| `surname` | 1 | 1 |
+| `primaryAcademicDivision` | 1 | 1 (a gain) |
+| `primaryOrg` | 263 | **2** |
+| `primaryProgram` | 244 | **5** |
+| `primaryTitle` | 266 | **5** |
+| `primaryAcademicDepartment` | 13,176 | 12,680 (12,495 gains, 185 changes) |
+
+Everything that collapsed was a NULL-overwrite artifact. The port reaches 8,916
+people Splunk's truncated output never did, and for those people the columns they
+do not qualify for come back empty; without the COALESCE guard the first run
+would have erased 237 `primaryProgram` and 261 `primaryOrg` values.
+
+The 185 department changes are ED updates Splunk has gone stale on --
+`Healthcare Policy and Research` -> `Population Health Sciences` (26),
+`Physiology and Biophysics` -> `Systems and Computational Biomedicine` (9),
+`Institute for Computational Biomedicine` -> `Systems and Computational
+Biomedicine` (4). The 12 remaining program/title/org changes are two rows gaining
+values and three MD students who moved into the PhD phase (`Medical Student` ->
+`Graduate Student`). All corrections, none regressions.
+
 ## The original
 
 `docs/reciter_identity_update.spl` is the Splunk saved search this job replaces,

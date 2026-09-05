@@ -673,10 +673,18 @@ def _program_value(row, primary=False):
     were added to it rather than a second mechanism being introduced.
     """
     pre = "weillCornellEduPrimary" if primary else "weillCornellEdu"
-    old = row.get(pre + "Program")
-    raw = (row.get(f"{pre}OrgUnit;level2") or old) if PREFER_ORGUNIT else old
-    if not raw:
+    # weillCornellEduProgram is MULTI-VALUED on ~335 records --
+    # ['MD-PhD Program', 'Biochemistry & Structural Biology'] -- and the generic
+    # entry sorts first. Splunk's case() evaluated every value and its
+    # sort-by-priority picked the specific one; taking row.get() here handed the
+    # generic label to 72 students. weillCornellEduPrimaryProgram is
+    # single-valued, but reading both the same way costs nothing.
+    olds = row.all(pre + "Program")
+    news = row.all(f"{pre}OrgUnit;level2") if PREFER_ORGUNIT else []
+    raws = news or olds
+    if not raws:
         return ""
+    raw = raws[0]
     # `program` was ALWAYS normalised -- the SPL's case() ran unconditionally,
     # and PROGRAM_PRIORITY is keyed on the normalised names, so skipping it also
     # breaks the ranking ("MD-PhD WGS Neuroscience" scores 999 instead of 6 and
@@ -684,7 +692,11 @@ def _program_value(row, primary=False):
     # and only until PREFER_ORGUNIT makes the two columns consistent.
     if primary and not PREFER_ORGUNIT:
         return raw
-    return PROGRAM_OVERRIDE.get(raw, raw)
+    # Best-ranked of the candidates, matching the SPL's `sort 0 cwid priority`
+    # followed by dedup. ed_students_program applies the same rule ACROSS
+    # records; this one applies it WITHIN a record.
+    return min((PROGRAM_OVERRIDE.get(r, r) for r in raws),
+               key=lambda p: PROGRAM_PRIORITY.get(p, 999))
 
 
 def _watch_orgunit_migration(rows):
@@ -967,6 +979,28 @@ def _coerce(r):
 #                                  WRITE
 # ---------------------------------------------------------------------------
 
+def _upsert_clauses():
+    """Column list, placeholders and the ON DUPLICATE KEY UPDATE clause.
+
+    Every column updates as COALESCE(VALUES(col), col): a new value overwrites,
+    but NULL leaves whatever is already there. Without this the port erases
+    history. It reaches 8,916 people Splunk's truncated output never did, and for
+    those people the columns they do not qualify for come back empty -- measured
+    2026-09-05, a plain VALUES() upsert would have wiped 237 primaryProgram and
+    261 primaryOrg values that had been correct for years.
+
+    The trade-off is that a value can never be cleared once set, only replaced.
+    That is the deliberate reading of a cumulative table whose whole purpose is
+    retaining department and division after someone leaves ED's ou=canonical.
+    Clearing a stale value is a separate, explicit operation.
+    """
+    cols = ", ".join(f"`{c}`" for c in UPSERT_COLUMNS)
+    placeholders = ", ".join(["%s"] * len(UPSERT_COLUMNS))
+    updates = ", ".join(f"`{c}`=COALESCE(VALUES(`{c}`), `{c}`)"
+                        for c in UPSERT_COLUMNS if c != "cwid")
+    return cols, placeholders, updates
+
+
 def db_conn():
     import pymysql  # lazy: see asms_division
 
@@ -989,9 +1023,7 @@ def write(rows, stage_only=False):
     are never deleted (see module docstring). It exists so the floor gate has
     something complete to measure before anything touches the live table.
     """
-    cols = ", ".join(f"`{c}`" for c in UPSERT_COLUMNS)
-    placeholders = ", ".join(["%s"] * len(UPSERT_COLUMNS))
-    updates = ", ".join(f"`{c}`=VALUES(`{c}`)" for c in UPSERT_COLUMNS if c != "cwid")
+    cols, placeholders, updates = _upsert_clauses()
 
     conn = db_conn()
     try:
@@ -1258,6 +1290,23 @@ def demo():
     assert PROGRAM_PRIORITY[_program_value(_Row([("weillCornellEduProgram",
                                                   "MD-PhD WGS Neuroscience")]))] == 6, \
         "normalised name must score in PROGRAM_PRIORITY, not fall to 999"
+
+    # A NULL must never overwrite an existing value: the port reaches people
+    # Splunk's truncated output never did, and writing their empty columns over
+    # real history is data loss, not a correction.
+    _cols, _ph, _upd = _upsert_clauses()
+    assert "VALUES(`surname`), `surname`" in _upd and "COALESCE" in _upd
+    assert "`cwid`=" not in _upd, "the join key is never updated"
+    assert _upd.count("COALESCE") == len(UPSERT_COLUMNS) - 1, "every column guarded"
+    assert _ph.count("%s") == len(UPSERT_COLUMNS)
+
+    # Multi-valued program: the generic entry sorts first, the specific one wins.
+    multi_prog = _Row([("weillCornellEduProgram",
+                        ["MD-PhD Program", "Biochemistry & Structural Biology"])])
+    assert _program_value(multi_prog) == "Biochemistry & Structural Biology", \
+        "highest-priority program wins within a record"
+    assert _program_value(_Row([("weillCornellEduProgram", ["MD-PhD Program"])])) \
+        == "MD-PhD Program", "single value unaffected"
     print("demo ok")
 
 
