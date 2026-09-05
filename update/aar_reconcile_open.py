@@ -372,6 +372,15 @@ def _load_class_b_modules():
     # The exact 9 columns #180 nulls and #182 says need refreshing -- imported, not
     # redefined, so the two tools can never silently diverge on which columns are in play.
     REFRESH_COLS = sweep.NULL_COLUMNS
+    # ...and the drift TRIGGER is that same set minus top_cwid, whose comparison is the
+    # CHANGED/UNCHANGED split itself. Asserted here rather than hand-synced (#205): a
+    # column added to the refresh set but not to rcp._DRIFT_COLS would be rewritten on
+    # every refresh yet never able to CAUSE one, so a row stale in that column alone
+    # would sit unreconciled forever.
+    assert set(_rcp._DRIFT_COLS) | {"top_cwid"} == set(REFRESH_COLS), (
+        f"drift trigger {sorted(_rcp._DRIFT_COLS)} + top_cwid != refresh set "
+        f"{sorted(REFRESH_COLS)} -- aar_report_changed_picks._DRIFT_COLS and "
+        "aar_sweep_stale.NULL_COLUMNS have diverged (#205).")
 
 
 # ============================================================================
@@ -1067,6 +1076,21 @@ def _selftest():
           set(payload.keys()) == set(REFRESH_COLS))
     check("write_payload's top_affil_match is coerced to 0/1",
           payload["top_affil_match"] == 1)
+
+    # #205: _write_payload's truncation widths and rcp._DRIFT_TRUNC were two hand-synced
+    # copies of the same VARCHAR widths. If they part company, a value _write_payload
+    # cuts reads as different from the un-cut replay value on the very next run and every
+    # row in the queue drifts forever.
+    FULL_CANDS_BY_ID[1001] = [{"cwid": "abc123", "name": "N" * 300,
+                               "person_type": "P" * 100, "dept": "D" * 300,
+                               "given_match": "full", "affil_dept_match": True,
+                               "cohort_size": 1, "confidence": 0.87}]
+    long_payload = _write_payload({"id": 1001, "source": "pubmed", "new_cwid": "abc123"})
+    check("write_payload truncates to exactly rcp._DRIFT_TRUNC's widths",
+          all(len(long_payload[c]) == w for c, w in rcp._DRIFT_TRUNC.items()))
+    check("the drift trigger is the refresh set minus top_cwid (asserted at import in "
+          "_load_class_b_modules too)",
+          set(rcp._DRIFT_COLS) | {"top_cwid"} == set(REFRESH_COLS))
 
     # apply-wiring contract (#189): main() feeds _apply_class_b the class-B slice of
     # ledger_entries, and _apply_class_b consumes exactly e["id"] + e["after"][col]

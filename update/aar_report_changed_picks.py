@@ -87,6 +87,7 @@ Usage:
   python aar_report_changed_picks.py --limit 50          # cap rows per lane (sanity)
   python aar_report_changed_picks.py --check 70797 74858 # named-row check only, no
                                                           # full sweep
+  python aar_report_changed_picks.py --selftest          # offline checks, no DB/network
 """
 import argparse, csv, json, os, sys, time
 from concurrent.futures import ThreadPoolExecutor
@@ -201,10 +202,22 @@ def _tier_move(old_tier, new_tier):
 _DRIFT_CAND_FIELDS = ("name", "person_type", "dept", "given_match",
                       "affil_dept_match", "cohort_size", "confidence")
 
+# The producer-owned COLUMNS _drift_cols can name. top_cwid is deliberately absent: its
+# comparison IS the CHANGED/UNCHANGED split in _row_result, so it is never re-tested as
+# drift. Tied at import time to aar_reconcile_open's REFRESH_COLS (which is
+# aar_sweep_stale.NULL_COLUMNS) by _load_class_b_modules, so a column added to the
+# refresh set can never silently stay outside the drift trigger (#205).
+_DRIFT_COLS = ("top_name", "top_person_type", "top_dept", "top_given_match",
+               "top_affil_match", "top_confidence", "n_candidates",
+               "candidate_cwids_json")
+
 # VARCHAR widths aar_reconcile_open._write_payload truncates to, so a stored value that
-# was cut to fit is not mistaken for drift. (Asserted consistent with _write_payload's
-# own output by aar_reconcile_open._selftest.)
+# was cut to fit is not mistaken for drift. (Asserted equal to _write_payload's own
+# widths by aar_reconcile_open._selftest -- #205: they used to be hand-synced, with
+# nothing failing if one moved.)
 _DRIFT_TRUNC = {"top_name": 255, "top_person_type": 64, "top_dept": 255}
+assert set(_DRIFT_TRUNC) <= set(_DRIFT_COLS), (
+    "_DRIFT_TRUNC names a column _drift_cols never emits")
 
 # `confidence` is round(..., 3) at the source (identity_index._confidence), and
 # `top_confidence` is a 4-byte FLOAT column, so a stored 0.775 reads back as
@@ -236,6 +249,36 @@ def _conf_ne(a, b):
     return abs(float(a) - float(b)) > _CONF_TOL
 
 
+def _int_ne(a, b):
+    if a is None or b is None:
+        return (a is None) != (b is None)
+    return int(a) != int(b)
+
+
+def _txt_ne(a, b):
+    return _norm_txt(a) != _norm_txt(b)
+
+
+def _flag_ne(a, b):
+    return _norm_flag(a) != _norm_flag(b)
+
+
+# One comparator per candidate field, looked up BY the field name so `_cands_drifted`
+# iterates `_DRIFT_CAND_FIELDS` itself (#205). Before this, that list drove only
+# `_cand_map`'s projection while `_cands_drifted` compared a second, hand-maintained
+# copy: a field added to the list alone was projected, never compared, and the addition
+# silently no-op'd. Fields not named here compare as text, which is right for the four
+# string-valued ones; the assert below is the tripwire for a comparator left behind by a
+# field that has since been removed.
+_DRIFT_CAND_CMP = {
+    "confidence": _conf_ne,
+    "affil_dept_match": _flag_ne,
+    "cohort_size": _int_ne,
+}
+assert set(_DRIFT_CAND_CMP) <= set(_DRIFT_CAND_FIELDS), (
+    "_DRIFT_CAND_CMP names a field _cand_map does not project")
+
+
 def _cand_map(cands):
     """cwid (case-folded, per the collation trap) -> the identity-derived fields only.
     Unordered on purpose: candidate ORDER is io-dependent on the pubmed lane."""
@@ -260,16 +303,8 @@ def _cands_drifted(stored_json, cands):
         return True
     for cw, o in old.items():
         n = new[cw]
-        if _conf_ne(o.get("confidence"), n.get("confidence")):
-            return True
-        if _norm_flag(o.get("affil_dept_match")) != _norm_flag(n.get("affil_dept_match")):
-            return True
-        if (o.get("cohort_size") is None) != (n.get("cohort_size") is None) or (
-                o.get("cohort_size") is not None
-                and int(o["cohort_size"]) != int(n["cohort_size"])):
-            return True
-        for f in ("name", "person_type", "dept", "given_match"):
-            if _norm_txt(o.get(f)) != _norm_txt(n.get(f)):
+        for f in _DRIFT_CAND_FIELDS:
+            if _DRIFT_CAND_CMP.get(f, _txt_ne)(o.get(f), n.get(f)):
                 return True
     return False
 
@@ -302,6 +337,9 @@ def _drift_cols(r, cands):
         out.append("n_candidates")
     if _cands_drifted(r.get("candidate_cwids_json"), cands):
         out.append("candidate_cwids_json")
+    assert not set(out) - set(_DRIFT_COLS), (
+        f"_drift_cols emitted {sorted(set(out) - set(_DRIFT_COLS))}, absent from "
+        "_DRIFT_COLS -- the one list aar_reconcile_open's REFRESH_COLS is tied to (#205)")
     return sorted(out)
 
 
@@ -553,6 +591,122 @@ def _check_ids(engine, idx, io_scorer, ids):
     return out
 
 
+# ---- offline self-test --------------------------------------------------------
+def _selftest():
+    """Offline: no DB, no network. Proves the #205 invariant -- that the drift
+    comparison is driven by `_DRIFT_CAND_FIELDS` and `_DRIFT_COLS` themselves rather
+    than by a second hand-maintained copy of either -- and re-proves the io exclusion
+    #204 rests on (see aar_reconcile_open.py's PRODUCER-COLUMN DRIFT section: io_score/
+    final_score/io_source are re-read from live S3 inputs the nightly inst-client keeps
+    refreshing, so if they triggered drift the pass would rewrite the whole open queue
+    every run)."""
+    ok = True
+
+    def check(label, cond):
+        nonlocal ok
+        ok &= bool(cond)
+        print(f"  [{'OK' if cond else '** FAIL'}] {label}")
+
+    # ---- the two lists ARE the source of truth --------------------------------
+    check("every _DRIFT_CAND_CMP comparator names a field _cand_map projects",
+          set(_DRIFT_CAND_CMP) <= set(_DRIFT_CAND_FIELDS))
+    check("_DRIFT_TRUNC only names columns _drift_cols can emit",
+          set(_DRIFT_TRUNC) <= set(_DRIFT_COLS))
+    check("top_cwid is NOT a drift column -- its comparison is the CHANGED/UNCHANGED "
+          "split itself", "top_cwid" not in _DRIFT_COLS)
+
+    def cand(cwid, **kw):
+        c = {"cwid": cwid, "name": "Jane Q Doe", "person_type": "Full-Time Faculty",
+             "dept": "Medicine", "division": "", "title": "", "given_match": "full",
+             "affil_dept_match": True, "affil_match_on": "dept", "cohort_size": 3,
+             "years_after_wcm": None, "confidence": 0.883}
+        c.update(kw)
+        return c
+
+    def row(cands):
+        """The stored row exactly as the producer wrote it from `cands` -- same
+        truncation and 0/1 coercion aar_reconcile_open._write_payload applies."""
+        top = cands[0]
+        return {"id": 1, "source": "pubmed", "pmid": 1, "external_id": None,
+                "wcm_author": "Jane Doe", "top_cwid": top["cwid"],
+                "top_name": _norm_txt(top["name"], _DRIFT_TRUNC["top_name"]),
+                "top_person_type": _norm_txt(top["person_type"],
+                                             _DRIFT_TRUNC["top_person_type"]),
+                "top_dept": _norm_txt(top["dept"], _DRIFT_TRUNC["top_dept"]),
+                "top_given_match": top["given_match"],
+                "top_affil_match": int(bool(top["affil_dept_match"])),
+                "top_confidence": top["confidence"],
+                "n_candidates": len(cands),
+                "candidate_cwids_json": json.dumps(cands)}
+
+    base = [cand("abc123"),
+            cand("def456", name="John Doe", dept="Surgery", given_match="initial",
+                 confidence=0.633)]
+    stored = row(base)
+    check("a row the producer would write identically today carries no drift",
+          _drift_cols(stored, base) == [])
+
+    long_cands = [cand("abc123", name="N" * 300, person_type="P" * 100, dept="D" * 300)]
+    check("a stored value cut to the VARCHAR width is not mistaken for drift",
+          _drift_cols(row(long_cands), long_cands) == [])
+
+    # ---- THE io exclusion (#204) ---------------------------------------------
+    io_cands = [dict(c) for c in base]
+    for c, io in zip(io_cands, (91.4, None)):
+        c["io_score"] = io
+        c["final_score"] = io
+        c["io_source"] = "retrieved" if io is not None else "not_retrieved"
+    check("io_score/final_score/io_source APPEARING on the replayed candidates is not "
+          "drift (the #182 run-to-run wobble can never trigger a refresh)",
+          _drift_cols(stored, io_cands) == [])
+    check("...nor is io DISAPPEARING from them (stored carried io, the replay does not)",
+          _drift_cols(row(io_cands), base) == [])
+    moved_io = [dict(io_cands[0], io_score=12.0, final_score=12.0,
+                     io_source="not_retrieved"), io_cands[1]]
+    check("...nor is an io score that MOVED between runs",
+          _drift_cols(row(io_cands), moved_io) == [])
+    check("io-driven reordering below the top pick is not drift either (the candidate "
+          "map is unordered, keyed by cwid)",
+          _drift_cols(stored, [base[0], base[1]][::1]) == []
+          and _drift_cols(row([base[0], base[1]]), [base[0], base[1]]) == [])
+
+    # ---- every candidate field in the list, changed ALONE, drifts -------------
+    # Perturbed on the NON-top candidate, so only candidate_cwids_json can move: that
+    # isolates _cands_drifted from _drift_cols' own top_* comparisons. Before #205 the
+    # loop below is exactly what silently no-op'd for a field added to
+    # _DRIFT_CAND_FIELDS without a matching hand-written comparison.
+    cand_perturb = {"name": "Someone Else", "person_type": "Voluntary Faculty",
+                    "dept": "Pediatrics", "given_match": "full",
+                    "affil_dept_match": False, "cohort_size": 4, "confidence": 0.5}
+    check("every field in _DRIFT_CAND_FIELDS has a perturbation below",
+          set(cand_perturb) == set(_DRIFT_CAND_FIELDS))
+    for f, v in cand_perturb.items():
+        moved = [base[0], dict(base[1], **{f: v})]
+        check(f"candidate field '{f}' changed alone drifts candidate_cwids_json",
+              _drift_cols(stored, moved) == ["candidate_cwids_json"])
+
+    # ---- every column in _DRIFT_COLS, stale ALONE, is reported ----------------
+    col_perturb = {
+        "top_name": "Someone Else", "top_person_type": "Voluntary Faculty",
+        "top_dept": "Pediatrics", "top_given_match": "initial",
+        "top_affil_match": 0, "top_confidence": 0.5, "n_candidates": 9,
+        "candidate_cwids_json": json.dumps([base[0], dict(base[1], dept="Pediatrics")]),
+    }
+    check("every column in _DRIFT_COLS has a perturbation below",
+          set(col_perturb) == set(_DRIFT_COLS))
+    for col, v in col_perturb.items():
+        check(f"stored column '{col}' stale alone is reported as drift",
+              _drift_cols(dict(stored, **{col: v}), base) == [col])
+
+    # A stored candidate JSON that will not parse is drift, not a crash.
+    check("unparseable stored candidate JSON reads as drift (rewriting it is the fix)",
+          _drift_cols(dict(stored, candidate_cwids_json="{not json"), base)
+          == ["candidate_cwids_json"])
+
+    print("\nSELFTEST", "PASS" if ok else "FAIL")
+    return ok
+
+
 # ---- driver --------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
@@ -571,12 +725,18 @@ def main():
                          "default (rescore on) is what the producer would actually write "
                          "if these rows were reprocessed today; this flag answers a "
                          "narrower question, not a more correct one.")
+    ap.add_argument("--selftest", action="store_true",
+                    help="offline checks, no DB/network (the #205 drift-field "
+                         "invariants and the #204 io exclusion)")
     ap.add_argument("--out-dir", default=HERE,
                     help="where the CSV/JSONL of CHANGED rows lands (default: this "
                          "file's own directory, same convention as aar_sweep_stale.py's "
                          "--ledger default -- gitignored, real prod row content, never "
                          "committed)")
     args = ap.parse_args()
+
+    if args.selftest:
+        sys.exit(0 if _selftest() else 1)
 
     run_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     print("Resolved producer modules (must all live under this file's directory):")
