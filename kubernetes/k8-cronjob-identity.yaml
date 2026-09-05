@@ -46,23 +46,11 @@ spec:
                 name: reciter-inst-secrets
             - configMapRef:
                 name: reciter-inst-client-configmap
-            env:
-            # The five SA-ldapsearch domain aliases the SPL used, as real base
-            # DNs. Set from ldap.conf; overridable here without a rebuild.
-            - name: LDAP_URL
-              value: "ldaps://ed.weill.cornell.edu"
-            - name: LDAP_BIND_DN
-              value: ""            # TODO: from SA-ldapsearch/local/ldap.conf
-            - name: LDAP_BASE_PEOPLE
-              value: ""            # TODO: domain=ed-people
-            - name: LDAP_BASE_ORGS
-              value: ""            # TODO: domain=ed-organizations
-            - name: LDAP_BASE_FACULTY
-              value: ""            # TODO: domain=ed-faculty
-            - name: LDAP_BASE_SORS
-              value: ""            # TODO: domain=ed-sors
-            - name: LDAP_BASE_STUDENTS
-              value: ""            # TODO: domain=ed-students
+            # LDAP_URL, LDAP_BIND_DN and the five base DNs default correctly in
+            # buildIdentity.py (taken from the institutional client's own config).
+            # Do NOT re-add them here as empty strings -- os.environ.get returns
+            # "" for a var set to empty, which would override the good defaults.
+            # Set one only to actually change it.
             resources:
               requests:
                 memory: 2G

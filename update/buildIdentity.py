@@ -43,8 +43,6 @@ import logging
 import os
 import sys
 
-import pymssql
-import pymysql
 from ldap3 import ALL, Connection, Server, SUBTREE
 from ldap3.extend.standard.PagedSearch import paged_search_generator
 
@@ -59,14 +57,28 @@ logger = logging.getLogger(__name__)
 #                                  CONFIG
 # ---------------------------------------------------------------------------
 
-LDAP_URL = os.environ.get("LDAP_URL", "ldaps://ed.weill.cornell.edu")
+# ldap.hostname / ldap.port from the institutional client's application.properties.
+LDAP_URL = os.environ.get("LDAP_URL", "ldaps://ed.weill.cornell.edu:636")
+LDAP_BIND_DN = os.environ.get(
+    "LDAP_BIND_DN", "cn=reciter,ou=binds,dc=weill,dc=cornell,dc=edu")
 LDAP_PAGE_SIZE = 500
 
 # The five SA-ldapsearch `domain=` aliases used by the SPL, mapped to real base
-# DNs. These are NOT verified -- SA-ldapsearch resolves them from its own
-# ldap.conf, which we do not have. Confirm each against
-# $SPLUNK_HOME/etc/apps/SA-ldapsearch/local/ldap.conf and correct via env
-# without a rebuild.
+# DNs. Four are confirmed against the institutional client, which reads the same
+# directory (application.properties ldap.base.dn, and the ldapSources block in
+# its k8-scheduling-default.yaml, itself a verbatim move from
+# LdapIdentityDaoImpl.getActivePeopleFromED):
+#
+#   ed-people    ou=people,dc=weill,dc=cornell,dc=edu        (ldap.base.dn)
+#   ed-faculty   ou=faculty,ou=sors,...                      (SOURCE_INACTIVE_ACADEMIC)
+#   ed-students  ou=students,ou=sors,...                     (SOURCE_STUDENT_MD_OR_PHD)
+#   ed-sors      ou=sors,...                                 (parent of the three
+#                above; the SPL filters on (ou=faculty)/(ou=students)/
+#                (ou=nyp affiliates), which only resolves from the parent)
+#
+# ed-organizations is NOT confirmed -- inferred from the sibling taxonomy branch
+# ou=locations,ou=Groups,... documented in the Everbridge location analysis. It
+# drives primaryOrg only. `--spike` proves or disproves it.
 # ponytail: env-overridable dict, not a config class. Five constants.
 BASE_DN = {
     "ed-people": os.environ.get(
@@ -157,7 +169,7 @@ def ldap_conn():
     if _conn is None:
         _conn = Connection(
             Server(LDAP_URL, get_info=ALL),
-            user=os.environ["LDAP_BIND_DN"],
+            user=LDAP_BIND_DN,
             password=os.environ["LDAP_BIND_PASSWORD"],
             auto_bind=True,
             raise_exceptions=True,
@@ -250,10 +262,29 @@ order by weillCornellEduEndDate desc
 """
 
 
+def _mssql_target(url):
+    """MSSQL_DB_URL is shared with the institutional client, which is Java and
+    puts a JDBC URL there (jdbc:sqlserver://host:1433;databaseName=...). pymssql
+    wants host and port separately, so accept either form and split them out
+    rather than relying on pymssql to parse a colon.
+    """
+    host = url.strip()
+    if "://" in host:
+        host = host.split("://", 1)[1]
+    host = host.split(";", 1)[0].split("/", 1)[0]
+    if ":" in host:
+        host, _, port = host.rpartition(":")
+        return host, int(port)
+    return host, 1433
+
+
 @source
 def asms_division():
+    import pymssql  # lazy: --spike and --demo must run without the MSSQL driver
+
+    host, port = _mssql_target(os.environ["MSSQL_DB_URL"])
     conn = pymssql.connect(
-        server=os.environ["MSSQL_DB_URL"],
+        server=host, port=port,
         user=os.environ["MSSQL_DB_USERNAME"],
         password=os.environ["MSSQL_DB_PASSWORD"],
         database=os.environ.get("MSSQL_DB_NAME", "ASMS"),
@@ -723,6 +754,8 @@ def _coerce(r):
 # ---------------------------------------------------------------------------
 
 def db_conn():
+    import pymysql  # lazy: see asms_division
+
     return pymysql.connect(
         host=os.environ["DB_HOST"],
         user=os.environ["DB_USERNAME"],
@@ -884,6 +917,10 @@ def demo():
     assert "exc0001" not in rows, "excluded cwid dropped"
     assert "nob0003" not in rows, "no role and no department - filtered out"
     assert rows["abc1001"]["startDateWCMFaculty"] is None, "empty year is NULL not 0"
+
+    assert _mssql_target("jdbc:sqlserver://asms.db:1433;databaseName=ASMS") == ("asms.db", 1433)
+    assert _mssql_target("asms.db") == ("asms.db", 1433)
+    assert _mssql_target("sqlserver://asms.db:1500") == ("asms.db", 1500)
     print("demo ok")
 
 
