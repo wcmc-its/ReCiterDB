@@ -122,12 +122,26 @@ def _byline_first_name(fore):
 # the Englander Institute for Precision Medicine, and Cornell Medical Practice (7, via
 # the word "Cornell") all self-matched a BARE WCM affiliation naming no division at all.
 #
+# WCM is not the only institution whose own NAME contains a department word. This queue's
+# entry condition is aar_universe's home-institution keyword list, which deliberately
+# includes the affiliated institutions -- "memorial|sloan|kettering" and
+# "hospital|special|surgery" among them -- so their names reach this test just as WCM's
+# does, and self-match exactly the same way. Measured on the live open queue, 2026-09-04:
+# 106 open rows carry top_affil_match=1 with a byline naming "Hospital for Special
+# Surgery" against a top_dept containing "Surgery", and 8 more match "Sloan Kettering
+# Cancer Center" against a Cancer/Oncology department. ("Methodist", checked the same
+# way, produced 0 -- an institution with no department-word collision belongs nowhere
+# near this list, since stripping it can only lose real matches.)
+#
 # These phrases are removed from the affiliation before any dept/division test. The
 # asymmetry is the point: "Weill Cornell Medicine, New York" must stop naming the
 # Department of Medicine, while "Department of Medicine, Weill Cornell Medicine" must
-# still name it. Edit this list freely -- it is re-sorted longest-first below, so a
+# still name it -- and likewise "Hospital for Special Surgery, New York" must stop
+# naming a Department of Surgery while "Department of Surgery, Hospital for Special
+# Surgery" still does. Edit this list freely -- it is re-sorted longest-first below, so a
 # short phrase can never eat part of a longer one ("weill cornell" must not strip
-# "Weill Cornell Medicine" down to a bare, self-matching "medicine").
+# "Weill Cornell Medicine" down to a bare, self-matching "medicine"). Add an institution
+# only when its own name contains a department or division word.
 INSTITUTION_PHRASES = (
     "Weill Cornell Medicine",
     "Weill Cornell Medical College",
@@ -137,6 +151,13 @@ INSTITUTION_PHRASES = (
     "NewYork-Presbyterian/Weill Cornell Medical Center",
     "Cornell University",
     "Weill Cornell",
+    # Affiliated institutions naming a department in their own name. The two Sloan
+    # Kettering spellings normalise to the same tokens (`_affil_words` splits on every
+    # non-word character, so the hyphen and the space are the same seam); both are
+    # listed because both are how the affiliation is actually written.
+    "Hospital for Special Surgery",
+    "Memorial Sloan Kettering Cancer Center",
+    "Memorial Sloan-Kettering Cancer Center",
 )
 
 
@@ -994,6 +1015,40 @@ def _selftest():
          "only, so no dept/division/phrase token can equal it",
          _norm(_AFFIL_SEP) == "" and _AFFIL_SEP not in name_tokens("Vascular | Surgery")
          and all(_AFFIL_SEP not in p for p in _INSTITUTION_TOKENS)),
+    ]
+
+    # --- affiliated institutions that name a department in their OWN name ----
+    # Same family 1 as WCM's, on the other institutions the home-institution keyword
+    # list admits: 106 open rows scored a phantom off "Hospital for Special Surgery"
+    # against a Surgery department, 8 off "Sloan Kettering Cancer Center" against a
+    # Cancer/Oncology one (measured on the live open queue, 2026-09-04).
+    surg = IdentityIndex([dict(rec("Ann", "", "Roe", cwid="s1"), dept="Surgery")])
+    onc = IdentityIndex([dict(rec("Ann", "", "Roe", cwid="o1"),
+                              division="Cancer Prevention and Control")])
+    checks += [
+        ("'Hospital for Special Surgery' no longer names a Department of Surgery",
+         surg.candidates("Roe", "Ann", "A", ["Hospital for Special Surgery, New York, "
+                                             "NY"])[0][0]["affil_dept_match"] is False),
+        ("...while 'Department of Surgery, Weill Cornell Medicine' still does -- the "
+         "same asymmetry as family 1",
+         surg.candidates("Roe", "Ann", "A",
+                         ["Department of Surgery, Weill Cornell Medicine"]
+                         )[0][0]["affil_match_on"] == "dept"),
+        ("...and naming the department alongside the institution still matches there "
+         "too ('Department of Surgery, Hospital for Special Surgery')",
+         surg.candidates("Roe", "Ann", "A",
+                         ["Department of Surgery, Hospital for Special Surgery, New "
+                          "York, NY"])[0][0]["affil_match_on"] == "dept"),
+        ("both Sloan Kettering spellings are stripped (the hyphen is not a token "
+         "boundary _affil_words treats differently from a space)",
+         _affil_tokens(["Memorial Sloan Kettering Cancer Center, New York, NY"])
+         == _affil_tokens(["Memorial Sloan-Kettering Cancer Center, New York, NY"])
+         == ("new", "york", "ny")),
+        ("...so a Cancer division no longer self-matches off that institution name "
+         "(the division test is a whole-token one, and 'Cancer' is a token of it)",
+         onc.candidates("Roe", "Ann", "A", ["Memorial Sloan Kettering Cancer Center, "
+                                            "New York, NY"])[0][0]["affil_dept_match"]
+         is False),
     ]
 
     ok = True
