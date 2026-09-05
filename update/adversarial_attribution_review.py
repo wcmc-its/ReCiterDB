@@ -36,11 +36,14 @@ import joblib
 HERE = os.path.dirname(os.path.abspath(__file__))
 # In-cluster (reciterdb image): the 6 models are baked at update/aar_models/ and
 # preprocessing.py is vendored alongside this file. Fall back to the local
-# ReCiter---Scoring checkout for Mac runs.
+# ReCiter---Scoring checkout for Mac runs -- but note that checkout is a WORKING
+# TREE and is routinely behind origin/master, so the fallback can silently serve
+# an older model generation. _assert_model_generation() below is the backstop.
 SCORING_REPO = os.path.expanduser("~/Dropbox/GitHub/ReCiter---Scoring/app")
 MODELS = os.path.join(HERE, "aar_models") if os.path.isdir(os.path.join(HERE, "aar_models")) \
     else os.path.join(SCORING_REPO, "models")
 sys.path.insert(0, HERE if os.path.exists(os.path.join(HERE, "preprocessing.py")) else SCORING_REPO)
+import preprocessing  # noqa: E402
 from preprocessing import (  # noqa: E402
     FEEDBACK_IDENTITY_BASE_FEATURES, FEEDBACK_IDENTITY_FEATURES,
     IDENTITY_ONLY_BASE_FEATURES, IDENTITY_ONLY_FEATURES,
@@ -65,6 +68,46 @@ FB_MODEL, FB_SCALER, FB_CALIB = (_load("feedbackIdentityModel.joblib"),
 IO_MODEL, IO_SCALER, IO_CALIB = (_load("identityOnlyModel.joblib"),
                                  _load("identityOnlyScaler.joblib"),
                                  _load("identityOnlyCalibrator.joblib"))
+
+# ---- generation guard ------------------------------------------------------
+# The gate MUST score with the model generation the production Lambda runs.
+# update/aar_models/ once drifted to v3.1 (67 feedback / 42 identity features)
+# while prod ran v3.2 (72/47), and nothing complained -- the gate just produced
+# io/fb numbers nobody could reproduce against prod (mis4060/42670968 scored
+# io 92.88 / fb 6.45 here vs io 90.57 / fb 4.24 in the Lambda). The models and
+# preprocessing.py move as a PAIR; a mismatch between them feeds the wrong
+# columns to a right-shaped scaler and is likewise silent. Fail at import.
+EXPECTED_FB_FEATURES = 72
+EXPECTED_IO_FEATURES = 47
+
+
+def _assert_model_generation():
+    fb_n, io_n = int(FB_SCALER.n_features_in_), int(IO_SCALER.n_features_in_)
+    fb_f, io_f = len(FEEDBACK_IDENTITY_FEATURES), len(IDENTITY_ONLY_FEATURES)
+    problems = []
+    if (fb_n, io_n) != (EXPECTED_FB_FEATURES, EXPECTED_IO_FEATURES):
+        problems.append(
+            f"scalers are feedback={fb_n} identity={io_n}, "
+            f"expected feedback={EXPECTED_FB_FEATURES} identity={EXPECTED_IO_FEATURES}")
+    if (fb_f, io_f) != (fb_n, io_n):
+        problems.append(
+            f"preprocessing.py feature lists are feedback={fb_f} identity={io_f}, "
+            f"which does not match the scalers (feedback={fb_n} identity={io_n})")
+    if not preprocessing._NAME_FREQ_TABLE:
+        problems.append(
+            "name_frequency.json did not load next to "
+            f"{os.path.abspath(preprocessing.__file__)} (looked in ./data/ then ../data/); "
+            "every firstNameFrequencyScore would silently be 0.0")
+    if problems:
+        raise RuntimeError(
+            f"AAR model generation mismatch (models dir: {MODELS}): "
+            + "; ".join(problems)
+            + ". Re-vendor update/aar_models/ AND update/preprocessing.py together from "
+              "ReCiter---Scoring origin/master:app/, and keep name_frequency.json at "
+              "update/data/name_frequency.json.")
+
+
+_assert_model_generation()
 
 def _file_sha(name):
     h = hashlib.sha256()
