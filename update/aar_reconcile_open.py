@@ -735,6 +735,64 @@ def _write_ledger(path, entries):
             fh.write(json.dumps(e, default=str) + "\n")
 
 
+# What "this run wrote this row" looks like in the table afterwards. Both UPDATEs carry
+# `AND status='open'`, so a row a curator resolved between the SELECT and the UPDATE is
+# skipped -- correctly -- and until now was still logged applied:true, because the flag
+# was simply the value of args.apply and nothing ever reconciled it with what the
+# statement did. The rowcount cannot do it either: it is a count, not a set of ids. So
+# each class re-selects the rows carrying THIS run's own stamp. CLASS A's dismissal
+# writes resolved_at=run_ts; CLASS B's refresh writes last_refreshed=run_ts, which it
+# only gained with #205 -- before that it left no stamp of its own to look for.
+#
+# Named rather than hidden: a row some other writer stamped with the same whole second
+# would read as written. run_ts is one timestamp for the whole run and the producer does
+# not run concurrently with this pass, so that is a theoretical ambiguity, not an
+# operational one -- and it can only ever over-report, never hide a skipped row.
+_APPLIED_CLAUSE = {"A": "status='dismissed' AND resolved_at = :ts",
+                   "B": "last_refreshed = :ts"}
+
+
+def _confirm_written(engine, ids, clause, run_ts):
+    """The subset of `ids` that carries this run's stamp. Chunked like the writes."""
+    from sqlalchemy import text, bindparam
+    ids = list(ids)
+    if not ids:
+        return set()
+    stmt = text(f"SELECT id FROM authorship_review WHERE id IN :ids AND {clause}") \
+        .bindparams(bindparam("ids", expanding=True))
+    out = set()
+    with engine.connect() as c:
+        for i in range(0, len(ids), 500):
+            out.update(r[0] for r in
+                       c.execute(stmt, {"ids": ids[i:i + 500], "ts": run_ts}).all())
+    return out
+
+
+def _mark_applied(entries, written_a, written_b):
+    """Set each entry's `applied` from the ids actually written. Pure, so _selftest can
+    exercise it without a DB."""
+    for e in entries:
+        e["applied"] = e["id"] in (written_a if e["class"] == "A" else written_b)
+    return entries
+
+
+def _reconcile_applied(engine, entries, run_ts):
+    by_cls = {c: [e["id"] for e in entries if e["class"] == c] for c in ("A", "B")}
+    return _mark_applied(
+        entries,
+        _confirm_written(engine, by_cls["A"], _APPLIED_CLAUSE["A"], run_ts),
+        _confirm_written(engine, by_cls["B"], _APPLIED_CLAUSE["B"], run_ts))
+
+
+def _report_skipped(entries):
+    skipped = [e["id"] for e in entries if not e["applied"]]
+    if skipped:
+        print(f"  ({len(skipped)} of {len(entries)} ledger rows recorded applied=false: "
+              f"a curator resolved them between the SELECT and the UPDATE, so the "
+              f"status='open' guard skipped them) ids: {skipped[:20]}"
+              f"{' ...' if len(skipped) > 20 else ''}")
+
+
 # ============================================================================
 # --check <ids>
 # ============================================================================
@@ -909,7 +967,10 @@ def main():
               f"{len(class_a)} class A)")
         if args.apply:
             na = _apply_class_a(engine, class_a, run_ts)
+            # `applied` is per-entry truth, re-read from the table, not the --apply flag.
+            _write_ledger(args.ledger, _reconcile_applied(engine, ledger_entries, run_ts))
             print(f"\n  APPLIED: {na} rows dismissed (class A)")
+            _report_skipped(ledger_entries)
         else:
             print(f"\n  DRY RUN -- 0 rows written. Re-run with --apply to write these "
                   f"{len(class_a)} dismissals for real.")
@@ -1014,7 +1075,10 @@ def main():
         # REFRESH_COLS payload the ledger promises), NOT raw write_set records (#189).
         nb = _apply_class_b(engine, [e for e in ledger_entries if e["class"] == "B"],
                             run_ts)
+        # `applied` is per-entry truth, re-read from the table, not the --apply flag.
+        _write_ledger(args.ledger, _reconcile_applied(engine, ledger_entries, run_ts))
         print(f"\n  APPLIED: {na} rows dismissed (class A), {nb} rows refreshed (class B)")
+        _report_skipped(ledger_entries)
     else:
         print(f"\n  DRY RUN -- 0 rows written. Re-run with --apply to write these "
               f"{len(class_a)} dismissals + {len(write_set)} refreshes for real.")
@@ -1189,6 +1253,21 @@ def _selftest():
     check("ledger entry carries id + a complete REFRESH_COLS 'after' payload "
           "(what _apply_class_b consumes)",
           "id" in entry and set(REFRESH_COLS) <= set(entry["after"].keys()))
+
+    # ---- ledger `applied` is per-entry truth, not the --apply flag (#205) ----
+    check("CLASS A's applied-confirmation clause looks for this run's own dismissal "
+          "stamp", _APPLIED_CLAUSE["A"] == "status='dismissed' AND resolved_at = :ts")
+    check("CLASS B's looks for last_refreshed, the stamp #205 gave the refresh",
+          _APPLIED_CLAUSE["B"] == "last_refreshed = :ts"
+          and "last_refreshed" in REFRESH_COLS)
+    marked = _mark_applied(
+        [{"id": 1, "class": "A", "applied": True}, {"id": 2, "class": "A", "applied": True},
+         {"id": 3, "class": "B", "applied": True}, {"id": 4, "class": "B", "applied": True}],
+        written_a={1}, written_b={4})
+    check("a row skipped by the status='open' guard is logged applied=false, not true "
+          "(ids 2 and 3 were resolved by a curator between the SELECT and the UPDATE)",
+          [(e["id"], e["applied"]) for e in marked]
+          == [(1, True), (2, False), (3, False), (4, True)])
 
     # ---- DRIFT_ONLY (#186) ---------------------------------------------------
     # A curator-touched row is never written: CLASS B's UPDATE carries the same
