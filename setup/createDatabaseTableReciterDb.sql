@@ -750,7 +750,8 @@ CREATE TABLE IF NOT EXISTS `person_article_author` (
   `orcid` varchar(50) DEFAULT NULL,
   `equalContrib` varchar(12) DEFAULT NULL,
   PRIMARY KEY (`id`),
-  KEY `personIdentifier` (`personIdentifier`,`pmid`) USING BTREE
+  KEY `personIdentifier` (`personIdentifier`,`pmid`) USING BTREE,
+  KEY `ix_pmid_rank` (`pmid`,`rank`,`personIdentifier`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `person_article_department` (
