@@ -234,8 +234,12 @@ def run_aar_close_attributed():
             logger.warning("AAR closer: DB_HOST/DB_NAME/DB_USERNAME/DB_PASSWORD unset — skipped")
             return
         timeout = int(os.getenv("AAR_CLOSER_TIMEOUT_SECONDS", "1800"))
+        # Explicit --ledger per invocation: aar_reconcile_open's default path is one
+        # file, and _write_ledger truncates, so the drift step below would destroy this
+        # run's ledger on any night both fire.
         run_script("aarReconcileOpenClassA",
-                   "python3 aar_reconcile_open.py --apply --class-a-only",
+                   "python3 aar_reconcile_open.py --apply --class-a-only "
+                   "--ledger aar_reconcile_class_a_ledger.jsonl",
                    timeout_seconds=timeout)
         run_script("aarDismissBylineOwner",
                    "python3 aar_dismiss_byline_owner.py --apply",
@@ -271,7 +275,9 @@ def run_aar_reconcile_drift_if_due():
 
     SHIPS OFF (AAR_DRIFT_CADENCE unset or "off"), and this is the point of the env var,
     not an afterthought. The class is safe per row but the BACKLOG is not small: the
-    2026-09-04 dry run measured DRIFT_ONLY at ~60% of the open queue, because nothing has
+    2026-09-04 dry runs measured DRIFT_ONLY at 5,308 of 11,624 open pubmed rows and, on
+    a re-run the same day, 5,222 of 11,335 -- about 46% of the lane, not the ~60% an
+    earlier draft of this note claimed. Nothing has
     ever reconciled it against #159 (temporal penalty), #171/#173/#174, #185, #201 or
     #203. Turning this on for the first time is a one-off catch-up of thousands of rows
     and wants a human reading the ledger, not a Sunday cron discovering it. Sequence:
@@ -309,8 +315,11 @@ def run_aar_reconcile_drift_if_due():
             logger.warning("AAR drift reconciliation: PUBMED_API_KEY unset (the replay "
                            "re-fetches every open pubmed row's article) — skipped")
             return
+        # Its own --ledger, not the shared default: the nightly closer next door runs
+        # the same script and _write_ledger truncates.
         run_script("aarReconcileDrift",
-                   "python3 aar_reconcile_open.py --apply --drift-only --lane pubmed",
+                   "python3 aar_reconcile_open.py --apply --drift-only --lane pubmed "
+                   "--ledger aar_reconcile_drift_ledger.jsonl",
                    timeout_seconds=int(os.getenv("AAR_DRIFT_TIMEOUT_SECONDS", "3600")))
     except Exception as e:
         logger.exception(f"AAR drift reconciliation failed (ignored — reporting "
