@@ -29,6 +29,10 @@ COPY update/run_all.py ./
 # runs at 12:00 UTC ahead of the reciterdb job -- deliberately NOT in run_all.py.
 COPY update/buildIdentity.py ./
 
+## Identity Authority port (imports _Row and ldap_conn from buildIdentity.py,
+## so both files must sit in the same directory)
+COPY update/buildIdentityAuthority.py ./
+
 # AAR Scopus lane (not-in-PubMed WCM authorship detector — weekly, gated in run_all.py)
 COPY update/identity_index.py ./
 COPY update/aar_db.py ./

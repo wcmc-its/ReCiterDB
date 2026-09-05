@@ -1,0 +1,89 @@
+# Nightly build of the Identity Authority tables from ED (LDAP), JenzabarPrd and
+# ASMS. Replaces ~51 Splunk saved searches; see PORT_SPEC.md in
+# wcmc-its/IdentityAuthorityDatabase for the per-search disposition.
+#
+# APPLY THIS BY HAND, ONCE. The ReCiterDB CodeBuild pipeline auto-deploys the
+# IMAGE only -- it does not apply manifests. Do not `kubectl apply`
+# k8-cronjob.yaml: it has drifted from the live object.
+#
+# NEW SECRETS ARE REQUIRED BEFORE THIS CAN RUN. The cluster today carries only
+# LDAP_BIND_PASSWORD and the ASMS MSSQL credentials (in reciter-inst-secrets).
+# This job additionally needs the Identity Authority database and JenzabarPrd:
+#   IA_DB_URL, IA_DB_USERNAME, IA_DB_PASSWORD, IA_DB_NAME
+#   JENZABAR_DB_URL, JENZABAR_DB_USERNAME, JENZABAR_DB_PASSWORD, JENZABAR_DB_NAME
+# Create them as a secret named identity-authority-secrets and they are picked up
+# by the envFrom below. Until then the job aborts on the first DB read, which is
+# the intended behaviour -- it never partially writes.
+#
+# Scheduled at 07:00 UTC (~2-3am ET) to land in the same window the Splunk
+# searches used, and well before the reciterdb cronjob at 14:30 UTC.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: reciterdb-identity-authority
+  namespace: reciter
+  labels:
+    app: reciterdb-identity-authority
+    tier: backend
+spec:
+  schedule: "0 7 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Every source runs to completion before anything is compared or written,
+      # and the writes are one transaction, so a job that dies halfway has
+      # written nothing. Retrying is always safe.
+      backoffLimit: 2
+      template:
+        spec:
+          containers:
+          - name: reciterdb-identity-authority
+            image: CONTAINER_IMAGE
+            # SHIPS ON --dry-run. It builds every source, reads the DB side,
+            # computes what it WOULD write and what it WOULD delete, logs the
+            # generated SQL, and writes nothing. Run it in parallel with the
+            # Splunk searches and reconcile the diff before removing this flag.
+            #
+            # Removing --dry-run is a two-step change, not one: drop it first
+            # while IA_DELETE_MODE is still "flag", confirm the upserts, and only
+            # then revisit deletion.
+            command: ["python3", "buildIdentityAuthority.py", "--dry-run"]
+            env:
+            # "flag" writes a soft-delete marker instead of removing rows. The
+            # Splunk job's IdentityAuthority_dn output stanza has NOT been read
+            # from conf-db_outputs, so whether the original deletes or flags is
+            # unknown. Do not set this to "delete" until that is confirmed -- and
+            # the code additionally refuses "delete" unless IA_DELETE_CONFIRMED
+            # is set, on purpose.
+            - name: IA_DELETE_MODE
+              value: "flag"
+            envFrom:
+            # LDAP_BIND_PASSWORD lives here, as does the ASMS MSSQL credential.
+            - secretRef:
+                name: reciter-inst-secrets
+            - configMapRef:
+                name: reciter-inst-client-configmap
+            # Identity Authority + JenzabarPrd credentials. Does not exist yet.
+            - secretRef:
+                name: identity-authority-secrets
+                optional: true
+            # LDAP_URL and LDAP_BIND_DN default correctly in the script, taken
+            # from the institutional client's own config. Do NOT re-add them here
+            # as empty strings -- os.environ.get returns "" for a var set empty,
+            # which would override the good defaults. The five UNRESOLVED base
+            # DNs (ed-groups, ed-locations, ed-phones, ed-emails, ed) can each be
+            # overridden with LDAP_BASE_GROUPS / _LOCATIONS / _PHONES / _EMAILS /
+            # _ROOT once --spike has established what they really are.
+            resources:
+              requests:
+                memory: 2G
+                cpu: 1
+              limits:
+                memory: 2G
+                cpu: 1
+          # NO nodeSelector. `lifecycle: Ec2Spot` in this repo's other cronjob
+          # manifest matches no node since the nodegroups were recreated on
+          # 2026-09-02; a pod carrying it sits Pending forever with no error.
+          restartPolicy: OnFailure
