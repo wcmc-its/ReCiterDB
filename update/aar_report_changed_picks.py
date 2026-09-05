@@ -204,9 +204,11 @@ _DRIFT_CAND_FIELDS = ("name", "person_type", "dept", "given_match",
 
 # The producer-owned COLUMNS _drift_cols can name. top_cwid is deliberately absent: its
 # comparison IS the CHANGED/UNCHANGED split in _row_result, so it is never re-tested as
-# drift. Tied at import time to aar_reconcile_open's REFRESH_COLS (which is
-# aar_sweep_stale.NULL_COLUMNS) by _load_class_b_modules, so a column added to the
-# refresh set can never silently stay outside the drift trigger (#205).
+# drift. aar_reconcile_open asserts this tuple + top_cwid == aar_sweep_stale.NULL_COLUMNS
+# when it loads CLASS B (lazily, in _load_class_b_modules), so a column added to the
+# refresh set cannot silently stay outside the drift trigger (#205). It is a TRIPWIRE,
+# not the source: _drift_cols still names each comparison by hand, and the selftest
+# checks that the two agree -- a column added here alone is asserted, not compared.
 _DRIFT_COLS = ("top_name", "top_person_type", "top_dept", "top_given_match",
                "top_affil_match", "top_confidence", "n_candidates",
                "candidate_cwids_json")

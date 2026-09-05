@@ -962,7 +962,7 @@ def main():
 
     if args.class_a_only:
         # CLASS A summary line printed above lands in the nightly log either way (T2).
-        ledger_entries = [_class_a_ledger_entry(h, run_ts, args.apply) for h in class_a.values()]
+        ledger_entries = [_class_a_ledger_entry(h, run_ts, False) for h in class_a.values()]
         _write_ledger(args.ledger, ledger_entries)
         print(f"\n  ledger -> {args.ledger} ({len(ledger_entries)} rows: "
               f"{len(class_a)} class A)")
@@ -1063,8 +1063,8 @@ def main():
               f"({len(cb['sc_unresolvable'])} total)")
 
     before_snapshots = _full_before_snapshots(engine, [r["id"] for r in write_set])
-    ledger_entries = ([_class_a_ledger_entry(h, run_ts, args.apply) for h in class_a.values()]
-                      + [_class_b_ledger_entry(r, run_ts, args.apply, before_snapshots[r["id"]])
+    ledger_entries = ([_class_a_ledger_entry(h, run_ts, False) for h in class_a.values()]
+                      + [_class_b_ledger_entry(r, run_ts, False, before_snapshots[r["id"]])
                          for r in write_set])
     _write_ledger(args.ledger, ledger_entries)
     print(f"\n  ledger -> {args.ledger} ({len(ledger_entries)} rows: "
