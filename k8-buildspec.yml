@@ -63,6 +63,15 @@ phases:
           docker logout $REPOSITORY_URI
           aws eks update-kubeconfig --name $EKS_CLUSTER_NAME --region us-east-1 --role-arn $EKS_KUBECTL_ROLE_ARN
           kubectl set image cronjob/$CRON_JOB_NAME $CRON_JOB_NAME=$REPOSITORY_URI:$TAG -n reciter
+          # CRON_JOB_NAME carries a single name, so the identity cronjob would
+          # otherwise stay pinned at whatever tag it was applied with while
+          # reciterdb moved on -- silently running stale code, the way
+          # reciter-scopus-prod sat 238 days old. Same image, same tag; skipped
+          # without error if the cronjob has not been applied yet.
+          if kubectl -n reciter get cronjob reciterdb-identity >/dev/null 2>&1; then
+            kubectl set image cronjob/reciterdb-identity \
+              reciterdb-identity=$REPOSITORY_URI:$TAG -n reciter
+          fi
         else
           echo "Not a pipeline-initiated deploy (initiator=${CODEBUILD_INITIATOR}, branch=${BRANCH})."
           echo "Image built and discarded; nothing pushed, cronjob untouched."
