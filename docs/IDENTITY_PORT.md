@@ -1,5 +1,46 @@
 # reciterdb.identity: Splunk to cron
 
+## STATUS: LIVE since 2026-09-05. Splunk retired.
+
+| | |
+|---|---|
+| job | CronJob `reciterdb-identity`, namespace `reciter`, `0 12 * * *` |
+| entry point | `python3 buildIdentity.py` (no flags = live upsert) |
+| image | tracks the pipeline; CodeBuild sets it alongside `reciterdb` |
+| PRs | #211 (the port), #212 (image tracking, nodeSelector, upsert SQL) |
+| Splunk | `ReCiter - output identity to db` DISABLED by Paul, 2026-09-05 |
+
+**`identity` now has exactly one writer, and a dead job raises nothing.** The
+table is cumulative, so every consumer keeps returning plausible rows while the
+data silently ages. There is no staleness alert. Until one exists, this is the
+check:
+
+```sql
+SELECT id, run_at, staged_rows, upserted
+FROM identity_build_log ORDER BY id DESC LIMIT 5;
+```
+
+Expect a daily row near 33,388 with `upserted = 1`. A gap of more than ~26 hours
+means the job has stopped and nothing else will tell you.
+
+### If you have to roll back
+
+Splunk is one click from being re-enabled and its lookup-building search was
+never disabled, so it can resume writing without any rebuild. The job's own
+history lives in `identity_build_log`. `uq_identity_cwid` on `identity.cwid` is
+required by the upsert; dropping it disables the new job but does not affect
+Splunk.
+
+### What shipped beyond a like-for-like port
+
+- **12,912 people gained a department** they never had. Splunk's `append`
+  subsearches were being silently truncated, so the data was always in ED and
+  simply never landed.
+- **417 people gained rows entirely.**
+- ASMS divisions matched Splunk's exactly: 1 row differing across 32,971.
+
+## What the port replaces
+
 `update/buildIdentity.py` replaces the Splunk saved search *"reciter identity
 update"* (1 `dbxquery` against ASMS + 16 `ldapsearch` subsearches, joined with
 `append` and a terminal `stats ... by weillCornellEduCWID`, written to the
@@ -302,6 +343,34 @@ The 185 department changes are ED updates Splunk has gone stale on --
 Biomedicine` (4). The 12 remaining program/title/org changes are two rows gaining
 values and three MD students who moved into the PhD phase (`Medical Student` ->
 `Graduate Student`). All corrections, none regressions.
+
+## Bugs that only appeared on the live path
+
+Three defects survived every dry run, because `--dry-run` returns before the
+upsert and my hand-built test pods differed from the manifest. Recorded because
+each is a class of mistake, not a one-off:
+
+1. **`nodeSelector: lifecycle: Ec2Spot` matches no node.** Copied from
+   `k8-cronjob.yaml`, which has drifted from the live object. The first run sat
+   `Pending` for eleven minutes with no error and no log line --
+   `FailedScheduling: 0/13 nodes are available`. No node has carried that label
+   since the nodegroups were recreated during the subnet-`0d35` recovery on
+   2026-09-02. The live `reciterdb` cronjob has no nodeSelector at all, so
+   neither does this one. **`k8-cronjob.yaml` still contains it.**
+2. **`(1052, "Column 'surname' in UPDATE is ambiguous")`.** The upsert runs as
+   `INSERT INTO identity ... SELECT ... FROM identity_staging`, so both tables
+   are in scope and bare column names in `ON DUPLICATE KEY UPDATE` are rejected.
+   Targets must be written `` `identity`.`col` ``.
+3. **The staging load was silently rolled back.** pymysql opens an implicit
+   transaction and does not autocommit; a stage-only run returned before any
+   commit and `conn.close()` discarded every row. `DROP`/`CREATE` implicitly
+   commit, so the empty table looked real and the diff read as total failure.
+
+The lesson worth carrying: **a safety mode that stops short of the dangerous
+operation gives false confidence about exactly the part you most want confidence
+in.** `--demo` now asserts on the generated SQL, which catches (2) offline.
+Better still would be for `--dry-run` to execute the upsert against a scratch
+copy and roll back, so the statement is genuinely exercised. Not done.
 
 ## The original
 
