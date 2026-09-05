@@ -996,8 +996,15 @@ def _upsert_clauses():
     """
     cols = ", ".join(f"`{c}`" for c in UPSERT_COLUMNS)
     placeholders = ", ".join(["%s"] * len(UPSERT_COLUMNS))
-    updates = ", ".join(f"`{c}`=COALESCE(VALUES(`{c}`), `{c}`)"
-                        for c in UPSERT_COLUMNS if c != "cwid")
+    # The target column MUST be table-qualified. This runs as
+    # INSERT INTO identity ... SELECT ... FROM identity_staging, so both tables
+    # are in scope and a bare column name in the UPDATE clause is rejected:
+    #   (1052, "Column 'surname' in UPDATE is ambiguous")
+    # No dry run reaches this -- stage_only returns before the upsert, so this
+    # statement first executed on the go-live attempt.
+    updates = ", ".join(
+        f"`identity`.`{c}`=COALESCE(VALUES(`{c}`), `identity`.`{c}`)"
+        for c in UPSERT_COLUMNS if c != "cwid")
     return cols, placeholders, updates
 
 
@@ -1295,8 +1302,10 @@ def demo():
     # Splunk's truncated output never did, and writing their empty columns over
     # real history is data loss, not a correction.
     _cols, _ph, _upd = _upsert_clauses()
-    assert "VALUES(`surname`), `surname`" in _upd and "COALESCE" in _upd
-    assert "`cwid`=" not in _upd, "the join key is never updated"
+    assert "VALUES(`surname`), `identity`.`surname`" in _upd, \
+        "the fallback column must be table-qualified or MySQL 1052s"
+    assert "COALESCE" in _upd
+    assert "`identity`.`cwid`=" not in _upd, "the join key is never updated"
     assert _upd.count("COALESCE") == len(UPSERT_COLUMNS) - 1, "every column guarded"
     assert _ph.count("%s") == len(UPSERT_COLUMNS)
 

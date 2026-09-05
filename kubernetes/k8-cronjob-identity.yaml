@@ -33,6 +33,9 @@ spec:
           containers:
           - name: reciterdb-identity
             image: CONTAINER_IMAGE
+            # Live. Add "--dry-run" to stage into identity_staging and record
+            # the run in identity_build_log without upserting -- that is how this
+            # job was validated before the Splunk search was retired.
             command: ["python3", "buildIdentity.py"]
             envFrom:
             # DB_USERNAME / DB_PASSWORD, and DB_HOST / DB_NAME from the configmap.
@@ -58,6 +61,14 @@ spec:
               limits:
                 memory: 2G
                 cpu: 1
-          nodeSelector:
-            lifecycle: Ec2Spot
+          # NO nodeSelector, matching the live reciterdb cronjob. The
+          # `lifecycle: Ec2Spot` selector in this repo's other cronjob manifest
+          # matches nothing: no node carries that label -- the only `lifecycle`
+          # value present is OnDemand, and all 13 nodes report ON_DEMAND
+          # capacity, including the nodegroup still named reciter-spot-al2023-ng
+          # (the nodegroups were recreated during the subnet-0d35 recovery on
+          # 2026-09-02). A pod with that selector sits Pending forever:
+          #   FailedScheduling: 0/13 nodes are available: 13 node(s) didn't
+          #   match Pod's node affinity/selector
+          # which for a cumulative table looks like nothing happening at all.
           restartPolicy: OnFailure
