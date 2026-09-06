@@ -426,6 +426,24 @@ def main():
     built = run_sources()
     logger.info("built %d types, %d rows total",
                 len(built), sum(len(v) for v in built.values()))
+
+    # The re-key check must run before any write, and independently of
+    # --no-delete: a DN format mismatch is a duplicate-INSERT bug on the upsert
+    # path just as much as it is a mass-delete trigger on the reconcile path.
+    # It needs the DB side, so it lives here rather than inside run_sources().
+    #
+    # Until db_dns() lands this is a no-op against an empty mapping, and it says
+    # so out loud -- an earlier version of this module defined the function,
+    # exercised it only in demo(), and let source docstrings claim it was
+    # protecting them. It was not.
+    existing = db_dns(TABLES) if "db_dns" in globals() else {}
+    if not existing:
+        logger.warning("dn overlap NOT checked: no database read available yet, "
+                       "so nothing has verified that the DNs built from ED match "
+                       "the DNs already stored")
+    else:
+        assert_dn_overlap(built, existing)
+
     if args.dry_run:
         logger.info("--dry-run: nothing written")
     return built
