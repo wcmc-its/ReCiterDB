@@ -29,6 +29,38 @@ def sanitize_field(value):
     # value = value.replace('\r', '').replace('\n', '').replace('"', '""')  # Escape double quotes    
     return value.strip()
 
+# LOAD DATA's NULL marker. Unquoted \N in the CSV loads as SQL NULL; quoted "\N"
+# loads as the two-character string, so this only works while write_csv_rows uses
+# csv.QUOTE_MINIMAL (\N contains no delimiter, quotechar or newline, so it is never
+# quoted). test_sanitize_field.py pins that end to end.
+NULL_MARKER = '\\N'
+
+
+def numeric_or_null(value):
+    """sanitize_field for a NUMERIC column: absent stays absent instead of becoming 0.
+
+    ReCiterDB #214 follow-up. sanitize_field returns '' for None/''/'NULL', and an
+    empty field in a LOAD DATA numeric column silently becomes 0 -- so person_article
+    has 0 NULLs in 858,946 rows and an article ReCiter never scored is indistinguishable
+    from one it scored 0. Measured 2026-09-05: 1,777 rows across 57 cwids carry a
+    confident 0.00 for a score that was never computed, 644 of them curator-ACCEPTED and
+    averaging 9.06/10 on the legacy totalArticleScoreStandardized -- i.e. a certain
+    non-match sitting next to a near-perfect one. lbm2001 carries a legacy 10 beside a
+    0.0 here.
+
+    Deliberately NOT applied to every numeric column: most of them use 0 as a real
+    value ("checked, no match"), and flipping those to NULL would break arithmetic in
+    every consumer. Only authorshipLikelihoodScore, where absent and zero are genuinely
+    different facts, uses this.
+
+    NOTE: this returns the marker for a MISSING value, not for a real 0.0 -- a payload
+    that genuinely contains 0.0 still loads as 0.0. It stops the corpus asserting a
+    score that was never computed; it restores none.
+    """
+    sanitized = sanitize_field(value)
+    return NULL_MARKER if sanitized == '' else sanitized
+
+
 def write_csv_header(file_path, headers):
     """Write the header row to a CSV file."""
     with open(file_path, 'w', encoding='utf-8', newline='') as f:
@@ -47,7 +79,11 @@ def write_csv_rows(file_path, rows):
         writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
         for row in rows:
             # Ensure no unwanted line breaks or extra characters in any field
-            sanitized_row = [sanitize_field(value) for value in row]
+            # NULL_MARKER must pass through untouched -- sanitize_field only blanks
+            # None/''/'NULL', so '\\N' survives, but say so explicitly since a future
+            # widening of sanitize_field would silently turn every NULL back into 0.
+            sanitized_row = [value if value == NULL_MARKER else sanitize_field(value)
+                             for value in row]
             writer.writerow(sanitized_row)
 
 def convert_timestamp(timestamp):
@@ -281,7 +317,7 @@ def process_person_article(items, output_path):
                             continue  # Skip articles without PMID
 
                         # Top-level article fields
-                        authorship_likelihood_score = sanitize_field(article.get('authorshipLikelihoodScore', ''))
+                        authorship_likelihood_score = numeric_or_null(article.get('authorshipLikelihoodScore', ''))
                         pmcid = sanitize_field(article.get('pmcid', ''))
                         user_assertion = sanitize_field(article.get('userAssertion', ''))
                         publication_date_display = sanitize_field(article.get('publicationDateDisplay', ''))
