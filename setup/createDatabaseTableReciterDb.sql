@@ -736,7 +736,8 @@ CREATE TABLE IF NOT EXISTS `person_article` (
   KEY `idx_scopusDocID` (`scopusDocID`) USING BTREE,
   KEY `idx_doi` (`doi`) USING BTREE,
   KEY `idx_pmid` (`pmid`) USING BTREE,
-  KEY `personIdentifier` (`personIdentifier`,`pmid`) USING BTREE
+  KEY `personIdentifier` (`personIdentifier`,`pmid`) USING BTREE,
+  KEY `ix_assertion_score` (`userAssertion`,`authorshipLikelihoodScore`,`personIdentifier`) USING BTREE
 ) ENGINE=InnoDB AUTO_INCREMENT=1852332 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 
 CREATE TABLE IF NOT EXISTS `person_article_author` (
