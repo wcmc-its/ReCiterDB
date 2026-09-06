@@ -225,9 +225,10 @@ MAX_DELETE_FRACTION = 0.02
 DELETE_MODE = os.environ.get("IA_DELETE_MODE", "flag")
 
 SOURCES = {}
+KEY_COLUMN = {}
 
 
-def source(type_name, alias=None):
+def source(type_name, alias=None, key_column="dn"):
     """Register a source. The function returns {dn: {column: value}}.
 
     type_name ties the source to its table, its row floor and its side of the
@@ -239,6 +240,10 @@ def source(type_name, alias=None):
     def wrap(fn):
         fn.type_name = type_name
         fn.alias = alias
+        # Most tables are keyed on the entry DN. _org_unit is keyed on the CSID,
+        # which ED makes unique across all 2,456 org units (uid == cn == SORID).
+        fn.key_column = key_column
+        KEY_COLUMN[type_name] = key_column
         SOURCES[fn.__name__] = fn
         return fn
     return wrap
@@ -387,6 +392,371 @@ def plan_deletions(built, db_dns):
     return plan
 
 
+# ---------------------------------------------------------------------------
+#                        SOURCE: org units (ED, new feed)
+# ---------------------------------------------------------------------------
+
+# DDL for the table this source writes. Apply by hand before the first live run;
+# there is no existing table because this feed has no Splunk ancestor.
+#
+#   CREATE TABLE _org_unit (
+#     csid            VARCHAR(16)  NOT NULL PRIMARY KEY,
+#     parent_csid     VARCHAR(16)  NULL,
+#     department_csid VARCHAR(16)  NULL,
+#     display_name    VARCHAR(255) NULL,
+#     hierarchy_level TINYINT      NULL,
+#     is_leaf         TINYINT(1)   NULL,
+#     fund_center     VARCHAR(32)  NULL,
+#     KEY ix_parent (parent_csid),
+#     KEY ix_department (department_csid)
+#   );
+#
+# Walk it with a recursive CTE, never unrolled self-joins -- the tree is nine
+# levels deep and the 2022 Duplicate CWID Detector needs 36 hand-unrolled joins
+# to cover it. MariaDB has supported recursive CTEs since 10.2.
+#
+# ponytail: depth is NOT stored. ED supplies weillCornellEduHierarchyLevel and it
+# is also derivable from parent_csid; a third copy is one more thing to keep true.
+# History is NOT modelled either -- an adjacency list holds only the present. If
+# "which org unit did this CSID sit under last year" is ever a requirement it
+# needs a dated table, and retrofitting is expensive. Flagged, not built.
+
+ORG_UNIT_COLUMNS = ("csid", "parent_csid", "department_csid", "display_name",
+                    "hierarchy_level", "is_leaf", "fund_center")
+
+
+def _parent_csid(row):
+    """The parent's CSID, taken from seeAlso's RDN.
+
+    seeAlso holds the parent's full DN (`cn=N4886,ou=orgunits,ou=Groups,...`) and
+    is single-valued on every one of the 2,442 entries that carry it -- measured,
+    not assumed. The CSID is the RDN value, so this parses rather than issuing a
+    second lookup per node.
+
+    Returns "" for the 18 roots. Uses .all() rather than .get() because a future
+    multi-valued seeAlso would otherwise silently pick one parent and build a
+    wrong tree; more than one parent is not representable here and says so.
+    """
+    values = row.all("seeAlso")
+    if not values:
+        return ""
+    if len(values) > 1:
+        raise SystemExit(
+            "ABORT: org unit %s has %d seeAlso values. This source assumes a "
+            "single parent (measured single-valued on all 2,442 entries carrying "
+            "it, 2026-09-06). A multi-parent hierarchy is not representable in "
+            "_org_unit and needs a design decision, not a silent first-wins."
+            % (row.get("uid") or row.entry_dn, len(values)))
+    head = values[0].split(",", 1)[0]
+    return head.split("=", 1)[1].strip() if "=" in head else ""
+
+
+@source("org_unit", alias="ed-orgunits", key_column="csid")
+def ed_org_units():
+    """ED's authoritative org unit hierarchy -- 2,457 entries, nine levels.
+
+    NEW FEED. It has no Splunk ancestor: the export never reads this branch, its
+    Organization search reads the older ou=departments,ou=Groups instead. So
+    there is no SPL to diff against and no "first diff should be empty" safety
+    net for this source. It exists because ED is migrating
+    department/departmentCode to orgUnit/orgUnitCode, which is driver #2 of the
+    port, and because source_organization -- the table that held this shape
+    before -- is a stale one-time artifact that must not be used.
+
+    THE CSID IS THE ORG UNIT IDENTIFIER: the DN's RDN, matched by uid and cn on
+    2,456 of 2,457 entries. Prefixes are mixed, not all N -- measured 2026-09-06:
+    N 2,214, Q 150, S 89, and one each of C, M and W.
+    weillCornellEduDepartmentCSID is a DIFFERENT thing: a denormalised pointer to
+    the nearest ancestor that is a department. Its 128 distinct values are simply
+    the 128 departments -- an org unit whose departmentCSID equals its own uid IS
+    a department, true for exactly 128 entries. Do not confuse the two; an
+    earlier reading of this branch did, and concluded backwards.
+    """
+    rows = ldap_search(
+        "ed-orgunits",
+        "(objectClass=*)",
+        ["uid", "cn", "weillCornellEduSORID", "seeAlso",
+         "weillCornellEduDepartmentCSID", "displayName",
+         "weillCornellEduHierarchyLevel", "weillCornellEduOrgUnitLeaf",
+         "weillCornellEduFundCenter"])
+
+    out, no_csid, disagree = {}, 0, 0
+    for row in rows:
+        # The DN is the authoritative identity, so the CSID is its RDN value.
+        # uid and cn both equal it on 2,456 of 2,457 entries (measured
+        # 2026-09-06); they are cross-checked rather than trusted.
+        #
+        # weillCornellEduSORID is NOT a CSID and is deliberately not used: on the
+        # 89 S-prefixed program units it carries a composite
+        # "<csid>:<program>:<degree>" (e.g. S1010090:HIAI:MS), and it matches the
+        # RDN on only 2,367 entries against uid/cn's 2,456. An earlier version
+        # had it in the fallback chain and claimed all three always agree; they
+        # do not, and that claim was never actually measured.
+        rdn = row.entry_dn.split(",", 1)[0]
+        # Real org units are cn=<csid>; the branch container itself is
+        # ou=orgunits and must not become a row (it has no csid, no parent, and
+        # would show up as a 15th root).
+        if not rdn.lower().startswith("cn="):
+            no_csid += 1
+            continue
+        csid = rdn.split("=", 1)[1].strip()
+        uid, cn = row.get("uid"), row.get("cn")
+        if not csid:
+            no_csid += 1          # the base entry itself carries none
+            continue
+        if (uid and uid != csid) or (cn and cn != csid):
+            disagree += 1
+        level = row.get("weillCornellEduHierarchyLevel")
+        leaf = row.get("weillCornellEduOrgUnitLeaf").upper()
+        out[csid] = {
+            "csid": csid,
+            "parent_csid": _parent_csid(row) or None,
+            "department_csid": row.get("weillCornellEduDepartmentCSID") or None,
+            "display_name": row.get("displayName") or None,
+            "hierarchy_level": int(level) if level.isdigit() else None,
+            "is_leaf": 1 if leaf == "TRUE" else (0 if leaf == "FALSE" else None),
+            "fund_center": row.get("weillCornellEduFundCenter") or None,
+        }
+
+    roots = sum(1 for v in out.values() if not v["parent_csid"])
+    depts = sum(1 for v in out.values() if v["department_csid"] == v["csid"])
+    orphans = sum(1 for v in out.values()
+                  if v["parent_csid"] and v["parent_csid"] not in out)
+    logger.info("org units: %d keyed, %d without a csid, %d roots, %d departments, "
+                "%d orphaned parents, %d id disagreements",
+                len(out), no_csid, roots, depts, orphans, disagree)
+    if disagree:
+        logger.warning("%d org units where uid or cn differs from the DN's RDN -- "
+                       "measured 0 on 2026-09-06, so the identifier assumption "
+                       "has changed", disagree)
+    # A tree whose parents mostly do not resolve is a broken read, not a shallow
+    # hierarchy. Measured: 3 of 2,442 point outside the branch.
+    if out and orphans > len(out) * 0.05:
+        raise SystemExit(
+            "ABORT: %d of %d org units name a parent CSID that is not in this "
+            "read (measured 3 of 2,442 on 2026-09-06). The hierarchy would be "
+            "built wrong. Nothing has been written." % (orphans, len(out)))
+    return out
+
+
+# ---------------------------------------------------------------------------
+#                             WRITE (MariaDB)
+# ---------------------------------------------------------------------------
+
+# Candidate names for the soft-delete marker. The real one is unknown until
+# conf-db_outputs and the schema are read, so DELETE_MODE="flag" refuses to run
+# rather than guessing one into existence.
+DELETE_FLAG_CANDIDATES = ("deleted", "isDeleted", "deletedAt", "deleteDate",
+                          "recordStatus", "status")
+
+IA_DB_ENV = ("IA_DB_HOST", "IA_DB_USERNAME", "IA_DB_PASSWORD", "IA_DB_NAME")
+
+
+def db_conn():
+    """Connection to the Identity Authority database.
+
+    MariaDB, not SQL Server -- established 2026-09-06 from a live 1064 error.
+    An earlier version of this port used pymssql and MERGE throughout, which
+    MariaDB does not have at all.
+
+    None of these variables exists in the cluster today: reciter-inst-secrets
+    carries LDAP_BIND_PASSWORD and the ASMS credential only. They come from a new
+    identity-authority-secrets, and until it exists this raises before any read.
+    """
+    import pymysql  # lazy: --demo and --spike must run with no driver installed
+
+    missing = [v for v in IA_DB_ENV if not os.environ.get(v)]
+    if missing:
+        raise SystemExit(
+            "ABORT: %s not set. The Identity Authority database credentials are "
+            "not in reciter-inst-secrets; create identity-authority-secrets with "
+            "these and reference it from the cronjob. Nothing has been read or "
+            "written." % ", ".join(missing))
+    return pymysql.connect(
+        host=os.environ["IA_DB_HOST"],
+        user=os.environ["IA_DB_USERNAME"],
+        password=os.environ["IA_DB_PASSWORD"],
+        database=os.environ["IA_DB_NAME"],
+        charset="utf8mb4", connect_timeout=10,
+        read_timeout=500, write_timeout=500,
+    )
+
+
+def upsert_sql(table, columns, key_column):
+    """INSERT ... ON DUPLICATE KEY UPDATE, mirroring buildIdentity.py.
+
+    Two things this must get right, both learned the expensive way on the
+    sibling port:
+
+    COALESCE(VALUES(c), t.c) -- a NULL from this run must never erase a value
+    already in the table. A plain VALUES() upsert there would have wiped 237
+    primaryProgram and 261 primaryOrg values that had been correct for years.
+    The accepted trade-off is that a value can be replaced but not cleared.
+
+    Table-qualified UPDATE targets -- a bare column name raises
+    (1052, "Column 'x' in UPDATE is ambiguous"). That reached production on the
+    sibling port because --dry-run returned before the upsert and three green dry
+    runs proved nothing about the SQL. Hence the demo() assertions below, which
+    check the generated statement with no database.
+
+    The key column is excluded from the UPDATE clause: it is what matched.
+    """
+    cols = ", ".join("`%s`" % c for c in columns)
+    placeholders = ", ".join(["%s"] * len(columns))
+    updates = ", ".join(
+        "`%s`.`%s`=COALESCE(VALUES(`%s`), `%s`.`%s`)" % (table, c, c, table, c)
+        for c in columns if c != key_column)
+    return ("INSERT INTO `%s` (%s) VALUES (%s) ON DUPLICATE KEY UPDATE %s"
+            % (table, cols, placeholders, updates))
+
+
+def db_keys(types):
+    """{type_name: set(existing key values)} -- replaces the eight `<X> - DN`
+    dbxquery searches, which read with maxrows=5000000, a silent cap.
+
+    Rows already soft-deleted are excluded where the marker column exists.
+    Without that the set difference is CUMULATIVE: a flagged row stays in the
+    stored set forever while never appearing in the live one, so it is
+    re-nominated every run and MAX_DELETE_FRACTION degrades from a per-run
+    ceiling into a lifetime budget.
+    """
+    conn = db_conn()
+    out, flags = {}, {}
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DATABASE(), @@version, CURRENT_USER()")
+            logger.info("IA database: %s (MariaDB/MySQL %s) as %s", *cur.fetchone())
+            for type_name in sorted(types):
+                table = TABLES[type_name]
+                key = KEY_COLUMN.get(type_name, "dn")
+                cur.execute(
+                    "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s", (table,))
+                present = {r[0] for r in cur.fetchall()}
+                if not present:
+                    raise SystemExit(
+                        "ABORT: table `%s` does not exist for source type %r. "
+                        "Nothing has been read or written." % (table, type_name))
+                if key not in present:
+                    raise SystemExit(
+                        "ABORT: `%s` has no `%s` column, which is this type's "
+                        "upsert key." % (table, key))
+                flags[type_name] = next(
+                    (c for c in DELETE_FLAG_CANDIDATES if c in present), None)
+                where = ""
+                if flags[type_name]:
+                    where = " AND (`%s` IS NULL OR `%s`=0)" % (
+                        flags[type_name], flags[type_name])
+                cur.execute("SELECT `%s` FROM `%s` WHERE `%s` IS NOT NULL%s"
+                            % (key, table, key, where))
+                # MariaDB's usual utf8mb4_general_ci is case-insensitive while
+                # Python set difference is not. Normalise both sides on one
+                # canonical key and carry the original string for the SQL.
+                keys = {}
+                for (value,) in cur.fetchall():
+                    keys[str(value).strip().casefold()] = str(value)
+                logger.info("db %-16s %-26s %d keys%s", type_name, table, len(keys),
+                            "" if flags[type_name]
+                            else "  (no soft-delete column found)")
+                out[type_name] = keys
+    finally:
+        conn.close()
+    return out, flags
+
+
+def upsert(built, dry_run):
+    """Write every type in ONE transaction. A failure rolls back all of it."""
+    conn = db_conn()
+    written = {}
+    try:
+        with conn.cursor() as cur:
+            for type_name, rows in sorted(built.items()):
+                if not rows:
+                    continue
+                table = TABLES[type_name]
+                key = KEY_COLUMN.get(type_name, "dn")
+                columns = sorted({c for r in rows.values() for c in r})
+                cur.execute(
+                    "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s", (table,))
+                present = {r[0] for r in cur.fetchall()}
+                unknown = [c for c in columns if c not in present]
+                if unknown:
+                    raise SystemExit(
+                        "ABORT: source %r emits columns `%s` has no: %s. Apply "
+                        "the DDL first. Nothing has been written."
+                        % (type_name, table, ", ".join(unknown)))
+                sql = upsert_sql(table, columns, key)
+                params = [[r.get(c) for c in columns] for r in rows.values()]
+                if dry_run:
+                    logger.info("--dry-run %-16s would upsert %d rows into `%s`",
+                                type_name, len(params), table)
+                    logger.info("--dry-run SQL: %s", sql)
+                else:
+                    cur.executemany(sql, params)
+                    logger.info("upserted %-16s %d rows into `%s`",
+                                type_name, len(params), table)
+                written[type_name] = len(params)
+        if dry_run:
+            conn.rollback()
+            logger.info("--dry-run: rolled back, nothing written")
+        else:
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return written
+
+
+def apply_deletions(plan, flags, dry_run):
+    """Honour DELETE_MODE. Ships as "flag" and refuses to guess."""
+    if DELETE_MODE not in ("flag", "delete"):
+        raise SystemExit("ABORT: IA_DELETE_MODE=%r; expected 'flag' or 'delete'."
+                         % DELETE_MODE)
+    if DELETE_MODE == "delete" and os.environ.get("IA_DELETE_CONFIRMED") != "yes":
+        raise SystemExit(
+            "ABORT: IA_DELETE_MODE=delete requires IA_DELETE_CONFIRMED=yes. The "
+            "Splunk job's IdentityAuthority_dn output stanza has never been read "
+            "from conf-db_outputs, so whether the original DELETEs rows or sets a "
+            "column is unknown. Read it before enabling this.")
+    if DELETE_MODE == "flag":
+        missing = sorted(t for t in plan if not flags.get(t))
+        if missing:
+            raise SystemExit(
+                "ABORT: no soft-delete column found on %s (looked for %s). "
+                "Nothing has been written." % (", ".join(missing),
+                                               ", ".join(DELETE_FLAG_CANDIDATES)))
+
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            for type_name, keys in sorted(plan.items()):
+                if not keys:
+                    continue
+                table, key = TABLES[type_name], KEY_COLUMN.get(type_name, "dn")
+                marks = ", ".join(["%s"] * len(keys))
+                if DELETE_MODE == "flag":
+                    sql = ("UPDATE `%s` SET `%s`=1 WHERE `%s` IN (%s)"
+                           % (table, flags[type_name], key, marks))
+                else:
+                    sql = "DELETE FROM `%s` WHERE `%s` IN (%s)" % (table, key, marks)
+                if dry_run:
+                    logger.info("--dry-run %-16s would %s %d rows in `%s`",
+                                type_name, DELETE_MODE, len(keys), table)
+                else:
+                    cur.execute(sql, list(keys))
+                    logger.info("%-16s %sged %d rows in `%s`",
+                                type_name, DELETE_MODE, len(keys), table)
+        conn.rollback() if dry_run else conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def demo():
     """Offline self-check of the logic that actually has branches worth breaking."""
     # mv() must join every value, in order, and never drop one
@@ -452,6 +822,34 @@ def demo():
     assert not (set(CONTACTS_BRANCH_ABSENT) & set(BASE_DN)), \
         "a base DN was added for a branch measured absent from ED"
 
+    # THE GENERATED SQL, checked with no database. --dry-run returns before the
+    # real upsert on the sibling port and three green dry runs passed while the
+    # statement was malformed, so these assertions exist precisely because a
+    # green dry run proves nothing about the SQL.
+    sql = upsert_sql("_org_unit", ["csid", "parent_csid", "display_name"], "csid")
+    assert sql.startswith("INSERT INTO `_org_unit` ("), sql
+    assert "ON DUPLICATE KEY UPDATE" in sql, sql
+    assert "MERGE" not in sql and "NVARCHAR" not in sql, "MariaDB, not SQL Server"
+    # every updated column table-qualified, or 1052 "Column 'x' is ambiguous"
+    assert "`_org_unit`.`parent_csid`=COALESCE(VALUES(`parent_csid`), " \
+           "`_org_unit`.`parent_csid`)" in sql, sql
+    # COALESCE on every updated column: a NULL must never erase stored history
+    assert sql.count("COALESCE(") == 2, sql
+    # the key is matched, never updated
+    assert "`_org_unit`.`csid`=" not in sql, sql
+    assert sql.count("%s") == 3, sql
+
+    # _parent_csid parses seeAlso's RDN, and refuses a second parent rather than
+    # silently picking one and building a wrong tree
+    r = _Row([("seeAlso", ["cn=N4886,ou=orgunits,ou=Groups,dc=weill,dc=cornell,dc=edu"])])
+    assert _parent_csid(r) == "N4886", _parent_csid(r)
+    assert _parent_csid(_Row([("cn", ["N1"])])) == ""      # a root
+    try:
+        _parent_csid(_Row([("seeAlso", ["cn=N1,ou=x", "cn=N2,ou=x"]), ("uid", ["N9"])]))
+        raise AssertionError("two parents must abort")
+    except SystemExit as exc:
+        assert "single parent" in str(exc)
+
     # the stale aliases must never come back
     assert not ({"ed-contacts", "ed-faculty", "ed-students", "ed-employees",
                  "ed-affiliates"} & set(BASE_DN))
@@ -496,25 +894,32 @@ def main():
     logger.info("built %d types, %d rows total",
                 len(built), sum(len(v) for v in built.values()))
 
-    # The re-key check must run before any write, and independently of
-    # --no-delete: a DN format mismatch is a duplicate-INSERT bug on the upsert
-    # path just as much as it is a mass-delete trigger on the reconcile path.
-    # It needs the DB side, so it lives here rather than inside run_sources().
-    #
-    # Until db_dns() lands this is a no-op against an empty mapping, and it says
-    # so out loud -- an earlier version of this module defined the function,
-    # exercised it only in demo(), and let source docstrings claim it was
-    # protecting them. It was not.
-    existing = db_dns(TABLES) if "db_dns" in globals() else {}
-    if not existing:
-        logger.warning("dn overlap NOT checked: no database read available yet, "
-                       "so nothing has verified that the DNs built from ED match "
-                       "the DNs already stored")
-    else:
-        assert_dn_overlap(built, existing)
+    existing, flags = db_keys(set(built))
 
-    if args.dry_run:
-        logger.info("--dry-run: nothing written")
+    # Before any write, and independently of --no-delete: a key-format mismatch
+    # is a duplicate-INSERT bug on the upsert path just as much as it is a
+    # mass-delete trigger on the reconcile path. Expected to abort at ~0% for
+    # the three contact types, whose stored DNs name ou=contacts -- a branch
+    # measured absent from ED on 2026-09-06.
+    assert_dn_overlap({t: {k.strip().casefold(): v for k, v in rows.items()}
+                       for t, rows in built.items()},
+                      {t: set(keys) for t, keys in existing.items()})
+
+    plan = {}
+    if not args.no_delete:
+        plan = plan_deletions(
+            {t: {k.strip().casefold(): v for k, v in rows.items()}
+             for t, rows in built.items()},
+            {t: set(keys) for t, keys in existing.items()})
+        # plan_deletions works on normalised keys; the SQL needs the stored
+        # strings, or the ceiling is enforced on one set and applied to another.
+        plan = {t: [existing[t][k] for k in keys] for t, keys in plan.items()}
+
+    upsert(built, args.dry_run)
+    if plan:
+        apply_deletions(plan, flags, args.dry_run)
+    elif not args.no_delete:
+        logger.info("no deletions planned")
     return built
 
 
