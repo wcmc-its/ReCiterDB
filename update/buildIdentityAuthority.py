@@ -92,37 +92,44 @@ ROOT = "dc=weill,dc=cornell,dc=edu"
 # The stale IdentityAuthorityQueries.txt listed ed-contacts, ed-faculty,
 # ed-students, ed-employees and ed-affiliates. NONE of those appear in the live
 # searches -- do not reintroduce them.
+# MEASURED AGAINST LIVE ED 2026-09-06 by spike_ia.py. Every base below either
+# resolved or is recorded as nonexistent; none is a guess any more.
 BASE_DN = {
     "ed-people": os.environ.get("LDAP_BASE_PEOPLE", "ou=people," + ROOT),
     "ed-sors": os.environ.get("LDAP_BASE_SORS", "ou=sors," + ROOT),
-    # The contact and taxonomy branches are NOT guesses: the SPL's own
-    # `eval dn = "uid=" . uid . ",ou=..."` reconstructions name the branch each
-    # entry lives in, which is exactly what the search base must cover.
-    #   L228  "uid=" . uid . ",ou=emails,ou=contacts,..."
-    #   L520  "uid=" . uid . ",ou=telephoneNumbers,ou=contacts,..."
-    #   L296  "uid=" . uid . ",ou=locations,ou=contacts,..."
-    #   L331  "cn="  . cn  . ",ou=locations,ou=Groups,..."      (location master)
-    #   L414  "cn="  . cn  . ",ou=departments,ou=Groups,..."    (organization)
-    # Still confirm with --spike before a live run; a base that binds to the
-    # wrong branch reads zero and would trip the MIN_ROWS abort, but there is no
-    # reason to discover that in production.
-    "ed-emails": os.environ.get("LDAP_BASE_EMAILS", "ou=emails,ou=contacts," + ROOT),
-    "ed-phones": os.environ.get("LDAP_BASE_PHONES", "ou=telephoneNumbers,ou=contacts," + ROOT),
-    "ed-locations": os.environ.get("LDAP_BASE_LOCATIONS", "ou=locations,ou=contacts," + ROOT),
     "ed-groups": os.environ.get("LDAP_BASE_GROUPS", "ou=departments,ou=Groups," + ROOT),
-    # THE AUTHORITATIVE ORG UNIT HIERARCHY (Paul, 2026-09-06). New feed, absent
-    # from the Splunk export entirely. This is the source that replaces
-    # source_organization -- see the warning below.
-    "ed-orgunits": os.environ.get("LDAP_BASE_ORGUNITS", "ou=orgUnits,ou=Groups," + ROOT),
-    # The Location Master search uses the bare `ed` alias, and its own dn eval
-    # says the entries sit under ou=locations,ou=Groups -- not the directory
-    # root. Searching from the root would work but would scan everything.
+    # The Location Master feed's bare `ed` alias. Confirmed: 200+ entries.
     "ed": os.environ.get("LDAP_BASE_ROOT", "ou=locations,ou=Groups," + ROOT),
+    # The authoritative org unit hierarchy. Confirmed: 2,457 entries.
+    "ed-orgunits": os.environ.get("LDAP_BASE_ORGUNITS", "ou=orgunits,ou=Groups," + ROOT),
 }
-# Every base above is now evidence-backed rather than guessed, but none has been
-# proved against live ED yet. --spike moves an alias out of this set.
-UNRESOLVED_ALIASES = {"ed-groups", "ed-locations", "ed-phones", "ed-emails", "ed",
-                      "ed-orgunits"}
+
+# ou=contacts DOES NOT EXIST IN ED. Measured 2026-09-06 with a BASE-scope search:
+# ou=contacts, ou=emails/ou=contacts, ou=telephoneNumbers/ou=contacts and
+# ou=locations/ou=contacts all return success with NO entry, and the directory
+# root has exactly two children -- ou=Groups and ou=People. (A subtree search
+# against a missing base returns success-and-empty here rather than
+# noSuchObject, which is why an earlier probe misreported it as "bound but
+# empty"; only BASE scope settles it.)
+#
+# So every dn the SPL writes for those three feeds --
+# "uid=" . uid . ",ou=emails,ou=contacts,..." and its siblings -- names a branch
+# that does not exist. Those DNs are string concatenations that were never
+# validated, so _contact_email / _contact_phone / _contact_location are keyed on
+# FICTIONAL DNs. assert_dn_overlap() will read ~0% for those three tables, and
+# it will be right to abort.
+#
+# What this does NOT establish: where those searches actually read from. The
+# `ed-emails` / `ed-phones` / `ed-locations` aliases are SA-ldapsearch domain
+# configs living in Splunk, which we have never seen -- the dn reconstruction is
+# just a string the author wrote and is not evidence of the search base. Person
+# entries under ou=people DO carry mail and telephoneNumber directly (confirmed),
+# so ou=people is the likely real source, but that must be read out of Splunk's
+# SA-ldapsearch config before these three sources are written.
+CONTACTS_BRANCH_ABSENT = ("ed-emails", "ed-phones", "ed-locations")
+
+# Empty: every alias in BASE_DN resolved against live ED on 2026-09-06.
+UNRESOLVED_ALIASES = set()
 
 # `CUMC` is Active Directory, NOT the Enterprise Directory -- a different host
 # with a different bind. Paul has said AD and Entra last-logins can be pulled
@@ -143,6 +150,9 @@ TABLES = {
     "location": "_contact_location",
     "location_master": "_location",
     "organization": "_organization",
+    # New feed, no Splunk ancestor and no existing table -- see the org unit
+    # notes below. Name is provisional until the DDL is agreed.
+    "org_unit": "_org_unit",
 }
 
 # A source returning fewer rows than its floor aborts the run. The floors are
@@ -157,6 +167,8 @@ MIN_ROWS = {
     "location": 5000,
     "location_master": 100,
     "organization": 100,
+    # Measured 2026-09-06: 2,457 entries under ou=orgunits,ou=Groups.
+    "org_unit": 2000,
 }
 
 # Refuse to delete more than this fraction of a type's existing DB rows in one
@@ -427,9 +439,18 @@ def demo():
 
     # the unresolved-base guard must be able to fire: alias names and type names
     # are disjoint vocabularies, and an earlier version intersected the wrong one
-    assert UNRESOLVED_ALIASES & set(BASE_DN), "guard operates on alias names"
+    # The guard reads alias names, not type names. Stated as a subset rather than
+    # a non-empty intersection so it stays true once every alias is resolved --
+    # which is now the case, and an assertion that only held while work was
+    # outstanding would have to be deleted exactly when it started mattering.
+    assert UNRESOLVED_ALIASES <= set(BASE_DN), \
+        "UNRESOLVED_ALIASES must contain alias names, not %s" % (
+            UNRESOLVED_ALIASES - set(BASE_DN))
     assert not (UNRESOLVED_ALIASES & set(TABLES)), \
         "alias names must never be type names, or the guard is dead again"
+    # The contacts branch does not exist in ED, so no source may claim to read it.
+    assert not (set(CONTACTS_BRANCH_ABSENT) & set(BASE_DN)), \
+        "a base DN was added for a branch measured absent from ED"
 
     # the stale aliases must never come back
     assert not ({"ed-contacts", "ed-faculty", "ed-students", "ed-employees",
