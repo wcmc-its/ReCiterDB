@@ -10,9 +10,13 @@
 # LDAP_BIND_PASSWORD and the ASMS MSSQL credentials (in reciter-inst-secrets).
 # This job additionally needs the Identity Authority database and JenzabarPrd:
 #   IA_DB_URL, IA_DB_USERNAME, IA_DB_PASSWORD, IA_DB_NAME
-#   JENZABAR_DB_URL, JENZABAR_DB_USERNAME, JENZABAR_DB_PASSWORD, JENZABAR_DB_NAME
 # Create them as a secret named identity-authority-secrets and they are picked up
-# by the envFrom below. Until then the job aborts on the first DB read, which is
+# by the envFrom below.
+#
+# JenzabarPrd is DEFERRED (Paul, 2026-09-05) -- the five student-master feeds are
+# not in this round, so no JENZABAR_* credential is needed yet. Note that the
+# Jenzabar student-master extract is broken in Splunk today anyway: it selects
+# from the Name Master view and every STUD_MSTR_* column it publishes is empty. Until then the job aborts on the first DB read, which is
 # the intended behaviour -- it never partially writes.
 #
 # Scheduled at 07:00 UTC (~2-3am ET) to land in the same window the Splunk

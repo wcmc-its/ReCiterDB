@@ -95,13 +95,28 @@ ROOT = "dc=weill,dc=cornell,dc=edu"
 BASE_DN = {
     "ed-people": os.environ.get("LDAP_BASE_PEOPLE", "ou=people," + ROOT),
     "ed-sors": os.environ.get("LDAP_BASE_SORS", "ou=sors," + ROOT),
-    "ed": os.environ.get("LDAP_BASE_ROOT", ROOT),
-    # UNRESOLVED - candidates only. --spike reports which of these bind.
-    "ed-groups": os.environ.get("LDAP_BASE_GROUPS", "ou=Groups," + ROOT),
-    "ed-locations": os.environ.get("LDAP_BASE_LOCATIONS", "ou=locations,ou=Groups," + ROOT),
-    "ed-phones": os.environ.get("LDAP_BASE_PHONES", "ou=phones," + ROOT),
-    "ed-emails": os.environ.get("LDAP_BASE_EMAILS", "ou=emails," + ROOT),
+    # The contact and taxonomy branches are NOT guesses: the SPL's own
+    # `eval dn = "uid=" . uid . ",ou=..."` reconstructions name the branch each
+    # entry lives in, which is exactly what the search base must cover.
+    #   L228  "uid=" . uid . ",ou=emails,ou=contacts,..."
+    #   L520  "uid=" . uid . ",ou=telephoneNumbers,ou=contacts,..."
+    #   L296  "uid=" . uid . ",ou=locations,ou=contacts,..."
+    #   L331  "cn="  . cn  . ",ou=locations,ou=Groups,..."      (location master)
+    #   L414  "cn="  . cn  . ",ou=departments,ou=Groups,..."    (organization)
+    # Still confirm with --spike before a live run; a base that binds to the
+    # wrong branch reads zero and would trip the MIN_ROWS abort, but there is no
+    # reason to discover that in production.
+    "ed-emails": os.environ.get("LDAP_BASE_EMAILS", "ou=emails,ou=contacts," + ROOT),
+    "ed-phones": os.environ.get("LDAP_BASE_PHONES", "ou=telephoneNumbers,ou=contacts," + ROOT),
+    "ed-locations": os.environ.get("LDAP_BASE_LOCATIONS", "ou=locations,ou=contacts," + ROOT),
+    "ed-groups": os.environ.get("LDAP_BASE_GROUPS", "ou=departments,ou=Groups," + ROOT),
+    # The Location Master search uses the bare `ed` alias, and its own dn eval
+    # says the entries sit under ou=locations,ou=Groups -- not the directory
+    # root. Searching from the root would work but would scan everything.
+    "ed": os.environ.get("LDAP_BASE_ROOT", "ou=locations,ou=Groups," + ROOT),
 }
+# Every base above is now evidence-backed rather than guessed, but none has been
+# proved against live ED yet. --spike moves an alias out of this set.
 UNRESOLVED_ALIASES = {"ed-groups", "ed-locations", "ed-phones", "ed-emails", "ed"}
 
 # `CUMC` is Active Directory, NOT the Enterprise Directory -- a different host
@@ -152,14 +167,18 @@ DELETE_MODE = os.environ.get("IA_DELETE_MODE", "flag")
 SOURCES = {}
 
 
-def source(type_name):
+def source(type_name, alias=None):
     """Register a source. The function returns {dn: {column: value}}.
 
     type_name ties the source to its table, its row floor and its side of the
-    deletion set difference.
+    deletion set difference. alias is the LDAP domain alias it reads, and exists
+    so the unresolved-base-DN guard can actually fire -- an earlier version
+    intersected UNRESOLVED_ALIASES (alias names) with type names, which are
+    disjoint vocabularies, so the warning was dead code.
     """
     def wrap(fn):
         fn.type_name = type_name
+        fn.alias = alias
         SOURCES[fn.__name__] = fn
         return fn
     return wrap
@@ -233,6 +252,48 @@ def run_sources(only=None):
     return built
 
 
+def assert_dn_overlap(built, db_dns, min_overlap=0.9):
+    """Abort if the DNs we just built do not look like the DNs already stored.
+
+    This job keys on the REAL entry DN from ldap3, while every row already in
+    the database was keyed by a Splunk string reconstruction
+    (`eval dn = "uid=" . uid . ",ou=emails,ou=contacts,..."`). Where the two
+    agree, an upsert updates the existing row. Where they disagree, the upsert
+    silently INSERTS a duplicate and the set difference reports the original as
+    deleted -- so a format mismatch is simultaneously a data-duplication bug and
+    a mass-deletion trigger.
+
+    The contact feeds should agree, because the SPL reconstructed exactly the
+    branch the entries live in. The Organization and SOR-affiliate paths are the
+    risk: both have a `case()` branch that builds the DN from `seeAlso` instead,
+    and if seeAlso is not the parent container DN those rows have been wrong for
+    years. That is an open question in PORT_SPEC.md, so it is checked at runtime
+    rather than assumed either way.
+
+    Runs before any write, and independently of whether deletion is enabled.
+    """
+    for type_name, existing in sorted(db_dns.items()):
+        if not existing:
+            continue
+        live = set(built.get(type_name, {}))
+        overlap = len(live & existing) / len(existing)
+        logger.info("dn overlap %-16s db=%d live=%d matched=%d (%.1f%%)",
+                    type_name, len(existing), len(live),
+                    len(live & existing), overlap * 100)
+        if overlap < min_overlap:
+            sample = sorted(existing - live)[:1]
+            raise SystemExit(
+                "ABORT: only %.1f%% of stored %s DNs match the DNs built from "
+                "ED, below the %.0f%% floor. The stored DNs are Splunk string "
+                "reconstructions and this job uses the real entry DN; if the "
+                "two formats disagree the upsert would insert duplicates and "
+                "the reconcile would report every stored row as deleted. "
+                "Nothing has been written. Example stored DN with no live "
+                "match: %s"
+                % (overlap * 100, type_name, min_overlap * 100,
+                   sample[0] if sample else "(none)"))
+
+
 def plan_deletions(built, db_dns):
     """Per-type set difference, with a volume ceiling.
 
@@ -303,6 +364,25 @@ def demo():
     except SystemExit as exc:
         assert "ceiling" in str(exc)
 
+    # assert_dn_overlap must catch a re-key rather than let it reach the upsert.
+    # A total format mismatch is the realistic shape: every stored DN is a Splunk
+    # reconstruction, so if the real entry DN differs it differs for all of them.
+    try:
+        assert_dn_overlap({"email": {"uid=a,ou=emails,ou=contacts,x": {}}},
+                          {"email": {"uid=a,ou=emails,x"}})
+        raise AssertionError("a re-keyed table must abort")
+    except SystemExit as exc:
+        assert "insert duplicates" in str(exc), exc
+    # matching DNs must pass
+    assert_dn_overlap({"email": {"dn=%d" % i: {} for i in range(100)}},
+                      {"email": {"dn=%d" % i for i in range(100)}})
+
+    # the unresolved-base guard must be able to fire: alias names and type names
+    # are disjoint vocabularies, and an earlier version intersected the wrong one
+    assert UNRESOLVED_ALIASES & set(BASE_DN), "guard operates on alias names"
+    assert not (UNRESOLVED_ALIASES & set(TABLES)), \
+        "alias names must never be type names, or the guard is dead again"
+
     # the stale aliases must never come back
     assert not ({"ed-contacts", "ed-faculty", "ed-students", "ed-employees",
                  "ed-affiliates"} & set(BASE_DN))
@@ -337,9 +417,11 @@ def main():
     if args.spike:
         return spike()
 
-    unresolved = UNRESOLVED_ALIASES & {fn.type_name for fn in SOURCES.values()}
+    unresolved = UNRESOLVED_ALIASES & {fn.alias for fn in SOURCES.values() if fn.alias}
     if unresolved:
-        logger.warning("aliases still unresolved: %s", ", ".join(sorted(unresolved)))
+        logger.warning(
+            "base DN not yet proved against live ED for: %s -- run --spike",
+            ", ".join(sorted(unresolved)))
 
     built = run_sources()
     logger.info("built %d types, %d rows total",
