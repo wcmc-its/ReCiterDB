@@ -14,7 +14,11 @@ KEEP below are genuine volume/issue/pages strings and must survive verbatim.
 
 Run: python3 test_sanitize_field.py
 """
-from dataTransformer import sanitize_field
+import csv
+import io
+
+from dataTransformer import (NULL_MARKER, numeric_or_null, sanitize_field,
+                             write_csv_rows)
 
 BLANK = [None, 'NULL', 'null', 'Null', 'nULL', '  NULL  ', ' null', '', '   ', '\t']
 KEEP = ['Suppl', 'Spec No', 'Suppl Web Exclusives', 'IX', 'PP', 'IV', 'XXIX',
@@ -33,7 +37,36 @@ def main():
     # embedded newlines/CRs still stripped (CSV safety, pre-existing behaviour)
     assert sanitize_field('a\r\nb') == 'ab'
 
-    print(f"OK: {len(BLANK)} null spellings blanked, {len(KEEP)} real values preserved")
+    # ---- numeric_or_null: absent must not become a confident 0 -------------------
+    # person_article had 0 NULLs in 858,946 rows because an empty CSV field loads as 0
+    # in a numeric column, so "never scored" and "scored zero" were the same value.
+    for v in BLANK:
+        assert numeric_or_null(v) == NULL_MARKER, \
+            f"expected the NULL marker for {v!r}, got {numeric_or_null(v)!r}"
+    # a genuine zero is a real measurement and must survive as 0
+    assert numeric_or_null(0) == '0'
+    assert numeric_or_null(0.0) == '0.0'
+    assert numeric_or_null('0.0') == '0.0'
+    assert numeric_or_null(97.35) == '97.35'
+
+    # ---- the marker must reach the file UNQUOTED, or LOAD DATA reads it as a string --
+    # csv.QUOTE_MINIMAL only quotes fields containing the delimiter, quotechar or a
+    # newline. If a future change quotes everything, "\\N" becomes the two-character
+    # string and every NULL silently turns back into 0.
+    import tempfile, os
+    fd, path = tempfile.mkstemp(suffix='.csv')
+    os.close(fd)
+    try:
+        write_csv_rows(path, [[numeric_or_null(None), numeric_or_null(0.0), 'text']])
+        with open(path) as f:
+            line = f.read().strip()
+    finally:
+        os.unlink(path)
+    assert line == '\\N,0.0,text', f"CSV line must carry an unquoted \\N, got {line!r}"
+    assert '"' not in line, f"the NULL marker must not be quoted: {line!r}"
+
+    print(f"OK: {len(BLANK)} null spellings blanked, {len(KEEP)} real values preserved, "
+          f"numeric_or_null emits an unquoted {NULL_MARKER} for absent and keeps a real 0")
 
 
 if __name__ == '__main__':
