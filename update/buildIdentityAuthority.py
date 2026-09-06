@@ -72,10 +72,10 @@ import sys
 # attribute (a plain .get() silently emptied 15 person-type flags on the
 # sibling port and was invisible until a production diff).
 try:
-    from buildIdentity import _Row, _flatten, ldap_conn, LDAP_PAGE_SIZE, _mssql_target
+    from buildIdentity import _Row, _flatten, ldap_conn, LDAP_PAGE_SIZE
 except ImportError:                                    # checkout layout
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from buildIdentity import _Row, _flatten, ldap_conn, LDAP_PAGE_SIZE, _mssql_target
+    from buildIdentity import _Row, _flatten, ldap_conn, LDAP_PAGE_SIZE
 
 logging.basicConfig(
     level=logging.INFO,
@@ -158,6 +158,28 @@ MIN_ROWS = {
 # run. The Splunk job has no such floor, which is why a single failed feeder
 # can nominate 100% of a type for deletion.
 MAX_DELETE_FRACTION = 0.02
+
+# THE IDENTITY AUTHORITY DATABASE IS MARIADB, NOT SQL SERVER.
+# Established 2026-09-06 from a live error ("check the manual that corresponds to
+# your MariaDB server version", 1064). Both draft writers were written against
+# SQL Server and are non-functional here: MariaDB has no MERGE statement at all,
+# no NVARCHAR(MAX), no WITH (HOLDLOCK), no sys.indexes and no @@SERVERNAME, and
+# pymssql is the wrong driver.
+#
+# The correct pattern already exists and is in production next door:
+# buildIdentity.py writes reciterdb with pymysql and
+#   INSERT ... ON DUPLICATE KEY UPDATE `t`.`c` = COALESCE(VALUES(`c`), `t`.`c`)
+# which is exactly what this job needs -- COALESCE so a NULL from one run never
+# erases history, and backtick quoting rather than brackets. Reuse it; do not
+# write a second upsert.
+#
+# Two consequences for the review findings already recorded:
+#   * "do not CAST the key, it costs the index seek" was SQL Server advice and is
+#     moot here.
+#   * the Python-vs-SQL string-equality mismatch STILL applies: MariaDB's usual
+#     utf8mb4_general_ci is case-insensitive while Python set difference is not,
+#     so the DN comparison must still be normalised on one canonical key.
+# ponytail: the fix is to delete a writer, not to write one.
 
 # "flag" writes a soft-delete marker; "delete" issues DELETEs. Ships as "flag"
 # because the SPL does not reveal whether the IdentityAuthority_dn stanza
