@@ -110,6 +110,10 @@ BASE_DN = {
     "ed-phones": os.environ.get("LDAP_BASE_PHONES", "ou=telephoneNumbers,ou=contacts," + ROOT),
     "ed-locations": os.environ.get("LDAP_BASE_LOCATIONS", "ou=locations,ou=contacts," + ROOT),
     "ed-groups": os.environ.get("LDAP_BASE_GROUPS", "ou=departments,ou=Groups," + ROOT),
+    # THE AUTHORITATIVE ORG UNIT HIERARCHY (Paul, 2026-09-06). New feed, absent
+    # from the Splunk export entirely. This is the source that replaces
+    # source_organization -- see the warning below.
+    "ed-orgunits": os.environ.get("LDAP_BASE_ORGUNITS", "ou=orgUnits,ou=Groups," + ROOT),
     # The Location Master search uses the bare `ed` alias, and its own dn eval
     # says the entries sit under ou=locations,ou=Groups -- not the directory
     # root. Searching from the root would work but would scan everything.
@@ -117,7 +121,8 @@ BASE_DN = {
 }
 # Every base above is now evidence-backed rather than guessed, but none has been
 # proved against live ED yet. --spike moves an alias out of this set.
-UNRESOLVED_ALIASES = {"ed-groups", "ed-locations", "ed-phones", "ed-emails", "ed"}
+UNRESOLVED_ALIASES = {"ed-groups", "ed-locations", "ed-phones", "ed-emails", "ed",
+                      "ed-orgunits"}
 
 # `CUMC` is Active Directory, NOT the Enterprise Directory -- a different host
 # with a different bind. Paul has said AD and Entra last-logins can be pulled
@@ -158,6 +163,27 @@ MIN_ROWS = {
 # run. The Splunk job has no such floor, which is why a single failed feeder
 # can nominate 100% of a type for deletion.
 MAX_DELETE_FRACTION = 0.02
+
+# DO NOT USE source_organization, AND DO NOT USE ZOUKEY.
+# Paul, 2026-09-06: source_organization is a one-time artifact several years old
+# and is not to be trusted. The 2022 Duplicate CWID Detector walks it with 36
+# hand-unrolled self-joins across DEPTH 4..10 to flatten the hierarchy into
+# deptCSIDLevel1/Level2 on analysis_person; that whole approach is dead, and any
+# recommendation built on ZOUKEY/ZOUKEYP (including one I made earlier today) is
+# withdrawn.
+#
+# The authoritative org unit hierarchy lives in ED at
+#   ou=orgUnits,ou=Groups,dc=weill,dc=cornell,dc=edu
+# and should become part of this feed. That is a NEW source: the Splunk export
+# contains no reference to it (its Organization search reads the older
+# ou=departments,ou=Groups branch instead), which is consistent with ED's
+# department -> orgUnit migration and makes this driver #2 of the port.
+#
+# Open, and what --spike must answer before this source is written: how ED
+# expresses parenthood in that branch (a parent DN, seeAlso, or the entry DN's
+# own position), what the CSID attribute is called, and how deep it goes. CSIDs
+# have N levels -- do not model them as Level1/Level2 columns, which is exactly
+# the mistake the flattened analysis_person columns encode.
 
 # THE IDENTITY AUTHORITY DATABASE IS MARIADB, NOT SQL SERVER.
 # Established 2026-09-06 from a live error ("check the manual that corresponds to
