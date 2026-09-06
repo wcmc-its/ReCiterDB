@@ -1,0 +1,21 @@
+-- Curator/model disagreement reports: Publication Manager's two canned reports (PM #997)
+-- filter person_article by userAssertion + authorshipLikelihoodScore --
+--   low-scoring accepts   userAssertion='ACCEPTED' AND authorshipLikelihoodScore < 10
+--   high-scoring rejects  userAssertion='REJECTED' AND authorshipLikelihoodScore >= 90
+-- and their two counts are computed on every /authorships load for the dropdown.
+--
+-- No existing index serves either predicate. Measured on prod 2026-09-06, EXPLAIN reports
+-- type=ALL over 738,599 rows and the counts took 1,415-1,429 ms each (2,923-3,556 ms before
+-- the EXISTS rewrite of the all-zero-cwid exclusion). The range this index has to walk is
+-- 3,111 rows for the accepts predicate and 758 for the rejects -- roughly 250x and 1000x
+-- less work than the scan.
+--
+-- Column order is (userAssertion, authorshipLikelihoodScore): equality first, range second,
+-- which is what makes the score bound a range scan rather than a filter. personIdentifier
+-- is carried as a third part so the identity join and the all-zero EXISTS both read it out
+-- of the index instead of the row.
+--
+-- person_article is not rebuilt by the nightly swap, so applying this once on prod is
+-- durable; createDatabaseTableReciterDb.sql carries it too for a fresh build.
+ALTER TABLE `person_article`
+  ADD KEY `ix_assertion_score` (`userAssertion`,`authorshipLikelihoodScore`,`personIdentifier`) USING BTREE;
