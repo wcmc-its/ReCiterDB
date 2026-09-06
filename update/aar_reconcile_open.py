@@ -391,13 +391,33 @@ def _load_class_b_modules():
     # trigger through the candidate entries, so a row that needs them rewritten is
     # already caught by candidate_cwids_json; last_refreshed changes on every write by
     # definition and would make every row drift forever.
-    REFRESH_COLS = list(sweep.NULL_COLUMNS) + [
+    # ...plus the four columns that DESCRIBE THE TOP CANDIDATE. CLASS B's whole job is
+    # to move top_cwid to a different person; leaving these behind detaches a row's
+    # score from the person the row names. Measured 2026-09-05: 512 open rows carried a
+    # top_fg_score/top_io_score pair belonging to a different candidate in their own
+    # candidate_cwids_json (413 of them the winner of the pre-#174 io-leading sort), and
+    # 855 rows read `buried` when their own top candidate was never scored and should
+    # read `absent`. 191 had already been assigned or dismissed by a curator off the
+    # back of it. The replay recomputes all four -- it runs with io-rescoring on -- so
+    # this writes fresh values, not stale ones.
+    #
+    # dup_flag/dup_reason are deliberately NOT here: they describe the ARTICLE's
+    # duplicate status, and CLASS B has no dup map to recompute them from. They belong
+    # to a batched aar_db.dup_flags_by_doi() pass, not to this one.
+    _TOP_CANDIDATE_COLS = [
+        "top_fg_score", "top_io_score", "top_years_after_wcm", "classification"]
+    REFRESH_COLS = list(sweep.NULL_COLUMNS) + _TOP_CANDIDATE_COLS + [
         "top_cohort_size", "single_candidate", "last_refreshed"]
     _EXTRA = [c for c in REFRESH_COLS if c not in sweep.NULL_COLUMNS]
-    assert set(sweep.NULL_COLUMNS) <= set(REFRESH_COLS) and _EXTRA == [
+    assert set(sweep.NULL_COLUMNS) <= set(REFRESH_COLS) and _EXTRA == _TOP_CANDIDATE_COLS + [
         "top_cohort_size", "single_candidate", "last_refreshed"], (
-        f"REFRESH_COLS is not aar_sweep_stale.NULL_COLUMNS plus exactly the three "
-        f"row-level producer columns: {REFRESH_COLS}")
+        f"REFRESH_COLS is not aar_sweep_stale.NULL_COLUMNS plus the four top-candidate "
+        f"columns plus exactly the three row-level producer columns: {REFRESH_COLS}")
+    # A column that describes the top candidate MUST be refreshed by a writer that moves
+    # top_cwid. This is the guard the original omission slipped past.
+    assert set(_TOP_CANDIDATE_COLS) <= set(REFRESH_COLS), (
+        f"a top-candidate column is missing from REFRESH_COLS: "
+        f"{[c for c in _TOP_CANDIDATE_COLS if c not in REFRESH_COLS]}")
     assert all(c in aar_db._REFRESH_COLS for c in REFRESH_COLS), (
         f"REFRESH_COLS names a column the producer itself does not refresh: "
         f"{[c for c in REFRESH_COLS if c not in aar_db._REFRESH_COLS]}")
@@ -542,7 +562,12 @@ def _write_payload(rec, run_ts):
     candidate list -- asserted against what the replay itself classified before being
     trusted (see REUSE).
 
-    Every column in REFRESH_COLS, not just #180's nine. top_cohort_size,
+    Every column in REFRESH_COLS, not just #180's nine. top_fg_score, top_io_score,
+    top_years_after_wcm and classification describe the TOP CANDIDATE, and CLASS B's
+    entire purpose is to move top_cwid to a different person -- omitting them left a
+    row naming one person while carrying another's score (see _load_class_b_modules).
+    `classification` mirrors aar_orchestrator._db_rows verbatim so the two writers
+    cannot drift. top_cohort_size,
     single_candidate and last_refreshed are row-level columns the producer writes from
     this same candidate list (aar_orchestrator._db_rows: `top_cohort_size = cohort`,
     `single_candidate = int(cohort == 1)`, `last_refreshed = run_date`), and cohort_size
@@ -565,6 +590,7 @@ def _write_payload(rec, run_ts):
     compact = orch._compact if rec["source"] == "pubmed" else scop._compact
     trunc = orch._trunc
     cohort = top.get("cohort_size")
+    fg = top.get("final_score")
     return {
         "top_cwid": top["cwid"],
         "top_name": trunc(top["name"], 255),
@@ -575,6 +601,11 @@ def _write_payload(rec, run_ts):
         "top_confidence": top["confidence"],
         "candidate_cwids_json": json.dumps(compact(cands)),
         "n_candidates": len(cands),
+        "top_fg_score": fg,
+        "top_io_score": top.get("io_score"),
+        "top_years_after_wcm": top.get("years_after_wcm"),
+        # verbatim from aar_orchestrator._db_rows
+        "classification": "absent" if fg is None else "buried",
         "top_cohort_size": cohort,
         "single_candidate": int(cohort == 1) if cohort else None,
         "last_refreshed": run_ts,
@@ -1148,6 +1179,8 @@ def _selftest():
           REFRESH_COLS == ["top_cwid", "top_name", "top_person_type", "top_dept",
                            "top_given_match", "top_affil_match", "top_confidence",
                            "candidate_cwids_json", "n_candidates",
+                           "top_fg_score", "top_io_score", "top_years_after_wcm",
+                           "classification",
                            "top_cohort_size", "single_candidate", "last_refreshed"])
     check("...and #180's own nine are still exactly its nine, untouched by that",
           sweep.NULL_COLUMNS == ["top_cwid", "top_name", "top_person_type", "top_dept",
@@ -1194,11 +1227,41 @@ def _selftest():
     FULL_CANDS_BY_ID[1000] = [{"cwid": "abc123", "name": "Jane Doe", "person_type": "Faculty",
                               "dept": "Medicine", "given_match": "full",
                               "affil_dept_match": True, "cohort_size": 1,
-                              "confidence": 0.87}]
+                              "confidence": 0.87, "final_score": 12.5, "io_score": 91.0,
+                              "years_after_wcm": 3},
+                             {"cwid": "zzz999", "name": "Someone Else", "person_type": "Staff",
+                              "dept": "Other", "given_match": "initial",
+                              "affil_dept_match": False, "cohort_size": 1,
+                              "confidence": 0.2, "final_score": 77.7, "io_score": 4.0,
+                              "years_after_wcm": 9}]
     good_rec = {"id": 1000, "source": "pubmed", "new_cwid": "abc123"}
     payload = _write_payload(good_rec, RUN_TS)
     check("write_payload builds every REFRESH_COLS column for a matching capture",
           set(payload.keys()) == set(REFRESH_COLS))
+
+    # The regression this fix exists to prevent: CLASS B moves top_cwid to a new person,
+    # so the columns describing the top candidate must move WITH it. Before the fix these
+    # were absent from the payload and the row kept the previous candidate's score --
+    # 512 open rows in prod, 855 mislabelled `buried`.
+    check("write_payload writes the TOP candidate's own score, not a runner-up's",
+          payload.get("top_fg_score") == 12.5 and payload.get("top_io_score") == 91.0
+          and payload.get("top_years_after_wcm") == 3)
+    check("...and never the second candidate's (77.7 must not appear anywhere)",
+          77.7 not in set(payload.values()))
+    check("write_payload classifies a scored top candidate as buried",
+          payload.get("classification") == "buried")
+
+    FULL_CANDS_BY_ID[1002] = [dict(FULL_CANDS_BY_ID[1000][0], final_score=None)]
+    unscored = _write_payload({"id": 1002, "source": "pubmed", "new_cwid": "abc123"}, RUN_TS)
+    check("write_payload classifies an unscored top candidate as absent, matching "
+          "aar_orchestrator._db_rows",
+          unscored.get("classification") == "absent"
+          and unscored.get("top_fg_score", "MISSING") is None)
+
+    check("every top-candidate column is in the SET clause CLASS B actually emits",
+          all(f"{c}=:{c}" in _class_b_update_sql()
+              for c in ("top_fg_score", "top_io_score", "top_years_after_wcm",
+                        "classification")))
     check("write_payload's top_affil_match is coerced to 0/1",
           payload["top_affil_match"] == 1)
 
@@ -1235,11 +1298,18 @@ def _selftest():
     check("the drift trigger is #180's null set minus top_cwid (asserted at import in "
           "_load_class_b_modules too)",
           set(rcp._DRIFT_COLS) | {"top_cwid"} == set(sweep.NULL_COLUMNS))
-    check("...and every trigger column is written by the refresh it triggers, while "
-          "the three #205 added are payload-only and never trigger",
+    check("...and every trigger column is written by the refresh it triggers, while the "
+          "three #205 added and the four top-candidate columns are payload-only and "
+          "never trigger",
           set(rcp._DRIFT_COLS) < set(REFRESH_COLS)
           and set(REFRESH_COLS) - set(rcp._DRIFT_COLS) - {"top_cwid"}
-          == {"top_cohort_size", "single_candidate", "last_refreshed"})
+          == {"top_fg_score", "top_io_score", "top_years_after_wcm", "classification",
+              "top_cohort_size", "single_candidate", "last_refreshed"})
+    # top_fg_score/top_io_score must stay payload-only for the same reason #182 gave:
+    # they wobble run to run, so as triggers they would make every row drift forever.
+    # They are written when something ELSE drifts, never the reason a row is rewritten.
+    check("the scores are written but never trigger a rewrite (#182 wobble)",
+          not ({"top_fg_score", "top_io_score"} & set(rcp._DRIFT_COLS)))
 
     # apply-wiring contract (#189): main() feeds _apply_class_b the class-B slice of
     # ledger_entries, and _apply_class_b consumes exactly e["id"] + e["after"][col]
