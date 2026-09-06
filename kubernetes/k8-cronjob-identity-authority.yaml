@@ -69,7 +69,13 @@ spec:
                 name: reciter-inst-secrets
             - configMapRef:
                 name: reciter-inst-client-configmap
-            # Identity Authority + JenzabarPrd credentials. Does not exist yet.
+            # Identity Authority database credentials. Create with
+            # kubernetes/k8-secrets-identity-authority.yaml as the reference --
+            # prefer `kubectl create secret generic`, since `apply` copies the
+            # values into the last-applied-configuration annotation in cleartext.
+            # Kept optional so the cronjob object stays applyable before the
+            # secret exists; buildIdentityAuthority.py aborts with the missing
+            # variable names before it reads or writes anything.
             - secretRef:
                 name: identity-authority-secrets
                 optional: true
