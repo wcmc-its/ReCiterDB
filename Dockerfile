@@ -34,6 +34,11 @@ COPY update/identity_index.py ./
 COPY update/aar_db.py ./
 COPY update/aar_universe_scopus.py ./
 COPY update/scopus_afids.csv ./
+# Cornell Ithaca AF-IDs stay a SEPARATE list from the WCM family set — appending them
+# to scopus_afids.csv would make wcm_authorships() tag every Ithaca author as WCM, and
+# would roughly double one Sunday sweep's fetch volume. Read via --afid-list by the
+# env-gated Ithaca lane in run_all.py (AAR_SCOPUS_ITHACA_LANE).
+COPY update/scopus_afids_cornell_ithaca.csv ./
 
 # AAR PubMed lane (orphan-authorship detector + IO/FB scoring — weekly, gated in run_all.py)
 COPY update/aar_universe.py ./

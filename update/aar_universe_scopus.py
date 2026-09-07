@@ -749,6 +749,17 @@ def _selftest():
           _container_doi("10.1007/s11940-026-00868-8", "Article") is None)
     check("119027669 (UCSF) excluded from family set",
           "119027669" not in load_family_afids())
+    # The Cornell Ithaca AF-IDs ship as their OWN list, read via --afid-list by the
+    # env-gated Ithaca lane in run_all.py. They must never be merged into
+    # scopus_afids.csv: wcm_authorships() selects an author purely on "carries an afid
+    # in the family set", so a merged list would tag every Ithaca author as WCM and
+    # would roughly double one Sunday sweep's fetch volume under a single timeout.
+    _ithaca_list = os.path.join(os.path.dirname(DEFAULT_AFID_LIST),
+                                "scopus_afids_cornell_ithaca.csv")
+    _ithaca = load_family_afids(_ithaca_list)
+    check("cornell ithaca afid list parses and carries 16 afids", len(_ithaca) == 16)
+    check("cornell ithaca afid list is disjoint from the WCM family set",
+          not (_ithaca & load_family_afids(DEFAULT_AFID_LIST)))
     check("isbn_in_pubmed makes no network call for an empty/missing isbn list",
           isbn_in_pubmed([]) is False and isbn_in_pubmed(None) is False)
     check("_extract_isbns unpacks Scopus's bracketed-string-in-a-dict-in-a-list form",
