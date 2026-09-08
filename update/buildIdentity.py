@@ -43,6 +43,7 @@ import collections
 import datetime
 import logging
 import os
+import re
 import sys
 
 from ldap3 import ALL, Connection, Server, SUBTREE
@@ -973,6 +974,12 @@ def load_cwid_bridge(path=CORNELL_BRIDGE):
     """netid -> (WCM cwid, already a ReCiter identity), for every bridged netid."""
     import csv  # lazy: nothing else in this module reads a CSV
 
+    if not os.path.exists(path):
+        raise SystemExit(
+            f"cornell: the CWID bridge is missing ({path}). It is gate 1 -- "
+            f"without it a dual-appointment person is minted under their netid "
+            f"and split across two uids. Check the Dockerfile COPY and "
+            f"CORNELL_BRIDGE agree on the filename.")
     with open(path, newline="") as fh:
         return {r["netid"]: (r["cornellEduCWID"], r.get("cwid_in_reciter") == "yes")
                 for r in csv.DictReader(fh)}
@@ -1127,9 +1134,15 @@ def _cornell_middle_name(full, first, last):
     full, first, last = (full or "").strip(), (first or "").strip(), (last or "").strip()
     if not (full and first and last):
         return ""
-    if full.lower().startswith(first.lower()) and full.lower().endswith(last.lower()):
-        return full[len(first):len(full) - len(last)].strip()
-    return ""
+    # Whole names on both sides, not a bare prefix/suffix test. "Jones" suffixes
+    # "Mary Jo Smith-Jones" and without this that yields a middleName of
+    # "Jo Smith-"; "Jo" prefixes "Joanna". The surname boundary is whitespace and
+    # NOT a hyphen, because a hyphen is inside a compound surname rather than
+    # before it -- "De Vlaminck" still brackets, "Smith-Jones" still does not.
+    if not (re.match(rf"{re.escape(first)}\b", full, re.I)
+            and re.search(rf"(?:^|\s){re.escape(last)}$", full, re.I)):
+        return ""
+    return full[len(first):len(full) - len(last)].strip()
 
 
 def _cornell_record(row):
@@ -1153,6 +1166,33 @@ def _cornell_record(row):
         "primaryAcademicDepartment": row["primary_department"] or "",
         CORNELL_MARK: "yes",
     }
+
+
+def _cornell_marked(roster, ours):
+    """Roster rows that person_person_type already agrees are Cornell.
+
+    Dropped, not warned about. An unmarked netid is not merely unlabelled: it
+    joins the WCM candidate pool (R1), `identity` is cumulative so the row cannot
+    be taken back out, and the damage lands in a rarity term computed before any
+    confidence exists. Admitting one is unrecoverable; skipping one costs a day,
+    because the next run picks it up as soon as its marker lands.
+    """
+    marked = [r for r in roster if r["netid"].lower() in ours]
+    if not marked:
+        raise SystemExit(
+            f"cornell: none of the {len(roster)} admitted netids has a "
+            f"`{CORNELL_CAMPUS_TYPE}` row in person_person_type, so every one of "
+            f"them would be indexed as WCM (R1). Run "
+            f"scripts/sync_cornell_ithaca_identities.py, let one nightly cycle "
+            f"land the person types, then enable IDENTITY_CORNELL_SOURCE.")
+    if len(marked) != len(roster):
+        logger.warning(
+            "cornell: skipping %d of %d admitted netids with no `%s` row in "
+            "person_person_type - they would be indexed as WCM (R1). Each is "
+            "admitted on the first run after its marker lands; run "
+            "scripts/sync_cornell_ithaca_identities.py to put it there.",
+            len(roster) - len(marked), len(roster), CORNELL_CAMPUS_TYPE)
+    return marked
 
 
 def cornell_ithaca():
@@ -1224,34 +1264,51 @@ def cornell_ithaca():
     # stamps it CAMPUS_WCM and it joins the WCM candidate pool, which is plan risk
     # R1 -- 5,834 WCM surname cohorts grow and 1,169 go from cohort 1 to >1. Hence
     # a loud count rather than silence.
-    unmarked = [r for r in roster if r["netid"].lower() not in ours]
-    if unmarked:
-        logger.warning(
-            "cornell: %d of %d admitted netids have no `%s` row in "
-            "person_person_type - IdentityIndex will index them as WCM (R1). Load "
-            "them into DynamoDB Identity with "
-            "scripts/sync_cornell_ithaca_identities.py first.",
-            len(unmarked), len(roster), CORNELL_CAMPUS_TYPE)
+    # Dropped, not warned about. An unmarked netid is not merely unlabelled: it
+    # joins the WCM candidate pool (R1), `identity` is cumulative so the row cannot
+    # be taken back out, and the damage is in a rarity term computed before any
+    # confidence exists. Admitting one is unrecoverable; skipping one costs a day,
+    # because the next run picks it up as soon as its marker lands. So the roster
+    # this source returns is exactly the people person_person_type already agrees
+    # are Cornell.
+    marked = _cornell_marked(roster, ours)
 
-    return {r["netid"]: _cornell_record(r) for r in roster}
+    return {r["netid"]: _cornell_record(r) for r in marked}
 
 
-# Registered ONLY when the gate is on, and registered LAST so merge()'s
-# setdefault leaves every WCM value in place on a shared cwid. Deliberately not
+# Registered ONLY when the gate is on, and registered LAST so merge()'s setdefault
+# leaves every WCM value in place on a shared cwid -- for the setdefault columns.
+# ponytail: MAX_COLUMNS (surname, givenName) fold by MAX rather than first-wins, so
+# on a shared cwid a Cornell name can still beat the WCM one. _cornell_collisions
+# is what stops that, and it skips anyone already in `ours`, so it catches the
+# collisions present on the first gate-on run but not a WCM cwid issued later that
+# equals an admitted netid. Closing that needs a WCM-side signal on the identity
+# row (any FLAG_COLUMN set) rather than the person_person_type marker; worth doing
+# if WCM and Cornell ever share an issuing authority, not before. Deliberately not
 # the other shape -- "always registered, returns {} when off" -- because build()
 # raises SystemExit on a source that returns 0 rows, which is the guard that stops
 # a silently missing source publishing a partial build, so an always-registered
 # off source would kill the nightly WCM build every night.
 #
-# ponytail: turning this ON is close to a one-way door and nothing here stops it.
-# `identity` is cumulative and the upsert is COALESCE-guarded, so switching the
-# variable back off does not remove the ~14k rows; and the MIN_ROWS_FLOOR baseline
-# is MAX(staged_rows) over 30 days with no lane discriminator, so the first
-# WCM-only build after a Cornell-on run stages ~70% of that baseline and refuses.
-# Both want a `lane` column on identity_build_log; neither is worth a schema
-# change before the first real run.
+# Turning this ON is still a one-way door for the ROWS -- `identity` is cumulative
+# and the upsert is COALESCE-guarded, so switching the variable back off does not
+# remove the ~14k Cornell rows. What it no longer does is take the WCM build down
+# with it: identity_build_log carries a `lane`, so the MIN_ROWS_FLOOR baseline for
+# a WCM-only run is other WCM-only runs (see write()). The variable is a real kill
+# switch for future builds; it is not an undo for past ones.
 if _cornell_enabled(os.getenv("IDENTITY_CORNELL_SOURCE")):
     source(cornell_ithaca)
+
+
+def build_lane():
+    """Which population this run stages, for the MIN_ROWS_FLOOR baseline.
+
+    Derived from SOURCES rather than the env var so it can never disagree with
+    what actually ran. Two lanes today; a third source would add a third name and
+    start its own baseline, which is the correct behaviour -- a floor is only
+    meaningful against runs that staged the same population.
+    """
+    return "wcm+cornell" if cornell_ithaca.__name__ in SOURCES else "wcm"
 
 
 # ---------------------------------------------------------------------------
@@ -1439,12 +1496,23 @@ def write(rows, stage_only=False):
                     run_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     staged_rows INT NOT NULL,
                     upserted TINYINT(1) NOT NULL DEFAULT 0,
+                    lane VARCHAR(16) NOT NULL DEFAULT 'wcm',
                     KEY idx_run_at (run_at)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
+            cur.execute("ALTER TABLE identity_build_log ADD COLUMN IF NOT EXISTS "
+                        "lane VARCHAR(16) NOT NULL DEFAULT 'wcm'")
+            # The floor compares this run against previous runs OF THE SAME LANE.
+            # Without that, one Cornell-on run (~48k staged) raises the 30-day
+            # MAX for every WCM-only run after it (~33k), which is below the 95%
+            # floor -- so flipping IDENTITY_CORNELL_SOURCE back off would refuse
+            # to write the WCM identity build for 30 days. The env var has to be a
+            # real kill switch, so the lane travels with the number it explains.
+            lane = build_lane()
             cur.execute(
                 "SELECT MAX(staged_rows) FROM identity_build_log "
-                "WHERE upserted = 1 AND run_at > NOW() - INTERVAL %s DAY",
-                (BUILD_LOG_WINDOW_DAYS,))
+                "WHERE upserted = 1 AND lane = %s "
+                "AND run_at > NOW() - INTERVAL %s DAY",
+                (lane, BUILD_LOG_WINDOW_DAYS))
             baseline = cur.fetchone()[0]
             if baseline:
                 short = staged < baseline * MIN_ROWS_FLOOR
@@ -1452,9 +1520,9 @@ def write(rows, stage_only=False):
                             baseline, BUILD_LOG_WINDOW_DAYS)
             else:
                 short = False
-                logger.warning("no prior build in the last %d days - "
+                logger.warning("no prior %s build in the last %d days - "
                                "floor not enforced on this run",
-                               BUILD_LOG_WINDOW_DAYS)
+                               lane, BUILD_LOG_WINDOW_DAYS)
             if short and not stage_only:
                 raise SystemExit(
                     f"staged {staged} rows against a recent best of {baseline} "
@@ -1465,7 +1533,7 @@ def write(rows, stage_only=False):
                 # The floor is reported rather than enforced -- a dry run should
                 # always finish and show its numbers.
                 cur.execute("INSERT INTO identity_build_log (staged_rows, "
-                            "upserted) VALUES (%s, 0)", (staged,))
+                            "upserted, lane) VALUES (%s, 0, %s)", (staged, lane))
                 conn.commit()
                 logger.info("--dry-run: %d rows staged, identity untouched%s",
                             staged, "  [BELOW FLOOR]" if short else "")
@@ -1476,8 +1544,8 @@ def write(rows, stage_only=False):
                 f"INSERT INTO identity ({cols}) "
                 f"SELECT {cols} FROM identity_staging "
                 f"ON DUPLICATE KEY UPDATE {updates}")
-            cur.execute("INSERT INTO identity_build_log (staged_rows, upserted) "
-                        "VALUES (%s, 1)", (staged,))
+            cur.execute("INSERT INTO identity_build_log (staged_rows, upserted, "
+                        "lane) VALUES (%s, 1, %s)", (staged, lane))
             conn.commit()
             logger.info("upserted %d rows into identity", staged)
     finally:
@@ -1714,6 +1782,23 @@ def demo():
         _cornell_enabled(os.getenv("IDENTITY_CORNELL_SOURCE")), \
         "cornell_ithaca is registered if and only if IDENTITY_CORNELL_SOURCE is on"
 
+    # The floor's baseline is per-lane, so flipping the gate back off cannot make
+    # the next WCM-only build look short against a Cornell-inflated best.
+    assert build_lane() == ("wcm+cornell" if "cornell_ithaca" in SOURCES else "wcm")
+
+    # R1: an unmarked netid is dropped, never admitted as WCM. Partial -> skip the
+    # unmarked ones; none marked -> refuse, because that is the precondition
+    # (sync + one nightly cycle) not having been met.
+    _r = [{"netid": "aa1"}, {"netid": "BB2"}, {"netid": "cc3"}]
+    assert [r["netid"] for r in _cornell_marked(_r, {"aa1", "bb2"})] == ["aa1", "BB2"], \
+        "marker test is case-insensitive on the netid"
+    try:
+        _cornell_marked(_r, set())
+    except SystemExit as e:
+        assert "person_person_type" in str(e)
+    else:
+        raise AssertionError("a wholly unmarked roster must refuse, not return []")
+
     # The campus marker is the whole point of the exercise; if it drifts from
     # identity_index's constant the scope reads every Cornell person as WCM.
     from identity_index import CAMPUS_ITHACA
@@ -1734,6 +1819,11 @@ def demo():
     # Compound surname: "De" is not a middle name.
     assert _cornell_middle_name("Iwijn De Vlaminck", "Iwijn", "De Vlaminck") == ""
     assert _cornell_middle_name("Andres Arroyo", "Andres", "Arroyo") == ""
+    # a surname that merely SUFFIXES the real one is not a match
+    assert _cornell_middle_name("Mary Jo Smith-Jones", "Mary", "Jones") == ""
+    assert _cornell_middle_name("Mary Jo Smith-Jones", "Mary", "Smith-Jones") == "Jo"
+    # ... and neither is a given name that merely prefixes it
+    assert _cornell_middle_name("Joanna Lee", "Jo", "Lee") == ""
 
     # finalize() keeps it. Without the CORNELL_MARK branch the has_role filter
     # drops it -- primaryAcademicDepartment satisfies the isnotnull filter but
