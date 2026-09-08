@@ -257,11 +257,15 @@ def _already_curated(top, attributed=(), byline=None, pmid=None, prod_holds=None
        prod_holds=None disables the narrowing and restores the pre-fix behaviour. That is
        the fail-open direction on purpose: an unavailable mirror suppresses, as it always
        did, rather than emptying the whole rescore-suppressed population into the queue."""
+    # Signal 2 first, because it is the only one that works without a candidate. Since
+    # candidate-less authorships are written rather than dropped, an authorship whose
+    # byline OWNER is already attributed must be suppressed here or it returns to the
+    # queue every run as an orphan that is not one.
+    if _byline_owner(byline, attributed):
+        return True
     if top is None:
         return False
     if attributed and any(cwid == top.get("cwid") for cwid, _pos, _names in attributed):
-        return True
-    if _byline_owner(byline, attributed):
         return True
     fg = top.get("final_score")
     if fg is None or fg < gate.STORAGE_THRESHOLD:
@@ -279,8 +283,15 @@ def _db_rows(resolved_auth, run_date, attr_by_pmid=None, prod_holds=None):
     the three signals and why reciterdb's own attribution leads. (Was
     previously written and left for PM to display; per product decision 2026-08-19
     that is wrong -- don't create a queue record for something already resolved.)
-    Unmatched authorships (no candidate to assign) are also skipped. single_candidate
-    uses the true cohort size (unique surname+initial), the strongest precision signal.
+    Unmatched authorships (no candidate to assign) ARE written, as `absent` with a NULL
+    top_cwid -- the shape #177/#180's sweep already leaves behind and PM already renders.
+    They were dropped until #222 showed what that costs: 3,623 WCM-affiliated bylines
+    matching nobody over 2026-04..09, 490 of them in WCM-NYC/Qatar scope, in no queue and
+    no report. A curator cannot ASSIGN such a row -- there is no cwid to assign to -- but
+    it is the only surfacing an orphaned WCM byline gets, and per-row triage against
+    `identity` is what distinguishes a roster gap from a matcher miss.
+    single_candidate uses the true cohort size (unique surname+initial), the strongest
+    precision signal.
 
     dup_flag/dup_reason: one batched aar_db.dup_flags_by_doi() call over every DOI in
     this run's resolved_auth (not a query per row), narrowed per row to THIS
@@ -292,15 +303,21 @@ def _db_rows(resolved_auth, run_date, attr_by_pmid=None, prod_holds=None):
     dup_map = aar_db.dup_flags_by_doi(dois) if dois else {}
     out = []
     for a, i, n, au, cands, top in resolved_auth:
-        if top is None:
-            continue                                   # unmatched: nothing to assign
-        fg = top.get("final_score")
         byline = _byline(au)
         if _already_curated(top, attr_by_pmid.get(a["pmid"], ()), byline,
                             a["pmid"], prod_holds):
             continue                                   # already curated -- not a queue record
-        held = (prod_holds or {}).get((int(a["pmid"]), top["cwid"]))
-        if fg is None:
+        t = top or {}
+        fg = t.get("final_score")
+        held = (prod_holds or {}).get((int(a["pmid"]), t["cwid"])) if top else None
+        if top is None:
+            # No candidate at all -- a WCM byline nobody in `identity` matches. Written
+            # rather than dropped: it is the strongest orphan signal the lane produces,
+            # and dropping it silently is what hid 490 in-scope authorships across
+            # 2026-04..09 (#222). Shares the `absent` + NULL top_cwid shape the #177/#180
+            # sweep already leaves on 464 live rows, so PM renders it unchanged.
+            cls = "absent"
+        elif fg is None:
             cls = "absent"                             # never scored locally
         elif fg < gate.STORAGE_THRESHOLD:
             cls = "buried"                             # locally sub-threshold
@@ -309,7 +326,7 @@ def _db_rows(resolved_auth, run_date, attr_by_pmid=None, prod_holds=None):
             # Classify by what production HAS, not by the rescore that overrode it:
             # a row it holds sub-threshold is buried, one it holds not at all is absent.
             cls = "buried" if held is not None else "absent"
-        cohort = top.get("cohort_size")
+        cohort = t.get("cohort_size")
         doi = a.get("doi")
         dup_uid = aar_db.dup_uid_for_authorship(dup_map, doi, top, cands)
         out.append({
@@ -323,15 +340,15 @@ def _db_rows(resolved_auth, run_date, attr_by_pmid=None, prod_holds=None):
             "entrez_date": a["entrez_date"], "title": a["title"],
             "journal": _trunc(a["journal"], 512), "doi": _trunc(a["doi"], 255),
             "classification": cls,
-            "top_cwid": top["cwid"], "top_name": _trunc(top["name"], 255),
-            "top_person_type": _trunc(top["person_type"], 64),
-            "top_dept": _trunc(top["dept"], 255),
-            "top_fg_score": fg, "top_io_score": top.get("io_score"),
-            "top_confidence": top["confidence"],
-            "top_years_after_wcm": top.get("years_after_wcm"),
+            "top_cwid": t.get("cwid"), "top_name": _trunc(t.get("name"), 255),
+            "top_person_type": _trunc(t.get("person_type"), 64),
+            "top_dept": _trunc(t.get("dept"), 255),
+            "top_fg_score": fg, "top_io_score": t.get("io_score"),
+            "top_confidence": t.get("confidence"),
+            "top_years_after_wcm": t.get("years_after_wcm"),
             "top_cohort_size": cohort,
-            "top_given_match": top["given_match"],
-            "top_affil_match": int(bool(top["affil_dept_match"])),
+            "top_given_match": t.get("given_match"),
+            "top_affil_match": (int(bool(t["affil_dept_match"])) if top else None),
             "n_candidates": len(cands), "single_candidate": int(cohort == 1),
             "candidate_cwids_json": json.dumps(_compact(cands)),
             "dup_flag": int(bool(dup_uid)),
@@ -792,8 +809,27 @@ def _selftest():
           len(rows) == 2 and all(r["classification"] != "suggested" for r in rows))
     check("_db_rows keeps absent (no FG) and buried (FG<threshold)",
           sorted(r["classification"] for r in rows) == ["absent", "buried"])
-    check("_db_rows still skips an unmatched authorship (top is None)",
-          _db_rows([(auth(None)[0], 0, 1, {}, [], None)], "2026-01-01") == [])
+    # ---- candidate-less authorships are LISTED, not dropped ----------------
+    # A WCM byline that matches nobody in `identity` is the strongest orphan signal the
+    # lane has; dropping it is what hid 490 in-scope authorships (#222). Same shape the
+    # #177/#180 sweep already leaves on 464 live rows: 'absent' with a NULL top_cwid.
+    nc = _db_rows([(auth(None)[0], 0, 1, {"fore": "Nomatch", "last": "Byline"}, [], None)],
+                  "2026-01-01")
+    check("an unmatched authorship (top is None) is now written, not skipped", len(nc) == 1)
+    check("it carries no candidate and classifies as 'absent'",
+          nc and nc[0]["top_cwid"] is None and nc[0]["classification"] == "absent"
+          and nc[0]["n_candidates"] == 0 and nc[0]["single_candidate"] == 0
+          and nc[0]["candidate_cwids_json"] == "[]")
+    check("no candidate-derived column is fabricated",
+          nc and all(nc[0][k] is None for k in
+                     ("top_name", "top_person_type", "top_dept", "top_fg_score",
+                      "top_io_score", "top_confidence", "top_cohort_size",
+                      "top_given_match", "top_affil_match")))
+    check("a candidate-less authorship whose BYLINE OWNER is already attributed is "
+          "still suppressed -- signal 2 is the only one that works with no candidate",
+          _db_rows([(auth(None)[0], 0, 1, {"fore": "Tony", "last": "Rosen"}, [], None)],
+                   "2026-01-01",
+                   {1: [("aer2006", "last", (("Tony", "Rosen"),))]}) == [])
 
     # ---- signal 3 is not self-sufficient -----------------------------------
     # The local rescore reads the uid's S3 scoring INPUT, which holds articles production
