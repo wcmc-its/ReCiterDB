@@ -14,6 +14,10 @@ appointment ended long before the paper was published is almost always a homonym
 the gap between the two years subtracts from that candidate's `confidence`, and is
 published per row as `authorship_review.top_years_after_wcm`. See `temporal_penalty`.
 
+And home to the CAMPUS SCOPE (Cornell Ithaca onboarding, risks R1/R6). One index holds
+exactly one campus's roster; `candidates()` is untouched by the scoping, because the
+records of every other campus are never indexed in the first place. See `CAMPUS_WCM`.
+
 Env: DB_USERNAME/DB_PASSWORD/DB_HOST/DB_NAME (reciterdb, read-only).
 """
 import os, re, unicodedata
@@ -46,6 +50,107 @@ PERSON_TYPES = [
     ("alumniResidentNYP", "Alumni Resident (NYP)", True),
 ]
 _PTYPE_COLS = [c for c, _, _ in PERSON_TYPES]
+
+
+# ---- campus scope ----------------------------------------------------------
+# ONE INDEX HOLDS ONE CAMPUS. `IdentityIndex(records, campus=...)` keeps only the
+# records of that campus, so `candidates()` -- the ranking function every prior
+# incident on this file was about -- is not touched by the scoping at all, and a
+# cross-campus candidate is not "ranked down", it is structurally absent.
+#
+# WHY A HARD SCOPE AND NOT A CONFIDENCE PREFERENCE. The damage the Cornell Ithaca
+# load does to WCM (plan risk R1) is measured as: 5,751 WCM people's surname+initial
+# cohorts grow, and 1,161 go from cohort 1 to cohort >1. Re-measured 2026-09-07
+# against the live rosters (identity 35,855; identity_cornell research population
+# 15,030) it is 5,834 and 1,169 -- the plan's numbers, plus the WCM roster's own
+# growth since. That loss is in the RARITY
+# TERM, `0.40 / cohort_size` in `_confidence` -- a WCM person who is the unique holder
+# of their surname+initial scores 0.40 there and drops to 0.20 the moment one Cornell
+# homonym joins the cohort. A preference expressed as a confidence nudge cannot repair
+# that, because `cohort_size` is counted BEFORE any confidence is computed (see
+# `candidates`): only removing the record from the cohort restores the signal. And a
+# Cornell candidate offered against a WCM authorship is never merely lower-ranked --
+# it can never be correct, because Cornell people are deliberately never scored and
+# hold no publications in this system, so the proposal costs a curator a decision and
+# buys nothing.
+#
+# WHY THE SCOPE IS DECLARED BY THE CALLER, NOT INFERRED FROM AFFILIATION TEXT. An
+# authorship's campus is not written on the row, but it does not need to be: each AAR
+# lane sweeps ONE institution's publication universe and therefore already knows which
+# roster it is matching against. The PubMed lane's universe is a `[Affiliation]` query
+# over `aar_universe`'s home-institution keywords; the Scopus lane's is an AF-ID family
+# read from `--afid-list`, and the Ithaca lane is a SEPARATE run over
+# `scopus_afids_cornell_ithaca.csv`, whose own comment already forbids merging the two
+# AF-ID sets for the same reason this forbids merging the two rosters. Campus is a
+# property of the RUN. Inferring it per row from affiliation text would be strictly
+# worse: the commonest WCM affiliation string is a bare "Weill Cornell Medicine, New
+# York, NY", which carries no campus discriminator the sweep did not already apply.
+CAMPUS_WCM = "wcm"
+CAMPUS_ITHACA = "cornell-ithaca"          # == sync_cornell_ithaca_identities.CAMPUS_TYPE
+
+# Cornell's OWN person-type vocabulary, in the same "first match wins" precedence
+# shape as PERSON_TYPES above. Emitted by scripts/sync_cornell_ithaca_identities.py
+# into DynamoDB `Identity.personTypes`, from which ReCiterDB's nightly import lands one
+# row per type in `person_person_type` (dataTransformer.process_person_person_type).
+#
+# Without this table every Cornell candidate falls through PERSON_TYPES -- which is a
+# list of WCM/NYP boolean COLUMNS that a Cornell person matches none of -- and renders
+# as "Other / CTSC" with historical=False (plan risk R6).
+#
+# Current roles lead, terminal states follow, so somebody who is both reads as what
+# they currently are. The label is display only; `historical` is the -0.10 term in
+# `_confidence` and is computed separately, below.
+CORNELL_PERSON_TYPES = [
+    ("cornell-faculty",                  "Cornell Faculty", False),
+    ("cornell-faculty-rte",              "Cornell Faculty (Research/Teaching/Extension)", False),
+    ("cornell-faculty-new",              "Cornell Faculty (New)", False),
+    ("cornell-academic",                 "Cornell Academic", False),
+    ("cornell-research-teaching-title",  "Cornell Research/Teaching Title", False),
+    ("cornell-researcher",               "Cornell Researcher", False),
+    ("cornell-researcher-project",       "Cornell Project Researcher", False),
+    ("cornell-postdoc",                  "Cornell Postdoc", False),
+    ("cornell-incubator-associate",      "Cornell Incubator Associate", False),
+    ("cornell-research-center-employee", "Cornell Research Center Employee", False),
+    ("cornell-student-grad",             "Cornell Student (Graduate)", False),
+    ("cornell-student-undergrad",        "Cornell Student (Undergraduate)", False),
+    ("cornell-student",                  "Cornell Student", False),
+    ("cornell-staff",                    "Cornell Staff", False),
+    ("cornell-affiliate",                "Cornell Affiliate", False),
+    # terminal states, last: reached only when no current role above fired
+    ("cornell-emeritus",                 "Cornell Emeritus", True),
+    ("cornell-retired-faculty",          "Cornell Retired Faculty", True),
+    ("cornell-former-postdoc",           "Cornell Former Postdoc", True),
+    ("cornell-alumni",                   "Cornell Alumni", True),
+    ("cornell-retiree",                  "Cornell Retiree", True),
+    ("cornell-inactive",                 "Cornell Inactive", True),
+]
+# `historical` is ANY terminal marker, independent of which label won precedence --
+# deliberately NOT coupled to the label the way the WCM branch couples them. R6's
+# complaint is that "Cornell emeriti and alumni miss the -0.10 penalty their WCM
+# equivalents get", and coupling would lose exactly the people it names: Cornell's
+# `is_faculty` is a current-role flag that an emeritus professor commonly still
+# carries, so a precedence-coupled flag would label them "Cornell Faculty" and hand
+# back historical=False -- the bug R6 reports, reintroduced one level down. The WCM
+# branch can couple them safely because ITS terminal states are exclusive columns
+# (`emeritusFaculty` is set only when `fullTimeFaculty` is not); Cornell's are not.
+CORNELL_HISTORICAL_TYPES = frozenset(t for t, _, h in CORNELL_PERSON_TYPES if h)
+
+
+def cornell_person_type(person_types):
+    """Cornell `personTypes` -> (label, historical), the R6 counterpart of the
+    PERSON_TYPES loop in `IdentityIndex._record`.
+
+    Falls back to a campus label rather than "Other / CTSC": every Cornell record
+    carries `cornell-ithaca` by construction (it is the first entry
+    sync_cornell_ithaca_identities.person_types() emits, and the sync never emits an
+    empty list), so "we know nothing beyond the campus" is the honest floor here."""
+    types = frozenset(person_types)
+    label = "Cornell Ithaca"
+    for t, lbl, _ in CORNELL_PERSON_TYPES:
+        if t in types:
+            label = lbl
+            break
+    return label, bool(types & CORNELL_HISTORICAL_TYPES)
 
 
 # ---- normalisation ---------------------------------------------------------
@@ -348,15 +453,77 @@ def _display_name(rec):
 
 # ---- identity index --------------------------------------------------------
 class IdentityIndex:
-    """In-memory index of reciterdb `identity`, keyed by normalised surname."""
+    """In-memory index of reciterdb `identity`, keyed by normalised surname, holding
+    exactly ONE campus's roster (`campus`, default `CAMPUS_WCM` -- see the campus-scope
+    block above for why the scope is an exclusion and why the caller declares it).
 
-    def __init__(self, records):
+    Records of any other campus are dropped here, at construction, and never reach
+    `by_surname`. That is the whole mechanism: `candidates()` needs no campus argument,
+    `cohort_size` counts only in-scope homonyms, and there is no code path by which an
+    out-of-scope record can be ranked, tie-broken or surfaced.
+
+    A record with no `campus` key is WCM. Every hand-built record in this file's and
+    the sibling modules' self-tests is therefore WCM, exactly as before, and so is
+    every row `_record` builds today (see `_campus_person_types`)."""
+
+    def __init__(self, records, campus=CAMPUS_WCM):
+        self.campus = campus
         self.by_surname = {}
+        self.n_other_campus = 0          # observability: how many the scope excluded
         for r in records:
+            if (r.get("campus") or CAMPUS_WCM) != campus:
+                self.n_other_campus += 1
+                continue
             self.by_surname.setdefault(r["surname_norm"], []).append(r)
 
+    @staticmethod
+    def _campus_person_types(conn):
+        """cwid -> frozenset of its `cornell-*` person types, for Cornell people only.
+
+        `person_person_type` is the ONLY place a non-WCM campus is recorded anywhere in
+        reciterdb: `identity` is built by buildIdentity.py from WCM Enterprise Directory
+        LDAP + ASMS and has no institution column at all, while this table is rebuilt
+        nightly from DynamoDB `Identity.personTypes`, one row per type. Its
+        `personIdentifier` and `identity.cwid` are both utf8mb4_unicode_ci, so this
+        needs no COLLATE (the 1267 trap is on authorship_review.top_cwid, not here).
+
+        ARMED BUT DORMANT, and whoever wires the Ithaca roster in needs to know why.
+        `load()` drives off `identity`, LEFT JOINs `person`, and `identity`'s only
+        writer is buildIdentity.py reading WCM LDAP + ASMS. So bulk-loading Cornell
+        people into DynamoDB `Identity` does NOT put them on this roster: it lands
+        their personTypes here in `person_person_type` and nothing else, and a right-
+        side LEFT JOIN row cannot manufacture a driving row. Measured 2026-09-07:
+        `personType LIKE 'cornell-%'` returns 0 rows, so today every record `_record`
+        builds is WCM and this scope excludes nobody. Whatever eventually admits
+        Cornell people to `identity` must land WITH that route, not after it -- the
+        R1 degradation starts the morning the roster grows, and this is what stops it.
+
+        Two deliberate narrownesses, each guarding a measured false positive:
+
+        * The SQL prefix is `cornell-%`, not `%cornell%`. `affiliate-cornell` is a
+          live WCM person type held by 483 people -- WCM staff with an Ithaca
+          affiliation -- and a substring test would move every one of them off the
+          WCM roster and out of their own lane's candidate pool.
+        * A cwid is Cornell only if it carries the explicit `cornell-ithaca` campus
+          marker, not merely some `cornell-`-prefixed type. The sync emits that marker
+          first on every record it writes, so requiring it costs nothing and means a
+          future `cornell-`-prefixed type landing on a WCM person cannot silently
+          deport them.
+
+        No try/except, deliberately. If this query fails the campus labels are unknown,
+        and the safe reading of "unknown" is NOT "everybody is WCM" -- that is exactly
+        the silent R1 regression this scope exists to prevent. Failing here aborts the
+        load, and every AAR caller already wraps its lane so a failure skips the run
+        loudly instead of degrading the ranking quietly."""
+        by_cwid = {}
+        for cwid, ptype in conn.execute(text(
+                "SELECT personIdentifier, personType FROM person_person_type "
+                "WHERE personType LIKE 'cornell-%'")):
+            by_cwid.setdefault(cwid, set()).add(ptype)
+        return {k: frozenset(v) for k, v in by_cwid.items() if CAMPUS_ITHACA in v}
+
     @classmethod
-    def load(cls):
+    def load(cls, campus=CAMPUS_WCM):
         eng = create_engine(
             f"mysql+pymysql://{os.environ['DB_USERNAME']}:{os.environ['DB_PASSWORD']}"
             f"@{os.environ['DB_HOST']}/{os.environ['DB_NAME']}",
@@ -375,20 +542,32 @@ class IdentityIndex:
                 "FROM identity i "
                 "LEFT JOIN person p ON p.personIdentifier = i.cwid "
                 "WHERE i.surname IS NOT NULL AND i.surname <> ''")).mappings().all()
-        return cls([cls._record(r) for r in rows])
+            campus_types = cls._campus_person_types(c)
+        return cls([cls._record(r, campus_types.get(r["cwid"], ())) for r in rows],
+                   campus=campus)
 
     @staticmethod
-    def _record(r):
+    def _record(r, campus_types=()):
         """One index record. `end_year` = the LATEST of the faculty/student WCM end
         years (both YEAR ints; None when both are null). Taking the max is the
         conservative reading — it penalises least — for the people who were here
         twice (student then faculty); which of the two really means "left WCM" is
-        an open question on issue #159, so a reviewer can overrule this."""
-        ptype, historical = "Other / CTSC", False
-        for col, label, hist in PERSON_TYPES:
-            if str(r[col]).lower() == "yes":
-                ptype, historical = label, hist
-                break
+        an open question on issue #159, so a reviewer can overrule this.
+
+        `campus_types` is this cwid's `cornell-*` person types from
+        `_campus_person_types`, empty for everybody on the WCM roster. Empty is the
+        only shape it has today (the query returns 0 rows), so the WCM branch below is
+        byte-for-byte the pre-campus code and every field it produces is unchanged."""
+        if campus_types:
+            campus = CAMPUS_ITHACA
+            ptype, historical = cornell_person_type(campus_types)
+        else:
+            campus = CAMPUS_WCM
+            ptype, historical = "Other / CTSC", False
+            for col, label, hist in PERSON_TYPES:
+                if str(r[col]).lower() == "yes":
+                    ptype, historical = label, hist
+                    break
         given = r["givenName"] or ""
         ends = [y for y in (r["endDateWCMFaculty"], r["endDateWCMStudent"]) if y]
         return {
@@ -408,6 +587,11 @@ class IdentityIndex:
             "title": r["primaryTitle"] or "",
             "person_type": ptype, "historical": historical,
             "end_year": max(ends) if ends else None,
+            # WCM for every row this builds today; the scope in __init__ reads it.
+            # Cornell records carry no WCM end year, so `temporal_penalty` is inert
+            # for them -- correct, not an oversight: endDateWCMFaculty/Student are
+            # WCM appointment columns and mean nothing about an Ithaca netid.
+            "campus": campus,
         }
 
     def candidates(self, last, fore=None, initials=None, affiliations=None, top_k=5,
@@ -1195,6 +1379,192 @@ def _selftest():
          onc.candidates("Roe", "Ann", "A", ["Memorial Sloan Kettering Cancer Center, "
                                             "New York, NY"])[0][0]["affil_dept_match"]
          is False),
+    ]
+
+    # --- campus scope: R1, the rarity term Cornell Ithaca would take from WCM -----
+    # The measured damage (onboarding plan, risk R1): loading 15,030 Cornell Ithaca
+    # people grows the surname+initial cohort of 5,751 WCM people, and takes 1,161 of
+    # them from cohort 1 to cohort >1 -- from the matcher's strongest signal, a rarity
+    # term of 0.40/1, to 0.20, in favour of a rival who can never be the right answer.
+    #
+    # `cornell` records here carry campus=CAMPUS_ITHACA the way `_record` sets it from
+    # the `cornell-ithaca` marker in person_person_type.
+    def ithaca(given, surname, cwid, types=("cornell-ithaca", "cornell-faculty")):
+        label, hist = cornell_person_type(types)
+        return dict(rec(given, "", surname, cwid=cwid),
+                    campus=CAMPUS_ITHACA, person_type=label, historical=hist)
+
+    # A WCM person who is today the UNIQUE holder of their surname+initial, and an
+    # Ithaca homonym who would join that cohort.
+    wcm_unique = rec("Robert", "", "Vanderlan", cwid="rov2001")
+    ith_rival = ithaca("Rachel", "Vanderlan", "rbv44")
+    scoped = IdentityIndex([wcm_unique, ith_rival])                 # default: WCM
+    scoped_cands, scoped_cohort = scoped.candidates("Vanderlan", "Robert", "R")
+    # The counterfactual, and the reason this test has teeth: the SAME two people in
+    # one flat pool, which is exactly what today's unscoped index becomes the morning
+    # after the load.
+    flat = IdentityIndex([wcm_unique, dict(ith_rival, campus=CAMPUS_WCM)])
+    flat_cands, flat_cohort = flat.candidates("Vanderlan", "Robert", "R")
+    checks += [
+        ("R1: a WCM person unique on surname+initial STAYS unique once Ithaca "
+         "homonyms exist -- cohort 1, rarity term 0.40, top pick unchanged",
+         scoped_cohort == 1 and len(scoped_cands) == 1
+         and scoped_cands[0]["cwid"] == "rov2001"
+         and scoped_cands[0]["confidence"] == 0.90),
+        ("...and the counterfactual proves the damage is real: unscoped, the same "
+         "Ithaca rival doubles the cohort and halves the rarity term (0.90 -> 0.70)",
+         flat_cohort == 2 and flat_cands[0]["confidence"] == 0.70),
+        ("the excluded records are counted, not silently dropped",
+         scoped.n_other_campus == 1 and flat.n_other_campus == 0),
+    ]
+
+    # (b) a Cornell authorship still finds its Cornell candidate -- the scope is a
+    # scope, not a Cornell blocklist. Same two records, Ithaca-scoped.
+    ith_idx = IdentityIndex([wcm_unique, ith_rival], campus=CAMPUS_ITHACA)
+    ith_cands, ith_cohort = ith_idx.candidates("Vanderlan", "Rachel", "R")
+    checks += [
+        ("R1: an Ithaca-scoped index still resolves an Ithaca byline to its Ithaca "
+         "person", ith_cohort == 1 and len(ith_cands) == 1
+         and ith_cands[0]["cwid"] == "rbv44"),
+        ("...and the WCM person is not in that pool either -- the exclusion runs "
+         "BOTH ways, so neither lane contaminates the other",
+         ith_idx.n_other_campus == 1
+         and "rov2001" not in {c["cwid"] for c in ith_cands}),
+        # A surname held ONLY on the WCM roster is invisible to the Ithaca scope --
+        # the byline resolves to nobody rather than to whoever happens to be nearest.
+        # (The pair above deliberately cannot show this: 'Robert' and 'Rachel' share
+        # the initial 'R', so the Ithaca Vanderlan is a legitimate Ithaca-scope
+        # candidate for that byline. Sharing an initial inside one campus is ordinary
+        # homonym ranking; the cross-campus leak is what this scope is about.)
+        ("a surname held only on the WCM roster resolves to nobody in the Ithaca "
+         "scope, instead of reaching across campuses for a rival",
+         IdentityIndex([rec("Stefan", "", "Worgall", cwid="stw2004"), ith_rival],
+                       campus=CAMPUS_ITHACA).candidates("Worgall", "Stefan", "S")
+         == ([], 0)),
+    ]
+
+    # Scoping must not disturb WCM ranking among WCM people: the same WCM cohort,
+    # scored with and without Ithaca records present, is identical field for field.
+    wcm_pair = [rec("John", "", "Smith", cwid="wcm1"),
+                rec("James", "", "Smith", cwid="wcm2")]
+    clean, clean_cohort = IdentityIndex(wcm_pair).candidates("Smith", None, "J")
+    noisy, noisy_cohort = IdentityIndex(
+        wcm_pair + [ithaca("Jane", "Smith", f"ith{i}") for i in range(6)]
+    ).candidates("Smith", None, "J")
+    checks.append(
+        ("R1: adding six Ithaca Smiths changes nothing about the WCM Smiths -- same "
+         "order, same cohort_size, same confidence, same everything",
+         clean == noisy and clean_cohort == noisy_cohort == 2))
+
+    # The default scope is WCM, and a record with NO campus key is WCM -- which is
+    # what makes this a no-op for every existing caller and for every hand-built
+    # record in this file and in aar_matcher / aar_sweep_stale's self-tests.
+    checks += [
+        ("default scope is WCM", IdentityIndex([]).campus == CAMPUS_WCM),
+        ("a record with no `campus` key is WCM, so no existing caller changes",
+         "campus" not in rec("Ann", "", "Roe")
+         and IdentityIndex([rec("Ann", "", "Roe")]).n_other_campus == 0),
+    ]
+
+    # --- campus marker: which cwids `load()` treats as Cornell -------------------
+    # `_campus_person_types` against a stub connection, so the two narrownesses that
+    # guard measured false positives are held by the test and not only by prose.
+    class _StubConn:
+        def __init__(self, rows): self.rows = rows
+        def execute(self, *_a, **_kw): return self.rows
+
+    marker = IdentityIndex._campus_person_types(_StubConn([
+        ("ith1", "cornell-ithaca"), ("ith1", "cornell-faculty"),
+        ("ith2", "cornell-ithaca"),
+        ("nomarker", "cornell-faculty"),        # cornell- prefixed, no campus marker
+    ]))
+    checks += [
+        ("a cwid carrying the `cornell-ithaca` marker is Cornell, with all of its "
+         "cornell- types",
+         marker.get("ith1") == frozenset({"cornell-ithaca", "cornell-faculty"})
+         and marker.get("ith2") == frozenset({"cornell-ithaca"})),
+        ("a cwid with a cornell- type but NO campus marker is NOT deported off the "
+         "WCM roster", "nomarker" not in marker),
+        ("the SQL prefix is `cornell-%`, never `%cornell%`: `affiliate-cornell` is a "
+         "live WCM person type on 483 people and must not match",
+         "cornell-%" in IdentityIndex._campus_person_types.__doc__
+         and not "affiliate-cornell".startswith("cornell-")),
+    ]
+
+    # --- R6: Cornell person types and the historical flag ------------------------
+    # Without CORNELL_PERSON_TYPES every Cornell candidate renders "Other / CTSC"
+    # (the WCM fallback) and historical=False, so Cornell emeriti and alumni miss the
+    # -0.10 their WCM equivalents get.
+    checks += [
+        ("R6: a Cornell faculty member is not 'Other / CTSC'",
+         cornell_person_type(["cornell-ithaca", "cornell-faculty"])
+         == ("Cornell Faculty", False)),
+        ("R6: the campus marker alone still yields a campus label, not the WCM "
+         "fallback", cornell_person_type(["cornell-ithaca"])
+         == ("Cornell Ithaca", False)),
+        ("R6: an emeritus gets the historical flag",
+         cornell_person_type(["cornell-ithaca", "cornell-emeritus"])
+         == ("Cornell Emeritus", True)),
+        ("R6: so do alumni, retirees, retired faculty, former postdocs and the "
+         "inactive -- the whole terminal set",
+         all(cornell_person_type(["cornell-ithaca", t])[1] for t in
+             ("cornell-alumni", "cornell-retiree", "cornell-retired-faculty",
+              "cornell-former-postdoc", "cornell-inactive"))),
+        ("R6: a current role does NOT clear the historical flag -- Cornell's "
+         "is_faculty is a current-role flag an emeritus commonly still carries, so "
+         "coupling the flag to the winning label would lose exactly the people R6 "
+         "names", cornell_person_type(
+             ["cornell-ithaca", "cornell-faculty", "cornell-emeritus"])
+         == ("Cornell Faculty", True)),
+        ("R6: a Cornell student is a student, not 'Other / CTSC'",
+         cornell_person_type(["cornell-ithaca", "cornell-student-grad"])
+         == ("Cornell Student (Graduate)", False)),
+        ("R6: no Cornell label can ever collide with a WCM one",
+         not ({lbl for _, lbl, _ in CORNELL_PERSON_TYPES} | {"Cornell Ithaca"})
+         & ({lbl for _, lbl, _ in PERSON_TYPES} | {"Other / CTSC"})),
+    ]
+
+    # ...and the flag actually reaches the curator-facing confidence, which is the
+    # whole point of R6's second half: -0.10, the same term a WCM alumnus gets.
+    emerita = ithaca("Ruth", "Ostrom", "rjo7", ("cornell-ithaca", "cornell-emeritus"))
+    active = ithaca("Rhea", "Ostrom", "rho8", ("cornell-ithaca", "cornell-faculty"))
+    r6_cands, _ = IdentityIndex([emerita, active],
+                                campus=CAMPUS_ITHACA).candidates("Ostrom", None, "R")
+    r6 = {c["cwid"]: c for c in r6_cands}
+    checks += [
+        ("R6: the historical penalty reaches confidence for a Cornell emerita, "
+         "exactly as it does for a WCM alumnus (-0.10)",
+         r6["rjo7"]["confidence"] == round(r6["rho8"]["confidence"] - 0.10, 3)),
+        ("R6: and the label the curator reads is the Cornell one",
+         r6["rjo7"]["person_type"] == "Cornell Emeritus"
+         and r6["rho8"]["person_type"] == "Cornell Faculty"),
+    ]
+
+    # The WCM branch of `_record` is untouched: same columns in, same person_type,
+    # historical and campus out, for a row carrying no Cornell types.
+    _wcm_row = dict({c: None for c in _PTYPE_COLS}, cwid="abc1234", givenName="Ann",
+                    middleName="", surname="Roe", primaryAcademicDepartment=None,
+                    primaryAcademicDivision=None, primaryTitle=None,
+                    primaryProgram=None, endDateWCMFaculty=None,
+                    endDateWCMStudent=None, prefFirstName=None)
+    plain = IdentityIndex._record(dict(_wcm_row, alumniMD="yes"))
+    faculty = IdentityIndex._record(dict(_wcm_row, fullTimeFaculty="yes"))
+    checks += [
+        ("_record's WCM branch is unchanged: the PERSON_TYPES loop still wins and "
+         "still sets historical",
+         (plain["person_type"], plain["historical"]) == ("Alumni MD", True)
+         and (faculty["person_type"], faculty["historical"])
+         == ("Full-Time Faculty", False)),
+        ("...and every row _record builds with no Cornell types is WCM, which is "
+         "every row it builds today (the marker query returns 0 rows)",
+         plain["campus"] == faculty["campus"] == CAMPUS_WCM),
+        ("_record with Cornell types yields an Ithaca record, so `load()` needs no "
+         "second code path",
+         IdentityIndex._record(_wcm_row, ("cornell-ithaca", "cornell-postdoc"))
+         ["campus"] == CAMPUS_ITHACA
+         and IdentityIndex._record(_wcm_row,
+                                   ("cornell-ithaca", "cornell-postdoc"))
+         ["person_type"] == "Cornell Postdoc"),
     ]
 
     ok = True
