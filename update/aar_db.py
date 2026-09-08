@@ -164,6 +164,27 @@ def upsert(rows):
     return n
 
 
+def existing_author_keys(keys):
+    """The subset of `keys` already present in the table.
+
+    Lets a recovery backfill insert only NEW authorships. `upsert` preserves a curator's
+    status/resolution/reviewer/note, but it refreshes every producer-owned column in
+    _REFRESH_COLS, so re-exploding an article to add one missing authorship also rewrites
+    the stored proposal for every OTHER authorship on it from the current matcher. That
+    is the CLASS B drift aar_reconcile_open.py deliberately withholds by default, and a
+    backfill has no business applying it as a side effect."""
+    keys = sorted({k for k in keys if k})
+    if not keys:
+        return set()
+    stmt = text(f"SELECT author_key FROM {TABLE} WHERE author_key IN :ks") \
+        .bindparams(bindparam("ks", expanding=True))
+    found = set()
+    with engine().connect() as c:
+        for i in range(0, len(keys), 500):
+            found.update(r[0] for r in c.execute(stmt, {"ks": keys[i:i + 500]}))
+    return found
+
+
 def dup_flags_by_doi(dois):
     """doi -> {uid, ...}: EVERY person a DOI is already added for in reciterdb
     `external_article` (the nightly ExternalArticle projection,

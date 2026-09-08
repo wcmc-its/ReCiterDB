@@ -1030,7 +1030,7 @@ def _selftest():
 
 
 def run_backfill(state_dir, run_date, workers=16, batch_size=500, limit=None, write_db=True,
-                 before=None, pmid_file=None):
+                 before=None, pmid_file=None, only_new=False):
     """Re-processes pmids previously logged as article-level 'attributed' -- under the
     OLD gate these were skipped at step 3 entirely, so any co-author who wasn't the
     one already attributed (e.g. prs4005 on PMID 41000987) was never scored or
@@ -1041,6 +1041,16 @@ def run_backfill(state_dir, run_date, workers=16, batch_size=500, limit=None, wr
     (idempotent by author_key, never touches an existing curator decision; does NOT
     also append to ledger.csv/processed_log -- those stay accurate as article-level
     records, this only backfills the PM-facing per-authorship sink).
+
+    `only_new` upserts ONLY author_keys the table does not already hold. A re-explode
+    otherwise refreshes every producer-owned column on every row it regenerates -- the
+    upsert preserves curator status/resolution/reviewer/note, but the PROPOSAL (top_cwid,
+    classification, scores, candidate_cwids_json) is rewritten from the current matcher.
+    That is precisely the CLASS B drift aar_reconcile_open.py gates behind
+    --include-sideways/--include-drift and withholds by default, so a recovery backfill
+    must not apply it as a side effect: re-exploding the 1,443 pmids that carry a
+    no-identity-match authorship would have refreshed 1,492 existing rows, 496 of them
+    curator-resolved. Use it whenever the point of the run is to ADD rows.
 
     `before` (YYYY-MM-DD, matched against processed_log.first_seen) is what keeps this
     targeted. 'attributed' meant "skipped at step 3" only under the OLD article-level
@@ -1085,7 +1095,7 @@ def run_backfill(state_dir, run_date, workers=16, batch_size=500, limit=None, wr
     print(f"Backfill: {len(pmids)} pmids to re-explode "
           f"({len(store.processed)} in processed_log; scope = {scope})", flush=True)
     groups = uni.load_home_institution_groups()
-    total_rows = 0
+    total_rows = total_skipped = 0
     n_batches = -(-len(pmids) // batch_size) if pmids else 0
     for bi, i in enumerate(range(0, len(pmids), batch_size), 1):
         chunk = pmids[i:i + batch_size]
@@ -1123,6 +1133,12 @@ def run_backfill(state_dir, run_date, workers=16, batch_size=500, limit=None, wr
             {(a["pmid"], top["cwid"]) for a, _j, _n, _au, _c, top in resolved_auth
              if top and (top.get("final_score") or 0) >= gate.STORAGE_THRESHOLD})
         db_rows = _db_rows(resolved_auth, run_date, chunk_attr, chunk_holds)
+        if only_new:
+            have = aar_db.existing_author_keys(r["author_key"] for r in db_rows)
+            skipped = len(db_rows)
+            db_rows = [r for r in db_rows if r["author_key"] not in have]
+            skipped -= len(db_rows)
+            total_skipped += skipped
         total_rows += len(db_rows)
         if write_db:
             aar_db.upsert(db_rows)
@@ -1131,7 +1147,8 @@ def run_backfill(state_dir, run_date, workers=16, batch_size=500, limit=None, wr
               f"{f' ({len(missing)} NOT RETURNED by EFetch)' if missing else ''} -> "
               f"{len(authorships)} authorships ({len(pool)} newly IO-scored)", flush=True)
     print(f"Backfill done: {total_rows} authorship_review rows "
-          f"{'COMPUTED (DRY RUN, no DB write)' if not write_db else 'upserted'}",
+          f"{'COMPUTED (DRY RUN, no DB write)' if not write_db else 'upserted'}"
+          f"{f'; {total_skipped} existing rows left untouched (--only-new)' if only_new else ''}",
           flush=True)
     return total_rows
 
@@ -1155,6 +1172,10 @@ def main():
     ap.add_argument("--before", default=None,
                     help="backfill only: restrict to processed_log rows with "
                          "first_seen < this YYYY-MM-DD (pass the #160 deploy date)")
+    ap.add_argument("--only-new", action="store_true",
+                    help="backfill only: upsert only author_keys not already in the "
+                         "table, so a recovery run adds rows without refreshing (and "
+                         "possibly drifting) the proposals on existing ones")
     ap.add_argument("--no-db", action="store_true",
                     help="skip the reciterdb.authorship_review sink (CSV/state only)")
     ap.add_argument("--s3-state", action="store_true",
@@ -1175,7 +1196,8 @@ def main():
 
     if args.mode == "backfill":
         # DB sink only -- no ledger/processed_log mutation, so no _s3_push_state.
-        run_backfill(args.state_dir, args.run_date, workers=args.workers,
+        run_backfill(args.state_dir, args.run_date, only_new=args.only_new,
+                     workers=args.workers,
                      limit=args.max, write_db=not args.no_db, before=args.before,
                      pmid_file=args.pmid_file)
         return
