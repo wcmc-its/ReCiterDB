@@ -29,6 +29,11 @@ COPY update/run_all.py ./
 # runs at 12:00 UTC ahead of the reciterdb job -- deliberately NOT in run_all.py.
 COPY update/buildIdentity.py ./
 
+# netid -> WCM cwid bridge for the gated Cornell Ithaca identity source. Read from
+# buildIdentity.py's own directory, so it must land beside it here. .gitignore has
+# update/*.csv, so this file needed `git add -f` -- same trap as scopus_afids.csv.
+COPY update/netid_cwid_bridge_2026-09-03.csv ./
+
 # AAR Scopus lane (not-in-PubMed WCM authorship detector — weekly, gated in run_all.py)
 COPY update/identity_index.py ./
 COPY update/aar_db.py ./
