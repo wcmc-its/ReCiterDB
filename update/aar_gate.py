@@ -27,8 +27,15 @@ Per-pair status (authoritative, cheap — no 25GB Analysis scan):
 
 "final" is recomputed from the per-user scoring input with the pinned local models
 (reusing the detector): feedback users -> min(fb, io*33)*100; feedback-less users ->
-identity-only*100 (their production pipeline). This matches what the storage filter
-persisted, so "final >= 30" is equivalent to "present in the Analysis".
+identity-only*100 (their production pipeline).
+
+It was long assumed this reproduces the storage filter, so that "final >= 30" is
+equivalent to "present in the Analysis". It is not. The scoring input holds every article
+ReCiter RETRIEVED for the uid; the Analysis holds only what production then scored over
+the filter. Measured 2026-09-08 over the 440 `suggested` pmids in the producer ledger,
+the rescore disagreed on 36 -- 28 of which the orchestrator suppressed into invisibility.
+`production_holds` is the authoritative answer to "is this in the Analysis"; the rescore
+is a RANKING signal, and callers gating on it must confirm against that.
 
 A PMID is ATTRIBUTED (gate drops it) iff some candidate is accepted or suggested_ge30.
 rejected / buried / absent are NOT attribution (a reject by A doesn't make it B's;
@@ -197,6 +204,51 @@ def attributions(pmids):
     for (pmid, cwid), (pos, names) in per_person.items():
         out.setdefault(pmid, []).append((cwid, pos, tuple(names)))
     return out
+
+
+def production_holds(pairs):
+    """(pmid, cwid) -> production's OWN authorshipLikelihoodScore, for the pairs it holds.
+
+    The header's correction, in code. A local rescore of >=STORAGE_THRESHOLD was taken to
+    mean "present in the Analysis"; it does not, for ~8% of the authorships the
+    orchestrator suppresses on it. The rescore reads the per-uid S3 scoring INPUT, every
+    article ReCiter RETRIEVED for that uid -- including ones production then scored below
+    the storage filter and never persisted. So a pmid can sit in the input, rescore >=30
+    here, and exist in nobody's Analysis.
+
+    Measured 2026-09-08 over the 440 `suggested` pmids in the producer ledger (entrez
+    2026-04-27..09-08): 404 agreed (285 accepted since, 119 a live pending suggestion
+    >=30), 36 did not, and 28 of those 36 reached no queue anywhere -- suppressed here as
+    "already curated" while production showed them to no one. About six articles a month,
+    silently and permanently.
+
+    `person_article` is reciterdb's mirror of the Analysis and answers what the rescore
+    cannot: does production actually hold this authorship, and at what score. A pair
+    missing from the return value is one production is showing nobody.
+
+    Read authorshipLikelihoodScore, NOT totalArticleScoreStandardized -- the latter is a
+    dead column, 0 on every row.
+
+    The mirror is a superset of the live Analysis (it keeps rows the Analysis has since
+    dropped: kty9001 100 vs 90, caa4011 15 vs 14, kmf4001 8 vs 8 on 2026-09-08), so a
+    stale row here suppresses a queue record -- the pre-existing behaviour. Erring the
+    other way would fill the curator queue on mirror lag."""
+    pairs = {(int(p), c) for p, c in pairs if c}
+    if not pairs:
+        return {}
+    stmt = text("SELECT pmid, personIdentifier, authorshipLikelihoodScore "
+                "FROM person_article WHERE pmid IN :ps") \
+        .bindparams(bindparam("ps", expanding=True))
+    pmids = sorted({p for p, _ in pairs})
+    held = {}
+    with _reciterdb().connect() as c:
+        for i in range(0, len(pmids), 1000):
+            for pmid, cwid, als in c.execute(stmt, {"ps": pmids[i:i + 1000]}):
+                key = (int(pmid), cwid)
+                if key in pairs and als is not None:
+                    # a (pmid, cwid) is duplicated on 23 rows; keep the strongest
+                    held[key] = max(float(als), held.get(key, float("-inf")))
+    return held
 
 
 def orphan_pmids(pmids):

@@ -212,7 +212,7 @@ def _byline_owner(byline, attributed):
     return None
 
 
-def _already_curated(top, attributed=(), byline=None):
+def _already_curated(top, attributed=(), byline=None, pmid=None, prod_holds=None):
     """This authorship is already resolved, so it is not a curation record. Three sites
     decide this -- the DB sink, the CSV sink, and the run log -- and they must never
     disagree, so they all call here.
@@ -241,7 +241,22 @@ def _already_curated(top, attributed=(), byline=None):
        that: without them a transient S3 failure would silently reclassify an attributed
        authorship as `absent` and push a spurious row into the curator queue -- a hole
        that could not exist before #160, when attributed articles were never exploded.
-       The anchor row's top_fg_score is NULL, so it took this fail-open path."""
+       The anchor row's top_fg_score is NULL, so it took this fail-open path.
+
+       Signal 3 alone is NOT sufficient, and `prod_holds` is what narrows it. The
+       rescore reads the uid's S3 scoring INPUT -- every article ReCiter retrieved for
+       that person, including ones production scored under the storage filter and never
+       persisted. Over the 440 `suggested` pmids in the ledger (2026-04-27..09-08) the
+       rescore disagreed with production on 36, and 28 of those reached no queue at all:
+       suppressed here, shown by production to nobody, invisible in both systems. So when
+       signals 1 and 2 are both silent -- which, by construction, they are for every one
+       of these, since an unattributed pmid gives `attributed` nothing to match -- ask
+       reciterdb whether production actually holds this authorship at >=threshold, and
+       suppress only if it does. See gate.production_holds.
+
+       prod_holds=None disables the narrowing and restores the pre-fix behaviour. That is
+       the fail-open direction on purpose: an unavailable mirror suppresses, as it always
+       did, rather than emptying the whole rescore-suppressed population into the queue."""
     if top is None:
         return False
     if attributed and any(cwid == top.get("cwid") for cwid, _pos, _names in attributed):
@@ -249,10 +264,15 @@ def _already_curated(top, attributed=(), byline=None):
     if _byline_owner(byline, attributed):
         return True
     fg = top.get("final_score")
-    return fg is not None and fg >= gate.STORAGE_THRESHOLD
+    if fg is None or fg < gate.STORAGE_THRESHOLD:
+        return False
+    if prod_holds is None or pmid is None:
+        return True                                # narrowing unavailable: suppress, as before
+    held = prod_holds.get((int(pmid), top.get("cwid")))
+    return held is not None and held >= gate.STORAGE_THRESHOLD
 
 
-def _db_rows(resolved_auth, run_date, attr_by_pmid=None):
+def _db_rows(resolved_auth, run_date, attr_by_pmid=None, prod_holds=None):
     """authorship_review rows for matched authorships, classified PER-AUTHORSHIP:
     absent (top candidate never scored) / buried (FG<30). An authorship _already_curated
     is skipped entirely rather than hidden behind a PM filter -- see that function for
@@ -276,9 +296,19 @@ def _db_rows(resolved_auth, run_date, attr_by_pmid=None):
             continue                                   # unmatched: nothing to assign
         fg = top.get("final_score")
         byline = _byline(au)
-        if _already_curated(top, attr_by_pmid.get(a["pmid"], ()), byline):
+        if _already_curated(top, attr_by_pmid.get(a["pmid"], ()), byline,
+                            a["pmid"], prod_holds):
             continue                                   # already curated -- not a queue record
-        cls = "absent" if fg is None else "buried"
+        held = (prod_holds or {}).get((int(a["pmid"]), top["cwid"]))
+        if fg is None:
+            cls = "absent"                             # never scored locally
+        elif fg < gate.STORAGE_THRESHOLD:
+            cls = "buried"                             # locally sub-threshold
+        else:
+            # Admitted despite a >=threshold local rescore, so production disagrees.
+            # Classify by what production HAS, not by the rescore that overrode it:
+            # a row it holds sub-threshold is buried, one it holds not at all is absent.
+            cls = "buried" if held is not None else "absent"
         cohort = top.get("cohort_size")
         doi = a.get("doi")
         dup_uid = aar_db.dup_uid_for_authorship(dup_map, doi, top, cands)
@@ -439,9 +469,25 @@ def run(date_from, date_to, state_dir, export_dir, run_date, workers=16, max_rec
                 and top["final_score"] >= gate.STORAGE_THRESHOLD:
             suggested_pmids.add(a["pmid"])
         resolved_auth.append((a, i, n, au, cands, top))
+    # Signal 3's narrowing input: for every authorship the local rescore puts at
+    # >=threshold, what production ITSELF holds for that (pmid, cwid). One batched query.
+    # Without it the rescore alone suppresses, and ~8% of the time production disagrees
+    # and the authorship reaches no queue at all. See gate.production_holds.
+    rescored_ge_t = {(a["pmid"], top["cwid"]) for a, _i, _n, _au, _c, top in resolved_auth
+                     if top and (top.get("final_score") or 0) >= gate.STORAGE_THRESHOLD}
+    prod_holds = gate.production_holds(rescored_ge_t) if rescored_ge_t else {}
+    n_rescue = len(rescored_ge_t) - sum(
+        1 for k in rescored_ge_t
+        if (prod_holds.get((int(k[0]), k[1])) or -1) >= gate.STORAGE_THRESHOLD)
+    T = gate.STORAGE_THRESHOLD
+    log(f"      {len(rescored_ge_t)} authorships rescore >={T}; production holds "
+        f"{len(rescored_ge_t) - n_rescue} of them at >={T} -- {n_rescue} admitted to the "
+        f"queue that the rescore alone would have suppressed")
+
     n_row_suggested = sum(
         1 for a, i, n, au, cands, top in resolved_auth
-        if _already_curated(top, attr_by_pmid.get(a["pmid"], ()), _byline(au)))
+        if _already_curated(top, attr_by_pmid.get(a["pmid"], ()), _byline(au),
+                            a["pmid"], prod_holds))
     log(f"      {len(suggested_pmids)} articles have >=1 authorship already SUGGESTED "
         f"(article-level, informational); {n_row_suggested}/{len(resolved_auth)} individual "
         f"authorships are SUGGESTED and excluded from the curator queue below, "
@@ -452,13 +498,14 @@ def run(date_from, date_to, state_dir, export_dir, run_date, workers=16, max_rec
     # already curated, so _db_rows skips it rather than writing it for PM to filter.
     # Curator status on existing rows is preserved.
     if write_db:
-        db_rows = _db_rows(resolved_auth, run_date, attr_by_pmid)
+        db_rows = _db_rows(resolved_auth, run_date, attr_by_pmid, prod_holds)
         aar_db.upsert(db_rows)
         log(f"      upserted {len(db_rows)} matched authorships -> reciterdb.authorship_review")
 
     new_rows = []
     for a, i, n, au, cands, top in resolved_auth:
-        if _already_curated(top, attr_by_pmid.get(a["pmid"], ()), _byline(au)):
+        if _already_curated(top, attr_by_pmid.get(a["pmid"], ()), _byline(au),
+                            a["pmid"], prod_holds):
             continue                                  # THIS authorship is already suggested/covered
         new_rows.append({
             "pmid": a["pmid"],
@@ -748,6 +795,32 @@ def _selftest():
     check("_db_rows still skips an unmatched authorship (top is None)",
           _db_rows([(auth(None)[0], 0, 1, {}, [], None)], "2026-01-01") == [])
 
+    # ---- signal 3 is not self-sufficient -----------------------------------
+    # The local rescore reads the uid's S3 scoring INPUT, which holds articles production
+    # scored under the storage filter and never persisted. 28 authorships over 2026-04-27
+    # ..09-08 were suppressed on a >=threshold rescore while production showed them to
+    # nobody. prod_holds is reciterdb's answer to "does production actually have this".
+    check("a >=threshold rescore is still suppressed when production holds the pair",
+          _db_rows([auth(T + 1)], "2026-01-01", None, {(1, "aaa1001"): T + 5}) == [])
+    check("a >=threshold rescore is ADMITTED when production holds the pair sub-threshold, "
+          "classified 'buried' from production's score, not the rescore",
+          [r["classification"] for r in
+           _db_rows([auth(T + 1)], "2026-01-01", None, {(1, "aaa1001"): T - 1})]
+          == ["buried"])
+    check("a >=threshold rescore is ADMITTED when production holds no such pair at all, "
+          "classified 'absent'",
+          [r["classification"] for r in
+           _db_rows([auth(T + 1)], "2026-01-01", None, {})] == ["absent"])
+    check("production holding the pmid for a DIFFERENT cwid does not suppress this one",
+          [r["classification"] for r in
+           _db_rows([auth(T + 1)], "2026-01-01", None, {(1, "bbb2002"): 100.0})]
+          == ["absent"])
+    check("prod_holds=None keeps the pre-fix behaviour (suppress on the rescore alone), "
+          "so an unavailable mirror never floods the queue",
+          _db_rows([auth(T + 1)], "2026-01-01", None, None) == [])
+    check("reciterdb attribution still wins outright, whatever the mirror says",
+          _db_rows([auth(T + 1)], "2026-01-01", {1: [("aaa1001", None, ())]}, {}) == [])
+
     # The S3/scoring failure hole. final_score is None on NoSuchKey, cold storage, a
     # malformed artifact, or a scoring exception. Before #160 that never mattered --
     # attributed articles were not exploded at all. Now they are, so without reciterdb's
@@ -1007,17 +1080,23 @@ def run_backfill(state_dir, run_date, workers=16, batch_size=500, limit=None, wr
                                              pub_year=a.get("pub_year"))
             top = cands[0] if cands else None
             resolved_auth.append((a, j, n, au, cands, top))
+        # Computed even on a dry run: --no-db that skips the row build reports 0 and
+        # proves nothing, which is no use for verifying a gate change before it ships.
+        chunk_attr = gate.attributions(chunk) if chunk else {}
+        chunk_holds = gate.production_holds(
+            {(a["pmid"], top["cwid"]) for a, _j, _n, _au, _c, top in resolved_auth
+             if top and (top.get("final_score") or 0) >= gate.STORAGE_THRESHOLD})
+        db_rows = _db_rows(resolved_auth, run_date, chunk_attr, chunk_holds)
+        total_rows += len(db_rows)
         if write_db:
-            chunk_attr = gate.attributions(chunk) if chunk else {}
-            db_rows = _db_rows(resolved_auth, run_date, chunk_attr)
             aar_db.upsert(db_rows)
-            total_rows += len(db_rows)
         missing = [p for p in chunk if p not in by_pmid]
         print(f"  batch {bi}/{n_batches}: {len(chunk)} requested, {len(by_pmid)} fetched"
               f"{f' ({len(missing)} NOT RETURNED by EFetch)' if missing else ''} -> "
               f"{len(authorships)} authorships ({len(pool)} newly IO-scored)", flush=True)
-    print(f"Backfill done: {total_rows} authorship_review rows upserted "
-          f"({'DRY RUN, no DB write' if not write_db else 'written'})", flush=True)
+    print(f"Backfill done: {total_rows} authorship_review rows "
+          f"{'COMPUTED (DRY RUN, no DB write)' if not write_db else 'upserted'}",
+          flush=True)
     return total_rows
 
 
