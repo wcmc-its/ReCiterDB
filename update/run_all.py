@@ -146,13 +146,28 @@ def run_scopus_ithaca_lane_if_due():
     matches nobody in reciterdb.identity — `top is None` -> `unmatched += 1; continue` —
     and no Cornell Ithaca people are in that table yet. Turning this on before the Ithaca
     identity load lands spends a rate-limited Elsevier key on a full sweep and writes
-    zero rows: every authorship it finds is unmatched by construction. Sequence: load the
-    Ithaca identities into reciterdb.identity, confirm identity_index resolves a handful
-    of known Ithaca authors, run `aar_universe_scopus.py --mode rolling --afid-list
-    scopus_afids_cornell_ithaca.csv` as a dry run and read the matched/unmatched counts,
-    then patch the CronJob env to AAR_SCOPUS_ITHACA_LANE=on. An env patch on the live
-    CronJob survives deploys (k8-buildspec only does `kubectl set image`), the same
-    escape hatch as AAR_DRIFT_CADENCE and AAR_PUBMED_LANE_CADENCE.
+    zero rows: every authorship it finds is unmatched by construction.
+
+    The precondition is TWO things, not one, and the second is the dangerous half.
+    `--afid-list` changes which documents the sweep fetches; it does NOT change which
+    roster they are matched against. Both `run()` and `run_backfill()` call a bare
+    `IdentityIndex.load()`, so an Ithaca sweep is scored against whatever roster that
+    default returns — today the flat pool, and the WCM roster once the campus-scope
+    change lands. Matching a Cornell author against a roster that is not the Cornell
+    roster does not merely find nothing: a Cornell surname that collides with a WCM
+    person's yields a confident FALSE ATTRIBUTION to that WCM person, written to
+    authorship_review as a real open row. So the lane must load the Ithaca roster
+    explicitly before it is ever enabled.
+
+    Sequence: (1) land whatever admits Cornell people to reciterdb.identity; (2) land the
+    campus scoping AND thread it through this lane, so the Ithaca invocation loads the
+    Ithaca roster rather than the default one; (3) confirm identity_index resolves a
+    handful of known Ithaca authors; (4) run `aar_universe_scopus.py --mode rolling
+    --afid-list scopus_afids_cornell_ithaca.csv` as a dry run and read the
+    matched/unmatched counts; (5) only then patch the CronJob env to
+    AAR_SCOPUS_ITHACA_LANE=on. An env patch on the live CronJob survives deploys
+    (k8-buildspec only does `kubectl set image`), the same escape hatch as
+    AAR_DRIFT_CADENCE and AAR_PUBMED_LANE_CADENCE.
 
     Same isolation contract as the WCM lane: gated to Sundays, skipped if its API keys
     are absent, and any failure is caught and logged so it can NEVER fail the nightly
