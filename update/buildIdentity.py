@@ -888,6 +888,373 @@ def ed_students_program():
 
 
 # ---------------------------------------------------------------------------
+#                 SOURCE: CORNELL ITHACA  (gated, ships OFF)
+# ---------------------------------------------------------------------------
+#
+# Cornell Ithaca people have no route into this table at all. `identity` is WCM
+# Enterprise Directory + ASMS, and IdentityIndex.load() drives off `identity`, so
+# bulk-loading them into DynamoDB `Identity` puts them in front of the AAR
+# matcher exactly nowhere. This source is that route, and it ships OFF:
+# registration is conditional on IDENTITY_CORNELL_SOURCE, so with the variable
+# unset the function is not in SOURCES, build() never calls it, and the staged
+# WCM rows are byte-for-byte what they were.
+#
+# It is NOT an LDAP enumeration like the sources above. Cornell's directory caps
+# EVERY search at 200 entries -- it is a lookup interface, not a bulk one -- so
+# the population cannot be read out of it. The roster comes from
+# reciterdb.identity_cornell (33,872 rows, loaded once from Cornell's
+# IthacaResearchFaculty.xlsx; there is no live feed), and the directory is asked
+# only "is this netid still there?", 100 netids per OR filter. Ported from
+# scripts/sync_cornell_ithaca_identities.py in the ReCiter Research repo, which
+# proved the shape at this scale on 2026-09-03: 150 batches, 14,222 resolved,
+# 15 seconds.
+
+
+def _cornell_enabled(value):
+    """The env gate. Unset, empty and anything unrecognised all read as off.
+
+    Tests the value rather than presence because os.environ.get returns "" for a
+    variable set to empty -- the same trap k8-cronjob-identity.yaml calls out
+    when it refuses to re-declare LDAP_URL and the five base DNs.
+    """
+    return (value or "").strip().lower() in ("on", "true", "1")
+
+
+# Research-relevant = holds, or has ever held, a role that publishes. Verbatim
+# from the sync script. The `_all` flags are Cornell's "ever was" variants, which
+# is what keeps former grad students and former project researchers in scope: an
+# emeritus professor still needs an identity so a 2021 paper can be attributed to
+# them. The set only grows, which is what a cumulative table wants.
+CORNELL_POPULATION = """(is_faculty OR is_rte_faculty OR is_researcher OR is_postdoc
+    OR is_student_grad_all OR is_rsrch_teach_title OR is_proj_researcher
+    OR is_incubator_assoc OR is_academic
+    OR affiliations_all REGEXP 'emeritus|retired faculty|former postdoc')"""
+
+# Only the seven columns that reach a real `identity` column. The sync selects
+# fourteen more -- role flags, three email columns, ORCID, affiliations_all --
+# because it builds a DynamoDB payload; every one of them would be discarded here
+# by _coerce, which iterates UPSERT_COLUMNS and drops unknown keys without a
+# warning. The non-empty name guard is the one IdentityIndex.load() applies on
+# the other side (`WHERE i.surname IS NOT NULL AND i.surname <> ''`): a row
+# without both names is un-indexable, so it is not worth writing.
+CORNELL_SELECT_SQL = """
+SELECT netid, name, name_first, name_last,
+       primary_department, primary_job_title, primary_business_title
+FROM identity_cornell
+WHERE {population}
+  AND name_first IS NOT NULL AND name_first <> ''
+  AND name_last  IS NOT NULL AND name_last  <> ''
+ORDER BY netid
+"""
+
+# == identity_index.CAMPUS_ITHACA, pinned by an assertion in demo(). The two must
+# agree or the campus scope silently reads every Cornell person as WCM.
+CORNELL_CAMPUS_TYPE = "cornell-ithaca"
+
+# Written on every Cornell record so finalize() can skip the WCM population
+# filters. Not an UPSERT_COLUMN, so _coerce drops it before anything is written.
+CORNELL_MARK = "cornellIthaca"
+
+# Cornell's live directory publishes `cornellEduCWID` for people who ALSO hold a
+# WCM identity. That is the authoritative dedup key: minting under the netid
+# creates a SECOND person for the same human and splits their publications across
+# two uids. Already happening for Martin Wells -- mtw1 (24 pubs) and maw2065 (65
+# pubs) are one person. Measured 2026-09-03: 273 of the 15,030 carry a CWID.
+#
+# ponytail: a dated CSV carried in the image, not a second LDAP attribute. The
+# directory search this source already runs would return cornellEduCWID for one
+# more entry in `attributes`, so regenerating the file is a one-attribute change
+# when the roster next moves. Nothing regenerates it today.
+CORNELL_BRIDGE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "netid_cwid_bridge_2026-09-03.csv")
+
+
+def load_cwid_bridge(path=CORNELL_BRIDGE):
+    """netid -> (WCM cwid, already a ReCiter identity), for every bridged netid."""
+    import csv  # lazy: nothing else in this module reads a CSV
+
+    with open(path, newline="") as fh:
+        return {r["netid"]: (r["cornellEduCWID"], r.get("cwid_in_reciter") == "yes")
+                for r in csv.DictReader(fh)}
+
+
+def _cornell_bridge_skips(bridge, live_cwids):
+    """Bridged netids to drop, on either of two verdicts.
+
+    The CSV's `cwid_in_reciter` was computed against DynamoDB `Identity` -- 57 of
+    the 273. This is a different table: measured 2026-09-07, only 37 of those 57
+    CWIDs have a row in `identity`, and one netid the CSV marks `no` (jje1 ->
+    joe2011, John Eckenrode) does. Either verdict alone splits somebody, so both
+    are honoured -- DynamoDB's because the WCM sources above may add that cwid
+    here tomorrow, this table's because it is the one the matcher reads today.
+    """
+    return {n for n, (cwid, in_reciter) in bridge.items()
+            if in_reciter or (cwid or "").strip().lower() in live_cwids}
+
+
+CORNELL_DIRECTORY_HOST = "query.directory.cornell.edu"
+CORNELL_DIRECTORY_PORT = 636
+CORNELL_DIRECTORY_BASE = "ou=People,o=Cornell University,c=us"
+
+# The directory enforces a hard 200-entry cap per search. 100 netids per OR
+# filter keeps clear of it, and the headroom is for DETECTABILITY rather than
+# politeness: at a batch of 200 a fully-resolving batch returns exactly 200
+# entries and is indistinguishable from a truncated one, so the cap check below
+# could never fire usefully. One netid can also return more than one entry.
+CORNELL_DIRECTORY_BATCH = 100
+CORNELL_DIRECTORY_MAX_ENTRIES = 200
+
+
+def _cornell_batches(seq, size=CORNELL_DIRECTORY_BATCH):
+    seq = list(seq)
+    return [seq[i:i + size] for i in range(0, len(seq), size)]
+
+
+def _cornell_filter(netids):
+    """An OR filter over a batch of netids, each escaped.
+
+    Not routed through ldap_search()'s multi-line flattening -- that helper is
+    for hand-written literal filters; this one is generated and every value has
+    to be escaped, because an unescaped `*` in a netid would silently widen the
+    search.
+    """
+    from ldap3.utils.conv import escape_filter_chars
+
+    return "(|" + "".join(f"(uid={escape_filter_chars(n)})" for n in netids) + ")"
+
+
+def cornell_directory_lookup(netids, batch_size=CORNELL_DIRECTORY_BATCH):
+    """The netids Cornell's live directory still returns, lowercased.
+
+    Its own bind and its own Connection, deliberately: ldap_conn() above is a
+    module-level singleton bound to ED with LDAP_BIND_PASSWORD, and ldap_search()
+    is hard-wired to BASE_DN and to paged_search_generator. Paging does not
+    defeat a server-side 200-entry cap -- batching the FILTER is the mechanism --
+    and binding the wrong directory would return nobody without erroring.
+
+    get_info=None rather than ALL skips the schema fetch, which is why 150
+    batches take 15 seconds. Errors are read off conn.result rather than raised,
+    so raise_exceptions is left off too.
+
+    Absence is expressed by omission. Any search that errors, or comes back at
+    the entry cap, aborts: a partial answer here reads downstream as "these
+    people no longer exist", which would silently shrink the roster.
+    """
+    dn = os.environ.get("CORNELL_ITHACA_ED_DN")
+    pw = os.environ.get("CORNELL_ITHACA_ED_PASS")
+    if not (dn and pw):
+        raise SystemExit(
+            "IDENTITY_CORNELL_SOURCE is on but CORNELL_ITHACA_ED_DN / "
+            "CORNELL_ITHACA_ED_PASS are unset, so no netid can be checked against "
+            "the live directory. The extract behind identity_cornell is dated "
+            "2025-10-16 and has no live feed; admitting people from it unchecked "
+            "mints identities for people who have left.")
+
+    server = Server(CORNELL_DIRECTORY_HOST, port=CORNELL_DIRECTORY_PORT,
+                    use_ssl=True, get_info=None)
+    try:
+        conn = Connection(server, user=dn, password=pw, auto_bind=True)
+    except Exception as exc:            # noqa: BLE001 - the detail echoes the DN
+        raise SystemExit(f"Cornell directory bind failed ({type(exc).__name__}).")
+
+    found = set()
+    batches = _cornell_batches(netids, batch_size)
+    try:
+        for n, batch in enumerate(batches, 1):
+            conn.search(CORNELL_DIRECTORY_BASE, _cornell_filter(batch),
+                        search_scope=SUBTREE, attributes=["uid"], time_limit=120)
+            desc = (conn.result or {}).get("description")
+            if desc != "success":
+                raise SystemExit(
+                    f"Cornell directory search failed on batch {n}/{len(batches)}: "
+                    f"{desc}. Refusing to treat an incomplete answer as absence.")
+            if len(conn.entries) >= CORNELL_DIRECTORY_MAX_ENTRIES:
+                raise SystemExit(
+                    f"Cornell directory returned {len(conn.entries)} entries for "
+                    f"batch {n}/{len(batches)} -- at or over the "
+                    f"{CORNELL_DIRECTORY_MAX_ENTRIES} cap, so the answer is "
+                    f"truncated. Lower CORNELL_DIRECTORY_BATCH.")
+            for entry in conn.entries:
+                uid = (entry.entry_attributes_as_dict.get("uid") or [""])[0]
+                if uid:
+                    found.add(uid.strip().lower())
+            if n % 25 == 0 or n == len(batches):
+                logger.info("cornell directory: %d/%d batches, %d resolved",
+                            n, len(batches), len(found))
+    finally:
+        conn.unbind()
+    return found
+
+
+# Cornell IT assigns netids and WCM IT assigns cwids with no coordination, so the
+# two sequences will eventually issue the same string to two different people.
+# That is worse here than in DynamoDB, not better: a PUT replaces the item and
+# the wrong record is at least visibly wrong, while this upsert MERGES --
+# COALESCE(VALUES(c), c) overwrites the WCM person's name, title and department
+# and leaves their fullTimeFaculty, WCM dates and profile URLs standing,
+# producing a chimera that looks like a valid WCM record and that no existing
+# check would spot. identity.cwid is utf8mb4_unicode_ci, so `abc1234` and
+# `ABC1234` are the same row -- the comparison below is case-folded to match.
+#
+# mtw1 and id93 are the two adjudicated cases, each the same human in both
+# systems. Anything else aborts the build. Measured 2026-09-07: 0 of the 33,872
+# netids exist as an identity.cwid, and that proves nothing about tomorrow, which
+# is why this runs on every build rather than once.
+CORNELL_KNOWN_COLLISIONS = {"mtw1", "id93"}
+
+
+def _cornell_collisions(netids, live_cwids, ours, allowed=CORNELL_KNOWN_COLLISIONS):
+    """Rostered netids that already name somebody else in `identity`.
+
+    `ours` is the set already carrying the campus marker in person_person_type.
+    `identity` has no institution column, so a re-run has no other way to
+    recognise the rows it wrote last night and would otherwise flag all 14k of
+    them as collisions.
+    """
+    return sorted(n for n in netids
+                  if n.lower() in live_cwids
+                  and n.lower() not in allowed
+                  and n.lower() not in ours)
+
+
+def _cornell_middle_name(full, first, last):
+    """Cornell ships NAME as one string; NAME_FIRST/NAME_LAST never carry the
+    middle. Empty unless the full name brackets exactly, so the compound-surname
+    case ("Iwijn De Vlaminck") yields "" rather than a middle name of "De" --
+    that family of empty-middleName/compound-surname rows has bitten ReCiter
+    before.
+    """
+    full, first, last = (full or "").strip(), (first or "").strip(), (last or "").strip()
+    if not (full and first and last):
+        return ""
+    if full.lower().startswith(first.lower()) and full.lower().endswith(last.lower()):
+        return full[len(first):len(full) - len(last)].strip()
+    return ""
+
+
+def _cornell_record(row):
+    """One identity_cornell row -> the `identity` columns a Cornell person has.
+
+    Five columns and the marker, and deliberately no more. Every FLAG_COLUMN is
+    an assertion about a Weill Cornell appointment -- fullTimeFaculty, the four
+    WCM date columns, facultyRank, the alumni flags -- and an Ithaca netid has
+    none of them; IdentityIndex._record never reads them for a Cornell record
+    anyway, because it takes the campus branch and labels from person_person_type.
+    primaryTitle and primaryAcademicDepartment are varchar(200) upstream and
+    varchar(128) here, so _coerce truncates the long ones and says so.
+    """
+    first = (row["name_first"] or "").strip()
+    last = (row["name_last"] or "").strip()
+    return {
+        "surname": last,
+        "givenName": first,
+        "middleName": _cornell_middle_name(row["name"], first, last),
+        "primaryTitle": row["primary_business_title"] or row["primary_job_title"] or "",
+        "primaryAcademicDepartment": row["primary_department"] or "",
+        CORNELL_MARK: "yes",
+    }
+
+
+def cornell_ithaca():
+    """The Cornell Ithaca research population, gated by three checks.
+
+    Order is the sync script's and is load-bearing: the CWID bridge runs first so
+    the directory is only asked about netids that survive it, the live directory
+    second, the namespace collision scan last, against the roster that is
+    actually about to be written.
+    """
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT MAX(update_date) FROM identity_cornell")
+            extract = cur.fetchone()[0]
+            cur.execute(CORNELL_SELECT_SQL.format(population=CORNELL_POPULATION))
+            names = [d[0] for d in cur.description]
+            roster = [dict(zip(names, r)) for r in cur.fetchall()]
+            # `identity` is small enough (35,868 rows, 2026-09-07) to read whole;
+            # it answers both the bridge's live-cwid test and the collision scan.
+            cur.execute("SELECT LOWER(cwid) FROM identity")
+            live_cwids = {c for (c,) in cur.fetchall()}
+            cur.execute("SELECT LOWER(personIdentifier) FROM person_person_type "
+                        "WHERE personType = %s", (CORNELL_CAMPUS_TYPE,))
+            ours = {c for (c,) in cur.fetchall()}
+    finally:
+        conn.close()
+
+    # There is no live feed behind identity_cornell, so the extract goes stale
+    # silently -- 327 days old on 2026-09-07. That is reported, not enforced: the
+    # per-netid directory check below is what turns "the extract is N days old"
+    # from a blanket refusal into a per-person answer, and a hard age limit in an
+    # unattended cron would simply mean this source never runs again.
+    if extract:
+        logger.info("cornell roster: %d rows, extract dated %s (%d days old)",
+                    len(roster), extract, (datetime.date.today() - extract).days)
+
+    rostered = {r["netid"] for r in roster}
+    bridged = _cornell_bridge_skips(load_cwid_bridge(), live_cwids) & rostered
+    roster = [r for r in roster if r["netid"] not in bridged]
+
+    present = cornell_directory_lookup([r["netid"] for r in roster])
+    absent = [r for r in roster if r["netid"].strip().lower() not in present]
+    roster = [r for r in roster if r["netid"].strip().lower() in present]
+    logger.info("cornell: %d rostered, %d skipped by the CWID bridge, %d absent "
+                "from the live directory, %d admitted",
+                len(rostered), len(bridged), len(absent), len(roster))
+
+    collisions = _cornell_collisions([r["netid"] for r in roster], live_cwids, ours)
+    if collisions:
+        raise SystemExit(
+            f"cornell: {len(collisions)} netid(s) already name somebody else in "
+            f"identity and this upsert would merge onto their row: "
+            f"{', '.join(collisions)}. Adjudicate each one, then add it to "
+            f"CORNELL_KNOWN_COLLISIONS or drop it from the roster.")
+
+    # ponytail: this source writes `identity` and NOTHING ELSE, and `identity` has
+    # no campus column to write. IdentityIndex reads campus from
+    # person_person_type (_campus_person_types), whose only writer is
+    # retrieveArticles.py's unfiltered DynamoDB `Identity` scan via
+    # dataTransformer.process_person_person_type -- and that table is dropped and
+    # RENAME-swapped whole every night by setup/person_table_swap.sql, so a second
+    # writer bolted in here would survive less than 24 hours. So the marker has to
+    # arrive the way it already can: scripts/sync_cornell_ithaca_identities.py
+    # PUTs these same netids to /reciter/save/identities/ with person_types()
+    # emitting `cornell-ithaca` first and the rest of CORNELL_PERSON_TYPES after
+    # it, and the nightly reciterdb job lands one row per type. RUN THAT FIRST. A
+    # netid here with no marker is not merely unlabelled: IdentityIndex._record
+    # stamps it CAMPUS_WCM and it joins the WCM candidate pool, which is plan risk
+    # R1 -- 5,834 WCM surname cohorts grow and 1,169 go from cohort 1 to >1. Hence
+    # a loud count rather than silence.
+    unmarked = [r for r in roster if r["netid"].lower() not in ours]
+    if unmarked:
+        logger.warning(
+            "cornell: %d of %d admitted netids have no `%s` row in "
+            "person_person_type - IdentityIndex will index them as WCM (R1). Load "
+            "them into DynamoDB Identity with "
+            "scripts/sync_cornell_ithaca_identities.py first.",
+            len(unmarked), len(roster), CORNELL_CAMPUS_TYPE)
+
+    return {r["netid"]: _cornell_record(r) for r in roster}
+
+
+# Registered ONLY when the gate is on, and registered LAST so merge()'s
+# setdefault leaves every WCM value in place on a shared cwid. Deliberately not
+# the other shape -- "always registered, returns {} when off" -- because build()
+# raises SystemExit on a source that returns 0 rows, which is the guard that stops
+# a silently missing source publishing a partial build, so an always-registered
+# off source would kill the nightly WCM build every night.
+#
+# ponytail: turning this ON is close to a one-way door and nothing here stops it.
+# `identity` is cumulative and the upsert is COALESCE-guarded, so switching the
+# variable back off does not remove the ~14k rows; and the MIN_ROWS_FLOOR baseline
+# is MAX(staged_rows) over 30 days with no lane discriminator, so the first
+# WCM-only build after a Cornell-on run stages ~70% of that baseline and refuses.
+# Both want a `lane` column on identity_build_log; neither is worth a schema
+# change before the first real run.
+if _cornell_enabled(os.getenv("IDENTITY_CORNELL_SOURCE")):
+    source(cornell_ithaca)
+
+
+# ---------------------------------------------------------------------------
 #                                  MERGE
 # ---------------------------------------------------------------------------
 
@@ -931,6 +1298,20 @@ def finalize(merged):
             or "")
 
         if cwid in EXCLUDED_CWIDS:
+            continue
+
+        # Cornell Ithaca rows skip the two WCM population filters below. Those
+        # filters are the SPL's and they answer "does this WCM person belong on
+        # the roster?" out of WCM appointment flags -- which a Cornell person
+        # holds none of, so every Cornell row would be dropped here silently,
+        # leaving a source that logs 14k cwids and stages nothing. Their
+        # membership was already decided upstream, by the research population
+        # predicate and the live-directory gate in cornell_ithaca(). The marker
+        # is not an UPSERT_COLUMN, so _coerce drops it and nothing new reaches
+        # the table; with the source unregistered no record carries it and this
+        # branch never fires.
+        if r.get(CORNELL_MARK):
+            out.append(_coerce(dict(r, cwid=cwid)))
             continue
 
         # `where isnotnull(...)` -- any evidence this person belongs at all.
@@ -1316,6 +1697,84 @@ def demo():
         "highest-priority program wins within a record"
     assert _program_value(_Row([("weillCornellEduProgram", ["MD-PhD Program"])])) \
         == "MD-PhD Program", "single value unaffected"
+
+    # -- Cornell Ithaca source (ships off) ---------------------------------
+    # The gate. Unset, empty, "off" and any junk all read as off; anything else
+    # registering the source would put ~14k Cornell people into the nightly WCM
+    # build without anyone asking for them.
+    assert _cornell_enabled(None) is False, "unset reads as off"
+    assert _cornell_enabled("") is False, "an empty variable reads as off"
+    assert _cornell_enabled("off") is False
+    assert _cornell_enabled("yes") is False, "only on/true/1 enable it"
+    assert _cornell_enabled(" ON ") and _cornell_enabled("True") and _cornell_enabled("1")
+    # Registration follows the gate in BOTH directions. Registering an off source
+    # that returns {} would hit build()'s zero-row SystemExit and kill the WCM
+    # build, so the two must never come apart.
+    assert ("cornell_ithaca" in SOURCES) == \
+        _cornell_enabled(os.getenv("IDENTITY_CORNELL_SOURCE")), \
+        "cornell_ithaca is registered if and only if IDENTITY_CORNELL_SOURCE is on"
+
+    # The campus marker is the whole point of the exercise; if it drifts from
+    # identity_index's constant the scope reads every Cornell person as WCM.
+    from identity_index import CAMPUS_ITHACA
+    assert CORNELL_CAMPUS_TYPE == CAMPUS_ITHACA, "campus marker must match identity_index"
+
+    # One roster row -> exactly the columns a Cornell person has, and no WCM flag.
+    cornell_row = {"netid": "mtw1", "name": "Martin Timothy Wells",
+                   "name_first": "Martin", "name_last": "Wells",
+                   "primary_department": "Statistics and Data Science",
+                   "primary_job_title": "Professor", "primary_business_title": None}
+    rec = _cornell_record(cornell_row)
+    assert rec == {"surname": "Wells", "givenName": "Martin", "middleName": "Timothy",
+                   "primaryTitle": "Professor",
+                   "primaryAcademicDepartment": "Statistics and Data Science",
+                   CORNELL_MARK: "yes"}, rec
+    assert not (set(rec) & FLAG_COLUMNS), "no WCM appointment flag on a Cornell person"
+    assert set(rec) - {CORNELL_MARK} <= set(UPSERT_COLUMNS), "no invented columns"
+    # Compound surname: "De" is not a middle name.
+    assert _cornell_middle_name("Iwijn De Vlaminck", "Iwijn", "De Vlaminck") == ""
+    assert _cornell_middle_name("Andres Arroyo", "Andres", "Arroyo") == ""
+
+    # finalize() keeps it. Without the CORNELL_MARK branch the has_role filter
+    # drops it -- primaryAcademicDepartment satisfies the isnotnull filter but
+    # not the role one, and the two lists are NOT the same list.
+    kept = {r["cwid"]: r for r in finalize({"mtw1": dict(rec)})}
+    assert kept["mtw1"]["surname"] == "Wells", "Cornell row survives finalize"
+    assert kept["mtw1"]["fullTimeFaculty"] is None, "no WCM flag written"
+    assert CORNELL_MARK not in kept["mtw1"], "the marker never reaches the table"
+    assert not finalize({"mtw1": {k: v for k, v in rec.items() if k != CORNELL_MARK}}), \
+        "unmarked, the same row is dropped by the WCM role filter"
+
+    # CWID bridge: skip on DynamoDB's verdict OR on a live row in this table.
+    # jje1 is the case the CSV alone gets wrong (marked `no`, cwid joe2011 is in
+    # `identity`), and admitting it would split John Eckenrode across two rows.
+    bridge = {"aa749": ("ava4001", True), "jje1": ("joe2011", False),
+              "aam346": ("alm4018", False)}
+    assert _cornell_bridge_skips(bridge, {"joe2011"}) == {"aa749", "jje1"}
+    assert _cornell_bridge_skips(bridge, set()) == {"aa749"}, "CSV verdict alone"
+
+    # Namespace collision: a netid already naming somebody else in `identity`
+    # aborts. Case-folded, because identity.cwid is utf8mb4_unicode_ci and the
+    # two would upsert onto one row.
+    assert _cornell_collisions(["aa749"], {"aa749"}, ours=set()) == ["aa749"]
+    assert _cornell_collisions(["AA749"], {"aa749"}, ours=set()) == ["AA749"], \
+        "collision test is case-folded"
+    assert _cornell_collisions(["aa749"], {"aa749"}, ours={"aa749"}) == [], \
+        "our own row from last night is not a collision"
+    assert _cornell_collisions(["mtw1"], {"mtw1"}, ours=set()) == [], "adjudicated"
+    assert _cornell_collisions(["aa749"], set(), ours=set()) == [], "no live row"
+
+    # Batching and filter escaping. The headroom assertion is the invariant, not
+    # the constant: at a batch of 200 a healthy batch is indistinguishable from a
+    # truncated one and the cap check could never fire.
+    assert CORNELL_DIRECTORY_BATCH * 2 <= CORNELL_DIRECTORY_MAX_ENTRIES
+    assert _cornell_batches(range(250), 100) == \
+        [list(range(100)), list(range(100, 200)), list(range(200, 250))]
+    assert _cornell_batches([], 100) == [], "no netids, no searches"
+    assert len(_cornell_batches(range(15030))) == 151, "one batch per 100 rostered"
+    assert _cornell_filter(["a1", "b2"]) == "(|(uid=a1)(uid=b2))"
+    assert _cornell_filter(["a*b"]) == r"(|(uid=a\2ab))", "filter metachars escaped"
+
     print("demo ok")
 
 
