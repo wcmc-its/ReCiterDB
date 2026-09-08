@@ -160,6 +160,28 @@ BUILD_LOG_WINDOW_DAYS = 30
 
 SOURCES = {}
 
+# Sources whose failure must NOT take the nightly WCM build down with it. Every
+# other source is load-bearing: an empty one is how the Splunk job failed
+# silently, so build() still refuses outright for those. Cornell is different --
+# it is an add-on population behind a kill switch, and a stale extract, a dead
+# LDAP bind or a missing marker is a Cornell problem, not a reason WCM identity
+# stops updating. Its seven abort sites raise SystemExit, a BaseException, so a
+# bare `except Exception` would not catch them.
+OPTIONAL_SOURCES = {"cornell_ithaca"}
+
+# What the last build() actually got rows from, which is not the same as what is
+# registered once an optional source can drop out. build_lane() reads this so the
+# recorded lane can never name a population the run did not stage.
+_built_sources = set()
+
+# How many finalized rows a MANDATORY source vouched for, and which optional
+# sources dropped out. MIN_ROWS_FLOOR is enforced on the first (see write()); the
+# second is the difference between "lane wcm because the gate is off" and "lane
+# wcm because Cornell has been broken for a month", which are otherwise
+# indistinguishable in the log and in the exit code.
+_mandatory_rows = 0
+_dropped_sources = None
+
 
 def source(fn):
     """Register a source function. Each returns {cwid: {column: value}}."""
@@ -1308,7 +1330,12 @@ def build_lane():
     start its own baseline, which is the correct behaviour -- a floor is only
     meaningful against runs that staged the same population.
     """
-    return "wcm+cornell" if cornell_ithaca.__name__ in SOURCES else "wcm"
+    # `_built_sources` before SOURCES: with the gate on but Cornell failing, the
+    # run stages ~33k WCM rows, and calling that lane "wcm+cornell" floors it
+    # against a ~47k baseline and refuses to write. Empty (nothing built yet)
+    # falls back to what is registered.
+    return ("wcm+cornell"
+            if cornell_ithaca.__name__ in (_built_sources or SOURCES) else "wcm")
 
 
 # ---------------------------------------------------------------------------
@@ -1324,7 +1351,7 @@ def merge(collected):
     """
     merged = {}
     for name in SOURCES:
-        for cwid, vals in collected[name].items():
+        for cwid, vals in collected.get(name, {}).items():
             record = merged.setdefault(cwid, {})
             for col, val in vals.items():
                 if val in (None, ""):
@@ -1497,43 +1524,70 @@ def write(rows, stage_only=False):
                     staged_rows INT NOT NULL,
                     upserted TINYINT(1) NOT NULL DEFAULT 0,
                     lane VARCHAR(16) NOT NULL DEFAULT 'wcm',
+                    mandatory_rows INT NULL,
+                    dropped_sources VARCHAR(255) NULL,
                     KEY idx_run_at (run_at)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
             cur.execute("ALTER TABLE identity_build_log ADD COLUMN IF NOT EXISTS "
                         "lane VARCHAR(16) NOT NULL DEFAULT 'wcm'")
-            # The floor compares this run against previous runs OF THE SAME LANE.
-            # Without that, one Cornell-on run (~48k staged) raises the 30-day
-            # MAX for every WCM-only run after it (~33k), which is below the 95%
-            # floor -- so flipping IDENTITY_CORNELL_SOURCE back off would refuse
-            # to write the WCM identity build for 30 days. The env var has to be a
-            # real kill switch, so the lane travels with the number it explains.
+            cur.execute("ALTER TABLE identity_build_log ADD COLUMN IF NOT EXISTS "
+                        "mandatory_rows INT NULL")
+            cur.execute("ALTER TABLE identity_build_log ADD COLUMN IF NOT EXISTS "
+                        "dropped_sources VARCHAR(255) NULL")
+            # Every run predating this column ran before any optional source
+            # existed, so all of its rows were mandatory. One-shot and idempotent;
+            # it matches nothing once done. Without it the first run after the
+            # ALTER has no baseline and writes unfloored.
+            cur.execute("UPDATE identity_build_log SET mandatory_rows = staged_rows "
+                        "WHERE mandatory_rows IS NULL")
+
+            # The floor guards the MANDATORY population only, across every lane.
+            # Scoping it by lane instead was two defects, both confirmed:
+            #  - a Cornell that returned SOME of its roster kept the wcm+cornell
+            #    lane, so a ~33k WCM build floored against a ~47k Cornell-inflated
+            #    baseline and refused to write -- every night, until Cornell
+            #    recovered or the 30-day window rolled off. Any Cornell
+            #    contribution from 1 to ~11.8k rows landed in that window.
+            #  - a Cornell that dropped out more than BUILD_LOG_WINDOW_DAYS after
+            #    the gate flip demoted the lane to `wcm`, which by then had NO
+            #    baseline -- so the guard silently switched itself off on exactly
+            #    the run that most needed it.
+            # Counting only what the mandatory sources vouched for makes the WCM
+            # floor immune to anything an optional source does: partial, empty,
+            # absent or broken. `lane` and `staged_rows` stay as the record of
+            # what a run actually staged, which is what makes `staged_rows`
+            # readable at all.
             lane = build_lane()
             cur.execute(
-                "SELECT MAX(staged_rows) FROM identity_build_log "
-                "WHERE upserted = 1 AND lane = %s "
-                "AND run_at > NOW() - INTERVAL %s DAY",
-                (lane, BUILD_LOG_WINDOW_DAYS))
+                "SELECT MAX(mandatory_rows) FROM identity_build_log "
+                "WHERE upserted = 1 AND run_at > NOW() - INTERVAL %s DAY",
+                (BUILD_LOG_WINDOW_DAYS,))
             baseline = cur.fetchone()[0]
+            logger.info("lane %s: %d staged, %d mandatory%s", lane, staged,
+                        _mandatory_rows,
+                        f", dropped {_dropped_sources}" if _dropped_sources else "")
             if baseline:
-                short = staged < baseline * MIN_ROWS_FLOOR
-                logger.info("baseline %d rows from the last %d days",
+                short = _mandatory_rows < baseline * MIN_ROWS_FLOOR
+                logger.info("baseline %d mandatory rows from the last %d days",
                             baseline, BUILD_LOG_WINDOW_DAYS)
             else:
                 short = False
-                logger.warning("no prior %s build in the last %d days - "
+                logger.warning("no prior build in the last %d days - "
                                "floor not enforced on this run",
-                               lane, BUILD_LOG_WINDOW_DAYS)
+                               BUILD_LOG_WINDOW_DAYS)
             if short and not stage_only:
                 raise SystemExit(
-                    f"staged {staged} rows against a recent best of {baseline} "
-                    f"(<{MIN_ROWS_FLOOR:.0%}) - refusing to write")
+                    f"staged {_mandatory_rows} mandatory rows against a recent "
+                    f"best of {baseline} (<{MIN_ROWS_FLOOR:.0%}) - refusing to write")
             if stage_only:
                 # Staged and stopped. identity is untouched, so the diff queries
                 # in docs/IDENTITY_PORT.md can compare the two side by side.
                 # The floor is reported rather than enforced -- a dry run should
                 # always finish and show its numbers.
                 cur.execute("INSERT INTO identity_build_log (staged_rows, "
-                            "upserted, lane) VALUES (%s, 0, %s)", (staged, lane))
+                            "upserted, lane, mandatory_rows, dropped_sources) "
+                            "VALUES (%s, 0, %s, %s, %s)",
+                            (staged, lane, _mandatory_rows, _dropped_sources))
                 conn.commit()
                 logger.info("--dry-run: %d rows staged, identity untouched%s",
                             staged, "  [BELOW FLOOR]" if short else "")
@@ -1545,7 +1599,9 @@ def write(rows, stage_only=False):
                 f"SELECT {cols} FROM identity_staging "
                 f"ON DUPLICATE KEY UPDATE {updates}")
             cur.execute("INSERT INTO identity_build_log (staged_rows, upserted, "
-                        "lane) VALUES (%s, 1, %s)", (staged, lane))
+                        "lane, mandatory_rows, dropped_sources) "
+                        "VALUES (%s, 1, %s, %s, %s)",
+                        (staged, lane, _mandatory_rows, _dropped_sources))
             conn.commit()
             logger.info("upserted %d rows into identity", staged)
     finally:
@@ -1557,20 +1613,49 @@ def write(rows, stage_only=False):
 # ---------------------------------------------------------------------------
 
 def build():
+    global _built_sources, _mandatory_rows, _dropped_sources
     collected = {}
+    dropped = []
     for name, fn in SOURCES.items():
-        rows = fn()
+        optional = name in OPTIONAL_SOURCES
+        try:
+            rows = fn()
+        except (Exception, SystemExit) as exc:      # noqa: BLE001 - see below
+            # SystemExit is a BaseException, so it is named explicitly: the
+            # Cornell source aborts with it in seven places and a bare
+            # `except Exception` would let every one of them through.
+            if not optional:
+                raise
+            logger.error("SOURCE DROPPED: optional source %s failed (%s: %s) - "
+                         "building without it", name, type(exc).__name__, exc)
+            dropped.append(f"{name}:{type(exc).__name__}")
+            continue
         logger.info("source %s: %d cwids", name, len(rows))
         if not rows:
             # An empty source is how the Splunk job failed silently. Never
             # publish a build with a missing source.
-            raise SystemExit(f"source {name} returned 0 rows - refusing to build")
+            if not optional:
+                raise SystemExit(f"source {name} returned 0 rows - refusing to build")
+            logger.error("SOURCE DROPPED: optional source %s returned 0 rows - "
+                         "building without it", name)
+            dropped.append(f"{name}:empty")
+            continue
         collected[name] = rows
+    _built_sources = set(collected)
+    _dropped_sources = ",".join(dropped) or None
 
     merged = merge(collected)
     logger.info("merged: %d cwids", len(merged))
     rows = finalize(merged)
-    logger.info("after filters: %d rows", len(rows))
+    # What MIN_ROWS_FLOOR guards: rows whose cwid a MANDATORY source vouched for.
+    # A cwid that both a mandatory and an optional source produced -- a bridged
+    # Cornell person sharing a WCM cwid -- counts, because that row is a WCM
+    # person either way.
+    mandatory = set().union(*(v for n, v in collected.items()
+                              if n not in OPTIONAL_SOURCES))
+    _mandatory_rows = sum(1 for r in rows if r["cwid"] in mandatory)
+    logger.info("after filters: %d rows (%d from mandatory sources)",
+                len(rows), _mandatory_rows)
     return rows
 
 
@@ -1864,6 +1949,66 @@ def demo():
     assert len(_cornell_batches(range(15030))) == 151, "one batch per 100 rostered"
     assert _cornell_filter(["a1", "b2"]) == "(|(uid=a1)(uid=b2))"
     assert _cornell_filter(["a*b"]) == r"(|(uid=a\2ab))", "filter metachars escaped"
+
+    # -- optional-source isolation -----------------------------------------
+    # With the gate on, every Cornell abort site used to take the nightly WCM
+    # identity build with it. It must not, and the lane must follow.
+    global _built_sources, _mandatory_rows, _dropped_sources
+    _saved = dict(SOURCES)
+    try:
+        def _wcm():
+            return {"abc1001": {"surname": "Doe", "faculty": "yes"}}
+
+        def _boom():
+            raise SystemExit("stale extract")     # a real Cornell abort site
+        SOURCES.clear()
+        SOURCES.update(wcm_stub=_wcm, cornell_ithaca=_boom)
+        assert build_lane() == "wcm+cornell", "registered, nothing built yet"
+        assert [r["cwid"] for r in build()] == ["abc1001"], \
+            "a Cornell SystemExit must not stop the WCM build"
+        assert build_lane() == "wcm", \
+            "a build Cornell did not contribute to is a wcm lane, or the floor " \
+            "compares 33k against a 47k baseline and refuses to write"
+
+        SOURCES["cornell_ithaca"] = dict          # registered, returns nothing
+        assert [r["cwid"] for r in build()] == ["abc1001"], "0 rows is not fatal either"
+        assert build_lane() == "wcm"
+
+        assert _dropped_sources == "cornell_ithaca:empty", _dropped_sources
+
+        SOURCES["cornell_ithaca"] = lambda: {"zzz9001": {"surname": "Ithaca",
+                                                         CORNELL_MARK: "yes"}}
+        assert len(build()) == 2 and build_lane() == "wcm+cornell"
+        assert _dropped_sources is None, "a healthy run drops nothing"
+        # The floor counts ONLY what a mandatory source vouched for, so a Cornell
+        # of any size cannot move it. Scoping the floor by lane instead meant a
+        # partial Cornell -- non-empty, non-raising, and the shape _cornell_marked
+        # is written to RETURN -- floored a 33k WCM build against a 47k baseline
+        # and refused to write every night until it recovered.
+        assert _mandatory_rows == 1, _mandatory_rows
+
+        # A cwid BOTH sources produced is a WCM person, and still counts.
+        SOURCES["cornell_ithaca"] = lambda: {"abc1001": {CORNELL_MARK: "yes"}}
+        build()
+        assert _mandatory_rows == 1, "a bridged cwid is not lost to the floor"
+
+        SOURCES["wcm_stub"] = dict                # a MANDATORY source still aborts
+        try:
+            build()
+        except SystemExit as e:
+            assert "refusing to build" in str(e)
+        else:
+            raise AssertionError("an empty mandatory source must still refuse")
+        SOURCES["wcm_stub"] = _boom               # ... and so does one that raises
+        try:
+            build()
+        except SystemExit as e:
+            assert "stale extract" in str(e), e
+        else:
+            raise AssertionError("a mandatory source's abort must still stop the build")
+    finally:
+        SOURCES.clear(); SOURCES.update(_saved)
+        _built_sources, _mandatory_rows, _dropped_sources = set(), 0, None
 
     print("demo ok")
 
