@@ -372,6 +372,40 @@ TEMPORAL_PENALTY_PER_YEAR = 0.01  # confidence points per stale year beyond the 
 TEMPORAL_PENALTY_CAP = 0.15       # reached at a 20y gap (issue #159's top band boundary)
 
 
+def _display_middle(middle):
+    """Collapse a comma-duplicated middleName, for DISPLAY ONLY.
+
+    `identity.middleName` arrives from the WCM Enterprise Directory legal-name field, and
+    392 of the 910 multi-token values there are comma-joined concatenations of separately
+    recorded names -- "Keith Richards,Keith Richards", "Kwon,Kwon". That is upstream data,
+    not something this pipeline assembles: _display_name printed the field faithfully and
+    the queue rendered "Dylan Kwon,Kwon Kim" for dkk4001, whose identity is otherwise
+    perfectly well formed. Nothing is wrong with the RECORD; what is wrong is showing a
+    curator the same name twice while they are trying to tell two people apart.
+
+    DISPLAY ONLY, and the distinction is load-bearing. The matching tier deliberately
+    consumes the WHOLE unsplit field (`middle_norm`, see the comment in candidates()):
+    splitting it there was implemented, measured and REVERTED, because a bare token like
+    "keith" reaches the `full` given-name tier, `full` leads the sort, and it flipped 7
+    curator-accepted rows onto the wrong person. This function must therefore never be
+    used to build `middle_norm` or anything else the ranking reads -- only the label.
+
+    Comma-separated segments, compared case/space-insensitively, first occurrence kept in
+    order, rejoined with a space. A field with no comma is returned untouched, so the
+    common case is byte-for-byte unchanged."""
+    if not middle or "," not in middle:
+        return middle
+    seen, out = set(), []
+    for part in (p.strip() for p in middle.split(",")):
+        key = _norm(part)
+        if part and key not in seen:
+            seen.add(key)
+            out.append(part)
+    # An all-empty field ("," or ", ,") leaves nothing; return the original rather than
+    # silently turning a present-but-junk value into a blank name component.
+    return " ".join(out) if out else middle
+
+
 def temporal_penalty(years_after_wcm):
     """Graduated demotion for a candidate proposed long after they left WCM.
 
@@ -439,8 +473,9 @@ def _display_name(rec):
     more. Restricting to a differing initial covers 181 of the 460 rows and leaves 279
     -- Gardella among them -- printing a name the byline does not contain.
 
-    Returns today's exact string, byte for byte, whenever either guard fails."""
-    legal = " ".join(x for x in (rec.get("given"), rec.get("middle"),
+    Returns today's exact string, byte for byte, whenever either guard fails -- except
+    that a comma-duplicated middleName collapses for DISPLAY only, see _display_middle."""
+    legal = " ".join(x for x in (rec.get("given"), _display_middle(rec.get("middle")),
                                  rec.get("surname")) if x)
     pref = (rec.get("pref") or "").strip()
     if not pref or _norm(pref) == _norm(rec.get("given")):
@@ -894,6 +929,30 @@ def _selftest():
         ("...which is what keeps a comma-joined concatenation from offering a bare "
          "first name ('Keith' out of 'Keith Richards,Keith Richards')",
          junk.candidates("J", "Keith", "K")[0] == []),
+        # The DISPLAY half of that same defect. The matching assertions directly above
+        # must keep passing unchanged: the label is deduped, the ranking still sees the
+        # whole raw field, and these two live side by side so a future edit cannot quietly
+        # collapse them into one behaviour.
+        ("a comma-duplicated middleName is collapsed in the LABEL",
+         _display_middle("Keith Richards,Keith Richards") == "Keith Richards"),
+        ("...the dkk4001 case, which is what was reported",
+         _display_middle("Kwon,Kwon") == "Kwon"),
+        ("a comma joining two DIFFERENT names keeps both, in order",
+         _display_middle("Kwon,Lee") == "Kwon Lee"),
+        ("duplicates differing only by case or padding still collapse",
+         _display_middle("Kwon, kwon ") == "Kwon"),
+        ("a middleName with no comma is returned untouched, byte for byte",
+         _display_middle("Wing Guinevere") == "Wing Guinevere"),
+        ("empty and None pass straight through",
+         _display_middle("") == "" and _display_middle(None) is None),
+        ("an all-empty comma field is NOT turned into a blank name component",
+         _display_middle(",") == ","),
+        ("the full label for dkk4001 reads once, not twice",
+         _display_name({"given": "Dylan", "middle": "Kwon,Kwon", "surname": "Kim"})
+         == "Dylan Kwon Kim"),
+        # Matching must be unmoved by all of the above.
+        ("the ranking still reads the RAW field, so its behaviour is unchanged",
+         junk.candidates("J", "Keith Richards,Keith Richards", "K")[0] != []),
     ]
 
     # givenName keeps BOTH tiers, untouched: nothing above may narrow it.
