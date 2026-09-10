@@ -107,23 +107,129 @@ def upload_log_to_s3():
         logger.error("Failed to upload logs to S3")
         logger.exception(e)
 
-# ------------- AAR Scopus lane (weekly, isolated) -------------
-def run_scopus_lane_if_due():
-    """Weekly Scopus not-in-PubMed authorship detector (AAR / PM#775).
+# ------------- AAR preflight: is the attribution table whole? -------------
+AAR_GUARD_DDL = """
+CREATE TABLE IF NOT EXISTS aar_lane_guard (
+  metric      VARCHAR(64)  NOT NULL,
+  value       BIGINT       NOT NULL,
+  observed_at DATETIME     NOT NULL,
+  PRIMARY KEY (metric)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+"""
 
-    Fully isolated from the reporting rebuild: gated to Sundays, skipped if its API
-    keys are absent, and any failure is caught and logged so it can NEVER fail the
-    nightly job. A pre-migration DB (missing authorship_review columns) surfaces here
-    as a swallowed script failure, not a pipeline abort."""
+
+def aar_lanes_safe():
+    """Refuse to run the AAR lanes when person_article came back materially short.
+
+    WHY THIS EXISTS. The AAR lanes read person_article to decide what is already
+    attributed — aar_gate, aar_dismiss_byline_owner and aar_reconcile_open all key off it.
+    If the reporting rebuild earlier in this same job read DynamoDB Analysis while
+    reciter-inst-client was still rewriting it, person_article lands partial and every lane
+    then reasons from a table missing attributions. The visible result is not an error: it
+    is a queue full of authorships that are in fact already attributed, plus reconciliation
+    deciding stored evidence is stale when only the input was. That is the shape of the May
+    2026 incident and of the -30% gate-table drop (ReCiterDB #122).
+
+    WHY IT IS A DATA CHECK AND NOT A LIVENESS CHECK. The obvious guard would ask Kubernetes
+    whether an inst-client job is still Running. This pod cannot: it runs as the `default`
+    ServiceAccount, which has no get/list on jobs, and the image ships no k8s client — only
+    requests. Adding RBAC plus a dependency to detect a condition already visible in the
+    data is the wrong trade. A short person_article is the symptom that actually matters,
+    and it also catches upstream failures that have nothing to do with timing.
+
+    HOW. Compare today's row count against the last count that PASSED. Below
+    AAR_LANE_MIN_RATIO (default 0.90) the lanes are skipped and the baseline is deliberately
+    NOT advanced, so a sustained partial state keeps failing instead of quietly becoming the
+    new normal. AAR_LANE_GUARD=off overrides; a fresh DB just records a baseline and runs.
+
+    Isolated like the lanes themselves: any failure here returns True (proceed). A broken
+    guard must not be able to stop the nightly — it is a safety net, not a dependency."""
+    if (os.getenv("AAR_LANE_GUARD") or "").strip().lower() == "off":
+        logger.info("AAR guard: disabled by AAR_LANE_GUARD=off")
+        return True
+    try:
+        from sqlalchemy import text
+        import aar_db
+        ratio = float(os.getenv("AAR_LANE_MIN_RATIO") or "0.90")
+        with aar_db.engine().begin() as cx:
+            cx.execute(text(AAR_GUARD_DDL))
+            now = cx.execute(text("SELECT COUNT(*) FROM person_article")).scalar() or 0
+            prev = cx.execute(text(
+                "SELECT value FROM aar_lane_guard WHERE metric = 'person_article_rows'")).scalar()
+            if prev and now < prev * ratio:
+                logger.error(
+                    f"AAR guard: person_article has {now:,} rows vs {prev:,} at the last good run "
+                    f"({now / prev:.1%} < {ratio:.0%}) — SKIPPING every AAR lane. The reporting "
+                    f"rebuild most likely read Analysis mid-rewrite; check whether a "
+                    f"reciter-inst-client job was still running, and note a hung inst-client pod "
+                    f"stays Running without progressing. Baseline left unchanged, so this keeps "
+                    f"failing until the count recovers or AAR_LANE_GUARD=off.")
+                return False
+            cx.execute(text(
+                "INSERT INTO aar_lane_guard (metric, value, observed_at) "
+                "VALUES ('person_article_rows', :v, NOW()) "
+                "ON DUPLICATE KEY UPDATE value = :v, observed_at = NOW()"), {"v": now})
+            logger.info(f"AAR guard: person_article {now:,} rows"
+                        + (f" (prev {prev:,})" if prev else " — first run, baseline recorded"))
+        return True
+    except Exception as e:
+        logger.exception(f"AAR guard failed (proceeding — it must never block the nightly): {e}")
+        return True
+
+
+# ------------- lane cadence -------------
+def lane_due(cadence, weekday, default):
+    """Is a cadence-gated lane due today? `weekday` is Mon=0..Sun=6.
+
+    Anything that is not exactly "daily" falls through to Sundays-only, so a typo in a
+    CronJob env patch keeps the conservative schedule instead of silently going daily on an
+    API budget nobody re-checked."""
+    return (cadence or default).strip().lower() == "daily" or weekday == 6
+
+
+# ------------- AAR Scopus lane (weekly by default, isolated) -------------
+def run_scopus_lane_if_due():
+    """Scopus not-in-PubMed authorship detector (AAR / PM#775).
+
+    Cadence is env-controlled (AAR_SCOPUS_LANE_CADENCE: "weekly" default — Sundays only —
+    or "daily"), mirroring AAR_PUBMED_LANE_CADENCE so it flips with a CronJob env patch
+    rather than a rebuild; k8-buildspec only does `kubectl set image`, so env set on the
+    live CronJob survives deploys. Default is weekly, so this change is inert until set.
+
+    Daily is CORRECT but not FREE, and the two are worth separating:
+
+      Correct, because overlapping ORIG-LOAD-DATE windows are idempotent via the author_key
+      (see aar_universe_scopus.rolling_window) — the same property the PubMed lane already
+      leans on every night.
+
+      Not free, because the sweep is 135 AF-IDs in chunks of 40 at 25 results/page (COMPLETE
+      view caps there) against Elsevier's weekly-rolling quota, so seven runs of the default
+      76-day window is ~7x the calls. AAR_SCOPUS_SPAN_DAYS narrows the window when running
+      daily: consecutive daily windows still overlap heavily, so coverage is unchanged while
+      the call count falls back to roughly weekly cost. Setting cadence daily WITHOUT a span
+      is the expensive combination — that is the knob to reach for.
+
+    Keep the 14-day lag either way. It is not padding: it exists so Scopus<->PubMed links
+    settle before the sweep reads them, and shortening it re-introduces the false
+    not-in-PubMed rows the lag was added to prevent.
+
+    Fully isolated from the reporting rebuild: keys-gated, timed out, and any failure is
+    caught and logged so it can NEVER fail the nightly job."""
     try:
         import datetime as _datetime
-        if _datetime.datetime.utcnow().weekday() != 6:   # 6 = Sunday
-            logger.info("Scopus lane: not due (runs weekly on Sundays) — skipped")
+        if not lane_due(os.getenv("AAR_SCOPUS_LANE_CADENCE"),
+                        _datetime.datetime.utcnow().weekday(), "weekly"):
+            logger.info("Scopus lane: not due (cadence=weekly, Sundays only) — skipped")
             return
         if not (os.getenv("SCOPUS_API_KEY") and os.getenv("SCOPUS_INST_TOKEN")):
             logger.warning("Scopus lane: SCOPUS_API_KEY/INST_TOKEN unset — skipped")
             return
-        run_script("aarScopusLane", "python3 aar_universe_scopus.py --mode rolling --apply",
+        cmd = "python3 aar_universe_scopus.py --mode rolling --apply"
+        span = (os.getenv("AAR_SCOPUS_SPAN_DAYS") or "").strip()
+        if span.isdigit() and int(span) > 0:
+            cmd += f" --span-days {span}"
+            logger.info(f"Scopus lane: narrowed sweep window to {span} days (AAR_SCOPUS_SPAN_DAYS)")
+        run_script("aarScopusLane", cmd,
                    timeout_seconds=int(os.getenv("SCOPUS_TIMEOUT_SECONDS", "3600")))
     except Exception as e:
         logger.exception(f"Scopus lane failed (ignored — reporting unaffected): {e}")
@@ -240,8 +346,8 @@ def run_pubmed_lane_if_due():
     (source='pubmed')."""
     try:
         import datetime as _datetime
-        cadence = (os.getenv("AAR_PUBMED_LANE_CADENCE") or "daily").strip().lower()
-        if cadence == "weekly" and _datetime.datetime.utcnow().weekday() != 6:   # 6 = Sunday
+        if not lane_due(os.getenv("AAR_PUBMED_LANE_CADENCE"),
+                        _datetime.datetime.utcnow().weekday(), "daily"):
             logger.info("PubMed lane: not due (cadence=weekly, Sundays only) — skipped")
             return
         if not os.getenv("PUBMED_API_KEY"):
@@ -422,12 +528,14 @@ def main():
 
     # Post-reporting projections/lanes — run only if the reporting rebuild succeeded,
     # each isolated so it can never fail the nightly.
-    if overall_success:
-        run_scopus_lane_if_due()              # weekly (Sun): AAR Scopus lane
+    # The AAR lanes all reason from person_article; skip them wholesale if the rebuild above
+    # produced a short one rather than let every lane draw conclusions from it.
+    if overall_success and aar_lanes_safe():
+        run_scopus_lane_if_due()              # weekly (Sun) unless AAR_SCOPUS_LANE_CADENCE=daily
         run_scopus_ithaca_lane_if_due()       # OFF unless AAR_SCOPUS_ITHACA_LANE=on: the same
                                               # weekly (Sun) Scopus lane over the Cornell Ithaca
                                               # AF-ID family; needs the Ithaca identity load first
-        run_pubmed_lane_if_due()              # weekly (Sun): AAR PubMed lane
+        run_pubmed_lane_if_due()              # DAILY by default (AAR_PUBMED_LANE_CADENCE)
         run_conflicts_refresh_if_due()        # weekly (Sun): refill empty COI rows (#130)
         run_aar_close_attributed()            # nightly: dismiss already-attributed open AAR rows (#186)
         run_aar_reconcile_drift_if_due()      # OFF unless AAR_DRIFT_CADENCE is set: refresh open AAR
