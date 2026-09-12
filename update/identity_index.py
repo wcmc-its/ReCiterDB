@@ -20,7 +20,7 @@ records of every other campus are never indexed in the first place. See `CAMPUS_
 
 Env: DB_USERNAME/DB_PASSWORD/DB_HOST/DB_NAME (reciterdb, read-only).
 """
-import os, re, unicodedata
+import logging, os, re, unicodedata
 
 from sqlalchemy import create_engine, text
 
@@ -477,6 +477,10 @@ def _display_name(rec):
     that a comma-duplicated middleName collapses for DISPLAY only, see _display_middle."""
     legal = " ".join(x for x in (rec.get("given"), _display_middle(rec.get("middle")),
                                  rec.get("surname")) if x)
+    # An alternate-name copy (issue #227) already carries the byline's name in
+    # given/middle/surname; the HR legal name rides along as `hr_name`.
+    if rec.get("alt_name"):
+        return f"{legal} (HR: {rec['hr_name']})"
     pref = (rec.get("pref") or "").strip()
     if not pref or _norm(pref) == _norm(rec.get("given")):
         return legal
@@ -486,7 +490,44 @@ def _display_name(rec):
     return f"{publishing} (HR: {legal})"
 
 
+# ---- alternate names (issue #227) -------------------------------------------
+def load_alternate_names():
+    """cwid -> [{firstName, middleName, lastName}, ...] from DynamoDB
+    `Identity.alternateNames` -- the prior / maiden / adopted names ReCiter itself
+    retrieves under, which reciterdb `identity` (HR legal name) and `person`
+    (publishing first name) both lack. Byline "Erika Hissong" (pmid 42644724) proposed
+    nobody although emh9016 (Erika Patel) lists exactly that name.
+
+    Paginated scan, same boto3 shape as retrieveS3.scan_table. On ANY failure -- no
+    boto3, no credentials, no table, throttling -- warn and return {}: the roster must
+    never fail because of this, it just falls back to primary names only."""
+    try:
+        import boto3
+        table = boto3.resource("dynamodb").Table("Identity")
+        kw = dict(ProjectionExpression="uid, #i.alternateNames",
+                  ExpressionAttributeNames={"#i": "identity"})
+        out, resp = {}, table.scan(**kw)
+        while True:
+            for item in resp.get("Items", []):
+                # `or {}` / `or []`: a DynamoDB NULL deserialises to None with the key
+                # PRESENT, so a .get() default never fires (see dataTransformer).
+                alts = (item.get("identity") or {}).get("alternateNames") or []
+                alts = [a for a in alts if isinstance(a, dict)]
+                if item.get("uid") and alts:
+                    out[item["uid"]] = alts
+            if "LastEvaluatedKey" not in resp:
+                return out
+            resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"], **kw)
+    except Exception as e:                                       # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "Identity.alternateNames unavailable (%r); indexing primary names only", e)
+        return {}
+
+
 # ---- identity index --------------------------------------------------------
+_TIER = {"full": 2, "initial": 1, "unknown": 0}   # given_match strength, for the cwid dedupe
+
+
 class IdentityIndex:
     """In-memory index of reciterdb `identity`, keyed by normalised surname, holding
     exactly ONE campus's roster (`campus`, default `CAMPUS_WCM` -- see the campus-scope
@@ -501,15 +542,48 @@ class IdentityIndex:
     the sibling modules' self-tests is therefore WCM, exactly as before, and so is
     every row `_record` builds today (see `_campus_person_types`)."""
 
-    def __init__(self, records, campus=CAMPUS_WCM):
+    def __init__(self, records, campus=CAMPUS_WCM, alternate_names=None):
         self.campus = campus
         self.by_surname = {}
         self.n_other_campus = 0          # observability: how many the scope excluded
+        self.n_alt_names = 0             # ...and how many alternate-name copies were indexed
+        alternate_names = alternate_names or {}
         for r in records:
             if (r.get("campus") or CAMPUS_WCM) != campus:
                 self.n_other_campus += 1
                 continue
             self.by_surname.setdefault(r["surname_norm"], []).append(r)
+            for alt in self._alt_records(r, alternate_names.get(r["cwid"])):
+                self.n_alt_names += 1
+                self.by_surname.setdefault(alt["surname_norm"], []).append(alt)
+
+    @staticmethod
+    def _alt_records(rec, alts):
+        """Copies of `rec` under each DynamoDB alternateName (issue #227), one per
+        distinct (first, last) that differs from the legal name's. The copy IS the
+        person -- same cwid, dept, person type, end year -- indexed under the other
+        surname, so a byline "Erika Hissong" reaches emh9016 (Erika Patel) through the
+        ordinary surname pool and the ordinary given-name tiers, with the alternate's
+        first name standing where givenName and the person-mirror name stand for a
+        primary record. `candidates()` collapses a cwid that lands in one pool twice
+        (primary "Ho-Yee Wong" + alternate "Tommy Wong" both key on "wong"), so no
+        cohort ever counts one person as two homonyms.
+
+        `hr_name` keeps the legal name for `_display_name`, which prints the alternate
+        first (it is what the byline carries) and the HR name behind it (it is what
+        the directory carries) -- the same convention as the publishing-name label."""
+        seen = {(rec["given_norm"], rec["surname_norm"])}
+        for a in alts or []:
+            given = (a.get("firstName") or "").strip()
+            surname = (a.get("lastName") or "").strip()
+            key = (_norm(given), _norm(surname))
+            if not key[1] or key in seen:
+                continue
+            seen.add(key)
+            yield dict(rec, given=given, middle=(a.get("middleName") or "").strip(),
+                       surname=surname, given_norm=key[0], surname_norm=key[1],
+                       pref=given, pref_norm=key[0], alt_name=True,
+                       hr_name=_display_name(dict(rec, pref="")))
 
     @staticmethod
     def _campus_person_types(conn):
@@ -558,7 +632,11 @@ class IdentityIndex:
         return {k: frozenset(v) for k, v in by_cwid.items() if CAMPUS_ITHACA in v}
 
     @classmethod
-    def load(cls, campus=CAMPUS_WCM):
+    def load(cls, campus=CAMPUS_WCM, alternate_names=None):
+        """`alternate_names` = {cwid: [{firstName, middleName, lastName}, ...]};
+        None -> read DynamoDB via `load_alternate_names()` (never raises)."""
+        if alternate_names is None:
+            alternate_names = load_alternate_names()
         eng = create_engine(
             f"mysql+pymysql://{os.environ['DB_USERNAME']}:{os.environ['DB_PASSWORD']}"
             f"@{os.environ['DB_HOST']}/{os.environ['DB_NAME']}",
@@ -579,7 +657,7 @@ class IdentityIndex:
                 "WHERE i.surname IS NOT NULL AND i.surname <> ''")).mappings().all()
             campus_types = cls._campus_person_types(c)
         return cls([cls._record(r, campus_types.get(r["cwid"], ())) for r in rows],
-                   campus=campus)
+                   campus=campus, alternate_names=alternate_names)
 
     @staticmethod
     def _record(r, campus_types=()):
@@ -759,6 +837,20 @@ class IdentityIndex:
             else:
                 given_match = "unknown"            # no usable given on either side
             cohort.append((rec, given_match))
+
+        # ONE CWID AT MOST ONCE (issue #227). A person indexed under both a legal and an
+        # alternate name lands in the same pool twice when the surnames agree ("Ho-Yee
+        # Wong" + alternate "Tommy Wong"); keep the stronger tier, first occurrence on a
+        # tie (the primary is appended first), BEFORE cohort_size is counted, so the
+        # curator never reads "2 WCM homonyms" for one person and the rarity term is
+        # not halved by a self-rival. Same person, same cwid, so nothing downstream
+        # can tell the two apart except the label.
+        best = {}
+        for rec, given_match in cohort:
+            held = best.get(rec["cwid"])
+            if held is None or _TIER[given_match] > _TIER[held[1]]:
+                best[rec["cwid"]] = (rec, given_match)
+        cohort = list(best.values())
 
         cohort_size = len(cohort)
         out = []
@@ -1624,6 +1716,85 @@ def _selftest():
          and IdentityIndex._record(_wcm_row,
                                    ("cornell-ithaca", "cornell-postdoc"))
          ["person_type"] == "Cornell Postdoc"),
+    ]
+
+    # --- DynamoDB Identity.alternateNames (issue #227) ---------------------------
+    # The anchor: pmid 42644724, byline "Erika Hissong", affiliation Weill Cornell
+    # Medicine, proposed NOBODY -- identity has emh9016 as Erika Patel, person mirrors
+    # "Erika", and no index key ever said "hissong", although her Identity item lists
+    # exactly that alternate name.
+    alts = {"emh9016": [{"firstName": "Erika", "middleName": "", "lastName": "Hissong"},
+                        {"firstName": "Erika", "middleName": "M", "lastName": "Patel"}]}
+    patel = dict(rec("Erika", "", "Patel", cwid="emh9016", pref_first="Erika"),
+                 dept="Pathology and Laboratory Medicine")
+    erikas = IdentityIndex([patel], alternate_names=alts)
+    hiss, hiss_cohort = erikas.candidates("Hissong", "Erika", "E")
+    pat, pat_cohort = erikas.candidates("Patel", "Erika", "E")
+    checks += [
+        ("(a) byline 'Erika Hissong' reaches emh9016 through her alternate name: exactly "
+         "one candidate, given_match full (pmid 42644724)",
+         len(hiss) == 1 and hiss_cohort == 1 and hiss[0]["cwid"] == "emh9016"
+         and hiss[0]["given_match"] == "full"),
+        ("(a) ...and the label the curator reads is the alternate name, the HR name "
+         "behind it", hiss[0]["name"] == "Erika Hissong (HR: Erika Patel)"
+         and "Hissong" in hiss[0]["name"]),
+        ("(a) the copy IS the person: dept and person type carry over",
+         hiss[0]["dept"] == "Pathology and Laboratory Medicine"
+         and hiss[0]["person_type"] == "Full-Time Faculty"),
+        ("(b) byline 'Erika Patel' still yields one candidate, cohort 1 -- the "
+         "'Erika M Patel' alternate is the primary name and is NOT indexed again",
+         len(pat) == 1 and pat_cohort == 1 and pat[0]["cwid"] == "emh9016"
+         and pat[0]["name"] == "Erika Patel" and erikas.n_alt_names == 1),
+        ("an alternate with no lastName is skipped, and None/empty lists are inert",
+         IdentityIndex([patel], alternate_names={"emh9016": [
+             {"firstName": "E", "lastName": ""}, {"firstName": "E"}]}).n_alt_names == 0
+         and IdentityIndex([patel], alternate_names={"emh9016": None}).n_alt_names == 0),
+        ("no alternate_names argument -> the index is byte-identical to before (every "
+         "existing caller and hand-built selftest record is unchanged)",
+         IdentityIndex([patel]).by_surname == {"patel": [patel]}
+         and IdentityIndex([patel]).n_alt_names == 0),
+    ]
+
+    # (c) An alternate sharing the SURNAME with a different first name: one person,
+    # two pool entries under "wong". Either byline must reach him at full with a
+    # cohort of ONE -- never "2 WCM homonyms" for one cwid.
+    wongs = IdentityIndex([rec("Ho-Yee", "", "Wong", cwid="hyw2001")], alternate_names={
+        "hyw2001": [{"firstName": "Tommy", "middleName": "", "lastName": "Wong"}]})
+    tommy, tommy_cohort = wongs.candidates("Wong", "Tommy", "T")
+    hoyee, hoyee_cohort = wongs.candidates("Wong", "Ho-Yee", "H")
+    checks += [
+        ("(c) byline 'Tommy Wong' -> one candidate, cohort 1, full",
+         len(tommy) == 1 and tommy_cohort == 1 and tommy[0]["cwid"] == "hyw2001"
+         and tommy[0]["given_match"] == "full"
+         and tommy[0]["name"] == "Tommy Wong (HR: Ho-Yee Wong)"),
+        ("(c) byline 'Ho-Yee Wong' -> one candidate, cohort 1, full",
+         len(hoyee) == 1 and hoyee_cohort == 1 and hoyee[0]["cwid"] == "hyw2001"
+         and hoyee[0]["given_match"] == "full" and hoyee[0]["name"] == "Ho-Yee Wong"),
+        ("(c) the pool really does hold him twice -- the dedupe is in candidates(), "
+         "not in the index", len(wongs.by_surname["wong"]) == 2),
+    ]
+
+    # The same person landing twice at the SAME tier (person mirror already says
+    # "Tommy", and the alternate says it again): still one candidate, the primary
+    # record's label wins the tie, and the rarity term is the cohort-of-one 0.40.
+    both = IdentityIndex([rec("Ho-Yee", "", "Wong", cwid="hyw2001", pref_first="Tommy")],
+                         alternate_names={"hyw2001": [
+                             {"firstName": "Tommy", "lastName": "Wong"}]})
+    twice, twice_cohort = both.candidates("Wong", "Tommy", "T")
+    checks += [
+        ("a cwid in one pool twice at the same tier is one candidate with confidence "
+         "0.90 (0.50 full + 0.40/1), the primary's label on the tie",
+         len(twice) == 1 and twice_cohort == 1 and twice[0]["confidence"] == 0.90
+         and twice[0]["name"] == "Tommy Wong (HR: Ho-Yee Wong)"),
+        ("the dedupe keeps the STRONGER tier when the two entries differ: byline "
+         "'T Wong' reaches the alternate at initial while the primary is excluded",
+         wongs.candidates("Wong", None, "T")[0][0]["given_match"] == "initial"
+         and wongs.candidates("Wong", None, "T")[1] == 1),
+        # A genuinely different person under the alternate surname still counts.
+        ("the dedupe is per cwid, not per surname: a real second Hissong still makes "
+         "a cohort of 2",
+         IdentityIndex([patel, rec("Emily", "", "Hissong", cwid="emh0001")],
+                       alternate_names=alts).candidates("Hissong", None, "E")[1] == 2),
     ]
 
     ok = True
