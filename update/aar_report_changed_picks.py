@@ -374,7 +374,12 @@ def _row_result(r, new_top, source, cands=None):
         "drift": _drift_cols(r, cands) if cls == "UNCHANGED" else [],
     }
     if cls == "CHANGED":
-        rec["tier_move"] = _tier_move(r["top_given_match"], new_top["given_match"])
+        # Nobody -> somebody is strictly stronger. A row the producer nulled (#177) or
+        # never matched has no old tier, and _tier_move would call that "unknown", which
+        # no apply gate accepts -- so a name the index learns later (#227) could never
+        # reach the rows that were opened before it knew the name.
+        rec["tier_move"] = ("stronger" if old_cwid is None
+                            else _tier_move(r["top_given_match"], new_top["given_match"]))
     return rec
 
 
@@ -650,6 +655,10 @@ def _selftest():
     stored = row(base)
     check("a row the producer would write identically today carries no drift",
           _drift_cols(stored, base) == [])
+
+    nulled = dict(stored, top_cwid=None, top_name=None, top_given_match=None, top_confidence=None)
+    check("a row that proposed nobody and now matches someone is a `stronger` pick change (#227)",
+          _row_result(nulled, base[0], "pubmed", base).get("tier_move") == "stronger")
 
     long_cands = [cand("abc123", name="N" * 300, person_type="P" * 100, dept="D" * 300)]
     check("a stored value cut to the VARCHAR width is not mistaken for drift",

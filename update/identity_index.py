@@ -524,6 +524,37 @@ def load_alternate_names():
         return {}
 
 
+# A byline name becomes an alternate only when it sits on at least this many ACCEPTED
+# articles of the cwid. One is not enough: the #171 sample found wrongly-accepted homonym
+# articles among single hits (2 of 4), and a name minted from one of those would pull the
+# homonym's other papers toward the wrong person. Two independent accepts is the cheapest
+# guard that a single curator slip cannot clear.
+ACCEPTED_BYLINE_MIN = 2
+
+_ACCEPTED_BYLINES_SQL = (
+    "SELECT personIdentifier AS cwid, articleAuthorNameFirstName AS fore, "
+    "articleAuthorNameLastName AS last, COUNT(*) AS n FROM person_article "
+    "WHERE userAssertion = 'ACCEPTED' AND articleAuthorNameLastName <> '' "
+    "GROUP BY 1, 2, 3 HAVING n >= :min")
+
+
+def accepted_byline_names(rows):
+    """cwid -> [{firstName, middleName, lastName}] from the names a person's ACCEPTED
+    articles actually carry (rows of `_ACCEPTED_BYLINES_SQL`). The second alternate-name
+    source beside DynamoDB alternateNames: a curator who accepted 40 Hissong papers for
+    emh9016 has already said "Erika Hissong" is her, whether or not anyone typed it into
+    the identity. PubMed's forename field is "Erika M" -- first token is the given name,
+    the rest the middle -- and `_alt_records` drops any pair that is the legal name."""
+    out = {}
+    for r in rows:
+        fore = (r["fore"] or "").split()
+        if not fore:
+            continue
+        out.setdefault(r["cwid"], []).append(
+            {"firstName": fore[0], "middleName": " ".join(fore[1:]), "lastName": r["last"]})
+    return out
+
+
 # ---- identity index --------------------------------------------------------
 _TIER = {"full": 2, "initial": 1, "unknown": 0}   # given_match strength, for the cwid dedupe
 
@@ -634,9 +665,11 @@ class IdentityIndex:
     @classmethod
     def load(cls, campus=CAMPUS_WCM, alternate_names=None):
         """`alternate_names` = {cwid: [{firstName, middleName, lastName}, ...]};
-        None -> read DynamoDB via `load_alternate_names()` (never raises)."""
+        None -> read DynamoDB via `load_alternate_names()` (never raises). The accepted-
+        byline names (`accepted_byline_names`) are always added on top."""
         if alternate_names is None:
             alternate_names = load_alternate_names()
+        alternate_names = {k: list(v or []) for k, v in alternate_names.items()}
         eng = create_engine(
             f"mysql+pymysql://{os.environ['DB_USERNAME']}:{os.environ['DB_PASSWORD']}"
             f"@{os.environ['DB_HOST']}/{os.environ['DB_NAME']}",
@@ -656,6 +689,9 @@ class IdentityIndex:
                 "LEFT JOIN person p ON p.personIdentifier = i.cwid "
                 "WHERE i.surname IS NOT NULL AND i.surname <> ''")).mappings().all()
             campus_types = cls._campus_person_types(c)
+            for cwid, names in accepted_byline_names(c.execute(
+                    text(_ACCEPTED_BYLINES_SQL), {"min": ACCEPTED_BYLINE_MIN}).mappings()).items():
+                alternate_names.setdefault(cwid, []).extend(names)
         return cls([cls._record(r, campus_types.get(r["cwid"], ())) for r in rows],
                    campus=campus, alternate_names=alternate_names)
 
@@ -1795,6 +1831,21 @@ def _selftest():
          "a cohort of 2",
          IdentityIndex([patel, rec("Emily", "", "Hissong", cwid="emh0001")],
                        alternate_names=alts).candidates("Hissong", None, "E")[1] == 2),
+        # (d) the second source: names carried by ACCEPTED articles, first token = given.
+        ("accepted bylines: 'Erika M' / 'Hissong' becomes given Erika, middle M, last Hissong",
+         accepted_byline_names([{"cwid": "emh9016", "fore": "Erika M", "last": "Hissong", "n": 40}])
+         == {"emh9016": [{"firstName": "Erika", "middleName": "M", "lastName": "Hissong"}]}),
+        ("accepted bylines: an empty forename is skipped, others kept",
+         accepted_byline_names([{"cwid": "x", "fore": "", "last": "Q", "n": 2},
+                                {"cwid": "x", "fore": "A", "last": "Q", "n": 2}])
+         == {"x": [{"firstName": "A", "middleName": "", "lastName": "Q"}]}),
+        ("accepted bylines reach the index by the same path: byline 'Erika Hissong' -> emh9016 full",
+         (lambda cs: len(cs) == 1 and cs[0]["cwid"] == "emh9016" and cs[0]["given_match"] == "full")(
+             IdentityIndex([patel], alternate_names=accepted_byline_names(
+                 [{"cwid": "emh9016", "fore": "Erika", "last": "Hissong", "n": 40}]))
+             .candidates("Hissong", "Erika", "E")[0])),
+        ("the accepted-byline threshold is enforced in SQL, at two",
+         "HAVING n >= :min" in _ACCEPTED_BYLINES_SQL and ACCEPTED_BYLINE_MIN == 2),
     ]
 
     ok = True
