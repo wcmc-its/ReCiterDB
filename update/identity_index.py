@@ -608,10 +608,17 @@ class IdentityIndex:
             given = (a.get("firstName") or "").strip()
             surname = (a.get("lastName") or "").strip()
             key = (_norm(given), _norm(surname))
-            if not key[1] or key in seen:
+            # An initial is not a name. An accepted byline "J L Stewart" would otherwise
+            # mint given "J", and byline "J L Stewart" then EXACT-matches it as `full` --
+            # a single letter masquerading as a full-name match, displacing the old pick
+            # (2026-09-12 dry run: S Li, Q Zhou, Y Lin, A Gupta, H Yang, S Mann...). Same
+            # for a one-letter middle: the whole-field middleName rule would let byline
+            # "Y Lin" match middle "Y" of "R Y Lin" as `full`.
+            if len(key[0]) < 2 or not key[1] or key in seen:
                 continue
             seen.add(key)
-            yield dict(rec, given=given, middle=(a.get("middleName") or "").strip(),
+            middle = (a.get("middleName") or "").strip()
+            yield dict(rec, given=given, middle=middle if len(_norm(middle)) >= 2 else "",
                        surname=surname, given_norm=key[0], surname_norm=key[1],
                        pref=given, pref_norm=key[0], alt_name=True,
                        hr_name=_display_name(dict(rec, pref="")))
@@ -883,6 +890,13 @@ class IdentityIndex:
         # can tell the two apart except the label.
         best = {}
         for rec, given_match in cohort:
+            # An alternate name is evidence only when the byline spells it out. Letting it
+            # into the initial tier is the widening #173 measured at 26% precision: byline
+            # "Todd Rosen" reached aer2006 through alternate "Tony Rosen" on T=T, and
+            # "Amanda Castillo" reached Andrew (2026-09-12 dry run, 22 of 50 fills). The
+            # primary record still competes at whatever tier it earns on its own.
+            if rec.get("alt_name") and given_match != "full":
+                continue
             held = best.get(rec["cwid"])
             if held is None or _TIER[given_match] > _TIER[held[1]]:
                 best[rec["cwid"]] = (rec, given_match)
@@ -1822,15 +1836,14 @@ def _selftest():
          "0.90 (0.50 full + 0.40/1), the primary's label on the tie",
          len(twice) == 1 and twice_cohort == 1 and twice[0]["confidence"] == 0.90
          and twice[0]["name"] == "Tommy Wong (HR: Ho-Yee Wong)"),
-        ("the dedupe keeps the STRONGER tier when the two entries differ: byline "
-         "'T Wong' reaches the alternate at initial while the primary is excluded",
-         wongs.candidates("Wong", None, "T")[0][0]["given_match"] == "initial"
-         and wongs.candidates("Wong", None, "T")[1] == 1),
+        ("an initial-only byline does NOT reach a person through an alternate: 'T Wong' "
+         "matches neither Ho-Yee (primary, H) nor alternate Tommy (full tier only)",
+         wongs.candidates("Wong", None, "T") == ([], 0)),
         # A genuinely different person under the alternate surname still counts.
-        ("the dedupe is per cwid, not per surname: a real second Hissong still makes "
-         "a cohort of 2",
-         IdentityIndex([patel, rec("Emily", "", "Hissong", cwid="emh0001")],
-                       alternate_names=alts).candidates("Hissong", None, "E")[1] == 2),
+        ("the dedupe is per cwid, not per surname: a real second Erika Hissong still makes "
+         "a cohort of 2 when the byline spells the name out",
+         IdentityIndex([patel, rec("Erika", "", "Hissong", cwid="emh0001")],
+                       alternate_names=alts).candidates("Hissong", "Erika", "E")[1] == 2),
         # (d) the second source: names carried by ACCEPTED articles, first token = given.
         ("accepted bylines: 'Erika M' / 'Hissong' becomes given Erika, middle M, last Hissong",
          accepted_byline_names([{"cwid": "emh9016", "fore": "Erika M", "last": "Hissong", "n": 40}])
@@ -1846,6 +1859,25 @@ def _selftest():
              .candidates("Hissong", "Erika", "E")[0])),
         ("the accepted-byline threshold is enforced in SQL, at two",
          "HAVING n >= :min" in _ACCEPTED_BYLINES_SQL and ACCEPTED_BYLINE_MIN == 2),
+        # (e) 2026-09-12 dry run: alternates count at `full` only, and initials are not names.
+        ("alternate at the initial tier is NOT a candidate: byline 'Todd Rosen' does not reach "
+         "Tony Rosen (HR Anthony) through alternate 'Tony'",
+         IdentityIndex([rec("Anthony", "Ehren", "Rosen", cwid="aer2006", pref_first="Tony")],
+                       alternate_names={"aer2006": [{"firstName": "Tony", "lastName": "Rosen"}]})
+         .candidates("Rosen", "Todd", "T") == ([], 0)),
+        ("...while the primary record still earns its own initial: byline 'A Rosen' -> aer2006 initial",
+         (lambda cs: len(cs) == 1 and cs[0]["given_match"] == "initial")(
+             IdentityIndex([rec("Anthony", "Ehren", "Rosen", cwid="aer2006", pref_first="Tony")],
+                           alternate_names={"aer2006": [{"firstName": "Tony", "lastName": "Rosen"}]})
+             .candidates("Rosen", "A", "A")[0])),
+        ("an initials-only accepted byline mints NO alternate: 'J L' / 'Stewart' is skipped",
+         IdentityIndex([rec("Jessica", "Lauren", "Stewart", cwid="jls4002")],
+                       alternate_names={"jls4002": [{"firstName": "J", "middleName": "L", "lastName": "Stewart"}]})
+         .n_alt_names == 0),
+        ("a one-letter middle on an alternate is dropped, so byline 'Y Lin' cannot match 'R Y Lin' as full",
+         IdentityIndex([rec("Robert", "Yao-Wen", "Lin", cwid="rol3002")],
+                       alternate_names={"rol3002": [{"firstName": "Rob", "middleName": "Y", "lastName": "Lin"}]})
+         .candidates("Lin", "Y", "Y") == ([], 0)),
     ]
 
     ok = True
