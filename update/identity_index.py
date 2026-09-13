@@ -421,82 +421,78 @@ def temporal_penalty(years_after_wcm):
 
 
 # ---- candidate label -------------------------------------------------------
-def _display_name(rec):
-    """The label a curator reads for a candidate: PUBLISHING name first, HR legal
-    name in parentheses behind it.
+def _display_name(rec, via="directory"):
+    """The label a curator reads for a candidate: ONE name, the FULL name of the source
+    that matched, exactly as that source records it. `via` is the source
+    `candidates()` matched through -- "primary", "directory", "alternate" or
+    "accepted" -- and the same value rides on the candidate dict as `name_source`, so
+    the PM card can badge it. Provenance is a badge; the label is one name.
 
     This is display ONLY. Nothing the matcher reads is derived from it, and it is
     computed after the cohort is fixed, so it cannot touch given_match, confidence,
     cohort_size or the sort.
 
-    WHY the publishing name leads. `person.firstName` mirrors DynamoDB
-    Identity.primaryName -- the name the person actually publishes under -- and since
-    issue #171 it is a first-class route to the `full` given-name tier: a byline can
-    match on it ALONE, with identity.givenName agreeing on nothing, not even the first
-    initial. Labelling that candidate with the legal name shows the curator a name the
-    byline does not contain and hides the one it does. Live anchor: pmid 42670968,
-    byline "Mila Sun", mis4060, given_match `full` off pref_norm -- and the queue
-    printed "Shuo Sun", the legal name, which appears on none of her publications. The
-    row reads as a mismatch the curator should reject; the match is correct.
+    The sources, and what each prints:
 
-    WHY the legal name stays. It is the name in the HR record, the directory and the
-    curator's other systems, and for the compound-surname / adopted-name population it
-    is the only string that joins the two. Dropping it would trade one confusion for
-    another, so both are shown and the parenthetical says which is which.
+      primary    `person.firstName/middleName/lastName` -- the DynamoDB primaryName
+                 mirror, the name the person publishes under, and since issue #171 a
+                 route to the `full` tier on its own: a byline can match pref_norm
+                 ALONE, with identity.givenName agreeing on nothing, not even the
+                 first initial. Live anchor: pmid 42670968, byline "Mila Sun",
+                 mis4060, `full` off pref_norm -- and the queue printed "Shuo Sun",
+                 the directory name, which appears on none of her publications.
+                 Prints `pref_full`; falls back to the directory name when the
+                 person row is missing.
+      directory  reciterdb `identity` (ED ou=people + ASMS): givenName, middleName,
+                 surname. Every match that went through given_norm, the whole-field
+                 middleName rule, the given+middle concatenation, the initial tier or
+                 "unknown" prints this, comma-duplicated middleName collapsed (see
+                 _display_middle). The WHOLE name, middle included, even when the
+                 byline's middle disagrees: "David K Jones" against David Randolph
+                 Jones prints "David Randolph Jones" -- the mismatch is the
+                 information, and a trimmed label would hide it.
+      alternate  a DynamoDB Identity.alternateNames entry (issue #227): the copy's
+                 own given/middle/surname, as recorded.
+      accepted   a name carried by >= ACCEPTED_BYLINE_MIN of the person's ACCEPTED
+                 articles (`accepted_byline_names`): likewise its own name as
+                 recorded, "Erika M Hissong" if that is what PubMed's forename
+                 field said.
 
-    WHEN it fires -- both guards must pass, and each one kills a distinct false
-    positive measured on prod (24,132 identity x person rows, 2026-09-05):
+    WHY one name and not a parenthetical. The old label was "<matched name> (HR:
+    <directory name>)". "HR" was the wrong word (the directory name is ED + ASMS, not
+    an HR feed); it printed the same name twice wherever the two sources agreed
+    ("Sandra Huicochea Castellanos (HR: Sandra Huicochea Castellanos)" was live); and
+    a parenthetical is not provenance -- a curator cannot tell an alternate name from
+    a publishing name from it, and neither can the PM card. `name_source` carries
+    that as data instead.
 
-      1. The first names must actually disagree, normalised. Gating on the RENDERED
-         strings instead fires on 13,027 cwids / 16,110 authorship_review rows,
-         because a publishing name simply DROPS the middle name: "John Smith
-         (HR: John Michael Smith)" on thousands of rows that were never confusing.
-         577 cwids differ on the raw first name; `_norm` equality then absorbs 54 more
-         that differ only in case, accents or punctuation (lcai "Li-Qun"/"Liqun",
-         leg9067 "Leigh Ann"/"Leigh ann").
-      2. The rendered strings must differ too. Otherwise the degenerate case where the
-         publishing name has already absorbed the middle name prints itself twice --
-         dpc2003, givenName "Diany", middleName "Paola", firstName "Diany Paola",
-         would render "Diany Paola Calderon (HR: Diany Paola Calderon)". 88 cwids.
+    WHY the matched source is the label and not always the directory. Labelling a
+    pref_norm match with the directory name shows the curator a name the byline does
+    not contain and hides the one it does; the row reads as a mismatch to reject when
+    the match is correct (mis4060 above). The same holds however the first names
+    differ, initial included: jog4030 is "Joseph Gardella" in the directory and
+    publishes as "Jae Gardella" -- same initial, and a directory label is exactly as
+    unreadable as mis4060's.
 
-    435 cwids survive both, reaching 460 of the 30,711 authorship_review rows carrying
-    a top_cwid (205 open / 148 accepted / 47 rejected / 45 dismissed / 15 assigned).
-    Longest result on prod is 84 characters against top_name VARCHAR(255); every write
+    Longest directory name on prod is well inside top_name VARCHAR(255); every write
     site truncates to 255 anyway (aar_orchestrator, aar_universe_scopus,
-    aar_reconcile_open, aar_report_changed_picks).
-
-    Fires on the WHOLE disagreeing population, NOT only where the first INITIAL also
-    differs. The initial is not the discriminator the confusion follows: jog4030 is
-    "Joseph Gardella" in HR and publishes as "Jae Gardella" -- same initial, and the
-    label is exactly as unreadable as mis4060's. So are kal4054 (Kai-Lin/Katherine),
-    jiy4011 (Jie/Jennifer), ahc2004 (Ah Yeon/Alice), mek4005 (Melanie/Mindy) and 53
-    more. Restricting to a differing initial covers 181 of the 460 rows and leaves 279
-    -- Gardella among them -- printing a name the byline does not contain.
-
-    Returns today's exact string, byte for byte, whenever either guard fails -- except
-    that a comma-duplicated middleName collapses for DISPLAY only, see _display_middle."""
-    legal = " ".join(x for x in (rec.get("given"), _display_middle(rec.get("middle")),
-                                 rec.get("surname")) if x)
-    # An alternate-name copy (issue #227) already carries the byline's name in
-    # given/middle/surname; the HR legal name rides along as `hr_name`.
-    if rec.get("alt_name"):
-        return f"{legal} (HR: {rec['hr_name']})"
-    pref = (rec.get("pref") or "").strip()
-    if not pref or _norm(pref) == _norm(rec.get("given")):
-        return legal
-    publishing = " ".join(x for x in (pref, rec.get("surname")) if x)
-    if _norm(publishing) == _norm(legal):
-        return legal
-    return f"{publishing} (HR: {legal})"
+    aar_reconcile_open, aar_report_changed_picks)."""
+    if via == "primary" and rec.get("pref_full"):
+        return rec["pref_full"]
+    # An alternate-name copy (issue #227) carries the alternate's own name in
+    # given/middle/surname, so this join IS its recorded name.
+    return " ".join(x for x in (rec.get("given"), _display_middle(rec.get("middle")),
+                                rec.get("surname")) if x)
 
 
 # ---- alternate names (issue #227) -------------------------------------------
 def load_alternate_names():
-    """cwid -> [{firstName, middleName, lastName}, ...] from DynamoDB
-    `Identity.alternateNames` -- the prior / maiden / adopted names ReCiter itself
-    retrieves under, which reciterdb `identity` (HR legal name) and `person`
-    (publishing first name) both lack. Byline "Erika Hissong" (pmid 42644724) proposed
-    nobody although emh9016 (Erika Patel) lists exactly that name.
+    """cwid -> [{firstName, middleName, lastName, source: "alternate"}, ...] from
+    DynamoDB `Identity.alternateNames` -- the prior / maiden / adopted names ReCiter
+    itself retrieves under, which reciterdb `identity` (directory legal name) and
+    `person` (publishing name) both lack. Byline "Erika Hissong" (pmid 42644724)
+    proposed nobody although emh9016 (Erika Patel) lists exactly that name. `source`
+    is the provenance `candidates()` publishes as `name_source`.
 
     Paginated scan, same boto3 shape as retrieveS3.scan_table. On ANY failure -- no
     boto3, no credentials, no table, throttling -- warn and return {}: the roster must
@@ -512,7 +508,7 @@ def load_alternate_names():
                 # `or {}` / `or []`: a DynamoDB NULL deserialises to None with the key
                 # PRESENT, so a .get() default never fires (see dataTransformer).
                 alts = (item.get("identity") or {}).get("alternateNames") or []
-                alts = [a for a in alts if isinstance(a, dict)]
+                alts = [dict(a, source="alternate") for a in alts if isinstance(a, dict)]
                 if item.get("uid") and alts:
                     out[item["uid"]] = alts
             if "LastEvaluatedKey" not in resp:
@@ -539,19 +535,22 @@ _ACCEPTED_BYLINES_SQL = (
 
 
 def accepted_byline_names(rows):
-    """cwid -> [{firstName, middleName, lastName}] from the names a person's ACCEPTED
-    articles actually carry (rows of `_ACCEPTED_BYLINES_SQL`). The second alternate-name
-    source beside DynamoDB alternateNames: a curator who accepted 40 Hissong papers for
-    emh9016 has already said "Erika Hissong" is her, whether or not anyone typed it into
-    the identity. PubMed's forename field is "Erika M" -- first token is the given name,
-    the rest the middle -- and `_alt_records` drops any pair that is the legal name."""
+    """cwid -> [{firstName, middleName, lastName, source: "accepted", n}] from the
+    names a person's ACCEPTED articles actually carry (rows of `_ACCEPTED_BYLINES_SQL`).
+    The second alternate-name source beside DynamoDB alternateNames: a curator who
+    accepted 40 Hissong papers for emh9016 has already said "Erika Hissong" is her,
+    whether or not anyone typed it into the identity. PubMed's forename field is
+    "Erika M" -- first token is the given name, the rest the middle -- and
+    `_alt_records` drops any pair that is the legal name. `n` is the accepted-paper
+    count, published per candidate as `name_n`."""
     out = {}
     for r in rows:
         fore = (r["fore"] or "").split()
         if not fore:
             continue
         out.setdefault(r["cwid"], []).append(
-            {"firstName": fore[0], "middleName": " ".join(fore[1:]), "lastName": r["last"]})
+            {"firstName": fore[0], "middleName": " ".join(fore[1:]), "lastName": r["last"],
+             "source": "accepted", "n": r["n"]})
     return out
 
 
@@ -600,9 +599,12 @@ class IdentityIndex:
         (primary "Ho-Yee Wong" + alternate "Tommy Wong" both key on "wong"), so no
         cohort ever counts one person as two homonyms.
 
-        `hr_name` keeps the legal name for `_display_name`, which prints the alternate
-        first (it is what the byline carries) and the HR name behind it (it is what
-        the directory carries) -- the same convention as the publishing-name label."""
+        `alt_source` / `alt_n` carry the entry's provenance ("alternate" from DynamoDB,
+        "accepted" plus the paper count from `accepted_byline_names`; an entry with no
+        `source` key is "alternate") through to `candidates()`, which publishes them as
+        `name_source` / `name_n`. First occurrence of a (given, surname) wins, so
+        `load()` lists the accepted names first and a name in both sources keeps its
+        evidence count."""
         seen = {(rec["given_norm"], rec["surname_norm"])}
         for a in alts or []:
             given = (a.get("firstName") or "").strip()
@@ -611,17 +613,17 @@ class IdentityIndex:
             # An initial is not a name. An accepted byline "J L Stewart" would otherwise
             # mint given "J", and byline "J L Stewart" then EXACT-matches it as `full` --
             # a single letter masquerading as a full-name match, displacing the old pick
-            # (2026-09-12 dry run: S Li, Q Zhou, Y Lin, A Gupta, H Yang, S Mann...). Same
-            # for a one-letter middle: the whole-field middleName rule would let byline
-            # "Y Lin" match middle "Y" of "R Y Lin" as `full`.
+            # (2026-09-12 dry run: S Li, Q Zhou, Y Lin, A Gupta, H Yang, S Mann...). A
+            # one-letter MIDDLE is the same hazard through the whole-field middleName
+            # rule ("Y Lin" vs "R Y Lin"); `candidates()` ignores it there, while the
+            # copy keeps it as recorded so the label can print "Erika M Hissong".
             if len(key[0]) < 2 or not key[1] or key in seen:
                 continue
             seen.add(key)
-            middle = (a.get("middleName") or "").strip()
-            yield dict(rec, given=given, middle=middle if len(_norm(middle)) >= 2 else "",
+            yield dict(rec, given=given, middle=(a.get("middleName") or "").strip(),
                        surname=surname, given_norm=key[0], surname_norm=key[1],
-                       pref=given, pref_norm=key[0], alt_name=True,
-                       hr_name=_display_name(dict(rec, pref="")))
+                       pref_norm=key[0], alt_name=True,
+                       alt_source=a.get("source", "alternate"), alt_n=a.get("n"))
 
     @staticmethod
     def _campus_person_types(conn):
@@ -671,9 +673,11 @@ class IdentityIndex:
 
     @classmethod
     def load(cls, campus=CAMPUS_WCM, alternate_names=None):
-        """`alternate_names` = {cwid: [{firstName, middleName, lastName}, ...]};
+        """`alternate_names` = {cwid: [{firstName, middleName, lastName, source?, n?}]};
         None -> read DynamoDB via `load_alternate_names()` (never raises). The accepted-
-        byline names (`accepted_byline_names`) are always added on top."""
+        byline names (`accepted_byline_names`) are always added, AHEAD of the DynamoDB
+        ones: `_alt_records` keeps the first of a duplicated (given, surname), and the
+        accepted entry is the one carrying the evidence count."""
         if alternate_names is None:
             alternate_names = load_alternate_names()
         alternate_names = {k: list(v or []) for k, v in alternate_names.items()}
@@ -685,20 +689,22 @@ class IdentityIndex:
             ["cwid", "givenName", "middleName", "surname", "primaryAcademicDepartment",
              "primaryAcademicDivision", "primaryTitle", "primaryProgram",
              "endDateWCMFaculty", "endDateWCMStudent"] + _PTYPE_COLS))
-        # `identity` is HR/LDAP: it carries the LEGAL name. `person` mirrors DynamoDB
-        # Identity.primaryName, which is the name the person actually publishes under.
-        # Both cwid columns are utf8mb4_unicode_ci, so this join needs no COLLATE (the
-        # 1267 trap is on authorship_review.top_cwid, which is general_ci — not here).
+        # `identity` is the directory (ED ou=people + ASMS): it carries the LEGAL name.
+        # `person` mirrors DynamoDB Identity.primaryName, which is the name the person
+        # actually publishes under. Both cwid columns are utf8mb4_unicode_ci, so this
+        # join needs no COLLATE (the 1267 trap is on authorship_review.top_cwid, which
+        # is general_ci — not here).
         with eng.connect() as c:
             rows = c.execute(text(
-                f"SELECT {cols}, p.firstName AS prefFirstName "
+                f"SELECT {cols}, p.firstName AS prefFirstName, "
+                "p.middleName AS prefMiddleName, p.lastName AS prefLastName "
                 "FROM identity i "
                 "LEFT JOIN person p ON p.personIdentifier = i.cwid "
                 "WHERE i.surname IS NOT NULL AND i.surname <> ''")).mappings().all()
             campus_types = cls._campus_person_types(c)
             for cwid, names in accepted_byline_names(c.execute(
                     text(_ACCEPTED_BYLINES_SQL), {"min": ACCEPTED_BYLINE_MIN}).mappings()).items():
-                alternate_names.setdefault(cwid, []).extend(names)
+                alternate_names[cwid] = names + alternate_names.get(cwid, [])
         return cls([cls._record(r, campus_types.get(r["cwid"], ())) for r in rows],
                    campus=campus, alternate_names=alternate_names)
 
@@ -731,12 +737,15 @@ class IdentityIndex:
             "given": given, "middle": r["middleName"] or "", "surname": r["surname"] or "",
             "given_norm": _norm(given), "surname_norm": _norm(r["surname"]),
             "pref_norm": _norm(r.get("prefFirstName")),
-            # The publishing name kept RAW, for `_display_name` only. pref_norm is
-            # lossy by construction (lowercased, unpunctuated) so the matched name was
-            # unavailable to print, which is the whole reason the label fell back to
-            # the legal one. The matcher must keep reading pref_norm and only
-            # pref_norm -- nothing below this line tests `pref`.
-            "pref": (r.get("prefFirstName") or "").strip(),
+            # The PRIMARY name in full, for `_display_name` only: what a pref_norm
+            # match prints, exactly as `person` records it. pref_norm is lossy by
+            # construction (lowercased, unpunctuated), so without this the matched
+            # name was unavailable to print. Empty when the person row is missing.
+            # The matcher must keep reading pref_norm and only pref_norm -- nothing
+            # below this line tests `pref_full`.
+            "pref_full": " ".join(x for x in (
+                (r.get(k) or "").strip()
+                for k in ("prefFirstName", "prefMiddleName", "prefLastName")) if x),
             "dept": r["primaryAcademicDepartment"] or "",
             "division": r["primaryAcademicDivision"] or "",
             "program": r["primaryProgram"] or "",
@@ -828,6 +837,12 @@ class IdentityIndex:
             # one -- that is `person.firstName` (issue #171 / PR #172), exact-only for the
             # same reason this is.
             middle_norm = _norm(rec["middle"])
+            # #230: on an alternate-name copy a one-letter middle is not a name. Accepted
+            # bylines mint "Erika M" for nearly everyone, and the whole-field rule below
+            # would let byline "M Hissong" match it as `full`. The copy keeps the middle
+            # as recorded (the label prints it); only the matcher looks past it.
+            if rec.get("alt_name") and len(middle_norm) < 2:
+                middle_norm = ""
             # The person mirror's first name is the one the byline actually uses. It
             # disagrees with identity.givenName on the FIRST INITIAL for 143 cwids
             # (Anthony->Tony, Xiaoxuan->Emily, Ho-Yee->Tommy), and the initial test below
@@ -860,10 +875,16 @@ class IdentityIndex:
             # on 216 rows, moved 7 top picks and disturbed ZERO curator-resolved rows.
             # Guarded on a non-empty middleName: with an empty one the concatenation is
             # just given_norm, the test beside it.
+            #
+            # `via` is WHICH source the match went through, for the label and the
+            # `name_source` badge: "primary" only when the pref_norm clause fired, else
+            # "directory"; an alternate-name copy reports its own source (below) --
+            # its pref_norm IS the alternate's given name, not the person mirror's.
+            via = "directory"
             if author_given and (rec.get("pref_norm") == author_given
                                  or (author_first
                                      and author_first == rec.get("pref_norm"))):
-                given_match = "full"
+                given_match, via = "full", "primary"
             elif author_init and (rec["given_norm"] or middle_norm):
                 if author_given and (author_given == rec["given_norm"]
                                      or author_given == middle_norm
@@ -879,7 +900,7 @@ class IdentityIndex:
                     continue                       # no exact name, no givenName initial -> not this person
             else:
                 given_match = "unknown"            # no usable given on either side
-            cohort.append((rec, given_match))
+            cohort.append((rec, given_match, rec.get("alt_source") or via))
 
         # ONE CWID AT MOST ONCE (issue #227). A person indexed under both a legal and an
         # alternate name lands in the same pool twice when the surnames agree ("Ho-Yee
@@ -889,7 +910,7 @@ class IdentityIndex:
         # not halved by a self-rival. Same person, same cwid, so nothing downstream
         # can tell the two apart except the label.
         best = {}
-        for rec, given_match in cohort:
+        for rec, given_match, via in cohort:
             # An alternate name is evidence only when the byline spells it out. Letting it
             # into the initial tier is the widening #173 measured at 26% precision: byline
             # "Todd Rosen" reached aer2006 through alternate "Tony Rosen" on T=T, and
@@ -899,18 +920,22 @@ class IdentityIndex:
                 continue
             held = best.get(rec["cwid"])
             if held is None or _TIER[given_match] > _TIER[held[1]]:
-                best[rec["cwid"]] = (rec, given_match)
+                best[rec["cwid"]] = (rec, given_match, via)
         cohort = list(best.values())
 
         cohort_size = len(cohort)
         out = []
-        for rec, given_match in cohort:
+        for rec, given_match, via in cohort:
             affil_match, where = self._affil_match(rec, affil_toks)
             gap = (pub_year - rec["end_year"]) if (pub_year and rec["end_year"]) else None
             penalty = temporal_penalty(gap)
             out.append({
                 "cwid": rec["cwid"],
-                "name": _display_name(rec),
+                "name": _display_name(rec, via),
+                # Provenance of `name`, for the PM card's badge: which source the
+                # match went through, and for "accepted" how many accepted papers
+                # carry that name (None for every other source).
+                "name_source": via, "name_n": rec.get("alt_n"),
                 "dept": rec["dept"], "division": rec["division"],
                 "person_type": rec["person_type"], "title": rec["title"],
                 "given_match": given_match,
@@ -1000,13 +1025,14 @@ def _selftest():
     middleName-as-alternate-given-name fix (Judy/Hua Zhong, PMID 40681448), its
     narrowing to exact-match-only (issue #173), the person-mirror publishing name
     (issue #171), and the temporal-plausibility penalty (issue #159)."""
-    def rec(given, middle, surname, end_year=None, cwid=None, pref_first=None):
+    def rec(given, middle, surname, end_year=None, cwid=None, pref_first=None,
+            pref_full=None):
         return {
             "cwid": cwid or f"{given or middle}_{surname}".lower(),
             "given": given, "middle": middle, "surname": surname,
             "given_norm": _norm(given), "surname_norm": _norm(surname),
             "pref_norm": _norm(pref_first),
-            "pref": (pref_first or "").strip(),
+            "pref_full": pref_full or "",
             "dept": "", "division": "", "program": "", "title": "",
             "person_type": "Full-Time Faculty", "historical": False,
             "end_year": end_year,
@@ -1267,77 +1293,109 @@ def _selftest():
                    poons.candidates("Poon", "Chi-Lam", "C") == ([], 0)))
 
     # --- the candidate LABEL (`name`) ----------------------------------------
-    # The publishing name is what the byline carries and, since #171, what can earn
-    # the `full` tier on its own; the legal name follows in parentheses. Every case
-    # where the two agree -- or where there is no publishing name at all -- must come
-    # out byte-identical to the pre-patch join, because that string is stored as
-    # authorship_review.top_name on 30,251 rows this must not churn.
+    # ONE name: the full name of the source that matched, as that source records it.
+    # A pref_norm match prints the primary name (`pref_full`); every directory match
+    # prints the directory name, middle included. No parenthetical, ever -- which
+    # source it was is `name_source`, data for the PM card's badge.
     legal_join = (lambda r: " ".join(x for x in (r["given"], r["middle"], r["surname"])
                                      if x))
-    mila = rec("Shuo", "", "Sun", cwid="mis4060", pref_first="Mila")
-    tony = rec("Anthony", "Ehren", "Rosen", cwid="aer2006", pref_first="Tony")
-    jae = rec("Joseph", "", "Gardella", cwid="jog4030", pref_first="Jae")
-    agree = rec("Jane", "Q", "Doe", cwid="agree", pref_first="Jane")
+    mila = rec("Shuo", "", "Sun", cwid="mis4060", pref_first="Mila", pref_full="Mila Sun")
+    tony = rec("Anthony", "Ehren", "Rosen", cwid="aer2006", pref_first="Tony",
+               pref_full="Tony Rosen")
+    jae = rec("Joseph", "", "Gardella", cwid="jog4030", pref_first="Jae",
+              pref_full="Jae Gardella")
+    agree = rec("Jane", "Q", "Doe", cwid="agree", pref_first="Jane", pref_full="Jane Q Doe")
     nopref = rec("Jane", "Q", "Doe", cwid="nopref")
-    blankpref = rec("Jane", "Q", "Doe", cwid="blank", pref_first="   ")
-    casediff = rec("Leigh", "Ann", "Griffin", cwid="leg9067", pref_first="leigh")
-    punct = rec("Li-Qun", "", "Cai", cwid="lcai", pref_first="Liqun")
-    absorbed = rec("Diany", "Paola", "Calderon", cwid="dpc2003",
-                   pref_first="Diany Paola")
-    nomiddle = rec("Xiaoxuan", "", "Chen", cwid="xic4004", pref_first="Emily")
+    nomiddle = rec("Xiaoxuan", "", "Chen", cwid="xic4004", pref_first="Emily",
+                   pref_full="Emily Chen")
     checks += [
-        ("the live anchor prints the publishing name first (pmid 42670968, mis4060)",
-         _display_name(mila) == "Mila Sun (HR: Shuo Sun)"),
-        ("a dropped middleName is preserved inside the parenthetical",
-         _display_name(tony) == "Tony Rosen (HR: Anthony Ehren Rosen)"),
-        ("a SAME-INITIAL disagreement fires too -- this is why the fix is not gated "
-         "on the first initial (jog4030 publishes as Jae, HR says Joseph)",
-         _display_name(jae) == "Jae Gardella (HR: Joseph Gardella)"),
-        ("no middleName, differing first name -> plain two-name parenthetical",
-         _display_name(nomiddle) == "Emily Chen (HR: Xiaoxuan Chen)"),
-        ("names that AGREE fall through byte-identical to the old join",
-         _display_name(agree) == legal_join(agree) == "Jane Q Doe"),
-        ("an ABSENT publishing name falls through byte-identical",
-         _display_name(nopref) == legal_join(nopref) == "Jane Q Doe"),
-        ("a whitespace-only publishing name falls through byte-identical "
-         "(5 such rows on prod, where SQL <> '' does not catch them)",
-         _display_name(blankpref) == legal_join(blankpref) == "Jane Q Doe"),
-        ("a case-only difference is not a difference (_norm equality)",
-         _display_name(casediff) == legal_join(casediff) == "Leigh Ann Griffin"),
-        ("nor is a punctuation-only one (Li-Qun / Liqun)",
-         _display_name(punct) == legal_join(punct) == "Li-Qun Cai"),
-        ("a publishing name that has ABSORBED the middleName does not print itself "
-         "twice (dpc2003: 'Diany' + 'Paola' vs 'Diany Paola')",
-         _display_name(absorbed) == legal_join(absorbed) == "Diany Paola Calderon"),
+        ("the live anchor prints the publishing name, alone (pmid 42670968, mis4060)",
+         _display_name(mila, "primary") == "Mila Sun"),
+        ("a primary-name match prints the primary name in full, nothing behind it",
+         _display_name(tony, "primary") == "Tony Rosen"),
+        ("a SAME-INITIAL disagreement prints the matched name too (jog4030 publishes "
+         "as Jae, the directory says Joseph)",
+         _display_name(jae, "primary") == "Jae Gardella"),
+        ("no middleName, differing first name -> the primary name, no parenthetical",
+         _display_name(nomiddle, "primary") == "Emily Chen"),
+        ("a directory match prints the directory name, byte-identical to the old join, "
+         "middle included", _display_name(mila) == "Shuo Sun"
+         and _display_name(tony) == legal_join(tony) == "Anthony Ehren Rosen"),
+        ("names that AGREE print once, whichever source matched",
+         _display_name(agree, "primary") == _display_name(agree) == legal_join(agree)
+         == "Jane Q Doe"),
+        ("an ABSENT primary name falls back to the directory name even on a primary "
+         "match", _display_name(nopref, "primary") == legal_join(nopref) == "Jane Q Doe"),
+        ("no label carries the old parenthetical, from any source",
+         all("(HR: " not in _display_name(r, v)
+             for r in (mila, tony, jae, nomiddle, agree, nopref)
+             for v in ("primary", "directory", "alternate", "accepted"))),
         ("an empty middleName never leaves a double space in either branch",
-         "  " not in _display_name(mila) and "  " not in _display_name(nomiddle)
+         "  " not in _display_name(mila) and "  " not in _display_name(nomiddle, "primary")
          and "  " not in _display_name(rec("Jane", "", "Doe", cwid="nm"))),
     ]
 
     # The label is downstream of the match: relabelling must not move given_match,
-    # confidence, cohort_size or the ranking. Same index, scored with and without the
-    # raw publishing name present.
+    # confidence, cohort_size, name_source or the ranking. Same index, scored with
+    # and without the raw primary name present.
     lbl = IdentityIndex([mila, rec("Yuqing", "", "Sun", cwid="yus9035",
-                                   pref_first="Erica")])
+                                   pref_first="Erica", pref_full="Erica Sun")])
     with_pref, coh_with = lbl.candidates("Sun", "Mila", "M")
-    stripped = IdentityIndex([{**mila, "pref": ""},
+    stripped = IdentityIndex([{**mila, "pref_full": ""},
                               {**rec("Yuqing", "", "Sun", cwid="yus9035",
-                                     pref_first="Erica"), "pref": ""}])
+                                     pref_first="Erica"), "pref_full": ""}])
     no_pref, coh_no = stripped.candidates("Sun", "Mila", "M")
     keys = ("cwid", "given_match", "confidence", "cohort_size", "affil_dept_match",
-            "person_type", "dept", "years_after_wcm")
+            "person_type", "dept", "years_after_wcm", "name_source", "name_n")
     checks += [
-        ("dropping the RAW publishing name changes nothing the matcher reads -- "
-         "cwid, given_match, confidence, cohort_size and order are identical",
+        ("dropping the RAW primary name changes nothing the matcher reads -- cwid, "
+         "given_match, confidence, cohort_size, name_source and order are identical",
          [tuple(c[k] for k in keys) for c in with_pref]
          == [tuple(c[k] for k in keys) for c in no_pref] and coh_with == coh_no),
         ("...and `name` is the ONLY field that moved",
          [c["name"] for c in with_pref] != [c["name"] for c in no_pref]
-         and with_pref[0]["name"] == "Mila Sun (HR: Shuo Sun)"
-         and no_pref[0]["name"] == "Shuo Sun"),
-        ("the anchor still reaches the `full` tier through pref_norm",
-         with_pref[0]["cwid"] == "mis4060"
-         and with_pref[0]["given_match"] == "full"),
+         and with_pref[0]["name"] == "Mila Sun" and no_pref[0]["name"] == "Shuo Sun"),
+        ("the anchor still reaches the `full` tier through pref_norm, and the "
+         "candidate says so: name_source primary, name_n None",
+         with_pref[0]["cwid"] == "mis4060" and with_pref[0]["given_match"] == "full"
+         and with_pref[0]["name_source"] == "primary" and with_pref[0]["name_n"] is None),
+    ]
+
+    # (c) the primary source through candidates(): pref_full "Tony Rosen" against the
+    # directory's "Anthony Ehren Rosen" prints the primary name and badges it.
+    tony_c = IdentityIndex([tony]).candidates("Rosen", "Tony", "T")[0][0]
+    # (d) a directory match keeps the WHOLE directory name even where the byline's
+    # middle disagrees: "David K Jones" against David Randolph Jones. The mismatch is
+    # the information; trimming to "David Jones" would hide it.
+    jones = IdentityIndex([rec("David", "Randolph", "Jones", cwid="dkj")]).candidates(
+        "Jones", "David K", "DK")[0][0]
+    # (e) the live duplicate: given Sandra, middle Huicochea, surname Castellanos
+    # printed "Sandra Huicochea Castellanos (HR: Sandra Huicochea Castellanos)". Once,
+    # through the given+middle concatenation -- and once through an alternate that
+    # spells the same name, the shape that produced it.
+    sandra = rec("Sandra", "Huicochea", "Castellanos", cwid="shc", pref_first="Sandra",
+                 pref_full="Sandra Huicochea Castellanos")
+    sandra_c = IdentityIndex([sandra]).candidates(
+        "Castellanos", "Sandra Huicochea", "SH")[0][0]
+    sandra_alt = IdentityIndex([sandra], alternate_names={"shc": [
+        {"firstName": "Sandra Huicochea", "lastName": "Castellanos"}]}).candidates(
+        "Castellanos", "Sandra Huicochea", "SH")[0]
+    checks += [
+        ("(c) a byline naming the primary name gets that name in full: 'Tony Rosen', "
+         "name_source primary",
+         tony_c["name"] == "Tony Rosen" and tony_c["name_source"] == "primary"
+         and tony_c["name_n"] is None and tony_c["given_match"] == "full"),
+        ("(d) 'David K Jones' against David Randolph Jones prints 'David Randolph "
+         "Jones' -- the directory name in full, middle kept -- name_source directory",
+         jones["name"] == "David Randolph Jones" and jones["name_source"] == "directory"
+         and jones["given_match"] == "full"),
+        ("(e) 'Sandra Huicochea Castellanos' prints exactly once, no parenthetical",
+         sandra_c["name"] == "Sandra Huicochea Castellanos"
+         and sandra_c["name_source"] == "directory"),
+        ("(e) ...and through an alternate spelling the same name: still one "
+         "candidate, still one name (the primary's, on the tie)",
+         len(sandra_alt) == 1 and sandra_alt[0]["name"] == "Sandra Huicochea Castellanos"
+         and sandra_alt[0]["name_source"] == "directory"),
     ]
 
     # --- temporal plausibility (issue #159) ---------------------------------
@@ -1747,10 +1805,20 @@ def _selftest():
                     middleName="", surname="Roe", primaryAcademicDepartment=None,
                     primaryAcademicDivision=None, primaryTitle=None,
                     primaryProgram=None, endDateWCMFaculty=None,
-                    endDateWCMStudent=None, prefFirstName=None)
+                    endDateWCMStudent=None, prefFirstName=None, prefMiddleName=None,
+                    prefLastName=None)
     plain = IdentityIndex._record(dict(_wcm_row, alumniMD="yes"))
     faculty = IdentityIndex._record(dict(_wcm_row, fullTimeFaculty="yes"))
     checks += [
+        # `_record` builds pref_full from the three person columns, stripped, and
+        # leaves it empty when the person row is missing (LEFT JOIN -> all None) or
+        # whitespace-only (5 such firstName rows on prod, where SQL <> '' misses them).
+        ("_record: pref_full is person first + middle + last, stripped",
+         IdentityIndex._record(dict(_wcm_row, prefFirstName="Tony", prefMiddleName=None,
+                                    prefLastName=" Rosen "))["pref_full"] == "Tony Rosen"),
+        ("_record: no person row -> pref_full empty; whitespace-only -> empty",
+         plain["pref_full"] == ""
+         and IdentityIndex._record(dict(_wcm_row, prefFirstName="   "))["pref_full"] == ""),
         ("_record's WCM branch is unchanged: the PERSON_TYPES loop still wins and "
          "still sets historical",
          (plain["person_type"], plain["historical"]) == ("Alumni MD", True)
@@ -1785,9 +1853,10 @@ def _selftest():
          "one candidate, given_match full (pmid 42644724)",
          len(hiss) == 1 and hiss_cohort == 1 and hiss[0]["cwid"] == "emh9016"
          and hiss[0]["given_match"] == "full"),
-        ("(a) ...and the label the curator reads is the alternate name, the HR name "
-         "behind it", hiss[0]["name"] == "Erika Hissong (HR: Erika Patel)"
-         and "Hissong" in hiss[0]["name"]),
+        ("(a) ...and the label the curator reads is the alternate name, alone, badged "
+         "as an alternate with no count (b: alternate-only -> 'alternate', name_n None)",
+         hiss[0]["name"] == "Erika Hissong" and hiss[0]["name_source"] == "alternate"
+         and hiss[0]["name_n"] is None),
         ("(a) the copy IS the person: dept and person type carry over",
          hiss[0]["dept"] == "Pathology and Laboratory Medicine"
          and hiss[0]["person_type"] == "Full-Time Faculty"),
@@ -1813,29 +1882,33 @@ def _selftest():
     tommy, tommy_cohort = wongs.candidates("Wong", "Tommy", "T")
     hoyee, hoyee_cohort = wongs.candidates("Wong", "Ho-Yee", "H")
     checks += [
-        ("(c) byline 'Tommy Wong' -> one candidate, cohort 1, full",
+        ("(c) byline 'Tommy Wong' -> one candidate, cohort 1, full, labelled with the "
+         "alternate name alone",
          len(tommy) == 1 and tommy_cohort == 1 and tommy[0]["cwid"] == "hyw2001"
-         and tommy[0]["given_match"] == "full"
-         and tommy[0]["name"] == "Tommy Wong (HR: Ho-Yee Wong)"),
-        ("(c) byline 'Ho-Yee Wong' -> one candidate, cohort 1, full",
+         and tommy[0]["given_match"] == "full" and tommy[0]["name"] == "Tommy Wong"
+         and tommy[0]["name_source"] == "alternate"),
+        ("(c) byline 'Ho-Yee Wong' -> one candidate, cohort 1, full, the directory name",
          len(hoyee) == 1 and hoyee_cohort == 1 and hoyee[0]["cwid"] == "hyw2001"
-         and hoyee[0]["given_match"] == "full" and hoyee[0]["name"] == "Ho-Yee Wong"),
+         and hoyee[0]["given_match"] == "full" and hoyee[0]["name"] == "Ho-Yee Wong"
+         and hoyee[0]["name_source"] == "directory"),
         ("(c) the pool really does hold him twice -- the dedupe is in candidates(), "
          "not in the index", len(wongs.by_surname["wong"]) == 2),
     ]
 
     # The same person landing twice at the SAME tier (person mirror already says
     # "Tommy", and the alternate says it again): still one candidate, the primary
-    # record's label wins the tie, and the rarity term is the cohort-of-one 0.40.
-    both = IdentityIndex([rec("Ho-Yee", "", "Wong", cwid="hyw2001", pref_first="Tommy")],
+    # record wins the tie -- so the label is the PRIMARY name and the badge says
+    # "primary", not "alternate" -- and the rarity term is the cohort-of-one 0.40.
+    both = IdentityIndex([rec("Ho-Yee", "", "Wong", cwid="hyw2001", pref_first="Tommy",
+                              pref_full="Tommy Wong")],
                          alternate_names={"hyw2001": [
                              {"firstName": "Tommy", "lastName": "Wong"}]})
     twice, twice_cohort = both.candidates("Wong", "Tommy", "T")
     checks += [
         ("a cwid in one pool twice at the same tier is one candidate with confidence "
-         "0.90 (0.50 full + 0.40/1), the primary's label on the tie",
+         "0.90 (0.50 full + 0.40/1), the primary's label and source on the tie",
          len(twice) == 1 and twice_cohort == 1 and twice[0]["confidence"] == 0.90
-         and twice[0]["name"] == "Tommy Wong (HR: Ho-Yee Wong)"),
+         and twice[0]["name"] == "Tommy Wong" and twice[0]["name_source"] == "primary"),
         ("an initial-only byline does NOT reach a person through an alternate: 'T Wong' "
          "matches neither Ho-Yee (primary, H) nor alternate Tommy (full tier only)",
          wongs.candidates("Wong", None, "T") == ([], 0)),
@@ -1844,24 +1917,55 @@ def _selftest():
          "a cohort of 2 when the byline spells the name out",
          IdentityIndex([patel, rec("Erika", "", "Hissong", cwid="emh0001")],
                        alternate_names=alts).candidates("Hissong", "Erika", "E")[1] == 2),
-        # (d) the second source: names carried by ACCEPTED articles, first token = given.
-        ("accepted bylines: 'Erika M' / 'Hissong' becomes given Erika, middle M, last Hissong",
+        # (d) the second source: names carried by ACCEPTED articles, first token = given,
+        # carrying its provenance and the accepted-paper count.
+        ("accepted bylines: 'Erika M' / 'Hissong' becomes given Erika, middle M, last "
+         "Hissong, source accepted, n 40",
          accepted_byline_names([{"cwid": "emh9016", "fore": "Erika M", "last": "Hissong", "n": 40}])
-         == {"emh9016": [{"firstName": "Erika", "middleName": "M", "lastName": "Hissong"}]}),
+         == {"emh9016": [{"firstName": "Erika", "middleName": "M", "lastName": "Hissong",
+                          "source": "accepted", "n": 40}]}),
         ("accepted bylines: an empty forename is skipped, others kept",
          accepted_byline_names([{"cwid": "x", "fore": "", "last": "Q", "n": 2},
                                 {"cwid": "x", "fore": "A", "last": "Q", "n": 2}])
-         == {"x": [{"firstName": "A", "middleName": "", "lastName": "Q"}]}),
-        ("accepted bylines reach the index by the same path: byline 'Erika Hissong' -> emh9016 full",
-         (lambda cs: len(cs) == 1 and cs[0]["cwid"] == "emh9016" and cs[0]["given_match"] == "full")(
+         == {"x": [{"firstName": "A", "middleName": "", "lastName": "Q",
+                    "source": "accepted", "n": 2}]}),
+        ("accepted bylines reach the index by the same path: byline 'Erika Hissong' -> "
+         "emh9016 full, badged accepted with the count",
+         (lambda cs: len(cs) == 1 and cs[0]["cwid"] == "emh9016"
+          and cs[0]["given_match"] == "full" and cs[0]["name"] == "Erika Hissong"
+          and cs[0]["name_source"] == "accepted" and cs[0]["name_n"] == 40)(
              IdentityIndex([patel], alternate_names=accepted_byline_names(
                  [{"cwid": "emh9016", "fore": "Erika", "last": "Hissong", "n": 40}]))
+             .candidates("Hissong", "Erika", "E")[0])),
+        # (a) the same name from BOTH sources: `load()` lists the accepted entry first,
+        # so the (given, surname) dedupe in _alt_records keeps the one with evidence.
+        ("(a) Hissong through both sources -> 'Erika Hissong', name_source accepted, "
+         "name_n 40 (the accepted entry is listed first and wins the dedupe)",
+         (lambda cs: len(cs) == 1 and cs[0]["name"] == "Erika Hissong"
+          and cs[0]["name_source"] == "accepted" and cs[0]["name_n"] == 40)(
+             IdentityIndex([patel], alternate_names={"emh9016": accepted_byline_names(
+                 [{"cwid": "emh9016", "fore": "Erika", "last": "Hissong", "n": 40}])
+                 ["emh9016"] + alts["emh9016"]}).candidates("Hissong", "Erika", "E")[0])),
+        ("(a) ...and the ORDER is what decides it: DynamoDB first would badge it "
+         "'alternate' and lose the count, which is why load() puts accepted first",
+         (lambda cs: cs[0]["name_source"] == "alternate" and cs[0]["name_n"] is None)(
+             IdentityIndex([patel], alternate_names={"emh9016": alts["emh9016"]
+                 + accepted_byline_names([{"cwid": "emh9016", "fore": "Erika",
+                                           "last": "Hissong", "n": 40}])["emh9016"]})
+             .candidates("Hissong", "Erika", "E")[0])),
+        # (f) the label is the name AS RECORDED: PubMed's forename "Erika M" keeps its
+        # middle initial in the label even though the matcher looks past it (#230).
+        ("(f) an accepted byline recorded as 'Erika M' prints 'Erika M Hissong'",
+         (lambda cs: len(cs) == 1 and cs[0]["name"] == "Erika M Hissong"
+          and cs[0]["name_source"] == "accepted")(
+             IdentityIndex([patel], alternate_names=accepted_byline_names(
+                 [{"cwid": "emh9016", "fore": "Erika M", "last": "Hissong", "n": 40}]))
              .candidates("Hissong", "Erika", "E")[0])),
         ("the accepted-byline threshold is enforced in SQL, at two",
          "HAVING n >= :min" in _ACCEPTED_BYLINES_SQL and ACCEPTED_BYLINE_MIN == 2),
         # (e) 2026-09-12 dry run: alternates count at `full` only, and initials are not names.
         ("alternate at the initial tier is NOT a candidate: byline 'Todd Rosen' does not reach "
-         "Tony Rosen (HR Anthony) through alternate 'Tony'",
+         "Tony Rosen (directory Anthony) through alternate 'Tony'",
          IdentityIndex([rec("Anthony", "Ehren", "Rosen", cwid="aer2006", pref_first="Tony")],
                        alternate_names={"aer2006": [{"firstName": "Tony", "lastName": "Rosen"}]})
          .candidates("Rosen", "Todd", "T") == ([], 0)),
@@ -1874,7 +1978,7 @@ def _selftest():
          IdentityIndex([rec("Jessica", "Lauren", "Stewart", cwid="jls4002")],
                        alternate_names={"jls4002": [{"firstName": "J", "middleName": "L", "lastName": "Stewart"}]})
          .n_alt_names == 0),
-        ("a one-letter middle on an alternate is dropped, so byline 'Y Lin' cannot match 'R Y Lin' as full",
+        ("a one-letter middle on an alternate is ignored by the matcher, so byline 'Y Lin' cannot match 'R Y Lin' as full",
          IdentityIndex([rec("Robert", "Yao-Wen", "Lin", cwid="rol3002")],
                        alternate_names={"rol3002": [{"firstName": "Rob", "middleName": "Y", "lastName": "Lin"}]})
          .candidates("Lin", "Y", "Y") == ([], 0)),

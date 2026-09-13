@@ -144,9 +144,9 @@ def _position_label(i, n):
 
 def _compact(cands):
     """Trim candidate dicts for JSON storage in the ledger."""
-    keep = ("cwid", "name", "person_type", "dept", "given_match", "affil_dept_match",
-            "cohort_size", "confidence", "years_after_wcm", "io_score", "final_score",
-            "io_source")
+    keep = ("cwid", "name", "name_source", "name_n", "person_type", "dept", "given_match",
+            "affil_dept_match", "cohort_size", "confidence", "years_after_wcm", "io_score",
+            "final_score", "io_source")
     return [{k: c.get(k) for k in keep} for c in cands]
 
 
