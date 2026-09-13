@@ -233,13 +233,14 @@ def _selftest():
     clean = {"given": "John", "middle": "Andrew", "surname": "Kim", "pref": ""}
     checks.append(("a record with no comma is not affected at all",
                    old_and_new_display(clean) == (None, None)))
-    # Pins the local restatement to the real function. If _display_name's structure ever
-    # changes, this fails and the backfill stops being trusted rather than quietly
-    # matching nothing.
+    # Pins the local restatement to the real function where the two still agree: a
+    # record whose publishing name is absent or equals the given name. _display_name no
+    # longer emits the "(HR: ...)" parenthetical at all (the label is one name, the
+    # source that matched, and provenance rides as `name_source`), so on a record whose
+    # publishing name DIFFERS the legacy string is legacy twice over. Rows still carrying
+    # that parenthetical are cleaned by a one-off SQL, not by this pass.
     for probe in (clean,
-                  {"given": "Qi", "middle": "Wing", "surname": "Lee", "pref": "Guinevere"},
-                  {"given": "Mila", "middle": "", "surname": "Sun", "pref": "Mila"},
-                  {"given": "Shuo", "middle": "", "surname": "Sun", "pref": "Mila"}):
+                  {"given": "Mila", "middle": "", "surname": "Sun", "pref": "Mila"}):
         checks.append((
             f"legacy renderer agrees with _display_name on an unaffected record "
             f"({probe['given']}/{probe['pref']})",
@@ -250,8 +251,8 @@ def _selftest():
     checks += [
         ("a person whose publishing name differs still gets both renderings",
          old_p == "Mila Sun (HR: Shuo Kwon,Kwon Sun)"),
-        ("...with the duplication collapsed only in the new one",
-         new_p == "Mila Sun (HR: Shuo Kwon Sun)"),
+        ("...with the duplication collapsed and no parenthetical in the new one",
+         new_p == "Shuo Kwon Sun"),
     ]
 
     affected = {"dkk4001": ("Dylan Kwon,Kwon Kim", "Dylan Kwon Kim")}

@@ -299,8 +299,8 @@ def _trunc(s, n):
 
 
 def _compact(cands):
-    keep = ("cwid", "name", "person_type", "dept", "given_match", "affil_dept_match",
-            "cohort_size", "confidence", "years_after_wcm")
+    keep = ("cwid", "name", "name_source", "name_n", "person_type", "dept", "given_match",
+            "affil_dept_match", "cohort_size", "confidence", "years_after_wcm")
     return [{k: c.get(k) for k in keep} for c in cands]
 
 
