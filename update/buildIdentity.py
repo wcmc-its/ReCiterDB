@@ -1659,6 +1659,210 @@ def build():
     return rows
 
 
+# ---------------------------------------------------------------------------
+#          SIDE TABLES: identity_* mirrors that do NOT feed `identity`
+# ---------------------------------------------------------------------------
+# A source contributes columns to `identity`, which is cumulative and
+# COALESCE-guarded: a value, once written, is never reset by a source that stops
+# mentioning the cwid. Right for a name or a department; wrong for a status that
+# can turn OFF. A gradSchoolFaculty flag on `identity` would reproduce
+# reporting_grad_school's defect -- 117 departed people still counted, three
+# years of appointments missing -- on the very first leaver. So Graduate School
+# faculty gets its own table, truncate-and-reloaded from the Jenzabar view every
+# run, and consumers JOIN it on cwid with wcgsFacultyStatus = 'Y'.
+#
+# Side tables run AFTER write(), so a Jenzabar outage can never touch the
+# identity build: the failure is logged and the previous run's rows stay.
+# ponytail: a failed side table is visible only in the job log (SIDE TABLE
+# SKIPPED); add it to identity_build_log if anyone ever needs to alert on it.
+
+GRAD_SCHOOL_TABLE = "identity_grad_school_faculty"
+
+# The IDM_JZBR principal has SELECT DENIED on Degree_Code, so `SELECT *` fails;
+# every column is named. Left = view column, right = ours. Column names follow
+# reporting_grad_school, the 2023 dump of this same view, so the pubs CASE and
+# anything else that joined it needs only a table-name change.
+GRAD_SCHOOL_COLUMNS = [
+    ("JID", "jid"),
+    ("LAST NAME", "lastName"),
+    ("FIRST_NAME", "firstName"),
+    ("MIDDLE NAME", "middleName"),
+    ("CWID", "cwid"),
+    ("EMAIL ADDRESS", "emailAddress"),
+    ("TERMINATION_DATE", "terminationDate"),
+    ("NAME STATUS", "nameStatus"),
+    ("FACULTY MASTER ACTIVE", "facultyMasterActiveStatus"),
+    ("WCGS FACULTY STATUS", "wcgsFacultyStatus"),
+    ("Is_Grad_Faculty_Member", "isGradFacultyMember"),
+    ("WCGS DIVISION", "wcgsDivision"),
+    ("DEPARTMENT", "department"),
+    ("INSTITUTION", "primaryInstitution"),
+    ("INSTRUCTOR TYPE", "primaryInstructorType"),
+    ("Secondary_Institution", "secondaryInstitution"),
+    ("Secondary_Instrctr_Type", "secondaryInstrctrType"),
+    ("Tertiary_Institution", "tertiaryInstitution"),
+    ("Tertiary_Instrctr_Type", "tertiaryInstrctrType"),
+    ("PRIMARY PHD AFFILIATION", "primaryPhdAffiliation"),
+    ("PRIMARY PhD APPOINTMENT DATE", "primaryPhdAppointmentDate"),
+    ("SECONDARY PHD AFFILIATION", "secondaryPhdAffiliation"),
+    ("SECONDARY PhD APPOINTMENT DATE", "secondaryPhdAppointmentDate"),
+    ("TERTIARY PHD AFFILIATION", "tertiaryPhdAffiliation"),
+    ("TERTIARY_APPOINTMENT_DATE", "tertiaryPhdAppointmentDate"),
+    ("MS AFFILIATION 1", "msAffiliation1"),
+    ("MS APPOINTMENT DATE 1", "msAppointmentDate1"),
+    ("MS AFFILIATION 2", "msAffiliation2"),
+    ("MS APPOINTMENT DATE 2", "msAppointmentDate2"),
+    ("FACULTY_VIVO_PROFILE", "facultyVivoProfile"),
+    ("LAB_LINK", "labLink"),
+]
+
+# The view types its PhD appointment dates and TERMINATION_DATE as nvarchar
+# ("M/D/YYYY"); only the MS dates are real datetimes. Ours are all DATE.
+GRAD_SCHOOL_DATE_COLUMNS = {
+    "terminationDate", "primaryPhdAppointmentDate", "secondaryPhdAppointmentDate",
+    "tertiaryPhdAppointmentDate", "msAppointmentDate1", "msAppointmentDate2",
+}
+
+GRAD_SCHOOL_QUERY = "SELECT " + ", ".join(
+    f"[{src}] AS [{dst}]" for src, dst in GRAD_SCHOOL_COLUMNS
+) + " FROM [dbo].[WCN_vw_GS_Faculty_LR]"
+
+# Y/N flags are char(1); everything else is sized to what the view can hold.
+# jid is the view's own unique key (775 distinct of 775, probed 2026-05-12).
+GRAD_SCHOOL_DDL = f"""CREATE TABLE IF NOT EXISTS {GRAD_SCHOOL_TABLE} (
+    jid INT NOT NULL,
+    lastName VARCHAR(128), firstName VARCHAR(128), middleName VARCHAR(128),
+    cwid VARCHAR(16),
+    emailAddress VARCHAR(128),
+    terminationDate DATE,
+    nameStatus CHAR(1), facultyMasterActiveStatus CHAR(1),
+    wcgsFacultyStatus CHAR(1), isGradFacultyMember CHAR(1),
+    wcgsDivision VARCHAR(255), department VARCHAR(128),
+    primaryInstitution VARCHAR(128), primaryInstructorType VARCHAR(128),
+    secondaryInstitution VARCHAR(128), secondaryInstrctrType VARCHAR(128),
+    tertiaryInstitution VARCHAR(128), tertiaryInstrctrType VARCHAR(128),
+    primaryPhdAffiliation VARCHAR(128), primaryPhdAppointmentDate DATE,
+    secondaryPhdAffiliation VARCHAR(128), secondaryPhdAppointmentDate DATE,
+    tertiaryPhdAffiliation VARCHAR(128), tertiaryPhdAppointmentDate DATE,
+    msAffiliation1 VARCHAR(128), msAppointmentDate1 DATE,
+    msAffiliation2 VARCHAR(128), msAppointmentDate2 DATE,
+    facultyVivoProfile VARCHAR(512), labLink VARCHAR(512),
+    update_date DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (jid),
+    KEY idx_cwid (cwid),
+    KEY idx_wcgs (wcgsFacultyStatus)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"""
+
+
+def _grad_school_date(value):
+    """'M/D/YYYY' string, datetime, date, '' or None -> date or None."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime.datetime):
+        return value.date()
+    if isinstance(value, datetime.date):
+        return value
+    text = str(value).strip()
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.datetime.strptime(text[:19], fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _grad_school_row(raw):
+    """One view row (dict keyed by our column names) -> one insert tuple."""
+    out = []
+    for _, col in GRAD_SCHOOL_COLUMNS:
+        v = raw.get(col)
+        if col == "jid":
+            v = int(v)
+        elif col in GRAD_SCHOOL_DATE_COLUMNS:
+            v = _grad_school_date(v)
+        else:
+            v = v.strip() if isinstance(v, str) else v
+            v = v if v not in ("", None) else None
+        out.append(v)
+    return tuple(out)
+
+
+def grad_school_faculty(dry_run=False):
+    """Mirror Jenzabar's WCN_vw_GS_Faculty_LR into identity_grad_school_faculty.
+
+    Reads the whole view (775 rows probed 2026-05-12), not just the active
+    ones, so the table is a faithful copy and the active filter stays where it
+    belongs -- in the consumer's JOIN. Refuses to write an empty result: an
+    empty view is a Jenzabar problem, and yesterday's rows beat none.
+    """
+    url = os.environ.get("MSSQL_JENZABAR_DB_URL")
+    if not url:
+        logger.warning("%s: MSSQL_JENZABAR_DB_URL unset - not configured, skipping",
+                       GRAD_SCHOOL_TABLE)
+        return 0
+
+    import pymssql  # lazy: see asms_division
+
+    host, port = _mssql_target(url)
+    conn = pymssql.connect(
+        server=host, port=port,
+        user=os.environ["MSSQL_JENZABAR_DB_USERNAME"],
+        password=os.environ["MSSQL_JENZABAR_DB_PASSWORD"],
+        database=os.environ.get("MSSQL_JENZABAR_DB_NAME", "TmsEPly"),
+        login_timeout=30,
+    )
+    try:
+        cur = conn.cursor(as_dict=True)
+        cur.execute(GRAD_SCHOOL_QUERY)
+        rows = [_grad_school_row(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+    cols = [c for _, c in GRAD_SCHOOL_COLUMNS]
+    i_status, i_cwid = cols.index("wcgsFacultyStatus"), cols.index("cwid")
+    active = sum(1 for r in rows if r[i_status] == "Y")
+    with_cwid = sum(1 for r in rows if r[i_cwid])
+    logger.info("%s: %d rows from Jenzabar, %d wcgsFacultyStatus=Y, %d with cwid",
+                GRAD_SCHOOL_TABLE, len(rows), active, with_cwid)
+    if not rows:
+        raise SystemExit(f"{GRAD_SCHOOL_TABLE}: view returned 0 rows - keeping previous")
+    if dry_run:
+        logger.info("%s: --dry-run, not written", GRAD_SCHOOL_TABLE)
+        return len(rows)
+
+    db = db_conn()
+    try:
+        cur = db.cursor()
+        cur.execute(GRAD_SCHOOL_DDL)
+        db.commit()                  # DDL autocommits anyway; be explicit
+        # DELETE, not TRUNCATE: TRUNCATE is DDL and commits on its own, so a
+        # failed INSERT would leave the table empty. This way it rolls back.
+        cur.execute(f"DELETE FROM {GRAD_SCHOOL_TABLE}")
+        cur.executemany(
+            f"INSERT INTO {GRAD_SCHOOL_TABLE} ({', '.join(cols)}) "
+            f"VALUES ({', '.join(['%s'] * len(cols))})",
+            rows)
+        db.commit()
+        cur.execute(f"SELECT COUNT(*) FROM {GRAD_SCHOOL_TABLE}")
+        n = cur.fetchone()[0]
+    finally:
+        db.close()
+    logger.info("%s: reloaded, %d rows", GRAD_SCHOOL_TABLE, n)
+    return n
+
+
+SIDE_TABLES = {GRAD_SCHOOL_TABLE: grad_school_faculty}
+
+
+def load_side_tables(dry_run=False):
+    for name, fn in SIDE_TABLES.items():
+        try:
+            fn(dry_run)
+        except (Exception, SystemExit) as exc:      # noqa: BLE001 - never fatal
+            logger.error("SIDE TABLE SKIPPED: %s failed (%s: %s) - previous rows kept",
+                         name, type(exc).__name__, exc)
+
+
 def main(dry_run=False):
     rows = build()
     if dry_run:
@@ -1670,6 +1874,7 @@ def main(dry_run=False):
             logger.info("  ED migration: %s=%d  %s=%d",
                         old, _migration_counts[old], new, _migration_counts[new])
     write(rows, stage_only=dry_run)
+    load_side_tables(dry_run)
 
 
 def spike():
@@ -1742,6 +1947,23 @@ def demo():
     assert rows["abc1001"]["startDateWCMFaculty"] is None, "empty year is NULL not 0"
 
     assert _mssql_target("jdbc:sqlserver://asms.db:1433;databaseName=ASMS") == ("asms.db", 1433)
+
+    # Grad school side table: every view column is named (Degree_Code is
+    # SELECT-denied, so `*` would fail), string dates become DATE, blanks NULL.
+    assert "*" not in GRAD_SCHOOL_QUERY and "Degree_Code" not in GRAD_SCHOOL_QUERY
+    assert GRAD_SCHOOL_QUERY.count(" AS ") == len(GRAD_SCHOOL_COLUMNS) == 31
+    gs = dict.fromkeys(c for _, c in GRAD_SCHOOL_COLUMNS)
+    gs.update(jid="42", cwid="abc1001 ", wcgsFacultyStatus="Y",
+              primaryPhdAppointmentDate="7/1/2019",
+              msAppointmentDate1=datetime.datetime(2021, 9, 1, 0, 0),
+              terminationDate="", labLink=None)
+    row = dict(zip((c for _, c in GRAD_SCHOOL_COLUMNS), _grad_school_row(gs)))
+    assert row["jid"] == 42 and row["cwid"] == "abc1001", "int jid, stripped cwid"
+    assert row["primaryPhdAppointmentDate"] == datetime.date(2019, 7, 1), "M/D/YYYY parsed"
+    assert row["msAppointmentDate1"] == datetime.date(2021, 9, 1), "datetime -> date"
+    assert row["terminationDate"] is None and row["labLink"] is None, "blank -> NULL"
+    assert _grad_school_date("not a date") is None, "unparsable -> NULL, not a crash"
+    assert len(row) == 31 and GRAD_SCHOOL_DDL.count("\n    ") >= 15
     assert _mssql_target("asms.db") == ("asms.db", 1433)
     assert _mssql_target("sqlserver://asms.db:1500") == ("asms.db", 1500)
 
@@ -2018,5 +2240,7 @@ if __name__ == "__main__":
         demo()
     elif "--spike" in sys.argv:     # confirm the five LDAP base DNs
         spike()
+    elif "--side-tables" in sys.argv:   # identity_* mirrors only; identity untouched
+        load_side_tables(dry_run="--dry-run" in sys.argv)
     else:
         main(dry_run="--dry-run" in sys.argv)
