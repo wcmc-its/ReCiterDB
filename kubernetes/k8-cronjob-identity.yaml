@@ -62,6 +62,13 @@ spec:
             # wcm with dropped_sources set, rather than failing.
             - secretRef:
                 name: cornell-ithaca-ed
+            # MSSQL_JENZABAR_DB_URL / _USERNAME / _PASSWORD, the IDM_JZBR read of
+            # WCN_vw_GS_Faculty_LR that fills identity_grad_school_faculty after
+            # the identity upsert. Optional: unset, the side table logs "not
+            # configured" and keeps its previous rows; identity is unaffected.
+            - secretRef:
+                name: reciterdb-jenzabar
+                optional: true
             # LDAP_URL, LDAP_BIND_DN and the five base DNs default correctly in
             # buildIdentity.py (taken from the institutional client's own config).
             # Do NOT re-add them here as empty strings -- os.environ.get returns
