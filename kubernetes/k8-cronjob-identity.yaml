@@ -37,6 +37,13 @@ spec:
             # the run in identity_build_log without upserting -- that is how this
             # job was validated before the Splunk search was retired.
             command: ["python3", "buildIdentity.py"]
+            env:
+            # Registers the cornell_ithaca source in buildIdentity.py. It is an
+            # OPTIONAL_SOURCE, so a Cornell failure cannot kill the WCM build
+            # (#224). identity is cumulative: turning this back off stops
+            # refreshing Cornell people but does not remove them.
+            - name: IDENTITY_CORNELL_SOURCE
+              value: "on"
             envFrom:
             # DB_USERNAME / DB_PASSWORD, and DB_HOST / DB_NAME from the configmap.
             - secretRef:
@@ -44,11 +51,17 @@ spec:
             - configMapRef:
                 name: reciterdb-configmap
             # LDAP_BIND_PASSWORD and MSSQL_DB_PASSWORD already live here for
-            # reciter-inst-client; this job needs no new secrets.
+            # reciter-inst-client; the WCM sources need nothing beyond them.
             - secretRef:
                 name: reciter-inst-secrets
             - configMapRef:
                 name: reciter-inst-client-configmap
+            # CORNELL_ITHACA_ED_DN / CORNELL_ITHACA_ED_PASS, the Cornell directory
+            # bind. Not optional once the gate above is on: without it
+            # cornell_ithaca is an OPTIONAL_SOURCE and drops out silently as lane
+            # wcm with dropped_sources set, rather than failing.
+            - secretRef:
+                name: cornell-ithaca-ed
             # LDAP_URL, LDAP_BIND_DN and the five base DNs default correctly in
             # buildIdentity.py (taken from the institutional client's own config).
             # Do NOT re-add them here as empty strings -- os.environ.get returns
