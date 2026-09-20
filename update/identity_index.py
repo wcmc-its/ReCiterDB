@@ -760,7 +760,7 @@ class IdentityIndex:
         }
 
     def candidates(self, last, fore=None, initials=None, affiliations=None, top_k=5,
-                   pub_year=None):
+                   pub_year=None, _swapped=False):
         """Ranked candidate CWIDs for one authorship (no identity-only score yet).
 
         `pub_year` is the paper's publication year; pass it to enable the temporal
@@ -781,6 +781,22 @@ class IdentityIndex:
             return [], 0
         pool = self.by_surname.get(surname_norm, [])
         if not pool:
+            # PubMed sometimes files a byline with LastName and ForeName inverted --
+            # pmid 42523178 has LastName='Anna J' ForeName='Podolanczuk' Initials='P' on
+            # authors 2-12 -- so the surname pool is empty and the roster's own faculty
+            # match nobody. Retry the two fields the other way round, `full` tier only:
+            # replayed over all 2,187 open no-match rows (2026-09-20) the swap reaches 58,
+            # 2 at `full` (both that pmid, both correct) and 56 initial-tier coincidences
+            # ("Will Moss" -> someone surnamed Will), so the initial tier stays shut.
+            # ponytail: fires only on an EMPTY pool; a swapped given name that is also a
+            # real surname ("Scott") never gets here. Widen if a measured case needs it.
+            if fore and not _swapped:
+                out, _ = self.candidates(fore, last, None, affiliations, top_k, pub_year,
+                                         _swapped=True)
+                out = [c for c in out if c["given_match"] == "full"]
+                for c in out:
+                    c["cohort_size"] = len(out)
+                return out, len(out)
             return [], 0
         author_init = _first_initial(fore, initials)
         author_given = _norm(fore)
@@ -1718,6 +1734,21 @@ def _selftest():
     # The default scope is WCM, and a record with NO campus key is WCM -- which is
     # what makes this a no-op for every existing caller and for every hand-built
     # record in this file and in aar_matcher / aar_sweep_stale's self-tests.
+    # --- PubMed LastName/ForeName inverted (pmid 42523178) -----------------------
+    annas = IdentityIndex([rec("Anna", "Jadwiga", "Podolanczuk", cwid="ajp9012"),
+                           rec("Zed", "", "Anna", cwid="za1")])
+    swapped, swapped_n = annas.candidates("Anna J", "Podolanczuk", "P")
+    checks += [
+        ("swapped byline LastName='Anna J' ForeName='Podolanczuk' reaches ajp9012 as full",
+         [(c["cwid"], c["given_match"]) for c in swapped] == [("ajp9012", "full")]
+         and swapped_n == 1),
+        ("the swap never admits an initial-tier coincidence: 'Will Moss' is nobody",
+         annas.candidates("Moss", "Will", "W") == ([], 0)),
+        ("a non-empty pool never swaps: LastName='Anna' finds the Anna pool (Zed Anna, "
+         "excluded on initial) and stops, so ajp9012 is not reached that way",
+         annas.candidates("Anna", "Podolanczuk", "P") == ([], 0)),
+    ]
+
     checks += [
         ("default scope is WCM", IdentityIndex([]).campus == CAMPUS_WCM),
         ("a record with no `campus` key is WCM, so no existing caller changes",
