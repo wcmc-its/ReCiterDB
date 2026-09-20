@@ -115,6 +115,23 @@ def match_home_institution(affil_text, groups):
     return any(all(tok in t for tok in tokens) for tokens in groups)
 
 
+_IS_WITH = re.compile(r"\b(?:is|are) with\b", re.I)
+
+
+def own_segment(affil_text, last):
+    """Some journals (AJPH: 'A is with X. B is with Y. ...') deposit ONE blob naming every
+    author's affiliation on EVERY author, so a single WCM co-author makes all 14 look WCM
+    (PMID 42753209: 14 rows, 1 real). Return this author's own clause when the blob has
+    that shape and the surname sits in exactly one clause; otherwise the text unchanged.
+    # ponytail: only the 'is/are with' idiom; add other journals' idioms as they show up."""
+    if not (affil_text and last) or len(_IS_WITH.findall(affil_text)) < 2:
+        return affil_text
+    segs = re.split(r"\.\s+(?=[A-Z][^.]*?\b(?:is|are) with\b)", affil_text)
+    own = [s for s in segs
+           if re.search(rf"\b{re.escape(last)}\b[^.]*?\b(?:is|are) with\b", s, re.I)]
+    return own[0].rstrip(".") + "." if len(own) == 1 else affil_text
+
+
 # ---- E-utilities -----------------------------------------------------------
 def _req(method, path, **params):
     params.update(tool=TOOL, email=EMAIL)
@@ -264,7 +281,7 @@ def parse_articles(xml_bytes, groups):
             fore = au.findtext("ForeName")
             if not (last or fore):
                 continue  # skip CollectiveName authors
-            affs = [a.text for a in au.findall("AffiliationInfo/Affiliation") if a.text]
+            affs = [own_segment(a.text, last) for a in au.findall("AffiliationInfo/Affiliation") if a.text]
             authors.append({
                 "last": last, "fore": fore, "initials": au.findtext("Initials"),
                 "affiliations": affs,
@@ -406,6 +423,26 @@ def _selftest():
               and "555..555" in raised and "3 attempts" in raised)
     finally:
         _req, time.sleep = orig_req, orig_sleep
+
+    blob = ("Lorna E. Thorpe is with the Department of Population Health, NYU Grossman School of "
+            "Medicine, New York, NY. Bruce R. Schackman is with the Department of Population Health "
+            "Sciences, Weill Cornell Medicine, New York, NY. Emily Oken is with the Department of "
+            "Population Medicine, Harvard Medical School, Boston, MA.")
+    check("own_segment keeps the WCM author's own clause (initial-split 'R. Schackman' included)",
+          own_segment(blob, "Schackman") == "Schackman is with the Department of Population Health "
+          "Sciences, Weill Cornell Medicine, New York, NY.")
+    check("own_segment strips Weill Cornell from a non-WCM co-author on the shared blob",
+          "Weill Cornell" not in own_segment(blob, "Thorpe"))
+    check("own_segment takes the trailing clause", own_segment(blob, "Oken").startswith("Emily Oken is with"))
+    check("own_segment leaves a surname that appears in no clause unchanged", own_segment(blob, "Nobody") == blob)
+    check("own_segment leaves an ordinary single affiliation unchanged",
+          own_segment("Dept of X, Weill Cornell Medicine, NY", "Lee") == "Dept of X, Weill Cornell Medicine, NY")
+    check("own_segment handles 'A and B are with'",
+          own_segment("A Lee and B Kim are with Weill Cornell. C Wu is with NYU.", "Kim")
+          == "A Lee and B Kim are with Weill Cornell.")
+    check("own_segment leaves an ambiguous surname (in two clauses) unchanged",
+          own_segment("A Lee is with Lee Hospital. B Lee is with NYU.", "Lee")
+          == "A Lee is with Lee Hospital. B Lee is with NYU.")
 
     print("SELFTEST", "PASS" if ok else "FAIL")
     return ok
