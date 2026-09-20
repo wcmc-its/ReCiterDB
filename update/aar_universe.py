@@ -115,20 +115,26 @@ def match_home_institution(affil_text, groups):
     return any(all(tok in t for tok in tokens) for tokens in groups)
 
 
-_IS_WITH = re.compile(r"\b(?:is|are) with\b", re.I)
+_WITH = r"\b(?:is|are|was|were) with\b"
+_IS_WITH = re.compile(_WITH, re.I)
 
 
 def own_segment(affil_text, last):
     """Some journals (AJPH: 'A is with X. B is with Y. ...') deposit ONE blob naming every
     author's affiliation on EVERY author, so a single WCM co-author makes all 14 look WCM
-    (PMID 42753209: 14 rows, 1 real). Return this author's own clause when the blob has
-    that shape and the surname sits in exactly one clause; otherwise the text unchanged.
-    # ponytail: only the 'is/are with' idiom; add other journals' idioms as they show up."""
+    (PMID 42753209: 14 rows, 1 real). Return just this author's own affiliation (the text
+    after 'is/are/was/were with', up to the next such clause) when the blob has that shape
+    and the surname sits in exactly one clause; otherwise the text unchanged. Names are
+    dropped on purpose: an author surnamed Cornell at a 'Medical Sciences' school matched
+    the cornell+medical group (PMID 40561400).
+    # ponytail: only the 'is/are with' idiom; a first-initial-only byline ('J. Doe is with')
+    # leaves a stray 'J.' on the previous clause. Add idioms as they show up."""
     if not (affil_text and last) or len(_IS_WITH.findall(affil_text)) < 2:
         return affil_text
-    segs = re.split(r"\.\s+(?=[A-Z][^.]*?\b(?:is|are) with\b)", affil_text)
-    own = [s for s in segs
-           if re.search(rf"\b{re.escape(last)}\b[^.]*?\b(?:is|are) with\b", s, re.I)]
+    # 'Bruce R. Schackman' -> 'Bruce R Schackman': a middle initial is not a sentence end
+    t = re.sub(r"(?<=[A-Za-z] [A-Z])\.(?= [A-Z])", "", affil_text)
+    own = re.findall(rf"\b{re.escape(last)}\b[^.]*?{_WITH}\s*(.*?)(?=\.\s+[^.]*?{_WITH}|\.?\s*$)",
+                     t, re.I | re.S)
     return own[0].rstrip(".") + "." if len(own) == 1 else affil_text
 
 
@@ -428,21 +434,33 @@ def _selftest():
             "Medicine, New York, NY. Bruce R. Schackman is with the Department of Population Health "
             "Sciences, Weill Cornell Medicine, New York, NY. Emily Oken is with the Department of "
             "Population Medicine, Harvard Medical School, Boston, MA.")
-    check("own_segment keeps the WCM author's own clause (initial-split 'R. Schackman' included)",
-          own_segment(blob, "Schackman") == "Schackman is with the Department of Population Health "
-          "Sciences, Weill Cornell Medicine, New York, NY.")
+    check("own_segment returns the WCM author's own affiliation (middle initial 'R.' not a sentence end)",
+          own_segment(blob, "Schackman")
+          == "the Department of Population Health Sciences, Weill Cornell Medicine, New York, NY.")
     check("own_segment strips Weill Cornell from a non-WCM co-author on the shared blob",
           "Weill Cornell" not in own_segment(blob, "Thorpe"))
-    check("own_segment takes the trailing clause", own_segment(blob, "Oken").startswith("Emily Oken is with"))
+    check("own_segment takes the trailing clause",
+          own_segment(blob, "Oken") == "the Department of Population Medicine, Harvard Medical School, Boston, MA.")
     check("own_segment leaves a surname that appears in no clause unchanged", own_segment(blob, "Nobody") == blob)
     check("own_segment leaves an ordinary single affiliation unchanged",
           own_segment("Dept of X, Weill Cornell Medicine, NY", "Lee") == "Dept of X, Weill Cornell Medicine, NY")
     check("own_segment handles 'A and B are with'",
-          own_segment("A Lee and B Kim are with Weill Cornell. C Wu is with NYU.", "Kim")
-          == "A Lee and B Kim are with Weill Cornell.")
+          own_segment("A Lee and B Kim are with Weill Cornell. C Wu is with NYU.", "Kim") == "Weill Cornell.")
     check("own_segment leaves an ambiguous surname (in two clauses) unchanged",
           own_segment("A Lee is with Lee Hospital. B Lee is with NYU.", "Lee")
           == "A Lee is with Lee Hospital. B Lee is with NYU.")
+    multi = ("Dina M. Jones, Carol E. Cornell, and Pebbles Fagan are with the Department of Health "
+             "Behavior, University of Arkansas for Medical Sciences, Little Rock. Mignonne C. Guy is "
+             "with the Department of Family Medicine, Virginia Commonwealth University, Richmond.")
+    check("own_segment drops the names, so a co-author surnamed Cornell can't match cornell+medical (40561400)",
+          own_segment(multi, "Cornell")
+          == "the Department of Health Behavior, University of Arkansas for Medical Sciences, Little Rock.")
+    check("own_segment finds a surname listed mid-clause behind two middle initials",
+          own_segment(multi, "Fagan") == own_segment(multi, "Cornell"))
+    check("own_segment handles 'was with' (42060871)",
+          own_segment("A Lee is with NYU, New York, NY. At the time of this study, Q Trinh was with "
+                      "the Department of Urology, Pittsburgh, PA.", "Trinh")
+          == "the Department of Urology, Pittsburgh, PA.")
 
     print("SELFTEST", "PASS" if ok else "FAIL")
     return ok
