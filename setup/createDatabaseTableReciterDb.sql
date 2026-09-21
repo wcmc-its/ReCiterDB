@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS `admin_users` (
   `status` int(1) DEFAULT 1,
   `scope_person_types` JSON DEFAULT NULL,
   `scope_org_units` JSON DEFAULT NULL,
+  `scope_institutions` JSON DEFAULT NULL,
   `proxy_person_ids` JSON DEFAULT NULL,
   `createTimestamp` timestamp NOT NULL DEFAULT '0000-00-00 00:00:00',
   `modifyTimestamp` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
