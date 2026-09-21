@@ -325,6 +325,21 @@ def run_conflicts_refresh_if_due():
         logger.exception(f"COI refresh failed (ignored — reporting unaffected): {e}")
 
 
+def run_orcid_suggestions():
+    """Nightly ORCID suggestions → pubsource_orcid_person (CWID, inferred): the ORCID at a
+    person's own byline position across their ACCEPTED articles (PubMed AUID, then Crossref
+    for the gap), with rejected counts as negative evidence. Scholars Profile System mirrors
+    the table nightly into its ORCID coverage dashboard and the self-edit "Is this your
+    ORCID iD?" row. The Crossref author cache lives in S3 (orcid-suggestions/), so after the
+    first run only new DOIs cost a call. Isolated like the lanes: a failure leaves yesterday's
+    rows in place and can never fail the nightly."""
+    try:
+        run_script("orcidSuggestions", "python3 updateOrcidSuggestions.py --apply --s3-cache",
+                   timeout_seconds=int(os.getenv("ORCID_SUGGESTIONS_TIMEOUT_SECONDS", "5400")))
+    except Exception as e:
+        logger.exception(f"ORCID suggestions failed (ignored — yesterday's rows stand): {e}")
+
+
 # ------------- AAR PubMed lane (daily by default, isolated) -------------
 def run_pubmed_lane_if_due():
     """PubMed orphan-authorship detector + IO/FB scoring (AAR).
@@ -537,6 +552,7 @@ def main():
                                               # AF-ID family; needs the Ithaca identity load first
         run_pubmed_lane_if_due()              # DAILY by default (AAR_PUBMED_LANE_CADENCE)
         run_conflicts_refresh_if_due()        # weekly (Sun): refill empty COI rows (#130)
+        run_orcid_suggestions()               # nightly: pubsource_orcid_person from accepted articles
         run_aar_close_attributed()            # nightly: dismiss already-attributed open AAR rows (#186)
         run_aar_reconcile_drift_if_due()      # OFF unless AAR_DRIFT_CADENCE is set: refresh open AAR
                                               # rows whose stored evidence columns no longer match
