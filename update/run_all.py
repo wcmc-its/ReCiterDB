@@ -263,13 +263,15 @@ def run_scopus_ithaca_lane_if_due():
     roster does not merely find nothing: a Cornell surname that collides with a WCM
     person's yields a confident FALSE ATTRIBUTION to that WCM person, written to
     authorship_review as a real open row. So the lane must load the Ithaca roster
-    explicitly before it is ever enabled.
+    explicitly before it is ever enabled. DONE: `--campus cornell-ithaca` below loads it,
+    run() refuses an afid list that overlaps the other campus's family, and authors who
+    also carry a WCM afid are left to the WCM lane (author_key has no campus).
 
     Sequence: (1) land whatever admits Cornell people to reciterdb.identity; (2) land the
     campus scoping AND thread it through this lane, so the Ithaca invocation loads the
     Ithaca roster rather than the default one; (3) confirm identity_index resolves a
     handful of known Ithaca authors; (4) run `aar_universe_scopus.py --mode rolling
-    --afid-list scopus_afids_cornell_ithaca.csv` as a dry run and read the
+    --afid-list scopus_afids_cornell_ithaca.csv --campus cornell-ithaca` as a dry run and read the
     matched/unmatched counts; (5) only then patch the CronJob env to
     AAR_SCOPUS_ITHACA_LANE=on. An env patch on the live CronJob survives deploys
     (k8-buildspec only does `kubectl set image`), the same escape hatch as
@@ -295,7 +297,7 @@ def run_scopus_ithaca_lane_if_due():
             return
         run_script("aarScopusLaneIthaca",
                    "python3 aar_universe_scopus.py --mode rolling "
-                   "--afid-list scopus_afids_cornell_ithaca.csv --apply",
+                   "--afid-list scopus_afids_cornell_ithaca.csv --campus cornell-ithaca --apply",
                    timeout_seconds=int(os.getenv("SCOPUS_ITHACA_TIMEOUT_SECONDS", "3600")))
     except Exception as e:
         logger.exception(f"Scopus Ithaca lane failed (ignored — reporting "
