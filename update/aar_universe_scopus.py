@@ -49,7 +49,7 @@ from datetime import date, datetime, timedelta
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from identity_index import IdentityIndex   # source-agnostic identity roster
+from identity_index import IdentityIndex, CAMPUS_WCM, CAMPUS_ITHACA   # source-agnostic identity roster
 import aar_db                              # shared authorship_review upsert sink
 
 SCOPUS_SEARCH = "https://api.elsevier.com/content/search/scopus"
@@ -58,6 +58,7 @@ SCOPUS_TOKEN = os.environ.get("SCOPUS_INST_TOKEN")
 
 # family AF-ID set ships alongside this script in the image (Dockerfile COPY).
 DEFAULT_AFID_LIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scopus_afids.csv")
+ITHACA_AFID_LIST = os.path.join(os.path.dirname(DEFAULT_AFID_LIST), "scopus_afids_cornell_ithaca.csv")
 
 # afid 119027669 "Weill Institute for Neurosciences" is a UCSF entity (no city, added by a
 # "Weill" affil-search rather than the home list). Including it would tag UCSF authors as WCM.
@@ -411,15 +412,19 @@ def _affil_names(entry):
     return out
 
 
-def wcm_authorships(entry, family):
-    """Yield (i, n, author-for-matcher, family_hits) for authors whose afid is in `family`."""
+def wcm_authorships(entry, family, yield_to=frozenset()):
+    """Yield (i, n, author-for-matcher, family_hits) for authors whose afid is in `family`.
+
+    An author who also carries an afid in `yield_to` is skipped: the lane owning that
+    family writes the row. author_key has no campus in it, so without this a dual-afid
+    author would be upserted by both lanes and the later one would overwrite the pick."""
     authors = _as_list(entry.get("author"))
     affil = _affil_names(entry)
     n = len(authors)
     for i, au in enumerate(authors):
         afids = [d.get("$") for d in _as_list(au.get("afid")) if d.get("$")]
         hits = [a for a in afids if a in family]
-        if not hits:
+        if not hits or any(a in yield_to for a in afids):
             continue
         yield i, n, {
             "last": au.get("surname"), "fore": au.get("given-name"),
@@ -579,9 +584,21 @@ def recheck_open_scopus(run_ts):
 
 
 # ---- driver -----------------------------------------------------------------
-def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True, idx=None):
+def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True, idx=None,
+        campus=CAMPUS_WCM):
     run_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     family = load_family_afids(afid_list)
+    # The afid family picks which documents are FETCHED; `campus` picks which roster they
+    # are MATCHED AGAINST. They must agree -- an Ithaca sweep scored against the WCM roster
+    # turns every surname collision (30% of Ithaca keys, 09-25) into a confident false
+    # attribution. Checked on content, not filename.
+    wcm_family, ithaca_family = load_family_afids(), load_family_afids(ITHACA_AFID_LIST)
+    other = ithaca_family if campus == CAMPUS_WCM else wcm_family
+    if family & other:
+        raise RuntimeError(f"afid list {afid_list} overlaps the other campus's family "
+                           f"for campus {campus!r}: {sorted(family & other)[:5]}")
+    # Dual-afid authors belong to the WCM lane (see wcm_authorships).
+    yield_to = wcm_family if campus == CAMPUS_ITHACA else frozenset()
 
     print(f"[1/5] Scopus sweep: {len(family)} family afids, ORIG-LOAD-DATE {aft}..{bef}",
           flush=True)
@@ -622,9 +639,11 @@ def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True,
           f"(kept, flagged with a candidate PMID for adjudication); {len(scopus_only)} SCOPUS-ONLY",
           flush=True)
 
-    print("[4/5] Matching WCM authorships against the identity roster ...", flush=True)
+    print(f"[4/5] Matching family authorships against the {campus} identity roster ...", flush=True)
     if idx is None:
-        idx = IdentityIndex.load()
+        idx = IdentityIndex.load(campus=campus)
+    if idx.campus != campus:
+        raise RuntimeError(f"roster campus {idx.campus!r} != sweep campus {campus!r}")
     # one batched dup-check join over every DOI in this month/window, not a query per
     # row (aar_db.dup_flags_by_doi docstring) — mirrors the "load the roster once"
     # convention already used for idx above.
@@ -632,7 +651,7 @@ def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True,
     dup_map = aar_db.dup_flags_by_doi(dois) if dois else {}
     rows, unmatched = [], 0
     for d in scopus_only:
-        for i, n, au, _ in wcm_authorships(d, family):
+        for i, n, au, _ in wcm_authorships(d, family, yield_to):
             cands, _ = idx.candidates(au["last"], au["fore"], au["initials"],
                                       au["affiliations"], top_k=5,
                                       pub_year=_pub_year(d))
@@ -709,12 +728,12 @@ def initial_months(years=5, today=None):
     return month_range((ey - years, em), (ey, em))
 
 
-def run_backfill(months, apply_writes=False, afid_list=DEFAULT_AFID_LIST):
+def run_backfill(months, apply_writes=False, afid_list=DEFAULT_AFID_LIST, campus=CAMPUS_WCM):
     """Backfill driver: sweep each calendar month once, sharing one identity index (the
     35k-row roster loads once, not per month). The open-row re-check runs ONCE at the end
     (only when applying). Idempotent per month via the author_key upsert — a run that dies
     partway resumes with `--from <next-month> --to <end-month>`."""
-    idx = IdentityIndex.load()
+    idx = IdentityIndex.load(campus=campus)
     print(f"Backfill: {len(months)} months, {months[0][0]}-{months[0][1]:02d} .. "
           f"{months[-1][0]}-{months[-1][1]:02d}"
           + ("  [APPLY]" if apply_writes else "  [DRY-RUN]"), flush=True)
@@ -724,7 +743,7 @@ def run_backfill(months, apply_writes=False, afid_list=DEFAULT_AFID_LIST):
         aft, bef = month_window(y, m)
         print(f"\n########## {y}-{m:02d}  ({k + 1}/{len(months)}) ##########", flush=True)
         s = run(aft, bef, apply_writes=apply_writes, afid_list=afid_list,
-                recheck=apply_writes and k == len(months) - 1, idx=idx)
+                recheck=apply_writes and k == len(months) - 1, idx=idx, campus=campus)
         for key in ("family_docs", "scopus_only", "matched_rows", "unmatched"):
             agg[key] += s[key]
         agg["per_month"].append({"month": f"{y}-{m:02d}", "scopus_only": s["scopus_only"],
@@ -754,9 +773,7 @@ def _selftest():
     # scopus_afids.csv: wcm_authorships() selects an author purely on "carries an afid
     # in the family set", so a merged list would tag every Ithaca author as WCM and
     # would roughly double one Sunday sweep's fetch volume under a single timeout.
-    _ithaca_list = os.path.join(os.path.dirname(DEFAULT_AFID_LIST),
-                                "scopus_afids_cornell_ithaca.csv")
-    _ithaca = load_family_afids(_ithaca_list)
+    _ithaca = load_family_afids(ITHACA_AFID_LIST)
     check("cornell ithaca afid list parses and carries 16 afids", len(_ithaca) == 16)
     check("cornell ithaca afid list is disjoint from the WCM family set",
           not (_ithaca & load_family_afids(DEFAULT_AFID_LIST)))
@@ -941,6 +958,23 @@ def _selftest():
           "matched_pmid_verdict" not in aar_db._INSERT_COLS
           and "matched_pmid_verdict" not in aar_db._REFRESH_COLS)
 
+    # A dual-afid author (WCM + Ithaca afid) belongs to the WCM lane only; author_key has
+    # no campus, so both lanes yielding it would let the Ithaca upsert overwrite the pick.
+    _w, _i = next(iter(load_family_afids())), next(iter(_ithaca))
+    _doc = {"author": [{"surname": "Dual", "afid": [{"$": _w}, {"$": _i}]},
+                       {"surname": "Ith", "afid": [{"$": _i}]}]}
+    check("ithaca lane yields dual-afid authors to the WCM lane",
+          [a["last"] for _, _, a, _ in wcm_authorships(_doc, _ithaca, load_family_afids())] == ["Ith"])
+    check("wcm lane still takes dual-afid authors",
+          [a["last"] for _, _, a, _ in wcm_authorships(_doc, load_family_afids())] == ["Dual"])
+    for _c, _l in ((CAMPUS_WCM, ITHACA_AFID_LIST), (CAMPUS_ITHACA, DEFAULT_AFID_LIST)):
+        try:
+            run("x", "y", afid_list=_l, campus=_c)
+            _raised = False
+        except RuntimeError:
+            _raised = True
+        check(f"run() refuses afid list {os.path.basename(_l)} on campus {_c}", _raised)
+
     print("\nSELFTEST", "PASS" if ok else "FAIL")
     return ok
 
@@ -957,6 +991,8 @@ def main():
     ap.add_argument("--to", dest="to_month", help="YYYY-MM backfill range end (with --from)")
     ap.add_argument("--years", type=int, default=5, help="--mode initial backfill span (default 5)")
     ap.add_argument("--afid-list", default=DEFAULT_AFID_LIST)
+    ap.add_argument("--campus", choices=[CAMPUS_WCM, CAMPUS_ITHACA], default=CAMPUS_WCM,
+                    help="identity roster to match against; must agree with --afid-list")
     ap.add_argument("--apply", action="store_true", help="write rows (default: dry-run)")
     ap.add_argument("--no-recheck", action="store_true",
                     help="skip resolving open scopus rows out (only meaningful with --apply)")
@@ -973,23 +1009,24 @@ def main():
         print(f"Scopus lane: loads of {y}-{m:02d}  (ORIG-LOAD-DATE {aft}..{bef})"
               + ("  [APPLY]" if args.apply else "  [DRY-RUN]"), flush=True)
         return run(aft, bef, apply_writes=args.apply, afid_list=args.afid_list,
-                   recheck=not args.no_recheck)
+                   recheck=not args.no_recheck, campus=args.campus)
 
     if args.mode == "rolling":
         aft, bef = rolling_window(lag_days=args.lag_days, span_days=args.span_days)
         print(f"Scopus lane: rolling ORIG-LOAD-DATE {aft}..{bef}"
               + ("  [APPLY]" if args.apply else "  [DRY-RUN]"), flush=True)
         summary = run(aft, bef, apply_writes=args.apply, afid_list=args.afid_list,
-                      recheck=not args.no_recheck)
+                      recheck=not args.no_recheck, campus=args.campus)
     elif args.mode == "recurring":
         summary = one_month(*recurring_month())
     elif args.mode == "initial":
         summary = run_backfill(initial_months(args.years), apply_writes=args.apply,
-                               afid_list=args.afid_list)
+                               afid_list=args.afid_list, campus=args.campus)
     elif args.from_month and args.to_month:
         f = tuple(int(x) for x in args.from_month.split("-"))
         t = tuple(int(x) for x in args.to_month.split("-"))
-        summary = run_backfill(month_range(f, t), apply_writes=args.apply, afid_list=args.afid_list)
+        summary = run_backfill(month_range(f, t), apply_writes=args.apply, afid_list=args.afid_list,
+                               campus=args.campus)
     elif args.month:
         summary = one_month(*(int(x) for x in args.month.split("-")))
     else:
