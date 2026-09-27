@@ -61,8 +61,8 @@ import adversarial_attribution_review as det   # Step-0 scoring engine (S3 + pin
 # IdentityIndex + name helpers + person-type table extracted to identity_index.py so the
 # Scopus lane can reuse them without this module's S3/model deps. Re-exported here for
 # any importer that still reaches for aar_matcher.IdentityIndex / _norm.
-from identity_index import (IdentityIndex, _norm, _first_initial,  # noqa: F401
-                            name_tokens, PERSON_TYPES)
+from identity_index import (IdentityIndex, CampusRoster, _norm, _first_initial,  # noqa: F401
+                            name_tokens, PERSON_TYPES, CAMPUS_WCM, CAMPUS_ITHACA)
 
 IDENTITY_ONLY_SUFFIX = "-identityOnlyScoringInput.json"
 
@@ -160,12 +160,27 @@ def match_authorship(author, pmid, idx, io_scorer, top_k=5, pub_year=None):
     outrank a 50-point identity-only score, and would sink the penalised candidate out
     of `candidates()`'s top_k altogether. `confidence` therefore keeps its LAST position
     here, unchanged by the reorder above. So on this lane the penalty moves the top pick
-    only among candidates otherwise tied — in practice the ones production never scored."""
+    only among candidates otherwise tied — in practice the ones production never scored.
+
+    CORNELL CANDIDATES (`idx` a `CampusRoster`, byline naming Ithaca) have no identity-only
+    score by construction: ReCiter never retrieves or scores Cornell people, so there is
+    no S3 input to read and the lookup is skipped outright (not attempted and missed).
+    They rank exactly as a WCM candidate ReCiter never retrieved does -- io_score None,
+    io_source "not_retrieved", -1.0 in the key. That is the rule, and why it cannot bury
+    them: on a Cornell-only byline every candidate is Cornell, so io ties across the
+    whole list and `candidates()`' own (tier, affiliation, confidence) order stands; on a
+    two-campus byline the given-name tier still LEADS, so a Cornell `full` match beats any
+    WCM `initial` one whatever its score. The one place a WCM rival wins is the same tier
+    WITH a retrieved score -- the ordinary "retrieved beats never-retrieved" tie-break
+    this key already applies between two WCM people, applied unchanged across campuses.
+    ponytail: that includes a near-zero WCM score (the Torres shape, one tier down).
+    Revisit if two-campus rows show curators overriding it."""
     cands, cohort = idx.candidates(
         author.get("last"), author.get("fore"), author.get("initials"),
         author.get("affiliations"), top_k=top_k, pub_year=pub_year)
     for c in cands:
-        v = io_scorer.scores(c["cwid"]).get(int(pmid)) if io_scorer else None
+        scored = io_scorer and c.get("campus", CAMPUS_WCM) == CAMPUS_WCM
+        v = io_scorer.scores(c["cwid"]).get(int(pmid)) if scored else None
         c["io_score"] = round(v[0], 2) if v else None
         c["final_score"] = round(v[1], 2) if v else None   # production final (>=30 == suggested)
         c["io_source"] = "retrieved" if v else "not_retrieved"
@@ -282,7 +297,48 @@ def _rank_selftest():
     st = match_authorship({"last": "Weiss", "fore": "Robert", "initials": "R",
                            "affiliations": []}, 99, same_tier, _OneScoredIO())
 
+    # --- Cornell candidates (CampusRoster): no io exists, none is fetched, none buries ---
+    def crec(given, surname, cwid):
+        return dict(rec(given, surname, None, cwid), campus=CAMPUS_ITHACA,
+                    person_type="Cornell Faculty", historical=False)
+
+    class _RecordingIO:
+        """Scores every WCM cwid 0.62 and records which cwids were asked for."""
+        def __init__(self):
+            self.asked = []
+
+        def scores(self, cwid):
+            self.asked.append(cwid)
+            return {99: (0.62, 0.0)}
+
+    ppl = [dict(rec("Karl", "Moss", None, "km_w"), historical=False),
+           crec("Kate", "Moss", "km_c"), crec("Kim", "Moss", "km_c2")]
+    roster = CampusRoster(IdentityIndex(ppl), ithaca=IdentityIndex(ppl, campus=CAMPUS_ITHACA))
+    ith = ["Department of Animal Science, Cornell University, Ithaca, NY"]
+    wcm = ["Department of Medicine, Weill Cornell Medicine, New York, NY"]
+    rio = _RecordingIO()
+    cu_only = match_authorship({"last": "Moss", "fore": "Kate", "initials": "K",
+                                "affiliations": ith}, 99, roster, rio)
+    cu_asked = list(rio.asked)
+    both_full = match_authorship({"last": "Moss", "fore": "Kate", "initials": "K",
+                                  "affiliations": wcm + ith}, 99, roster, _RecordingIO())
+    both_tie = match_authorship({"last": "Moss", "fore": None, "initials": "K",
+                                 "affiliations": wcm + ith}, 99, roster, _RecordingIO())
+
     checks = [
+        ("Cornell-only byline: the Cornell people come back, top is the full match, "
+         "io_score None / not_retrieved, and the scorer was NEVER asked for a Cornell cwid",
+         [c["cwid"] for c in cu_only] == ["km_c", "km_c2"]
+         and all(c["io_score"] is None and c["io_source"] == "not_retrieved" for c in cu_only)
+         and cu_asked == []),
+        ("two-campus byline: a Cornell FULL match outranks a WCM initial-tier rival that "
+         "carries a retrieved score (the tier leads)",
+         both_full[0]["cwid"] == "km_c" and both_full[0]["io_score"] is None
+         and any(c["cwid"] == "km_w" and c["io_score"] == 0.62 for c in both_full)),
+        ("two-campus byline, same tier: the retrieved WCM candidate wins the tie-break "
+         "(documented rule), and every Cornell candidate is still offered",
+         both_tie[0]["cwid"] == "km_w"
+         and {c["cwid"] for c in both_tie} == {"km_w", "km_c", "km_c2"}),
         ("pre-#159 (no pub_year): io_score alone puts the departed Lee on top",
          before[0]["cwid"] == "departed" and before[0]["io_score"] == 95.0),
         ("INTENDED: a 25-year gap does NOT outrank a 95-point identity-only score",
@@ -376,7 +432,7 @@ def main():
     if not args.surname:
         ap.error("use --selftest or --surname [...]")
 
-    idx = IdentityIndex.load()
+    idx = CampusRoster.load()          # --affil naming Ithaca reaches the Cornell roster
     io = IdentityOnlyScorer() if args.pmid else None
     author = {"last": args.surname, "fore": args.given,
               "initials": args.initials, "affiliations": args.affil}

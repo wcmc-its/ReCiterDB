@@ -264,9 +264,7 @@ def _classify_scopus(rows, idx, limit=None):
             if hit is None:
                 unresolvable.append(r)
             else:
-                cands, _cohort = idx.candidates(hit["last"], hit["fore"], hit["initials"],
-                                                hit["affiliations"], top_k=5,
-                                                pub_year=scop._pub_year(entry))
+                cands, _cohort = scop.wcm_lane_candidates(idx, hit, scop._pub_year(entry))
                 if cands:
                     matched.append(r)
                 else:
@@ -354,7 +352,9 @@ def main():
     print()
 
     engine = aar_db.engine()
-    idx = IdentityIndex.load()
+    # Both campuses, per byline, exactly as the producer now matches (CampusRoster) --
+    # a WCM-only replay would read every Cornell proposal as drift.
+    idx = idxmod.CampusRoster.load()
     n_roster = sum(len(v) for v in idx.by_surname.values())
     print(f"Identity roster: {n_roster} people\n")
 

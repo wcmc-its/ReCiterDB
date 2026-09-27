@@ -970,7 +970,10 @@ def main():
     engine = aar_db.engine()
     idx = io_scorer = None
     if need_class_b:
-        idx = IdentityIndex.load()
+        # Both campuses, per byline, as the producer matches (CampusRoster): a WCM-only
+        # replay would read every Cornell proposal as CLASS B drift and "refresh" it
+        # back onto WCM homonyms.
+        idx = idxmod.CampusRoster.load()
         n_roster = sum(len(v) for v in idx.by_surname.values())
         print(f"Identity roster: {n_roster} people\n")
         io_scorer = matcher.IdentityOnlyScorer()

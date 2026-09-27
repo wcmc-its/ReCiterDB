@@ -49,7 +49,8 @@ from datetime import date, datetime, timedelta
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from identity_index import IdentityIndex, CAMPUS_WCM, CAMPUS_ITHACA   # source-agnostic identity roster
+from identity_index import (IdentityIndex, CampusRoster, byline_campuses,  # identity roster(s)
+                            CAMPUS_WCM, CAMPUS_ITHACA)
 import aar_db                              # shared authorship_review upsert sink
 
 SCOPUS_SEARCH = "https://api.elsevier.com/content/search/scopus"
@@ -302,7 +303,11 @@ def _trunc(s, n):
 def _compact(cands):
     keep = ("cwid", "name", "name_source", "name_n", "person_type", "dept", "given_match",
             "affil_dept_match", "cohort_size", "confidence", "years_after_wcm")
-    return [{k: c.get(k) for k in keep} for c in cands]
+    # `campus` only when a candidate carries one (Cornell): a WCM entry keeps its exact
+    # pre-campus bytes, and PM spreads each entry as an opaque object, so the extra key
+    # rides through to the card untouched.
+    return [dict({k: c.get(k) for k in keep}, **({"campus": c["campus"]} if c.get("campus")
+                                                 else {})) for c in cands]
 
 
 def _pub_year(entry):
@@ -430,6 +435,7 @@ def wcm_authorships(entry, family, yield_to=frozenset()):
             "last": au.get("surname"), "fore": au.get("given-name"),
             "initials": au.get("initials"),
             "affiliations": [affil[a] for a in afids if a in affil],
+            "afids": afids,
         }, hits
 
 
@@ -584,6 +590,42 @@ def recheck_open_scopus(run_ts):
 
 
 # ---- driver -----------------------------------------------------------------
+def _roster(campus):
+    """The WCM lane matches against BOTH campuses, picked per author (`_campuses`); the
+    Ithaca lane only ever sees authors with no WCM afid, so it keeps the one roster."""
+    return CampusRoster.load() if campus == CAMPUS_WCM else IdentityIndex.load(campus=campus)
+
+
+def _campuses(au, ithaca_family):
+    """Campuses for a WCM-lane author: WCM always (the author carries a WCM afid -- that
+    is how the lane picked them), plus Cornell when the author ALSO carries an Ithaca
+    afid or an affiliation clause names Ithaca. The afid term is needed, not belt-and-
+    braces: several Ithaca afids' canonical names ("Cornell University College of
+    Engineering") carry no Ithaca marker unless Scopus appends the city, and the
+    classifier reads such a name as the ambiguous-Cornell WCM default. Dual-afid authors
+    are the WCM lane's alone (`wcm_authorships` yield_to), so this is the one place they
+    can be offered both campuses."""
+    out = {CAMPUS_WCM} | byline_campuses(au["affiliations"])
+    if ithaca_family & set(au.get("afids") or ()):
+        out.add(CAMPUS_ITHACA)
+    return out
+
+
+def wcm_lane_candidates(idx, au, pub_year, ithaca_family=None):
+    """`idx.candidates` for one WCM-lane author -- the producer's call, and the one the
+    replay tools (aar_sweep_stale / aar_report_changed_picks) make on a live re-fetch, so
+    a replay reaches the same roster(s) the producer did. A `CampusRoster` gets the
+    afid-aware campus set; a bare single-campus index (the Ithaca lane, hand-built
+    selftest rosters) is called exactly as before."""
+    kw = {}
+    if isinstance(idx, CampusRoster):
+        if ithaca_family is None:
+            ithaca_family = load_family_afids(ITHACA_AFID_LIST)
+        kw["campuses"] = _campuses(au, ithaca_family)
+    return idx.candidates(au["last"], au["fore"], au["initials"], au["affiliations"],
+                          top_k=5, pub_year=pub_year, **kw)
+
+
 def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True, idx=None,
         campus=CAMPUS_WCM):
     run_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -641,7 +683,7 @@ def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True,
 
     print(f"[4/5] Matching family authorships against the {campus} identity roster ...", flush=True)
     if idx is None:
-        idx = IdentityIndex.load(campus=campus)
+        idx = _roster(campus)
     if idx.campus != campus:
         raise RuntimeError(f"roster campus {idx.campus!r} != sweep campus {campus!r}")
     # one batched dup-check join over every DOI in this month/window, not a query per
@@ -652,9 +694,7 @@ def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True,
     rows, unmatched = [], 0
     for d in scopus_only:
         for i, n, au, _ in wcm_authorships(d, family, yield_to):
-            cands, _ = idx.candidates(au["last"], au["fore"], au["initials"],
-                                      au["affiliations"], top_k=5,
-                                      pub_year=_pub_year(d))
+            cands, _ = wcm_lane_candidates(idx, au, _pub_year(d), ithaca_family)
             top = cands[0] if cands else None
             if top is None:
                 unmatched += 1                         # nothing to assign (v1 skips unmatched)
@@ -733,7 +773,7 @@ def run_backfill(months, apply_writes=False, afid_list=DEFAULT_AFID_LIST, campus
     35k-row roster loads once, not per month). The open-row re-check runs ONCE at the end
     (only when applying). Idempotent per month via the author_key upsert — a run that dies
     partway resumes with `--from <next-month> --to <end-month>`."""
-    idx = IdentityIndex.load(campus=campus)
+    idx = _roster(campus)
     print(f"Backfill: {len(months)} months, {months[0][0]}-{months[0][1]:02d} .. "
           f"{months[-1][0]}-{months[-1][1]:02d}"
           + ("  [APPLY]" if apply_writes else "  [DRY-RUN]"), flush=True)
@@ -967,6 +1007,58 @@ def _selftest():
           [a["last"] for _, _, a, _ in wcm_authorships(_doc, _ithaca, load_family_afids())] == ["Ith"])
     check("wcm lane still takes dual-afid authors",
           [a["last"] for _, _, a, _ in wcm_authorships(_doc, load_family_afids())] == ["Dual"])
+    # Byline campus on the WCM lane: WCM always, Cornell added by an Ithaca afid or an
+    # Ithaca clause. The dual-afid author above is the case that motivates the afid term.
+    _dual = next(a for _, _, a, _ in wcm_authorships(dict(_doc, affiliation=[
+        {"afid": _w, "affilname": "Weill Cornell Medicine", "affiliation-city": "New York"},
+        {"afid": _i, "affilname": "Cornell University College of Engineering"}]),
+        load_family_afids()))
+    check("dual-afid author: afids ride on the author, both campuses offered (the Ithaca "
+          "afid's city-less name alone would read as the WCM default)",
+          _dual["afids"] == [_w, _i] and _campuses(_dual, _ithaca) == {CAMPUS_WCM, CAMPUS_ITHACA})
+    check("WCM-afid author with a WCM affiliation only -> WCM only",
+          _campuses({"affiliations": ["Weill Cornell Medicine, New York"], "afids": [_w]},
+                    _ithaca) == {CAMPUS_WCM})
+    check("WCM-afid author whose other affiliation names Ithaca -> both",
+          _campuses({"affiliations": ["Weill Cornell Medicine, New York",
+                                      "Cornell University, Ithaca"], "afids": [_w, "1"]},
+                    _ithaca) == {CAMPUS_WCM, CAMPUS_ITHACA})
+
+    from identity_index import _norm as _n
+
+    def _rec(given, surname, cwid, campus=CAMPUS_WCM):
+        return {"cwid": cwid, "given": given, "middle": "", "surname": surname,
+                "given_norm": _n(given), "surname_norm": _n(surname), "pref_norm": "",
+                "dept": "", "division": "", "program": "", "title": "",
+                "person_type": "Cornell Faculty" if campus != CAMPUS_WCM else "Faculty",
+                "historical": False, "end_year": None, "campus": campus}
+
+    _people = [_rec("Ann", "Dual", "ad_wcm"), _rec("Ann", "Dual", "ad_cu", CAMPUS_ITHACA)]
+    _roster2 = CampusRoster(IdentityIndex(_people),
+                            ithaca=IdentityIndex(_people, campus=CAMPUS_ITHACA))
+    _au = dict(_dual, fore="Ann")
+    _both, _ = _roster2.candidates("Dual", "Ann", None, _au["affiliations"],
+                                   campuses=_campuses(_au, _ithaca))
+    _row = _build_row(entry, 0, 2, _au, _both[0], _both, "2026-09-27 00:00:00")
+    _stored = json.loads(_row["candidate_cwids_json"])
+    check("dual-afid row offers BOTH people; the Cornell entry is tagged campus, the WCM "
+          "entry carries no campus key; not a single-candidate row",
+          [c["cwid"] for c in _stored] == ["ad_wcm", "ad_cu"]
+          and "campus" not in _stored[0] and _stored[1]["campus"] == CAMPUS_ITHACA
+          and _row["single_candidate"] == 0 and _row["top_cwid"] == "ad_wcm")
+    check("wcm_lane_candidates (the producer's and the replays' call) routes a dual-afid "
+          "author to both campuses via a CampusRoster, and a bare index exactly as before",
+          [c["cwid"] for c in wcm_lane_candidates(_roster2, _au, None, _ithaca)[0]]
+          == ["ad_wcm", "ad_cu"]
+          and [c["cwid"] for c in wcm_lane_candidates(IdentityIndex(_people), _au, None)[0]]
+          == ["ad_wcm"])
+    _wcm_only, _ = _roster2.candidates("Dual", "Ann", None, ["Weill Cornell Medicine, New York"],
+                                       campuses={CAMPUS_WCM})
+    check("WCM-only row: candidate_cwids_json byte-identical to the bare WCM index's",
+          _build_row(entry, 0, 2, _au, _wcm_only[0], _wcm_only, "t")["candidate_cwids_json"]
+          == json.dumps(_compact(IdentityIndex(_people).candidates(
+              "Dual", "Ann", None, ["Weill Cornell Medicine, New York"])[0])))
+
     for _c, _l in ((CAMPUS_WCM, ITHACA_AFID_LIST), (CAMPUS_ITHACA, DEFAULT_AFID_LIST)):
         try:
             run("x", "y", afid_list=_l, campus=_c)
