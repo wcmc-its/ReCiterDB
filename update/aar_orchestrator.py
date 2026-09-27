@@ -147,7 +147,10 @@ def _compact(cands):
     keep = ("cwid", "name", "name_source", "name_n", "person_type", "dept", "given_match",
             "affil_dept_match", "cohort_size", "confidence", "years_after_wcm", "io_score",
             "final_score", "io_source")
-    return [{k: c.get(k) for k in keep} for c in cands]
+    # `campus` only on a Cornell candidate -- same rule, and same reason, as
+    # aar_universe_scopus._compact: WCM entries keep their exact pre-campus bytes.
+    return [dict({k: c.get(k) for k in keep}, **({"campus": c["campus"]} if c.get("campus")
+                                                 else {})) for c in cands]
 
 
 def _trunc(s, n):
@@ -395,7 +398,10 @@ def _new_ctx(state_dir):
     """Shared context across tiled slices: one ledger store, one identity index, one
     identity-only score cache (so a CWID is downloaded+scored once for the whole run)."""
     return {"store": LedgerStore(state_dir),
-            "idx": matcher.IdentityIndex.load(),
+            # Both campuses, chosen per byline (identity_index.CampusRoster): a byline
+            # naming Ithaca is offered Cornell people. The Cornell roster loads lazily,
+            # once, on the first such byline.
+            "idx": matcher.CampusRoster.load(),
             "io": matcher.IdentityOnlyScorer()}
 
 
@@ -453,7 +459,8 @@ def run(date_from, date_to, state_dir, export_dir, run_date, workers=16, max_rec
             cands, _ = idx.candidates(au.get("last"), au.get("fore"),
                                       au.get("initials"), au.get("affiliations"), top_k=5,
                                       pub_year=a.get("pub_year"))
-            cwid_pool.update(c["cwid"] for c in cands)
+            # Cornell cwids have no identity-only input to warm (match_authorship skips them).
+            cwid_pool.update(c["cwid"] for c in cands if not c.get("campus"))
             authorships.append((a, i, n, au, cands))
     log(f"      {len(authorships)} WCM authorships; {len(cwid_pool)} distinct candidate CWIDs")
 
@@ -809,6 +816,18 @@ def _selftest():
           len(rows) == 2 and all(r["classification"] != "suggested" for r in rows))
     check("_db_rows keeps absent (no FG) and buried (FG<threshold)",
           sorted(r["classification"] for r in rows) == ["absent", "buried"])
+    _cu = dict(auth(None)[5], cwid="cu1", campus="cornell-ithaca", io_score=None)
+    _mixed = _compact([auth(None)[5], _cu])
+    check("_compact tags a Cornell candidate with its campus and leaves the WCM entry "
+          "exactly as before (no campus key)",
+          "campus" not in _mixed[0] and _mixed[1]["campus"] == "cornell-ithaca"
+          and _mixed[0] == _compact([auth(None)[5]])[0])
+    check("a Cornell top candidate (no FG) writes an 'absent' row proposing the Cornell cwid",
+          (lambda r: len(r) == 1 and r[0]["top_cwid"] == "cu1"
+           and r[0]["classification"] == "absent"
+           and json.loads(r[0]["candidate_cwids_json"])[0]["campus"] == "cornell-ithaca")(
+              _db_rows([(auth(None)[0], 0, 1, {"last": "N", "fore": "F", "affiliations": []},
+                         [_cu], _cu)], "2026-01-01")))
     # ---- candidate-less authorships are LISTED, not dropped ----------------
     # A WCM byline that matches nobody in `identity` is the strongest orphan signal the
     # lane has; dropping it is what hid 490 in-scope authorships (#222). Same shape the
@@ -1069,7 +1088,7 @@ def run_backfill(state_dir, run_date, workers=16, batch_size=500, limit=None, wr
     is in that file and NOT in S3, so --s3-state alone cannot reach the case that
     motivates the whole recovery. Extract the list from there and pass it here."""
     store = LedgerStore(state_dir)
-    idx = matcher.IdentityIndex.load()
+    idx = matcher.CampusRoster.load()
     io = matcher.IdentityOnlyScorer()
     if pmid_file:
         with open(pmid_file) as fh:
@@ -1114,7 +1133,7 @@ def run_backfill(state_dir, run_date, workers=16, batch_size=500, limit=None, wr
                 cands, _ = idx.candidates(au.get("last"), au.get("fore"),
                                           au.get("initials"), au.get("affiliations"),
                                           top_k=5, pub_year=a.get("pub_year"))
-                cwid_pool.update(c["cwid"] for c in cands)
+                cwid_pool.update(c["cwid"] for c in cands if not c.get("campus"))
                 authorships.append((a, j, n, au, cands))
         pool = sorted(c for c in cwid_pool if c not in io._cache)
         if pool:

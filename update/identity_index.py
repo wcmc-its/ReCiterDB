@@ -85,6 +85,17 @@ _PTYPE_COLS = [c for c, _, _ in PERSON_TYPES]
 # property of the RUN. Inferring it per row from affiliation text would be strictly
 # worse: the commonest WCM affiliation string is a bare "Weill Cornell Medicine, New
 # York, NY", which carries no campus discriminator the sweep did not already apply.
+#
+# WHAT CHANGED 2026-09-27, and what did not. The curator requirement is "If WCM
+# affiliation, show WCM people. If CU affiliation, show CU options. If both, show both",
+# so WHICH ROSTER(S) a byline is matched against is now decided per row -- but above the
+# index, by `byline_campuses` + `CampusRoster`, never inside one. The argument above
+# still decides the default: a byline with no Ithaca-side marker (the bare "Weill Cornell
+# Medicine" case, "Cornell University, New York", any non-Cornell affiliation) stays on
+# WCM exactly as before. Only a clause naming Ithaca, Geneva/AgriTech, Cornell Tech, the
+# vet college and the like reaches for the Cornell roster. And each campus is still its
+# own index, so the R1 rarity term is untouched: a Cornell homonym never enters a WCM
+# cohort, it only stands BESIDE it on a byline that names both campuses.
 CAMPUS_WCM = "wcm"
 CAMPUS_ITHACA = "cornell-ithaca"          # == sync_cornell_ithaca_identities.CAMPUS_TYPE
 
@@ -314,6 +325,59 @@ def _affil_tokens(affiliations):
                 i += 1
         toks = tuple(out)
     return toks
+
+
+# ---- byline campus ---------------------------------------------------------
+# Which roster(s) a byline's candidates come from (see the campus-scope block at the top
+# of this file). Evaluated PER CLAUSE -- each affiliation string split on ';' -- because
+# PubMed merges co-authors' affiliations into one string often enough that an AND across
+# the whole blob would read a Cornell co-author's "Ithaca" as this author's campus.
+#
+# A clause is WCM when it names the medical college or its partners. `weill` alone is
+# not enough: the Weill Institute for Cell and Molecular Biology and Weill Hall are both
+# in Ithaca, so "Weill Institute ..., Cornell University, Ithaca" is an Ithaca clause.
+_WCM_CLAUSE = re.compile(
+    r"weill(?!\s+(?:institute|hall))|presbyterian|qatar|doha|cornell (?:university )?medic"
+    r"|medical college|york avenue|\b100(?:65|21)\b", re.I)
+# A clause is Cornell-Ithaca only when it is NOT WCM, says `cornell`, and names an
+# Ithaca-side place or unit: Ithaca (and its measured misspellings / zip codes), Geneva
+# (AgriTech), Cornell Tech on Roosevelt Island, and the units that only exist upstate.
+_ITHACA_CLAUSE = re.compile(
+    r"ithaca|itaca|ithica|\b1485[0-3]\b"
+    r"|agritech|\b14456\b|geneva,? (?:ny|new york)"
+    r"|cornell tech|technion|roosevelt island|\b10044\b"
+    r"|ornithology|cooperative extension|\bchess\b|chexs|veterinary|baker institute"
+    r"|biological field station", re.I)
+# `cornell` that is not the university: street names (Cincinnati's Cornell Road is a
+# live byline shape) and Cornell College in Mount Vernon, Iowa.
+_NOT_CORNELL = re.compile(
+    r"cornell (?:road|rd|st|street|ave|drive|lane|blvd)\b|cornell college", re.I)
+_EMAIL = re.compile(r"\S+@\S+")
+
+
+def byline_campuses(affiliation_texts):
+    """Affiliation strings -> the set of campuses whose roster this byline is matched
+    against: {CAMPUS_WCM}, {CAMPUS_ITHACA}, or both.
+
+    Emails are stripped first ("...@cornell.edu" is not an affiliation). Then each ';'
+    clause is WCM (`_WCM_CLAUSE`), Cornell-Ithaca (`_ITHACA_CLAUSE`, only if not WCM and
+    it says `cornell` outside `_NOT_CORNELL`), an AMBIGUOUS Cornell clause (says cornell,
+    no marker either way -- "Cornell University, New York, NY" -- which counts as WCM,
+    today's reading), or not Cornell at all, which says nothing. A byline where nothing
+    spoke is WCM: every lane's universe is WCM-first, so that is exactly the pre-campus
+    behaviour for every row that does not name Ithaca."""
+    out = set()
+    for text_ in affiliation_texts or []:
+        for clause in _EMAIL.sub(" ", str(text_ or "")).split(";"):
+            if _WCM_CLAUSE.search(clause):
+                out.add(CAMPUS_WCM)
+                continue
+            if "mount vernon" in clause.lower():
+                continue
+            if "cornell" not in _NOT_CORNELL.sub(" ", clause).lower():
+                continue
+            out.add(CAMPUS_ITHACA if _ITHACA_CLAUSE.search(clause) else CAMPUS_WCM)
+    return out or {CAMPUS_WCM}
 
 
 # ---- temporal plausibility -------------------------------------------------
@@ -556,6 +620,12 @@ def accepted_byline_names(rows):
 
 # ---- identity index --------------------------------------------------------
 _TIER = {"full": 2, "initial": 1, "unknown": 0}   # given_match strength, for the cwid dedupe
+
+
+def _rank_key(d):
+    """`candidates()`' ordering, shared with `CampusRoster` so a two-campus merge ranks
+    both lists by exactly the key each was already ranked by."""
+    return d["given_match"] == "full", d["affil_dept_match"], d["confidence"]
 
 
 class IdentityIndex:
@@ -961,8 +1031,13 @@ class IdentityIndex:
                 "confidence": self._confidence(given_match, cohort_size, affil_match,
                                                rec["historical"], penalty),
             })
-        out.sort(key=lambda d: (d["given_match"] == "full", d["affil_dept_match"],
-                                d["confidence"]), reverse=True)
+            if self.campus != CAMPUS_WCM:
+                # Only off-WCM candidates say which campus they are: a WCM entry stays
+                # byte-for-byte what it was (the stored candidate_cwids_json and every
+                # replay that diffs it), and "no campus key is WCM" is already this
+                # file's rule for records.
+                out[-1]["campus"] = self.campus
+        out.sort(key=_rank_key, reverse=True)
         return out[:top_k], cohort_size
 
     @staticmethod
@@ -1033,6 +1108,85 @@ class IdentityIndex:
         affil = 0.25 if affil_match else 0.0
         hist = -0.10 if historical else 0.0
         return round(max(0.0, min(1.0, base + rarity + affil + hist - penalty)), 3)
+
+
+# ---- per-byline campus routing ---------------------------------------------
+class CampusRoster:
+    """The WCM index plus a lazily loaded Cornell-Ithaca index, picked PER BYLINE by
+    `byline_campuses` -- what every lane proposing candidates on WCM-universe rows now
+    holds instead of a bare WCM `IdentityIndex`. Same `candidates()` signature and
+    `(candidates, cohort_size)` return, so `aar_matcher.match_authorship` and every
+    replay tool take it unchanged.
+
+      {wcm}     -> the WCM index's candidates(), untouched: a WCM-only row is byte-for-
+                   byte what it was.
+      {ithaca}  -> the Ithaca index's candidates(): a Cornell byline proposes Cornell
+                   people, so top_cwid (the lane's cands[0]) is a Cornell person.
+      both      -> both lists merged by `_rank_key` (stable, so WCM keeps exact ties --
+                   the pre-campus answer), cut at the caller's top_k. Each entry keeps
+                   the confidence its OWN campus's cohort gave it (the R1 rarity term is
+                   per campus), but `cohort_size` on every entry becomes the combined
+                   count: it is the "choose among N" number the card shows and what
+                   `single_candidate` is derived from, and a person unique on WCM is not
+                   a single candidate on a byline that also offers a Cornell one -- PM
+                   would render the single-candidate card and hide the Cornell option.
+
+    The Ithaca roster loads on the FIRST byline that needs it, once per instance (one
+    instance per run), never per row; a run with no Cornell byline never pays for it.
+    `campuses` lets a caller that knows more than the text (the Scopus lane's afids)
+    state the set outright.
+
+    `campus` / `by_surname` answer as the WCM index does, for the callers that assert
+    the lane's campus or log the roster size."""
+
+    campus = CAMPUS_WCM
+
+    def __init__(self, wcm, ithaca=None, load_ithaca=None):
+        self.wcm = wcm
+        self._ithaca = ithaca
+        self._load_ithaca = load_ithaca
+        self.n_ithaca_bylines = 0        # observability: bylines that reached Cornell
+
+    @property
+    def by_surname(self):
+        return self.wcm.by_surname
+
+    @property
+    def ithaca(self):
+        if self._ithaca is None:
+            # No loader (a hand-built roster): an EMPTY Ithaca index, so a Cornell byline
+            # proposes nobody rather than falling back onto WCM homonyms.
+            self._ithaca = (self._load_ithaca() if self._load_ithaca
+                            else IdentityIndex([], campus=CAMPUS_ITHACA))
+            if self._ithaca.campus != CAMPUS_ITHACA:
+                raise RuntimeError(f"Ithaca roster has campus {self._ithaca.campus!r}")
+        return self._ithaca
+
+    @classmethod
+    def load(cls, alternate_names=None):
+        """Both rosters from reciterdb, the Ithaca one deferred. Alternate names are
+        read once and shared, so the lazy load does not rescan DynamoDB."""
+        if alternate_names is None:
+            alternate_names = load_alternate_names()
+        return cls(IdentityIndex.load(alternate_names=alternate_names),
+                   load_ithaca=lambda: IdentityIndex.load(campus=CAMPUS_ITHACA,
+                                                          alternate_names=alternate_names))
+
+    def candidates(self, last, fore=None, initials=None, affiliations=None, top_k=5,
+                   pub_year=None, campuses=None):
+        campuses = campuses or byline_campuses(affiliations)
+        args = (last, fore, initials, affiliations, top_k, pub_year)
+        if CAMPUS_ITHACA not in campuses:
+            return self.wcm.candidates(*args)
+        self.n_ithaca_bylines += 1
+        if CAMPUS_WCM not in campuses:
+            return self.ithaca.candidates(*args)
+        w, w_n = self.wcm.candidates(*args)
+        c, c_n = self.ithaca.candidates(*args)
+        merged = sorted(w + c, key=_rank_key, reverse=True)[:top_k]
+        for d in merged:
+            d["cohort_size"] = w_n + c_n
+        return merged, w_n + c_n
 
 
 # ---- offline self-test ------------------------------------------------------
@@ -2013,6 +2167,101 @@ def _selftest():
          IdentityIndex([rec("Robert", "Yao-Wen", "Lin", cwid="rol3002")],
                        alternate_names={"rol3002": [{"firstName": "Rob", "middleName": "Y", "lastName": "Lin"}]})
          .candidates("Lin", "Y", "Y") == ([], 0)),
+    ]
+
+    # --- byline campus: "If WCM affiliation, show WCM people. If CU affiliation, show CU
+    # options. If both, show both." (2026-09-27) ---------------------------------------
+    W, C = {CAMPUS_WCM}, {CAMPUS_ITHACA}
+    checks += [
+        ("classifier: a WCM clause is WCM",
+         byline_campuses(["Department of Medicine, Weill Cornell Medicine, New York, NY"]) == W),
+        ("classifier: an Ithaca clause is Cornell",
+         byline_campuses(["Department of Chemistry, Cornell University, Ithaca, NY 14853"]) == C),
+        ("classifier: 'Weill Institute ... Ithaca' is Cornell (the Weill Institute is upstate)",
+         byline_campuses(["Weill Institute for Cell and Molecular Biology, Cornell University, "
+                          "Ithaca, NY, USA"]) == C),
+        ("classifier: 'Weill Cornell Medicine, Cornell University, Ithaca' is WCM (a WCM "
+         "marker wins inside one clause)",
+         byline_campuses(["Weill Cornell Medicine, Cornell University, Ithaca, NY"]) == W),
+        ("classifier: a merged blob is read PER CLAUSE -- a Cornell co-author's Ithaca clause "
+         "beside the author's WCM clause gives both, never Ithaca alone",
+         byline_campuses(["Department of Pediatrics, Weill Cornell Medicine, New York, NY; "
+                          "College of Veterinary Medicine, Cornell University, Ithaca, NY"])
+         == W | C),
+        ("classifier: 'Cornell Road' is not Cornell University -> the WCM default",
+         byline_campuses(["Children's Hospital, 3333 Cornell Road, Cincinnati, OH"]) == W),
+        ("classifier: Cornell College, Mount Vernon is not Cornell University -> WCM default",
+         byline_campuses(["Department of Biology, Cornell College, Mount Vernon, IA"]) == W),
+        ("classifier: two affiliation strings, one per campus, give both",
+         byline_campuses(["Weill Cornell Medicine, New York, NY",
+                          "Cornell Tech, Roosevelt Island, New York, NY"]) == W | C),
+        ("classifier: bare 'Cornell University, New York' is ambiguous -> WCM, today's reading",
+         byline_campuses(["Cornell University, New York, NY, USA"]) == W),
+        ("classifier: an email never makes a clause Cornell",
+         byline_campuses(["Rockefeller University, New York, NY. jdoe@cornell.edu"]) == W),
+        ("classifier: AgriTech/Geneva and the vet college are Cornell",
+         byline_campuses(["Cornell AgriTech, Geneva, NY 14456"]) == C
+         and byline_campuses(["Baker Institute for Animal Health, Cornell University"]) == C),
+        ("classifier: no affiliation at all is the WCM default",
+         byline_campuses([]) == W and byline_campuses(None) == W),
+    ]
+
+    # Assembly, over hand-built rosters for BOTH campuses. "Smith, J" has a WCM holder and
+    # a Cornell holder; "Ostrom" exists only at Cornell.
+    w_smith = rec("John", "", "Smith", cwid="jos2001")
+    c_smith = ithaca("John", "Smith", "js123")
+    c_ostrom = ithaca("Elinor", "Ostrom", "eo1")
+    loads = []
+
+    def _load_ith():
+        loads.append(1)
+        return IdentityIndex([w_smith, c_smith, c_ostrom], campus=CAMPUS_ITHACA)
+
+    roster = CampusRoster(IdentityIndex([w_smith, c_smith, c_ostrom]), load_ithaca=_load_ith)
+    wcm_aff = ["Weill Cornell Medicine, New York, NY"]
+    ith_aff = ["Cornell University, Ithaca, NY"]
+    plain = IdentityIndex([w_smith]).candidates("Smith", "John", "J", wcm_aff)
+    w_only = roster.candidates("Smith", "John", "J", wcm_aff)
+    checks += [
+        ("assembly: a WCM-only byline returns exactly the WCM index's answer (byte-for-byte "
+         "unchanged row) and never loads the Ithaca roster",
+         w_only == plain and not loads and "campus" not in w_only[0][0]),
+    ]
+    c_only, c_n = roster.candidates("Smith", "John", "J", ith_aff)
+    both, both_n = roster.candidates("Smith", "John", "J", wcm_aff + ith_aff)
+    ostrom_w = roster.candidates("Ostrom", "Elinor", "E", wcm_aff)
+    ostrom_c = roster.candidates("Ostrom", "Elinor", "E", ith_aff)
+    checks += [
+        ("assembly: a Cornell-only byline proposes the Cornell person as top, tagged with "
+         "its campus",
+         [c["cwid"] for c in c_only] == ["js123"] and c_only[0]["campus"] == CAMPUS_ITHACA
+         and c_only[0]["person_type"] == "Cornell Faculty" and c_n == 1),
+        ("assembly: both campuses -> both people, WCM first on an exact tie, cohort_size is "
+         "the combined 2 on every entry (so the card is not a single-candidate card)",
+         [c["cwid"] for c in both] == ["jos2001", "js123"] and both_n == 2
+         and all(c["cohort_size"] == 2 for c in both)
+         and "campus" not in both[0] and both[1]["campus"] == CAMPUS_ITHACA),
+        ("assembly: ...while each keeps its own campus's confidence (R1: rarity is per campus)",
+         both[0]["confidence"] == both[1]["confidence"] == 0.90),
+        ("assembly: a Cornell-only person is unreachable from a WCM byline, reachable from a "
+         "Cornell one",
+         ostrom_w == ([], 0) and [c["cwid"] for c in ostrom_c[0]] == ["eo1"]),
+        ("assembly: the Ithaca roster loaded ONCE for the whole run, not per row",
+         len(loads) == 1 and roster.n_ithaca_bylines == 3),
+        ("assembly: a merge keeps the caller's top_k",
+         len(roster.candidates("Smith", "John", "J", wcm_aff + ith_aff, top_k=1)[0]) == 1),
+        ("assembly: a stronger Cornell candidate outranks a weaker WCM one on a two-campus "
+         "byline (the merge ranks, it does not append)",
+         [c["cwid"] for c in CampusRoster(
+             IdentityIndex([rec("Anne", "", "Doe", cwid="ad_w")]),
+             ithaca=IdentityIndex([ithaca("Alan", "Doe", "ad_c")], campus=CAMPUS_ITHACA))
+          .candidates("Doe", "Alan", "A", wcm_aff + ith_aff)[0]] == ["ad_c", "ad_w"]),
+        ("assembly: no Ithaca loader -> a Cornell byline proposes nobody, never WCM homonyms",
+         CampusRoster(IdentityIndex([w_smith])).candidates("Smith", "John", "J", ith_aff)
+         == ([], 0)),
+        ("assembly: an explicit `campuses` overrides the text",
+         [c["cwid"] for c in roster.candidates("Smith", "John", "J", wcm_aff,
+                                                campuses={CAMPUS_ITHACA})[0]] == ["js123"]),
     ]
 
     ok = True
