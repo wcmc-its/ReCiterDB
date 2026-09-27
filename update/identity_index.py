@@ -647,11 +647,16 @@ class IdentityIndex:
         self.by_surname = {}
         self.n_other_campus = 0          # observability: how many the scope excluded
         self.n_alt_names = 0             # ...and how many alternate-name copies were indexed
+        # In-scope cwids with a Cornell appointment on record (see `_cornell_linked_cwids`):
+        # what `CampusRoster` keeps from THIS index on a Cornell-only byline.
+        self.cornell_linked = set()
         alternate_names = alternate_names or {}
         for r in records:
             if (r.get("campus") or CAMPUS_WCM) != campus:
                 self.n_other_campus += 1
                 continue
+            if r.get("cornell_linked"):
+                self.cornell_linked.add(r["cwid"])
             self.by_surname.setdefault(r["surname_norm"], []).append(r)
             for alt in self._alt_records(r, alternate_names.get(r["cwid"])):
                 self.n_alt_names += 1
@@ -741,6 +746,25 @@ class IdentityIndex:
             by_cwid.setdefault(cwid, set()).add(ptype)
         return {k: frozenset(v) for k, v in by_cwid.items() if CAMPUS_ITHACA in v}
 
+    @staticmethod
+    def _cornell_linked_cwids(conn):
+        """WCM-roster cwids that ALSO hold a Cornell (Ithaca) appointment: any `cornell-*`
+        person type without the campus marker, or the WCM type `affiliate-cornell`.
+
+        These are the people a Cornell-only byline must still reach on the WCM roster.
+        A dual appointee is deliberately NOT on the Ithaca roster: the Cornell sync's
+        bridge (sync_cornell_ithaca_identities.merge_bridged) keeps their netid off it
+        and unions their cornell-* types onto the WCM identity minus `cornell-ithaca`,
+        so `_campus_person_types` leaves them WCM. Measured 2026-09-09: 37 such people on
+        the WCM roster with 150 open authorship_review rows (Koretzky, Spector, Sabuncu).
+        Their Ithaca-side papers ("... Weill Hall, Ithaca, NY") read as Cornell-only, and
+        matching those against the Ithaca roster alone would drop them from their own
+        card. The Cornell-campus cwids are returned too; harmless, they are never on the
+        WCM roster. Same no-try/except rule as `_campus_person_types`."""
+        return {cwid for (cwid,) in conn.execute(text(
+            "SELECT DISTINCT personIdentifier FROM person_person_type "
+            "WHERE personType LIKE 'cornell-%' OR personType = 'affiliate-cornell'"))}
+
     @classmethod
     def load(cls, campus=CAMPUS_WCM, alternate_names=None):
         """`alternate_names` = {cwid: [{firstName, middleName, lastName, source?, n?}]};
@@ -772,14 +796,16 @@ class IdentityIndex:
                 "LEFT JOIN person p ON p.personIdentifier = i.cwid "
                 "WHERE i.surname IS NOT NULL AND i.surname <> ''")).mappings().all()
             campus_types = cls._campus_person_types(c)
+            linked = cls._cornell_linked_cwids(c)
             for cwid, names in accepted_byline_names(c.execute(
                     text(_ACCEPTED_BYLINES_SQL), {"min": ACCEPTED_BYLINE_MIN}).mappings()).items():
                 alternate_names[cwid] = names + alternate_names.get(cwid, [])
-        return cls([cls._record(r, campus_types.get(r["cwid"], ())) for r in rows],
+        return cls([cls._record(r, campus_types.get(r["cwid"], ()), r["cwid"] in linked)
+                    for r in rows],
                    campus=campus, alternate_names=alternate_names)
 
     @staticmethod
-    def _record(r, campus_types=()):
+    def _record(r, campus_types=(), cornell_linked=False):
         """One index record. `end_year` = the LATEST of the faculty/student WCM end
         years (both YEAR ints; None when both are null). Taking the max is the
         conservative reading — it penalises least — for the people who were here
@@ -789,7 +815,10 @@ class IdentityIndex:
         `campus_types` is this cwid's `cornell-*` person types from
         `_campus_person_types`, empty for everybody on the WCM roster. Empty is the
         only shape it has today (the query returns 0 rows), so the WCM branch below is
-        byte-for-byte the pre-campus code and every field it produces is unchanged."""
+        byte-for-byte the pre-campus code and every field it produces is unchanged.
+
+        `cornell_linked` (a WCM record with a Cornell appointment, `_cornell_linked_cwids`)
+        adds one internal key, only when true; `candidates()` never publishes it."""
         if campus_types:
             campus = CAMPUS_ITHACA
             ptype, historical = cornell_person_type(campus_types)
@@ -1136,6 +1165,19 @@ class CampusRoster:
     `campuses` lets a caller that knows more than the text (the Scopus lane's afids)
     state the set outright.
 
+    A Cornell-only byline ALSO keeps the WCM candidates who hold a Cornell appointment
+    (`IdentityIndex.cornell_linked`: bridged dual appointees and `affiliate-cornell`).
+    Dual appointees live ONLY on the WCM roster -- the Cornell sync keeps their netids
+    off the Ithaca one -- so without this their own Ithaca-side papers ("Meinig School,
+    Weill Hall, Ithaca") would lose them to a Cornell homonym or to nobody. Every other
+    WCM person stays off a Cornell-only byline: that is the homonym flood the byline rule
+    exists to keep out. They are ranked with the Cornell list by `_rank_key` (stable,
+    Cornell first so a Cornell person keeps an exact tie on a Cornell byline), searched
+    past the caller's top_k on the WCM side so a linked person is not cut by unlinked
+    WCM homonyms that are then thrown away, and each keeps its WCM confidence; the
+    combined count is the cohort, as for `both`. No linked match -> the Ithaca answer
+    exactly.
+
     `campus` / `by_surname` answer as the WCM index does, for the callers that assert
     the lane's campus or log the roster size."""
 
@@ -1179,11 +1221,21 @@ class CampusRoster:
         if CAMPUS_ITHACA not in campuses:
             return self.wcm.candidates(*args)
         self.n_ithaca_bylines += 1
-        if CAMPUS_WCM not in campuses:
-            return self.ithaca.candidates(*args)
-        w, w_n = self.wcm.candidates(*args)
         c, c_n = self.ithaca.candidates(*args)
-        merged = sorted(w + c, key=_rank_key, reverse=True)[:top_k]
+        if CAMPUS_WCM in campuses:
+            w, w_n = self.wcm.candidates(*args)
+            head = w + c                 # WCM first: an exact tie keeps the pre-campus pick
+        else:
+            linked = self.wcm.cornell_linked
+            # top_k=None: the whole ranked WCM cohort (candidates() only slices by it).
+            w = [d for d in (self.wcm.candidates(last, fore, initials, affiliations,
+                                                 None, pub_year)[0] if linked else [])
+                 if d["cwid"] in linked]
+            if not w:
+                return c, c_n
+            w_n = len(w)
+            head = c + w                 # Cornell first: a Cornell byline's tie is Cornell's
+        merged = sorted(head, key=_rank_key, reverse=True)[:top_k]
         for d in merged:
             d["cohort_size"] = w_n + c_n
         return merged, w_n + c_n
@@ -2227,6 +2279,18 @@ def _selftest():
          "unchanged row) and never loads the Ithaca roster",
          w_only == plain and not loads and "campus" not in w_only[0][0]),
     ]
+    # Dual appointee: on the WCM roster with the bridge's cornell-* flag, off the Ithaca one.
+    spector = dict(rec("Jason", "", "Spector", cwid="jas2037"), cornell_linked=True)
+    spector_idx = IdentityIndex([spector, rec("Jason", "", "Spector", cwid="jxs9")])
+    spector_aff = ["Nancy E. and Peter C. Meinig School of Biomedical Engineering, Cornell "
+                   "University, Weill Hall, Ithaca, NY 14853, USA"]
+    spector_c, spector_n = CampusRoster(spector_idx).candidates(
+        "Spector", "Jason", "J", spector_aff)
+    spector_both, spector_both_n = CampusRoster(
+        spector_idx, ithaca=IdentityIndex([ithaca("Jason", "Spector", "js_ith")],
+                                          campus=CAMPUS_ITHACA)).candidates(
+        "Spector", "Jason", "J", spector_aff)
+    spector_w = CampusRoster(spector_idx).candidates("Spector", "Jason", "J", wcm_aff)
     c_only, c_n = roster.candidates("Smith", "John", "J", ith_aff)
     both, both_n = roster.candidates("Smith", "John", "J", wcm_aff + ith_aff)
     ostrom_w = roster.candidates("Ostrom", "Elinor", "E", wcm_aff)
@@ -2259,6 +2323,26 @@ def _selftest():
         ("assembly: no Ithaca loader -> a Cornell byline proposes nobody, never WCM homonyms",
          CampusRoster(IdentityIndex([w_smith])).candidates("Smith", "John", "J", ith_aff)
          == ([], 0)),
+        ("assembly: a bridged dual appointee (WCM record, cornell-* types, NOT on the Ithaca "
+         "roster) is still offered on a Cornell-only 'Weill Hall, Ithaca' byline -- only he, "
+         "not his unlinked WCM homonym; an Ithaca-only person still ranks by tier",
+         [c["cwid"] for c in spector_c] == ["jas2037"] and spector_n == 1
+         and "campus" not in spector_c[0]
+         and byline_campuses(spector_aff) == C),
+        ("assembly: ...and beside a Cornell homonym both are offered, cohort is the combined "
+         "count, the Cornell person keeps an exact tie on a Cornell byline",
+         [c["cwid"] for c in spector_both] == ["js_ith", "jas2037"] and spector_both_n == 2
+         and all(c["cohort_size"] == 2 for c in spector_both)),
+        ("assembly: ...found even when unlinked WCM homonyms outrank him past top_k",
+         [c["cwid"] for c in CampusRoster(
+             IdentityIndex([rec("Jason", "", "Spector", cwid=f"u{i}") for i in range(6)]
+                           + [dict(rec("Jason", "", "Spector", cwid="jas2037"),
+                                   cornell_linked=True)]))
+          .candidates("Spector", "Jason", "J", spector_aff, top_k=1)[0]] == ["jas2037"]),
+        ("assembly: a WCM-only byline is unchanged by the linked flag (no key published)",
+         spector_w == IdentityIndex([rec("Jason", "", "Spector", cwid="jas2037"),
+                                     rec("Jason", "", "Spector", cwid="jxs9")]).candidates(
+             "Spector", "Jason", "J", wcm_aff)),
         ("assembly: an explicit `campuses` overrides the text",
          [c["cwid"] for c in roster.candidates("Smith", "John", "J", wcm_aff,
                                                 campuses={CAMPUS_ITHACA})[0]] == ["js123"]),
