@@ -815,7 +815,7 @@ def _selftest():
     # in the family set", so a merged list would tag every Ithaca author as WCM and
     # would roughly double one Sunday sweep's fetch volume under a single timeout.
     _ithaca = load_family_afids(ITHACA_AFID_LIST)
-    check("cornell ithaca afid list parses and carries 16 afids", len(_ithaca) == 16)
+    check("cornell ithaca afid list parses and carries 35 afids", len(_ithaca) == 35)
     check("cornell ithaca afid list is disjoint from the WCM family set",
           not (_ithaca & load_family_afids(DEFAULT_AFID_LIST)))
     check("isbn_in_pubmed makes no network call for an empty/missing isbn list",

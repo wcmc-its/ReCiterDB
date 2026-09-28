@@ -240,7 +240,7 @@ def run_scopus_ithaca_lane_if_due():
     """The same weekly Scopus sweep as run_scopus_lane_if_due(), pointed at the Cornell
     University (Ithaca) AF-ID family instead of the WCM one.
 
-    Its own AF-ID list (update/scopus_afids_cornell_ithaca.csv, 16 AF-IDs) rather than 16
+    Its own AF-ID list (update/scopus_afids_cornell_ithaca.csv, 35 AF-IDs) rather than 16
     more rows in scopus_afids.csv, deliberately. aar_universe_scopus.wcm_authorships()
     selects an author purely on "this author carries an afid in the family set", so
     appending would label every Ithaca author a WCM authorship; and one merged set would
