@@ -768,10 +768,11 @@ def initial_months(years=5, today=None):
     return month_range((ey - years, em), (ey, em))
 
 
-def run_backfill(months, apply_writes=False, afid_list=DEFAULT_AFID_LIST, campus=CAMPUS_WCM):
+def run_backfill(months, apply_writes=False, afid_list=DEFAULT_AFID_LIST, campus=CAMPUS_WCM,
+                 recheck=True):
     """Backfill driver: sweep each calendar month once, sharing one identity index (the
     35k-row roster loads once, not per month). The open-row re-check runs ONCE at the end
-    (only when applying). Idempotent per month via the author_key upsert — a run that dies
+    (only when applying, and not with --no-recheck). Idempotent per month via the author_key upsert — a run that dies
     partway resumes with `--from <next-month> --to <end-month>`."""
     idx = _roster(campus)
     print(f"Backfill: {len(months)} months, {months[0][0]}-{months[0][1]:02d} .. "
@@ -783,7 +784,7 @@ def run_backfill(months, apply_writes=False, afid_list=DEFAULT_AFID_LIST, campus
         aft, bef = month_window(y, m)
         print(f"\n########## {y}-{m:02d}  ({k + 1}/{len(months)}) ##########", flush=True)
         s = run(aft, bef, apply_writes=apply_writes, afid_list=afid_list,
-                recheck=apply_writes and k == len(months) - 1, idx=idx, campus=campus)
+                recheck=recheck and apply_writes and k == len(months) - 1, idx=idx, campus=campus)
         for key in ("family_docs", "scopus_only", "matched_rows", "unmatched"):
             agg[key] += s[key]
         agg["per_month"].append({"month": f"{y}-{m:02d}", "scopus_only": s["scopus_only"],
@@ -1113,12 +1114,13 @@ def main():
         summary = one_month(*recurring_month())
     elif args.mode == "initial":
         summary = run_backfill(initial_months(args.years), apply_writes=args.apply,
-                               afid_list=args.afid_list, campus=args.campus)
+                               afid_list=args.afid_list, campus=args.campus,
+                               recheck=not args.no_recheck)
     elif args.from_month and args.to_month:
         f = tuple(int(x) for x in args.from_month.split("-"))
         t = tuple(int(x) for x in args.to_month.split("-"))
         summary = run_backfill(month_range(f, t), apply_writes=args.apply, afid_list=args.afid_list,
-                               campus=args.campus)
+                               campus=args.campus, recheck=not args.no_recheck)
     elif args.month:
         summary = one_month(*(int(x) for x in args.month.split("-")))
     else:
