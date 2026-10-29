@@ -73,12 +73,19 @@ SLEEP = 0.3          # polite Scopus throttle between pages
 EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 _PUBMED_API_KEY = os.environ.get("PUBMED_API_KEY")
 _PM_SLEEP = 0.12 if _PUBMED_API_KEY else 0.34   # 10 req/s with key, 3/s without
+PUBMED_STATS = {"calls": 0, "failures": 0}   # this run; see _pubmed_esearch
 
 
 def _pubmed_esearch(term):
     """esearch result dict for a PubMed term (throttled, retrying), or None on
     persistent failure — the safe direction: an unresolved DOI/title stays a scopus
-    row and is re-checked next run rather than being silently dropped."""
+    row and is re-checked next run rather than being silently dropped.
+
+    None also means "no match" to every caller, so a persistent failure is counted in
+    PUBMED_STATS: a PubMed outage would otherwise look like a run where nothing was in
+    PubMed, and queue every work the DOI drop should have removed. run() checks
+    pubmed_unreliable() before it writes."""
+    PUBMED_STATS["calls"] += 1
     params = {"db": "pubmed", "term": term, "retmax": 1, "retmode": "json",
               "tool": "reciterdb-aar-scopus", "email": os.environ.get("NCBI_EMAIL", "")}
     if _PUBMED_API_KEY:
@@ -92,11 +99,35 @@ def _pubmed_esearch(term):
                 time.sleep(1.5 * (attempt + 1))
                 continue
             r.raise_for_status()
-        except (requests.RequestException, KeyError, ValueError, TypeError):
+        except (requests.RequestException, KeyError, ValueError, TypeError) as e:
             if attempt == 4:
-                return None
+                return _pubmed_failed(term, e)
             time.sleep(1.5 * (attempt + 1))
+    return _pubmed_failed(term, "HTTP 429/5xx on every attempt")
+
+
+def _pubmed_failed(term, why):
+    PUBMED_STATS["failures"] += 1
+    print(f"      WARNING: PubMed esearch failed after 5 attempts ({why}): {term[:120]}",
+          flush=True)
     return None
+
+
+def reset_pubmed_stats():
+    PUBMED_STATS.update(calls=0, failures=0)
+
+
+def pubmed_unreliable(stats=None):
+    """True when this run's persistent PubMed failures pass PUBMED_MAX_FAILURE_RATE
+    (default 2%) of its esearch calls, with at least 3 failures so one dropped request
+    doesn't skip a week. A lane then skips its upsert: rows that only exist because
+    PubMed never answered would land in the curator queue."""
+    st = stats or PUBMED_STATS
+    try:
+        rate = float(os.environ.get("PUBMED_MAX_FAILURE_RATE", "0.02"))
+    except ValueError:
+        rate = 0.02
+    return st["failures"] >= 3 and st["failures"] > rate * max(st["calls"], 1)
 
 
 def _pubmed_count(term):
@@ -634,6 +665,7 @@ def wcm_lane_candidates(idx, au, pub_year, ithaca_family=None):
 def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True, idx=None,
         campus=CAMPUS_WCM):
     run_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    reset_pubmed_stats()
     family = load_family_afids(afid_list)
     # The afid family picks which documents are FETCHED; `campus` picks which roster they
     # are MATCHED AGAINST. They must agree -- an Ithaca sweep scored against the WCM roster
@@ -707,7 +739,13 @@ def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True,
             rows.append(_build_row(d, i, n, au, top, cands, run_ts, dup_map=dup_map))
     print(f"      {len(rows)} matched authorships; {unmatched} unmatched (skipped)", flush=True)
 
-    if apply_writes:
+    unreliable = pubmed_unreliable()
+    print(f"      PubMed: {PUBMED_STATS['failures']} of {PUBMED_STATS['calls']} esearch calls "
+          f"failed", flush=True)
+    if apply_writes and unreliable:
+        print(f"[5/5] SKIPPED: PubMed failed too often to trust the drops; {len(rows)} rows "
+              f"NOT written (PUBMED_MAX_FAILURE_RATE)", flush=True)
+    elif apply_writes:
         n = aar_db.upsert(rows)
         print(f"[5/5] upserted {n} scopus authorships -> reciterdb.authorship_review", flush=True)
         if recheck:
@@ -722,7 +760,9 @@ def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True,
             "no_pmid": len(no_pmid), "doi_resolved_pubmed": resolved,
             "flagged_by_title": flagged_by_title,
             "scopus_only": len(scopus_only), "matched_rows": len(rows),
-            "unmatched": unmatched}
+            "unmatched": unmatched, "pubmed_calls": PUBMED_STATS["calls"],
+            "pubmed_failures": PUBMED_STATS["failures"], "writes_skipped": bool(
+                apply_writes and unreliable)}
 
 
 # ---- windows ----------------------------------------------------------------
@@ -981,6 +1021,41 @@ def _selftest():
               title_in_pubmed("") is None and title_in_pubmed(None) is None)
     finally:
         _pubmed_esearch = _real_esearch
+
+    # A persistent PubMed failure is still None to callers, but now it is counted, and
+    # pubmed_unreliable() trips at >=3 failures above the rate. requests/time stubbed.
+    global requests, time
+    _real_requests, _real_time = requests, time
+
+    class _Down:
+        RequestException = _real_requests.RequestException
+
+        @staticmethod
+        def get(*a, **k):
+            raise _real_requests.ConnectionError("simulated outage")
+
+    class _NoSleep:
+        @staticmethod
+        def sleep(_s):
+            pass
+    requests, time = _Down, _NoSleep
+    try:
+        reset_pubmed_stats()
+        check("a persistent PubMed failure still returns None (doi kept, not dropped)",
+              doi_in_pubmed("10.1/down") is None)
+        check("...and is counted as one call and one failure",
+              PUBMED_STATS == {"calls": 1, "failures": 1})
+    finally:
+        requests, time = _real_requests, _real_time
+        reset_pubmed_stats()
+    check("pubmed_unreliable: 2 of 2 failed stays trusted (needs >= 3 failures)",
+          not pubmed_unreliable({"calls": 2, "failures": 2}))
+    check("pubmed_unreliable: 3 of 1000 failed stays trusted (under 2%)",
+          not pubmed_unreliable({"calls": 1000, "failures": 3}))
+    check("pubmed_unreliable: 30 of 1000 failed trips the gate",
+          pubmed_unreliable({"calls": 1000, "failures": 30}))
+    check("pubmed_unreliable: no calls, no failures stays trusted",
+          not pubmed_unreliable({"calls": 0, "failures": 0}))
 
     entry_matched = dict(entry, _matched_pmid=555)
     row_matched = _build_row(entry_matched, i, n, au, top, [top], "2026-07-03 00:00:00")

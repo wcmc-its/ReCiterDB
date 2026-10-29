@@ -85,7 +85,8 @@ from identity_index import IdentityIndex, CAMPUS_WCM   # noqa: E402
 import aar_db                                          # noqa: E402
 from aar_universe_scopus import (                      # noqa: E402
     doi_in_pubmed, resolve_no_doi, wcm_lane_candidates, _roster, rolling_window,
-    recheck_open_scopus, _compact, _normalize_issn, _position_label, _trunc, _PM_SLEEP)
+    recheck_open_scopus, _compact, _normalize_issn, _position_label, _trunc, _PM_SLEEP,
+    PUBMED_STATS, reset_pubmed_stats, pubmed_unreliable)
 
 OPENALEX_WORKS = "https://api.openalex.org/works"
 # Weill Cornell Medicine + Weill Cornell Medical Center. NOT WCM-Qatar (I4210152471).
@@ -585,6 +586,7 @@ def source_enum_ready():
 # ---- driver -----------------------------------------------------------------
 def run(since, until, apply_writes=False, recheck=True, idx=None):
     run_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    reset_pubmed_stats()
     if apply_writes and not source_enum_ready():
         raise RuntimeError("authorship_review.source has no 'openalex' value: apply "
                            "setup/alter_authorship_review_add_openalex_v3.2.sql first")
@@ -648,7 +650,13 @@ def run(since, until, apply_writes=False, recheck=True, idx=None):
             rows.append(_build_row(w, i, n, au, top, cands, run_ts, dup_map=dup_map))
     print(f"      {len(rows)} matched authorships; {unmatched} unmatched (skipped)", flush=True)
 
-    if apply_writes:
+    unreliable = pubmed_unreliable()
+    print(f"      PubMed: {PUBMED_STATS['failures']} of {PUBMED_STATS['calls']} esearch calls "
+          f"failed", flush=True)
+    if apply_writes and unreliable:
+        print(f"[5/5] SKIPPED: PubMed failed too often to trust the drops; {len(rows)} rows "
+              f"NOT written (PUBMED_MAX_FAILURE_RATE)", flush=True)
+    elif apply_writes:
         n = aar_db.upsert(rows)
         print(f"[5/5] upserted {n} openalex authorships -> reciterdb.authorship_review", flush=True)
         n_scopus = dismiss_scopus_held(run_ts)
@@ -673,7 +681,9 @@ def run(since, until, apply_writes=False, recheck=True, idx=None):
             "doi_resolved_pubmed": resolved, "flagged_by_title": flagged_by_title,
             "preprint_published_pubmed": len(published),
             "openalex_only": len(openalex_only), "openalex_only_by_type": by_type,
-            "matched_rows": len(rows), "unmatched": unmatched}
+            "matched_rows": len(rows), "unmatched": unmatched,
+            "pubmed_calls": PUBMED_STATS["calls"], "pubmed_failures": PUBMED_STATS["failures"],
+            "writes_skipped": bool(apply_writes and unreliable)}
 
 
 def _iso(yyyymmdd):
@@ -817,7 +827,7 @@ def _selftest():
                                "scopus_lane_dois", "source_enum_ready", "time",
                                "dismiss_scopus_held", "recheck_open_scopus", "requests",
                                "external_article_uids_by_wid", "crossref_preprint_of",
-                               "rxiv_published", "dismiss_published")}
+                               "rxiv_published", "dismiss_published", "pubmed_unreliable")}
     _http_json_saved = _http_json
     saved_upsert = aar_db.upsert
     saved_dup = aar_db.dup_flags_by_doi
@@ -903,6 +913,16 @@ def _selftest():
               order == [("upsert", 1), ("scopus_held",),
                         ("published", {"W6": ("10.64898/2026.01.01.000001", "10.1016/pub", 555)}),
                         ("recheck", "openalex")])
+
+        # PubMed too unreliable to trust the drops: --apply writes and dismisses nothing.
+        order.clear()
+        g["pubmed_unreliable"] = lambda: True
+        with contextlib.redirect_stdout(io.StringIO()):
+            skipped = run("2026-01-01", "2026-12-31", apply_writes=True,
+                          idx=IdentityIndex([rec("Alissa", "Cooper", "ac1")]))
+        g["pubmed_unreliable"] = saved["pubmed_unreliable"]
+        check("--apply skips upsert, dismissals and recheck when PubMed is unreliable",
+              order == [] and skipped["writes_skipped"] is True)
 
         # step 3b never fails the run: Crossref / bioRxiv / PubMed errors keep the work
         def boom(*a):
