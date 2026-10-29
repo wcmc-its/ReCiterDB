@@ -73,7 +73,7 @@ def engine():
 DDL = f"""
 CREATE TABLE IF NOT EXISTS {TABLE} (
   id                     BIGINT       NOT NULL AUTO_INCREMENT,
-  source                 ENUM('pubmed','scopus') NOT NULL DEFAULT 'pubmed',
+  source                 ENUM('pubmed','scopus','openalex') NOT NULL DEFAULT 'pubmed',
   pmid                   BIGINT       NULL,
   external_id            VARCHAR(96)  NULL,
   author_key             VARCHAR(160) NOT NULL,
