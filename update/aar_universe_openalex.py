@@ -20,7 +20,35 @@ Per-work pipeline:
   4. Per WCM authorship (an institution id in WCM_OPENALEX_IDS) match the byline against
      identity_index via the Scopus lane's wcm_lane_candidates.
   5. Upsert via aar_db (source='openalex', external_id=W id, pub_type=OpenAlex type,
-     pmid=NULL); then the Scopus lane's recheck, run over source='openalex' open rows.
+     pmid=NULL); then dismiss open openalex rows whose DOI the Scopus lane has since
+     picked up, then the Scopus lane's recheck, run over source='openalex' open rows.
+
+Step 2 alone only works one way. The OpenAlex window keys on publication date and the
+Scopus window on Scopus load date, so a work can reach this lane first and the Scopus
+lane weeks later, leaving one authorship open twice (openalex:{doi}:{i} and
+scopus:{doi}:{i}; the prefixed keys never collide). dismiss_scopus_held() closes the
+openalex side once the Scopus row exists. Scopus wins because its rows carry Scopus
+author ids and the afid-aware campus split. The Scopus lane stays unaware of this lane,
+which keeps it unchanged. The nightly runs this lane after the Scopus lanes, so the
+dismissal lands the same night the Scopus row appears.
+
+Hardcoded source='scopus' sites elsewhere (handoff item 4), decided per site:
+  * aar_universe_scopus.recheck_open_scopus: takes a `source` argument now (default
+    'scopus'). This lane calls it with source='openalex'. Openalex rows have the same
+    pmid-less shape, so the same DOI/title recheck applies.
+  * setup/fix_authorship_review_suggested_open_v2.6.sql and
+    fix_authorship_review_reopen_title_dismissed_v2.8.sql: left alone. Both are one-off
+    repairs of Scopus rows written before those fixes. No openalex row predates them, and
+    this lane writes the post-fix shape from the start.
+  * targeted_authors_backfill.py and backfill_external_article_authors_932.py: left
+    alone. Both re-fetch author data from the Scopus API by Scopus id. An openalex row
+    has no Scopus id, and this lane writes authors_json and every author column at
+    insert.
+  * aar_reconcile_open / aar_report_changed_picks (CLASS B drift refresh): replay only
+    'pubmed' and 'scopus'. Openalex rows get no drift refresh yet. A replay would need an
+    OpenAlex re-fetch per row. That is a follow-up once the lane is on and has rows.
+  * aar_close_attributed / byline-owner sweeps key on pmid IS NOT NULL, so they never
+    touch openalex rows (pmid is always NULL here).
 
 Refuses --apply until setup/alter_authorship_review_add_openalex_v3.2.sql is applied: a
 source='openalex' insert into the old ENUM stores '' under non-strict SQL mode.
@@ -75,16 +103,17 @@ def _openalex_get(params):
         try:
             r = requests.get(OPENALEX_WORKS, params=params, timeout=60,
                              headers={"Accept": "application/json"})
-            if r.status_code == 200:
-                return r.json()
-            if r.status_code in (429, 500, 502, 503, 504):
-                time.sleep(2 * (attempt + 1))
-                continue
-            r.raise_for_status()
-        except requests.RequestException:
+        except (requests.ConnectionError, requests.Timeout):
             if attempt == 4:
                 raise
             time.sleep(2 * (attempt + 1))
+            continue
+        if r.status_code == 200:
+            return r.json()
+        if r.status_code in (429, 500, 502, 503, 504):
+            time.sleep(2 * (attempt + 1))
+            continue
+        r.raise_for_status()   # any other 4xx/5xx is not transient: raise now, no retry
     raise RuntimeError("OpenAlex works fetch failed after retries")
 
 
@@ -283,6 +312,20 @@ def scopus_lane_dois(dois):
     return out
 
 
+def dismiss_scopus_held(run_ts):
+    """Dismiss open openalex rows whose DOI the Scopus lane now holds (any status) --
+    the other direction of step 2's drop; see the module docstring. Returns the count."""
+    from sqlalchemy import text
+    with aar_db.engine().begin() as c:
+        return c.execute(text(
+            "UPDATE authorship_review oa JOIN authorship_review sc "
+            "ON sc.source='scopus' AND sc.doi IS NOT NULL AND LOWER(sc.doi)=LOWER(oa.doi) "
+            "SET oa.status='dismissed', oa.resolved_at=:ts, "
+            "oa.note=CONCAT('auto: Scopus lane holds DOI ', oa.doi) "
+            "WHERE oa.source='openalex' AND oa.status='open' AND oa.doi IS NOT NULL"),
+            {"ts": run_ts}).rowcount
+
+
 def source_enum_ready():
     """Does authorship_review.source accept 'openalex' (migration v3.2 applied)?"""
     from sqlalchemy import text
@@ -355,6 +398,9 @@ def run(since, until, apply_writes=False, recheck=True, idx=None):
     if apply_writes:
         n = aar_db.upsert(rows)
         print(f"[5/5] upserted {n} openalex authorships -> reciterdb.authorship_review", flush=True)
+        n_scopus = dismiss_scopus_held(run_ts)
+        print(f"      {n_scopus} open openalex rows dismissed: the Scopus lane now holds "
+              f"their DOI", flush=True)
         if recheck:
             n_dismissed, n_flagged = recheck_open_scopus(run_ts, source="openalex")
             print(f"      re-check: {n_dismissed} open openalex rows resolved out (DOI match), "
@@ -487,7 +533,9 @@ def _selftest():
     from identity_index import _norm
     g = globals()
     saved = {k: g[k] for k in ("_openalex_get", "doi_in_pubmed", "resolve_no_doi",
-                               "scopus_lane_dois", "source_enum_ready", "time")}
+                               "scopus_lane_dois", "source_enum_ready", "time",
+                               "dismiss_scopus_held", "recheck_open_scopus", "requests")}
+    saved_upsert = aar_db.upsert
     saved_dup = aar_db.dup_flags_by_doi
     pmid_work = dict(_fixture(), id="https://openalex.org/W2",
                      ids={"pmid": "https://pubmed.ncbi.nlm.nih.gov/41234567"})
@@ -544,6 +592,47 @@ def _selftest():
               len(calls) == PAGE_CAP // PER_PAGE
               and buf.getvalue().count("WARNING") == 2)
 
+        # --apply path: upsert, then the Scopus-held dismissal, then the recheck on
+        # source='openalex' -- in that order.
+        order = []
+        g["_openalex_get"] = lambda p: {"meta": {"count": 1}, "results": [_fixture()]}
+        g["source_enum_ready"] = lambda: True
+        aar_db.upsert = lambda rows: order.append(("upsert", len(rows))) or len(rows)
+        g["dismiss_scopus_held"] = lambda ts: order.append(("scopus_held",)) or 0
+        g["recheck_open_scopus"] = lambda ts, source="scopus": order.append(("recheck", source)) or (0, 0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            run("2026-01-01", "2026-12-31", apply_writes=True,
+                idx=IdentityIndex([rec("Alissa", "Cooper", "ac1")]))
+        check("--apply: upsert, then dismiss Scopus-held DOIs, then recheck source=openalex",
+              order == [("upsert", 1), ("scopus_held",), ("recheck", "openalex")])
+
+        # a non-retryable 4xx raises on the first response, no backoff retries
+        import requests as _rq
+        gets = []
+
+        class _Resp:
+            status_code = 400
+
+            def raise_for_status(self):
+                raise _rq.HTTPError("400")
+
+        class _FakeRequests:
+            ConnectionError, Timeout, HTTPError = _rq.ConnectionError, _rq.Timeout, _rq.HTTPError
+
+            @staticmethod
+            def get(*a, **k):
+                gets.append(1)
+                return _Resp()
+
+        g["_openalex_get"] = saved["_openalex_get"]
+        g["requests"] = _FakeRequests
+        try:
+            _openalex_get({"page": 51})
+            raised = False
+        except _rq.HTTPError:
+            raised = True
+        check("a 400 from OpenAlex raises after one request, not five", raised and gets == [1])
+
         g["source_enum_ready"] = lambda: False
         try:
             run("2026-01-01", "2026-12-31", apply_writes=True)
@@ -554,6 +643,7 @@ def _selftest():
     finally:
         g.update(saved)
         aar_db.dup_flags_by_doi = saved_dup
+        aar_db.upsert = saved_upsert
 
     print("\nSELFTEST", "PASS" if ok else "FAIL")
     return ok

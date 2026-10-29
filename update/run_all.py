@@ -320,7 +320,8 @@ def run_openalex_lane_if_due():
     `aar_universe_openalex.py --mode rolling` and read the counts. An env patch on the live
     CronJob survives deploys (k8-buildspec only does `kubectl set image`).
 
-    No API key: OpenAlex page= paging is keyless. Same isolation contract as the other
+    No OpenAlex key (page= paging is keyless); PUBMED_API_KEY is required, as on the PubMed
+    lane, because every kept work is resolved against PubMed. Same isolation contract as the other
     lanes: timed out, and any failure is caught and logged so it can NEVER fail the
     nightly job."""
     try:
@@ -332,6 +333,11 @@ def run_openalex_lane_if_due():
             return
         if not lane_due(cadence, _datetime.datetime.utcnow().weekday(), "weekly"):
             logger.info("OpenAlex lane: not due (cadence=weekly, Sundays only) — skipped")
+            return
+        if not os.getenv("PUBMED_API_KEY"):
+            # Keyless OpenAlex, but every kept work is resolved against PubMed; keyed
+            # like the PubMed lane so a missing key skips rather than crawls at 3 req/s.
+            logger.warning("OpenAlex lane: PUBMED_API_KEY unset — skipped")
             return
         run_script("aarOpenalexLane", "python3 aar_universe_openalex.py --mode rolling --apply",
                    timeout_seconds=int(os.getenv("OPENALEX_TIMEOUT_SECONDS", "3600")))
@@ -589,7 +595,7 @@ def main():
                                               # AF-ID family; needs the Ithaca identity load first
         run_openalex_lane_if_due()            # OFF unless AAR_OPENALEX_LANE_CADENCE=weekly|daily:
                                               # WCM conference abstracts + preprints from OpenAlex
-        run_pubmed_lane_if_due()             # DAILY by default (AAR_PUBMED_LANE_CADENCE)
+        run_pubmed_lane_if_due()              # DAILY by default (AAR_PUBMED_LANE_CADENCE)
         run_conflicts_refresh_if_due()        # weekly (Sun): refill empty COI rows (#130)
         run_orcid_suggestions()               # nightly: pubsource_orcid_person from accepted articles
         run_aar_close_attributed()            # nightly: dismiss already-attributed open AAR rows (#186)

@@ -78,9 +78,17 @@ for _val in (None, "", "off", "weekyl"):
     run_all.run_openalex_lane_if_due()
 check("openalex lane never runs unset, empty, off or typo'd", _ran, [])
 os.environ["AAR_OPENALEX_LANE_CADENCE"] = "daily"
+_saved_key = os.environ.pop("PUBMED_API_KEY", None)
+run_all.run_openalex_lane_if_due()
+check("openalex lane skips when daily but PUBMED_API_KEY is unset", _ran, [])
+os.environ["PUBMED_API_KEY"] = "test-key-not-real"
 run_all.run_openalex_lane_if_due()
 check("openalex lane runs when set to daily",
       _ran, ["python3 aar_universe_openalex.py --mode rolling --apply"])
 os.environ.pop("AAR_OPENALEX_LANE_CADENCE", None)
+if _saved_key is None:
+    os.environ.pop("PUBMED_API_KEY", None)
+else:
+    os.environ["PUBMED_API_KEY"] = _saved_key
 
 print(f"\n{n}/{n} passed\n")
