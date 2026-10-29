@@ -174,13 +174,19 @@ def _work_id(w):
     return _short_id(w.get("id"))
 
 
+def _bare_doi(d):
+    """'https://doi.org/10.1/x', 'http://doi.org/…', 'doi:…' or '10.1/x' -> '10.1/x', or None."""
+    d = (d or "").strip()
+    for p in ("https://doi.org/", "http://doi.org/", "https://dx.doi.org/",
+              "http://dx.doi.org/", "doi:"):
+        if d.lower().startswith(p):
+            d = d[len(p):].strip()
+    return d or None
+
+
 def _doi(w):
     """Bare DOI ('10.1016/…') from OpenAlex's 'https://doi.org/…' form, or None."""
-    d = (w.get("doi") or (w.get("ids") or {}).get("doi") or "").strip()
-    for p in ("https://doi.org/", "http://doi.org/", "doi:"):
-        if d.lower().startswith(p):
-            d = d[len(p):]
-    return d or None
+    return _bare_doi(w.get("doi") or (w.get("ids") or {}).get("doi"))
 
 
 def _openalex_pmid(w):
@@ -405,17 +411,29 @@ def _crossref_preprint_of(items):
     return out
 
 
+class PartialLookupError(Exception):
+    """A batched lookup stopped early. `.partial` holds what the earlier batches found."""
+    def __init__(self, msg, partial):
+        super().__init__(msg)
+        self.partial = partial
+
+
 def crossref_preprint_of(dois, deadline):
-    """Batched Crossref lookup, CROSSREF_BATCH DOIs per call. Raises on failure or past
-    `deadline`; the caller treats that as 'no link'."""
+    """Batched Crossref lookup, CROSSREF_BATCH DOIs per call. On a failed batch or past
+    `deadline` it raises PartialLookupError carrying the links the earlier batches found,
+    so one bad batch does not throw away the good ones."""
     dois = sorted({d.lower() for d in dois if d and "," not in d})
     out = {}
     for i in range(0, len(dois), CROSSREF_BATCH):
         if time.monotonic() > deadline:
-            raise TimeoutError("Crossref lookups hit OPENALEX_PREPRINT_LINK_SECONDS")
+            raise PartialLookupError("hit OPENALEX_PREPRINT_LINK_SECONDS", out)
         chunk = dois[i:i + CROSSREF_BATCH]
-        j = _http_json(CROSSREF_WORKS, {"filter": ",".join(f"doi:{d}" for d in chunk),
-                                        "select": "DOI,relation", "rows": len(chunk)})
+        try:
+            j = _http_json(CROSSREF_WORKS, {"filter": ",".join(f"doi:{d}" for d in chunk),
+                                            "select": "DOI,relation", "rows": len(chunk)})
+        except Exception as e:   # noqa: BLE001
+            raise PartialLookupError(f"batch {i // CROSSREF_BATCH + 1} failed "
+                                     f"({type(e).__name__}: {e})", out) from e
         out.update(_crossref_preprint_of((j.get("message") or {}).get("items")))
         time.sleep(CROSSREF_SLEEP)
     return out
@@ -429,7 +447,13 @@ def _rxiv_published(j):
 
 
 def rxiv_published(server, doi):
-    return _rxiv_published(_http_json(RXIV_DETAILS.format(server=server, doi=doi)))
+    """Published DOI from the bioRxiv/medRxiv details API. A 10.1101 DOI sent to 'biorxiv'
+    only because OpenAlex named no medRxiv venue is retried on medRxiv when bioRxiv has
+    no record of it (pre-2025 medRxiv shares the 10.1101 prefix)."""
+    j = _http_json(RXIV_DETAILS.format(server=server, doi=doi))
+    if server == "biorxiv" and not (j or {}).get("collection"):
+        j = _http_json(RXIV_DETAILS.format(server="medrxiv", doi=doi))
+    return _rxiv_published(j)
 
 
 def published_in_pubmed(preprints, budget_seconds=None):
@@ -449,13 +473,24 @@ def published_in_pubmed(preprints, budget_seconds=None):
       * OpenAlex carries no link: no journal publishedVersion location on any of them,
         and related_works is a similarity list."""
     if budget_seconds is None:
-        budget_seconds = int(os.environ.get("OPENALEX_PREPRINT_LINK_SECONDS", "600"))
-    deadline = time.monotonic() + budget_seconds
+        raw = os.environ.get("OPENALEX_PREPRINT_LINK_SECONDS", "600")
+        try:
+            budget_seconds = int(raw)
+        except ValueError:
+            budget_seconds = 600
+            print(f"      WARNING: OPENALEX_PREPRINT_LINK_SECONDS={raw!r} is not an "
+                  f"integer; using 600", flush=True)
+    start = time.monotonic()
+    deadline = start + budget_seconds
+    # The per-DOI bioRxiv/medRxiv calls stop at 80% of the budget so the PubMed checks
+    # (which cover the call-free eLife links too) always get a share of it.
+    rxiv_deadline = start + 0.8 * budget_seconds
     links, errors = {}, 0
 
     def add(wid, d):
-        if d and d.lower() not in links.setdefault(wid, []):
-            links[wid].append(d.lower())
+        d = (_bare_doi(d) or "").lower()
+        if d and d not in links.setdefault(wid, []):
+            links[wid].append(d)
 
     by_doi = {}
     for w in preprints:
@@ -463,14 +498,16 @@ def published_in_pubmed(preprints, budget_seconds=None):
             by_doi.setdefault(_doi(w).lower(), []).append(_work_id(w))
             add(_work_id(w), _elife_vor(_doi(w)))
     try:
-        for d, pubs in crossref_preprint_of(by_doi, deadline).items():
-            for wid in by_doi.get(d, []):
-                for p in pubs:
-                    add(wid, p)
+        xref = crossref_preprint_of(by_doi, deadline)
     except Exception as e:   # noqa: BLE001 -- a Crossref failure must never fail the run
         errors += 1
-        print(f"      WARNING: Crossref is-preprint-of lookup failed ({type(e).__name__}: "
-              f"{e}); continuing without it", flush=True)
+        xref = getattr(e, "partial", None) or {}
+        print(f"      WARNING: Crossref is-preprint-of lookup stopped ({type(e).__name__}: "
+              f"{e}); keeping {len(xref)} links from earlier batches", flush=True)
+    for d, pubs in xref.items():
+        for wid in by_doi.get(d, []):
+            for p in pubs:
+                add(wid, p)
     rxiv_cache = {}
     for w in preprints:
         server = _rxiv_server(w)
@@ -478,9 +515,9 @@ def published_in_pubmed(preprints, budget_seconds=None):
         if not server or key in rxiv_cache:
             add(_work_id(w), rxiv_cache.get(key))
             continue
-        if time.monotonic() > deadline:
-            print("      WARNING: OPENALEX_PREPRINT_LINK_SECONDS reached; remaining "
-                  "bioRxiv/medRxiv preprints kept unchecked", flush=True)
+        if time.monotonic() > rxiv_deadline:
+            print("      WARNING: bioRxiv/medRxiv share of OPENALEX_PREPRINT_LINK_SECONDS "
+                  "reached; remaining bioRxiv/medRxiv preprints kept unchecked", flush=True)
             break
         try:
             rxiv_cache[key] = rxiv_published(server, key[1])
@@ -492,11 +529,12 @@ def published_in_pubmed(preprints, budget_seconds=None):
         add(_work_id(w), rxiv_cache[key])
         time.sleep(RXIV_SLEEP)
 
-    out, pm_cache = {}, {}
+    out, pm_cache, pm_skipped = {}, {}, 0
     for wid, cands in links.items():
         for d in cands:
             if d not in pm_cache:
                 if time.monotonic() > deadline:
+                    pm_skipped += 1
                     break
                 try:
                     pm_cache[d] = doi_in_pubmed(d)
@@ -509,6 +547,9 @@ def published_in_pubmed(preprints, budget_seconds=None):
             if pm_cache[d]:
                 out[wid] = (d, pm_cache[d])
                 break
+    if pm_skipped:
+        print(f"      WARNING: OPENALEX_PREPRINT_LINK_SECONDS reached; {pm_skipped} linked "
+              f"preprints kept without a PubMed check", flush=True)
     n_linked = sum(1 for c in links.values() if c)
     print(f"      preprint links: {n_linked} preprints carry a published DOI, {len(out)} "
           f"resolve in PubMed; {errors} lookup errors (kept)", flush=True)
@@ -902,6 +943,64 @@ def _selftest():
             g["_http_json"] = _http_json_saved
         check("Crossref batched 40 DOIs per call (81 -> 3 calls), comma DOIs skipped",
               len(xc) == 3 and all("10.1/a,b" not in c["filter"] for c in xc))
+
+        # a failed Crossref batch keeps the links earlier batches found
+        def _xc_flaky(u, p=None):
+            if "doi:10.1/k0" in p["filter"]:
+                return {"message": {"items": [{"DOI": "10.1/K0", "relation": {"is-preprint-of": [
+                    {"id-type": "doi", "id": "https://doi.org/10.1016/PUB.K0"}]}}]}}
+            raise RuntimeError("crossref down")
+        g["_http_json"] = _xc_flaky
+        try:
+            crossref_preprint_of([f"10.1/k{k}" for k in range(41)], time.monotonic() + 60)
+            partial = None
+        except PartialLookupError as e:
+            partial = e.partial
+        finally:
+            g["_http_json"] = _http_json_saved
+        check("a failed Crossref batch raises PartialLookupError with batch 1's links",
+              partial == {"10.1/k0": ["https://doi.org/10.1016/PUB.K0"]})
+        xpp = dict(_fixture(), id="https://openalex.org/W8", type="preprint",
+                   doi="https://doi.org/10.1/k0")
+        g["crossref_preprint_of"] = lambda ds, dl: (_ for _ in ()).throw(
+            PartialLookupError("batch 2 failed", {"10.1/k0": ["https://doi.org/10.1016/PUB.K0"]}))
+        pm_seen = []
+        g["doi_in_pubmed"] = lambda d: pm_seen.append(d) or (777 if d == "10.1016/pub.k0" else None)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            got = published_in_pubmed([xpp], budget_seconds=60)
+        check("partial Crossref links are used, and a doi.org-prefixed relation id is "
+              "stripped before the PubMed search",
+              got == {"W8": ("10.1016/pub.k0", 777)} and pm_seen == ["10.1016/pub.k0"]
+              and out.getvalue().count("WARNING") == 1)
+        g["crossref_preprint_of"] = lambda ds, dl: {}
+        os.environ["OPENALEX_PREPRINT_LINK_SECONDS"] = "ten"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                published_in_pubmed([], budget_seconds=None)
+        finally:
+            del os.environ["OPENALEX_PREPRINT_LINK_SECONDS"]
+        check("a non-integer OPENALEX_PREPRINT_LINK_SECONDS falls back to 600, logged",
+              "not an integer; using 600" in out.getvalue())
+        g["doi_in_pubmed"] = lambda d: 4242
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            got = published_in_pubmed([elife], budget_seconds=-1)
+        check("PubMed checks skipped at the deadline are logged, not silent",
+              got == {} and "1 linked preprints kept without a PubMed check" in out.getvalue())
+        g["crossref_preprint_of"] = saved["crossref_preprint_of"]
+        rq = []
+        g["_http_json"] = lambda u, p=None: rq.append(u) or (
+            {"collection": [{"published": "10.1016/MED"}]} if "/medrxiv/" in u else {"collection": []})
+        try:
+            got = saved["rxiv_published"]("biorxiv", "10.1101/2021.01.01.21249999")
+            got_m = saved["rxiv_published"]("medrxiv", "10.1101/2021.01.01.21249999")
+        finally:
+            g["_http_json"] = _http_json_saved
+        check("a 10.1101 DOI bioRxiv does not know is retried on medRxiv; medRxiv is "
+              "not retried", got == "10.1016/MED" and got_m == "10.1016/MED" and len(rq) == 3)
+        check("_bare_doi strips doi.org / dx.doi.org / doi: prefixes",
+              _bare_doi("https://doi.org/10.1/a") == "10.1/a"
+              and _bare_doi("http://dx.doi.org/10.1/a") == "10.1/a"
+              and _bare_doi("doi:10.1/a") == "10.1/a" and _bare_doi("  ") is None)
 
         # a non-retryable 4xx raises on the first response, no backoff retries
         import requests as _rq
