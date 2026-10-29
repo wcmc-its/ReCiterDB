@@ -518,7 +518,7 @@ def _build_row(entry, i, n, author, top, cands, run_ts, dup_map=None):
 
 
 # ---- re-check open scopus rows ----------------------------------------------
-def recheck_open_scopus(run_ts):
+def recheck_open_scopus(run_ts, source="scopus"):
     """Open scopus rows now PubMed-reachable are handled two different ways, by DOI
     when present, else delegated to resolve_no_doi (ISSN dead-journal pre-filter /
     title fallback — same logic ingest uses). A DOI hit is a reliable, unambiguous
@@ -553,13 +553,18 @@ def recheck_open_scopus(run_ts):
     of ingest vintage.
 
     ISBN is passed for every pub_type, exactly as at ingest; resolve_no_doi no longer
-    consults it at all (v2.7 — see that function's docstring)."""
+    consults it at all (v2.7 — see that function's docstring).
+
+    `source` lets the OpenAlex lane (aar_universe_openalex.py) run this same recheck
+    over its own open rows, which carry the same pmid-less shape; the default keeps
+    this lane's behaviour unchanged."""
     from sqlalchemy import text
     eng = aar_db.engine()
     with eng.connect() as c:
         rows = c.execute(text(
             "SELECT author_key, doi, title, wcm_author, pub_type, issn, isbn FROM authorship_review "
-            "WHERE source='scopus' AND status='open' AND matched_pmid IS NULL")).mappings().all()
+            "WHERE source=:src AND status='open' AND matched_pmid IS NULL"),
+            {"src": source}).mappings().all()
     dismissed, flagged = 0, 0
     for r in rows:
         if r["doi"]:

@@ -46,6 +46,10 @@ COPY update/scopus_afids.csv ./
 # env-gated Ithaca lane in run_all.py (AAR_SCOPUS_ITHACA_LANE).
 COPY update/scopus_afids_cornell_ithaca.csv ./
 
+# AAR OpenAlex lane (WCM conference abstracts + preprints; OFF unless
+# AAR_OPENALEX_LANE_CADENCE is set in run_all.py). Imports aar_universe_scopus above.
+COPY update/aar_universe_openalex.py ./
+
 # AAR PubMed lane (orphan-authorship detector + IO/FB scoring — weekly, gated in run_all.py)
 COPY update/aar_universe.py ./
 COPY update/aar_gate.py ./

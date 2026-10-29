@@ -16,6 +16,9 @@
 --   scopus  — documents NOT in PubMed (no PMID); author_key = `scopus:{doi-or-scopusid}:{position}`;
 --             external_id = DOI (else numeric Scopus ID); pub_type = subtypeDescription;
 --             container_id = book base DOI where derivable; resolves to ExternalArticle.
+--   openalex — (v3.2) conference abstracts and preprints found in OpenAlex and NOT in
+--             PubMed; author_key = `openalex:{doi-or-workid}:{position}`; external_id =
+--             OpenAlex work id (W…); pub_type = OpenAlex type; resolves to ExternalArticle.
 --   Existing (pre-v1.6) rows are PubMed via the column default.
 --
 -- POPULATED EXTERNALLY (this repo's ETL cannot compute the scores). The producer is
@@ -43,7 +46,7 @@
 
 CREATE TABLE IF NOT EXISTS `authorship_review` (
   `id`                     BIGINT       NOT NULL AUTO_INCREMENT,
-  `source`                 ENUM('pubmed','scopus') NOT NULL DEFAULT 'pubmed',
+  `source`                 ENUM('pubmed','scopus','openalex') NOT NULL DEFAULT 'pubmed',
   `pmid`                   BIGINT       NULL,                -- NULL for scopus rows
   `external_id`            VARCHAR(96)  NULL,                -- DOI-first, numeric Scopus ID fallback
   `author_key`             VARCHAR(160) NOT NULL,            -- `{pmid}:{position}` or `scopus:{doi-or-scopusid}:{position}`

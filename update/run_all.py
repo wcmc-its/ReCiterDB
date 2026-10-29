@@ -304,6 +304,41 @@ def run_scopus_ithaca_lane_if_due():
                          f"unaffected): {e}")
 
 
+# ------------- AAR OpenAlex lane (env-gated, OFF by default, isolated) -------------
+def run_openalex_lane_if_due():
+    """OpenAlex not-in-PubMed detector for WCM conference abstracts and preprints
+    (aar_universe_openalex.py), a sibling of the Scopus lane.
+
+    SHIPS OFF: AAR_OPENALEX_LANE_CADENCE unset (or anything but "weekly"/"daily") means it
+    never runs. Off by default, not weekly like the Scopus lane, because an accepted row
+    becomes an OPENALEX: ExternalArticle and the existing pipeline puts it on the SPS
+    profile automatically. Whether abstracts belong on profiles is a display-policy call
+    for governance, and the queue must not fill before it is made. Before setting the env:
+    (1) apply setup/alter_authorship_review_add_openalex_v3.2.sql (the lane refuses
+    --apply without it); (2) ship the Publication Manager change that treats 'openalex' as
+    an external source (PM today reads anything not 'scopus' as PubMed); (3) dry-run
+    `aar_universe_openalex.py --mode rolling` and read the counts. An env patch on the live
+    CronJob survives deploys (k8-buildspec only does `kubectl set image`).
+
+    No API key: OpenAlex page= paging is keyless. Same isolation contract as the other
+    lanes: timed out, and any failure is caught and logged so it can NEVER fail the
+    nightly job."""
+    try:
+        import datetime as _datetime
+        cadence = (os.getenv("AAR_OPENALEX_LANE_CADENCE") or "off").strip().lower()
+        if cadence not in ("daily", "weekly"):
+            logger.info("OpenAlex lane: AAR_OPENALEX_LANE_CADENCE=%s — skipped (off until "
+                        "the abstracts/preprints display policy is decided)", cadence)
+            return
+        if not lane_due(cadence, _datetime.datetime.utcnow().weekday(), "weekly"):
+            logger.info("OpenAlex lane: not due (cadence=weekly, Sundays only) — skipped")
+            return
+        run_script("aarOpenalexLane", "python3 aar_universe_openalex.py --mode rolling --apply",
+                   timeout_seconds=int(os.getenv("OPENALEX_TIMEOUT_SECONDS", "3600")))
+    except Exception as e:
+        logger.exception(f"OpenAlex lane failed (ignored — reporting unaffected): {e}")
+
+
 # ------------- COI refresh pass (weekly, isolated) -------------
 def run_conflicts_refresh_if_due():
     """Weekly refill of reporting_conflicts rows that exist but are empty (#130).
@@ -552,7 +587,9 @@ def main():
         run_scopus_ithaca_lane_if_due()       # OFF unless AAR_SCOPUS_ITHACA_LANE=on: the same
                                               # weekly (Sun) Scopus lane over the Cornell Ithaca
                                               # AF-ID family; needs the Ithaca identity load first
-        run_pubmed_lane_if_due()              # DAILY by default (AAR_PUBMED_LANE_CADENCE)
+        run_openalex_lane_if_due()            # OFF unless AAR_OPENALEX_LANE_CADENCE=weekly|daily:
+                                              # WCM conference abstracts + preprints from OpenAlex
+        run_pubmed_lane_if_due()             # DAILY by default (AAR_PUBMED_LANE_CADENCE)
         run_conflicts_refresh_if_due()        # weekly (Sun): refill empty COI rows (#130)
         run_orcid_suggestions()               # nightly: pubsource_orcid_person from accepted articles
         run_aar_close_attributed()            # nightly: dismiss already-attributed open AAR rows (#186)

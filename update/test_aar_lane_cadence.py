@@ -63,4 +63,24 @@ check("case and whitespace are tolerated", lane_due("  DAILY  ", MON, "weekly"),
 check("empty string falls back to the default", lane_due("", MON, "daily"), True)
 check("...and an empty string cannot force a weekly lane daily", lane_due("", MON, "weekly"), False)
 
+# --- OpenAlex: unset means OFF, never weekly ------------------------------------------
+# The lane fills a curator queue whose accepts reach SPS profiles, so it must not run until
+# someone sets AAR_OPENALEX_LANE_CADENCE on purpose.
+import run_all   # noqa: E402
+
+_ran = []
+run_all.run_script = lambda name, cmd, timeout_seconds=None: _ran.append(cmd) or True
+for _val in (None, "", "off", "weekyl"):
+    if _val is None:
+        os.environ.pop("AAR_OPENALEX_LANE_CADENCE", None)
+    else:
+        os.environ["AAR_OPENALEX_LANE_CADENCE"] = _val
+    run_all.run_openalex_lane_if_due()
+check("openalex lane never runs unset, empty, off or typo'd", _ran, [])
+os.environ["AAR_OPENALEX_LANE_CADENCE"] = "daily"
+run_all.run_openalex_lane_if_due()
+check("openalex lane runs when set to daily",
+      _ran, ["python3 aar_universe_openalex.py --mode rolling --apply"])
+os.environ.pop("AAR_OPENALEX_LANE_CADENCE", None)
+
 print(f"\n{n}/{n} passed\n")
