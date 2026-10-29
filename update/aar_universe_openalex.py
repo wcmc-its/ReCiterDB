@@ -19,9 +19,13 @@ Per-work pipeline:
      with matched_pmid flagged for curator adjudication (v2.7 semantics, unchanged).
   4. Per WCM authorship (an institution id in WCM_OPENALEX_IDS) match the byline against
      identity_index via the Scopus lane's wcm_lane_candidates.
+  3b. A preprint whose PUBLISHED version resolves in PubMed is dropped too (counted as
+     preprint_published_pubmed): its own DOI never matches, because the published
+     article has a different DOI. See published_in_pubmed() for where the link comes from.
   5. Upsert via aar_db (source='openalex', external_id=W id, pub_type=OpenAlex type,
      pmid=NULL); then dismiss open openalex rows whose DOI the Scopus lane has since
-     picked up, then the Scopus lane's recheck, run over source='openalex' open rows.
+     picked up, and open rows for preprints step 3b dropped; then the Scopus lane's
+     recheck, run over source='openalex' open rows.
 
 Step 2 alone only works one way. The OpenAlex window keys on publication date and the
 Scopus window on Scopus load date, so a work can reach this lane first and the Scopus
@@ -61,7 +65,9 @@ works at the WCM filter (live, 2026-10-29), so a year is a handful of 200-work p
 Overlapping runs are idempotent via the author_key upsert, as on the Scopus lane.
 
 Env (never printed): PUBMED_API_KEY (DOI resolution), DB_* (identity roster + sink),
-OPENALEX_MAILTO (optional polite-pool address, same env name as Scholars-Profile-System).
+OPENALEX_MAILTO (optional polite-pool address, same env name as Scholars-Profile-System),
+CROSSREF_MAILTO (optional Crossref polite-pool address; falls back to OPENALEX_MAILTO),
+OPENALEX_PREPRINT_LINK_SECONDS (wall-clock cap on step 3b, default 600).
 
 Usage:
   python aar_universe_openalex.py --selftest                     # offline checks, fixtures only
@@ -69,7 +75,7 @@ Usage:
   python aar_universe_openalex.py --mode rolling --apply         # write (cron, once enabled)
   python aar_universe_openalex.py --since 2026-01-01 --until 2026-03-31   # dry-run a range
 """
-import argparse, json, os, sys, time
+import argparse, json, os, re, sys, time
 from datetime import date, datetime
 
 import requests
@@ -91,6 +97,13 @@ SELECT = ("id,doi,ids,title,display_name,type,publication_date,publication_year,
 PER_PAGE = 200            # OpenAlex maximum
 PAGE_CAP = 10_000         # keyless page= paging stops here; cursor= needs an API key
 SLEEP = 0.2               # polite throttle between pages
+
+CROSSREF_WORKS = "https://api.crossref.org/works"
+CROSSREF_BATCH = 40       # DOIs per filter=doi:a,doi:b call
+CROSSREF_SLEEP = 0.4      # Crossref's public list-query limit is 3 req/s (x-rate-limit-limit)
+RXIV_DETAILS = "https://api.biorxiv.org/details/{server}/{doi}"
+RXIV_PREFIXES = ("10.1101/", "10.64898/")   # bioRxiv + medRxiv (10.64898 since late 2025)
+RXIV_SLEEP = 0.2
 
 
 # ---- OpenAlex fetch ---------------------------------------------------------
@@ -348,6 +361,176 @@ def dismiss_scopus_held(run_ts):
             {"ts": run_ts}).rowcount
 
 
+# ---- preprint -> published version (step 3b) --------------------------------
+def _contact_ua():
+    mailto = (os.environ.get("CROSSREF_MAILTO") or os.environ.get("OPENALEX_MAILTO") or "").strip()
+    return "reciterdb-aar-openalex" + (f" (mailto:{mailto})" if mailto else "")
+
+
+def _http_json(url, params=None):
+    r = None
+    for attempt in range(3):
+        r = requests.get(url, params=params, timeout=30,
+                         headers={"Accept": "application/json", "User-Agent": _contact_ua()})
+        if r.status_code == 200:
+            return r.json()
+        if r.status_code in (429, 500, 502, 503, 504):
+            time.sleep(2 * (attempt + 1))
+            continue
+        r.raise_for_status()
+    raise RuntimeError(f"{url}: HTTP {r.status_code} after retries")
+
+
+def _elife_vor(doi):
+    """eLife reviewed preprint 10.7554/eLife.N.v -> its version of record 10.7554/eLife.N."""
+    m = re.fullmatch(r"(10\.7554/elife\.\d+)\.\d+", doi or "", re.I)
+    return m.group(1) if m else None
+
+
+def _rxiv_server(w):
+    doi = (_doi(w) or "").lower()
+    if not doi.startswith(RXIV_PREFIXES):
+        return None
+    return "medrxiv" if "medrxiv" in (_source(w).get("display_name") or "").lower() else "biorxiv"
+
+
+def _crossref_preprint_of(items):
+    """Crossref work items -> {doi_lower: [published DOI, ...]} from relation is-preprint-of."""
+    out = {}
+    for it in items or []:
+        rel = [x.get("id") for x in ((it.get("relation") or {}).get("is-preprint-of") or [])
+               if x.get("id-type") == "doi" and x.get("id")]
+        if rel and it.get("DOI"):
+            out[it["DOI"].lower()] = rel
+    return out
+
+
+def crossref_preprint_of(dois, deadline):
+    """Batched Crossref lookup, CROSSREF_BATCH DOIs per call. Raises on failure or past
+    `deadline`; the caller treats that as 'no link'."""
+    dois = sorted({d.lower() for d in dois if d and "," not in d})
+    out = {}
+    for i in range(0, len(dois), CROSSREF_BATCH):
+        if time.monotonic() > deadline:
+            raise TimeoutError("Crossref lookups hit OPENALEX_PREPRINT_LINK_SECONDS")
+        chunk = dois[i:i + CROSSREF_BATCH]
+        j = _http_json(CROSSREF_WORKS, {"filter": ",".join(f"doi:{d}" for d in chunk),
+                                        "select": "DOI,relation", "rows": len(chunk)})
+        out.update(_crossref_preprint_of((j.get("message") or {}).get("items")))
+        time.sleep(CROSSREF_SLEEP)
+    return out
+
+
+def _rxiv_published(j):
+    """bioRxiv/medRxiv details response -> the published DOI, or None ('NA' = unpublished)."""
+    pubs = [c.get("published") for c in (j or {}).get("collection") or []]
+    pubs = [p for p in pubs if p and p != "NA"]
+    return pubs[-1] if pubs else None
+
+
+def rxiv_published(server, doi):
+    return _rxiv_published(_http_json(RXIV_DETAILS.format(server=server, doi=doi)))
+
+
+def published_in_pubmed(preprints, budget_seconds=None):
+    """{W id: (published DOI, PMID)} for preprints whose published version resolves in
+    PubMed via the lane's quoted "<doi>"[DOI] search. Never raises: a failed or
+    out-of-budget lookup leaves the work kept, and is logged.
+
+    Where the link comes from, live-measured 2026-10-29 over the 301 OpenAlex-only
+    preprints in the 365-day window:
+      * bioRxiv/medRxiv details API `published` (108 bioRxiv + 45 medRxiv looked up):
+        2 linked, 1 in PubMed. One call per DOI, the only per-work cost here.
+      * eLife reviewed preprints (10.7554/eLife.N.v): the version of record is
+        10.7554/eLife.N by eLife's DOI scheme, no call needed: 5 in PubMed.
+      * Crossref relation is-preprint-of: 0 of 242 Crossref-registered preprint DOIs
+        carry it (bioRxiv deposits none, even for an old bioRxiv->Nature pair).
+        Kept because it is cheap (CROSSREF_BATCH DOIs per call) and generic.
+      * OpenAlex carries no link: no journal publishedVersion location on any of them,
+        and related_works is a similarity list."""
+    if budget_seconds is None:
+        budget_seconds = int(os.environ.get("OPENALEX_PREPRINT_LINK_SECONDS", "600"))
+    deadline = time.monotonic() + budget_seconds
+    links, errors = {}, 0
+
+    def add(wid, d):
+        if d and d.lower() not in links.setdefault(wid, []):
+            links[wid].append(d.lower())
+
+    by_doi = {}
+    for w in preprints:
+        if _doi(w):
+            by_doi.setdefault(_doi(w).lower(), []).append(_work_id(w))
+            add(_work_id(w), _elife_vor(_doi(w)))
+    try:
+        for d, pubs in crossref_preprint_of(by_doi, deadline).items():
+            for wid in by_doi.get(d, []):
+                for p in pubs:
+                    add(wid, p)
+    except Exception as e:   # noqa: BLE001 -- a Crossref failure must never fail the run
+        errors += 1
+        print(f"      WARNING: Crossref is-preprint-of lookup failed ({type(e).__name__}: "
+              f"{e}); continuing without it", flush=True)
+    rxiv_cache = {}
+    for w in preprints:
+        server = _rxiv_server(w)
+        key = (server, (_doi(w) or "").lower())
+        if not server or key in rxiv_cache:
+            add(_work_id(w), rxiv_cache.get(key))
+            continue
+        if time.monotonic() > deadline:
+            print("      WARNING: OPENALEX_PREPRINT_LINK_SECONDS reached; remaining "
+                  "bioRxiv/medRxiv preprints kept unchecked", flush=True)
+            break
+        try:
+            rxiv_cache[key] = rxiv_published(server, key[1])
+        except Exception as e:   # noqa: BLE001
+            errors += 1
+            rxiv_cache[key] = None
+            print(f"      WARNING: {server} lookup failed for {key[1]} ({type(e).__name__})",
+                  flush=True)
+        add(_work_id(w), rxiv_cache[key])
+        time.sleep(RXIV_SLEEP)
+
+    out, pm_cache = {}, {}
+    for wid, cands in links.items():
+        for d in cands:
+            if d not in pm_cache:
+                if time.monotonic() > deadline:
+                    break
+                try:
+                    pm_cache[d] = doi_in_pubmed(d)
+                except Exception as e:   # noqa: BLE001
+                    errors += 1
+                    pm_cache[d] = None
+                    print(f"      WARNING: PubMed lookup failed for {d} ({type(e).__name__})",
+                          flush=True)
+                time.sleep(_PM_SLEEP)
+            if pm_cache[d]:
+                out[wid] = (d, pm_cache[d])
+                break
+    n_linked = sum(1 for c in links.values() if c)
+    print(f"      preprint links: {n_linked} preprints carry a published DOI, {len(out)} "
+          f"resolve in PubMed; {errors} lookup errors (kept)", flush=True)
+    return out
+
+
+def dismiss_published(published, run_ts):
+    """Dismiss open openalex rows for preprints step 3b dropped. `published` maps
+    W id -> (preprint DOI or None, published DOI, PMID). Returns the count."""
+    from sqlalchemy import text
+    n = 0
+    stmt = text("UPDATE authorship_review SET status='dismissed', resolved_at=:ts, note=:note "
+                "WHERE source='openalex' AND status='open' AND (external_id=:wid OR "
+                "(doi IS NOT NULL AND :doi IS NOT NULL AND LOWER(doi)=LOWER(:doi)))")
+    with aar_db.engine().begin() as c:
+        for wid, (doi, pub_doi, pmid) in published.items():
+            n += c.execute(stmt, {"ts": run_ts, "wid": wid, "doi": doi,
+                                  "note": f"auto: published version {pub_doi} is PMID {pmid}"}
+                           ).rowcount
+    return n
+
+
 def source_enum_ready():
     """Does authorship_review.source accept 'openalex' (migration v3.2 applied)?"""
     from sqlalchemy import text
@@ -398,7 +581,13 @@ def run(since, until, apply_writes=False, recheck=True, idx=None):
                 w["_matched_pmid"] = hit
         openalex_only.append(w)
     print(f"      {resolved} resolved to PubMed by DOI (dropped); {flagged_by_title} title-matched "
-          f"(kept, flagged); {len(openalex_only)} OPENALEX-ONLY", flush=True)
+          f"(kept, flagged)", flush=True)
+    pubs = published_in_pubmed([w for w in openalex_only if w.get("type") == "preprint"])
+    published = {_work_id(w): (_doi(w),) + pubs[_work_id(w)]
+                 for w in openalex_only if _work_id(w) in pubs}
+    openalex_only = [w for w in openalex_only if _work_id(w) not in published]
+    print(f"      {len(published)} preprints' published version is in PubMed (dropped); "
+          f"{len(openalex_only)} OPENALEX-ONLY", flush=True)
 
     print("[4/5] Matching WCM authorships against the identity roster ...", flush=True)
     if idx is None:
@@ -424,6 +613,9 @@ def run(since, until, apply_writes=False, recheck=True, idx=None):
         n_scopus = dismiss_scopus_held(run_ts)
         print(f"      {n_scopus} open openalex rows dismissed: the Scopus lane now holds "
               f"their DOI", flush=True)
+        n_pub = dismiss_published(published, run_ts) if published else 0
+        print(f"      {n_pub} open openalex rows dismissed: published version is in PubMed",
+              flush=True)
         if recheck:
             n_dismissed, n_flagged = recheck_open_scopus(run_ts, source="openalex")
             print(f"      re-check: {n_dismissed} open openalex rows resolved out (DOI match), "
@@ -438,6 +630,7 @@ def run(since, until, apply_writes=False, recheck=True, idx=None):
             "openalex_pmid": len(works) - len(no_pmid),
             "in_scopus_lane": len(no_pmid) - len(candidates),
             "doi_resolved_pubmed": resolved, "flagged_by_title": flagged_by_title,
+            "preprint_published_pubmed": len(published),
             "openalex_only": len(openalex_only), "openalex_only_by_type": by_type,
             "matched_rows": len(rows), "unmatched": unmatched}
 
@@ -554,6 +747,27 @@ def _selftest():
     check("default window is [today-365d, today-14d] as YYYY-MM-DD",
           openalex_window(date(2026, 10, 29)) == ("2025-10-29", "2026-10-15"))
 
+    # ---- preprint -> published version: pure parsers
+    check("eLife reviewed preprint .v -> version of record; VOR and others -> None",
+          _elife_vor("10.7554/eLife.108190.2") == "10.7554/eLife.108190"
+          and _elife_vor("10.7554/elife.108190") is None and _elife_vor("10.1101/x.1") is None)
+    check("bioRxiv/medRxiv server from DOI prefix + venue; other prefixes skipped",
+          _rxiv_server({"doi": "https://doi.org/10.64898/2026.06.19.733041",
+                        "primary_location": {"source": {"display_name": "medRxiv"}}}) == "medrxiv"
+          and _rxiv_server({"doi": "10.1101/2025.06.20.660826"}) == "biorxiv"
+          and _rxiv_server({"doi": "10.48550/arxiv.2511.05887"}) is None)
+    check("bioRxiv details: last non-NA `published`, all-NA -> None",
+          _rxiv_published({"collection": [{"published": "NA"}, {"published": "10.1016/j.x.1"}]})
+          == "10.1016/j.x.1"
+          and _rxiv_published({"collection": [{"published": "NA"}]}) is None
+          and _rxiv_published({"collection": []}) is None)
+    check("Crossref is-preprint-of: DOI ids only, keyed lowercase",
+          _crossref_preprint_of([
+              {"DOI": "10.21203/RS.3.rs-1/v1", "relation": {"is-preprint-of": [
+                  {"id-type": "doi", "id": "10.1038/s1"}, {"id-type": "uri", "id": "http://x"}]}},
+              {"DOI": "10.64898/a", "relation": {"is-version-of": [{"id-type": "doi", "id": "q"}]}},
+          ]) == {"10.21203/rs.3.rs-1/v1": ["10.1038/s1"]})
+
     # ---- offline end-to-end: run() over canned pages, with PubMed, reciterdb and the
     # roster replaced. Everything patched is restored in `finally`.
     from identity_index import _norm
@@ -561,7 +775,9 @@ def _selftest():
     saved = {k: g[k] for k in ("_openalex_get", "doi_in_pubmed", "resolve_no_doi",
                                "scopus_lane_dois", "source_enum_ready", "time",
                                "dismiss_scopus_held", "recheck_open_scopus", "requests",
-                               "external_article_uids_by_wid")}
+                               "external_article_uids_by_wid", "crossref_preprint_of",
+                               "rxiv_published", "dismiss_published")}
+    _http_json_saved = _http_json
     saved_upsert = aar_db.upsert
     saved_dup = aar_db.dup_flags_by_doi
     pmid_work = dict(_fixture(), id="https://openalex.org/W2",
@@ -570,7 +786,10 @@ def _selftest():
     scopus_doi = dict(_fixture(), id="https://openalex.org/W4", doi="https://doi.org/10.1/SC")
     preprint = dict(_fixture(), id="https://openalex.org/W5", doi=None, ids={},
                     type="preprint", title="A preprint")
-    pages = {1: [_fixture(), pmid_work, pubmed_doi, scopus_doi] * 50, 2: [preprint]}
+    published_pp = dict(_fixture(), id="https://openalex.org/W6", type="preprint",
+                        doi="https://doi.org/10.64898/2026.01.01.000001",
+                        primary_location={"source": {"display_name": "bioRxiv"}})
+    pages = {1: [_fixture(), pmid_work, pubmed_doi, scopus_doi] * 50, 2: [preprint, published_pp]}
     calls = []
 
     class _NoSleep:
@@ -578,10 +797,14 @@ def _selftest():
         def sleep(_):
             pass
 
+        monotonic = staticmethod(time.monotonic)
+
     try:
         g["_openalex_get"] = lambda p: (calls.append(p) or
                                         {"meta": {"count": 201}, "results": pages[p["page"]]})
-        g["doi_in_pubmed"] = lambda d: 999 if d == "10.1/inpm" else None
+        g["doi_in_pubmed"] = lambda d: {"10.1/inpm": 999, "10.1016/pub": 555}.get(d)
+        g["crossref_preprint_of"] = lambda ds, dl: {}
+        g["rxiv_published"] = lambda srv, d: "10.1016/PUB" if d.endswith(".000001") else None
         g["resolve_no_doi"] = lambda *a: 777 if a[0] == "A preprint" else None
         g["scopus_lane_dois"] = lambda ds: {"10.1/sc"} & {d.lower() for d in ds}
         g["time"] = _NoSleep
@@ -597,7 +820,9 @@ def _selftest():
 
         s = run("2026-01-01", "2026-12-31", idx=IdentityIndex([rec("Alissa", "Cooper", "ac1")]))
         check("paging stops on the first short page", [c["page"] for c in calls] == [1, 2])
-        check("works deduped by W id across pages", s["works"] == 5)
+        check("works deduped by W id across pages", s["works"] == 6)
+        check("bioRxiv preprint whose published DOI is in PubMed dropped and counted",
+              s["preprint_published_pubmed"] == 1)
         check("ids.pmid work and DOI-in-PubMed work dropped; Scopus-lane DOI dropped "
               "case-insensitively",
               s["openalex_pmid"] == 1 and s["doi_resolved_pubmed"] == 1
@@ -623,7 +848,8 @@ def _selftest():
         # --apply path: upsert, then the Scopus-held dismissal, then the recheck on
         # source='openalex' -- in that order.
         order = []
-        g["_openalex_get"] = lambda p: {"meta": {"count": 1}, "results": [_fixture()]}
+        g["_openalex_get"] = lambda p: {"meta": {"count": 2}, "results": [_fixture(), published_pp]}
+        g["dismiss_published"] = lambda pubs, ts: order.append(("published", pubs)) or 0
         g["source_enum_ready"] = lambda: True
         aar_db.upsert = lambda rows: order.append(("upsert", len(rows))) or len(rows)
         g["dismiss_scopus_held"] = lambda ts: order.append(("scopus_held",)) or 0
@@ -631,8 +857,51 @@ def _selftest():
         with contextlib.redirect_stdout(io.StringIO()):
             run("2026-01-01", "2026-12-31", apply_writes=True,
                 idx=IdentityIndex([rec("Alissa", "Cooper", "ac1")]))
-        check("--apply: upsert, then dismiss Scopus-held DOIs, then recheck source=openalex",
-              order == [("upsert", 1), ("scopus_held",), ("recheck", "openalex")])
+        check("--apply: upsert, dismiss Scopus-held DOIs, dismiss published-in-PubMed "
+              "preprints (W id, preprint DOI, published DOI, PMID), then recheck",
+              order == [("upsert", 1), ("scopus_held",),
+                        ("published", {"W6": ("10.64898/2026.01.01.000001", "10.1016/pub", 555)}),
+                        ("recheck", "openalex")])
+
+        # step 3b never fails the run: Crossref / bioRxiv / PubMed errors keep the work
+        def boom(*a):
+            raise RuntimeError("down")
+        elife = dict(_fixture(), id="https://openalex.org/W7", type="preprint",
+                     doi="https://doi.org/10.7554/eLife.108190.2")
+        g["crossref_preprint_of"] = boom
+        g["rxiv_published"] = boom
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            got = published_in_pubmed([published_pp, elife], budget_seconds=60)
+        check("Crossref + bioRxiv failures are logged, not raised, and the works are kept",
+              got == {} and out.getvalue().count("WARNING") == 2)
+        g["doi_in_pubmed"] = lambda d: 4242 if d == "10.7554/elife.108190" else None
+        with contextlib.redirect_stdout(io.StringIO()):
+            got = published_in_pubmed([published_pp, elife], budget_seconds=60)
+        check("eLife .v preprint resolves through its version of record",
+              got == {"W7": ("10.7554/elife.108190", 4242)})
+        g["doi_in_pubmed"] = boom
+        with contextlib.redirect_stdout(io.StringIO()):
+            got = published_in_pubmed([elife], budget_seconds=60)
+        check("a PubMed failure on the published DOI keeps the work", got == {})
+        rx = []
+        g["rxiv_published"] = lambda srv, d: rx.append(d)
+        with contextlib.redirect_stdout(io.StringIO()):
+            published_in_pubmed([published_pp] * 3, budget_seconds=60)
+        check("bioRxiv lookups cached per DOI within a run", len(rx) == 1)
+        rx.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            published_in_pubmed([published_pp], budget_seconds=-1)
+        check("past OPENALEX_PREPRINT_LINK_SECONDS no bioRxiv call is made", rx == [])
+        g["crossref_preprint_of"] = saved["crossref_preprint_of"]
+        xc = []
+        g["_http_json"] = lambda u, p=None: xc.append(p) or {"message": {"items": []}}
+        try:
+            crossref_preprint_of([f"10.1/{k}" for k in range(81)] + ["10.1/a,b"],
+                                 time.monotonic() + 60)
+        finally:
+            g["_http_json"] = _http_json_saved
+        check("Crossref batched 40 DOIs per call (81 -> 3 calls), comma DOIs skipped",
+              len(xc) == 3 and all("10.1/a,b" not in c["filter"] for c in xc))
 
         # a non-retryable 4xx raises on the first response, no backoff retries
         import requests as _rq

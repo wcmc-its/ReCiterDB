@@ -23,6 +23,12 @@ spec:
             # first, or patch the image separately.
             image: CONTAINER_IMAGE
             env:
+            # AAR lane switches read by run_all.py. Both are set on the live CronJob;
+            # keep them here so a manual apply of this file doesn't turn the lanes off.
+            - name: AAR_SCOPUS_ITHACA_LANE
+              value: "on"
+            - name: AAR_OPENALEX_LANE_CADENCE
+              value: "weekly"
             # AAR Scopus + PubMed lanes (weekly, gated in run_all.py)
             - name: SCOPUS_API_KEY
               valueFrom:
