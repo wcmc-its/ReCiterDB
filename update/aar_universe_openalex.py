@@ -251,6 +251,10 @@ def _build_row(w, i, n, author, top, cands, run_ts, dup_map=None):
     wid, doi = _work_id(w), _doi(w)
     cohort = top.get("cohort_size") if top else None
     dup_uid = aar_db.dup_uid_for_authorship(dup_map, doi, top, cands)
+    dup_how = "DOI match"
+    if not dup_uid and wid:
+        dup_uid = aar_db.dup_uid_for_authorship(dup_map, f"OPENALEX:{wid}", top, cands)
+        dup_how = "OpenAlex id match"
     return {
         "source": "openalex", "pmid": None,
         # bare work id -> the PM Accept builds articleId "OPENALEX:<external_id>".
@@ -285,7 +289,7 @@ def _build_row(w, i, n, author, top, cands, run_ts, dup_map=None):
         "n_candidates": len(cands), "single_candidate": int(cohort == 1) if cohort else None,
         "candidate_cwids_json": json.dumps(_compact(cands)),
         "dup_flag": int(bool(dup_uid)),
-        "dup_reason": (f"Already added as ExternalArticle for {dup_uid} (DOI match)"
+        "dup_reason": (f"Already added as ExternalArticle for {dup_uid} ({dup_how})"
                        if dup_uid else None),
         "matched_pmid": w.get("_matched_pmid"),
         "matched_pmid_source": "title" if w.get("_matched_pmid") else None,
@@ -309,6 +313,24 @@ def scopus_lane_dois(dois):
     with aar_db.engine().connect() as c:
         for i in range(0, len(dois), 500):
             out.update(d.lower() for (d,) in c.execute(stmt, {"ds": dois[i:i + 500]}) if d)
+    return out
+
+
+def external_article_uids_by_wid(wids):
+    """'openalex:w…' -> {uid, ...} for works already hand-added as OPENALEX:<W id>
+    ExternalArticles. Catches DOI-less works dup_flags_by_doi can't see; keyed lowercase
+    so it merges into the same dup_map. Read-only, batched."""
+    from sqlalchemy import bindparam, text
+    keys = sorted({f"OPENALEX:{w}" for w in wids if w})
+    out = {}
+    if not keys:
+        return out
+    stmt = text("SELECT article_id, uid FROM external_article WHERE article_id IN :ks") \
+        .bindparams(bindparam("ks", expanding=True))
+    with aar_db.engine().connect() as c:
+        for i in range(0, len(keys), 500):
+            for aid, uid in c.execute(stmt, {"ks": keys[i:i + 500]}):
+                out.setdefault(aid.lower(), set()).add(uid)
     return out
 
 
@@ -383,6 +405,7 @@ def run(since, until, apply_writes=False, recheck=True, idx=None):
         idx = _roster(CAMPUS_WCM)
     dois = {_doi(w) for w in openalex_only if _doi(w)}
     dup_map = aar_db.dup_flags_by_doi(dois) if dois else {}
+    dup_map.update(external_article_uids_by_wid({_work_id(w) for w in openalex_only}))
     rows, unmatched = [], 0
     for w in openalex_only:
         for i, n, au in wcm_authorships(w):
@@ -519,6 +542,9 @@ def _selftest():
                      dup_map={"10.1016/j.jtho.2026.104007": {"ac1"}})["dup_flag"] == 1
           and _build_row(w, i, n, au, top, [top], "t",
                          dup_map={"10.1016/j.jtho.2026.104007": {"zz9"}})["dup_flag"] == 0)
+    check("row dup_flag set by an OPENALEX:<W id> ExternalArticle when the DOI misses",
+          "OpenAlex id match" in (_build_row(w, i, n, au, top, [top], "t",
+                                  dup_map={"openalex:w7167238871": {"ac1"}})["dup_reason"] or ""))
     nodoi = dict(w, doi=None, ids={"openalex": w["id"]}, _matched_pmid=42)
     row2 = _build_row(nodoi, i, n, au, top, [top], "2026-10-29 00:00:00")
     check("no-DOI row keys on the W id and carries a title-match flag",
@@ -534,7 +560,8 @@ def _selftest():
     g = globals()
     saved = {k: g[k] for k in ("_openalex_get", "doi_in_pubmed", "resolve_no_doi",
                                "scopus_lane_dois", "source_enum_ready", "time",
-                               "dismiss_scopus_held", "recheck_open_scopus", "requests")}
+                               "dismiss_scopus_held", "recheck_open_scopus", "requests",
+                               "external_article_uids_by_wid")}
     saved_upsert = aar_db.upsert
     saved_dup = aar_db.dup_flags_by_doi
     pmid_work = dict(_fixture(), id="https://openalex.org/W2",
@@ -559,6 +586,7 @@ def _selftest():
         g["scopus_lane_dois"] = lambda ds: {"10.1/sc"} & {d.lower() for d in ds}
         g["time"] = _NoSleep
         aar_db.dup_flags_by_doi = lambda ds: {}
+        g["external_article_uids_by_wid"] = lambda ws: {}
 
         def rec(given, surname, cwid):
             return {"cwid": cwid, "given": given, "middle": "", "surname": surname,
