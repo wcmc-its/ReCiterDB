@@ -440,6 +440,18 @@ def run_external_article_etl():
         logger.exception(f"External-article ETL failed (ignored — reporting unaffected): {e}")
 
 
+def run_external_abstract_import():
+    """Fill reporting_external_abstracts for external_article rows that have none yet
+    (fetch-once, OpenAlex). Runs right after the external-article projection so new
+    rows are picked up the same night. Isolated like it: a failure only delays
+    abstracts, never the nightly. Skips itself until the v3.3 table exists."""
+    try:
+        run_script("externalAbstractImport", "python3 externalAbstractImport.py --apply",
+                   timeout_seconds=int(os.getenv("EXTERNAL_ABSTRACT_TIMEOUT_SECONDS", "900")))
+    except Exception as e:
+        logger.exception(f"External-abstract import failed (ignored — reporting unaffected): {e}")
+
+
 # ------------- AAR nightly closer: dismiss already-attributed open rows (#186) -------------
 def run_aar_close_attributed():
     """Nightly DB-side closer for open AAR rows ReCiter has already attributed.
@@ -575,6 +587,7 @@ def main():
     # (STEP 6b) unions freshly-loaded external_article rows (ReCiterDB #101). Isolated,
     # so a failure here degrades to stale/empty external pubs, never a failed nightly.
     run_external_article_etl()
+    run_external_abstract_import()
 
     for name, cmd in scripts:
         #ok = run_script(name, cmd)
