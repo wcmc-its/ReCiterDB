@@ -1317,18 +1317,77 @@ proc_main: BEGIN
         SET v_rows = ROW_COUNT();
         CALL log_progress(v_job_id, v_step, 'Inserted external article rows', 'INFO', v_rows, NULL);
 
-        -- Person -> publication link rows (one per uid + article_id). authorPosition
-        -- and authors left NULL: external has no target-author signal, and SPS renders
-        -- the byline from the external_article JSON.
+        -- Where each person sits in an external byline, from the authorship_review row a
+        -- curator accepted (resolution_cwid = who it went to). authorPosition uses the
+        -- producer's first/middle/last label, mapped to PubMed's convention ('first' /
+        -- 'last', middle = NULL). authors is "Surname Initials, ..." with the person
+        -- wrapped in ((..)), the same shape as PubMed rows, so position filters and
+        -- author counts treat external pubs like PubMed ones. Unmatched rows (manual
+        -- dropdown adds, no review row) keep NULL/NULL. If this build fails, the
+        -- CONTINUE handler skips it and the LEFT JOIN below falls back to NULL/NULL.
+        DROP TABLE IF EXISTS temp_external_position;
+        CREATE TABLE temp_external_position (
+            uid             VARCHAR(64)   NOT NULL,
+            article_id      VARCHAR(96)   NOT NULL,
+            author_position VARCHAR(20)   NULL,
+            authors         VARCHAR(1000) NULL,
+            PRIMARY KEY (uid, article_id)
+        ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+        IF EXISTS (SELECT 1 FROM information_schema.tables
+                   WHERE table_schema = DATABASE() AND table_name = 'authorship_review') THEN
+            INSERT INTO temp_external_position (uid, article_id, author_position, authors)
+            SELECT r.uid, r.article_id,
+                   CASE r.author_position_label WHEN 'first' THEN 'first' WHEN 'last' THEN 'last' END,
+                   (SELECT LEFT(GROUP_CONCAT(
+                               IF(j.ord = r.author_position, CONCAT('((', j.nm, '))'), j.nm)
+                               ORDER BY j.ord SEPARATOR ', '), 1000)
+                    FROM (SELECT r2.uid, r2.article_id, jt.ord,
+                                 TRIM(CONCAT(COALESCE(jt.surname, ''), ' ',
+                                      UPPER(REGEXP_REPLACE(COALESCE(jt.given, ''),
+                                            '([[:alpha:]])[[:alpha:]]*[^[:alpha:]]*', '\\1')))) AS nm
+                          FROM (SELECT resolution_cwid AS uid,
+                                       CONCAT(UPPER(source), ':', external_id) AS article_id,
+                                       IF(JSON_VALID(authors_json), authors_json, '[]') AS aj,
+                                       ROW_NUMBER() OVER (PARTITION BY resolution_cwid, source, external_id
+                                                          ORDER BY author_position) AS rn
+                                FROM authorship_review
+                                WHERE source IN ('scopus', 'openalex')
+                                  AND status IN ('accepted', 'assigned')
+                                  AND resolution_cwid IS NOT NULL) r2
+                          JOIN JSON_TABLE(r2.aj, '$[*]' COLUMNS (
+                                 ord     FOR ORDINALITY,
+                                 surname VARCHAR(255) PATH '$.surname',
+                                 given   VARCHAR(255) PATH '$.given')) jt
+                          WHERE r2.rn = 1) j
+                    WHERE j.uid = r.uid AND j.article_id = r.article_id)
+            FROM (SELECT resolution_cwid AS uid,
+                         CONCAT(UPPER(source), ':', external_id) AS article_id,
+                         author_position, author_position_label,
+                         -- a person matched to two slots on one paper: keep the earliest
+                         ROW_NUMBER() OVER (PARTITION BY resolution_cwid, source, external_id
+                                            ORDER BY author_position) AS rn
+                  FROM authorship_review
+                  WHERE source IN ('scopus', 'openalex')
+                    AND status IN ('accepted', 'assigned')
+                    AND resolution_cwid IS NOT NULL) r
+            WHERE r.rn = 1;
+            SET v_rows = ROW_COUNT();
+            CALL log_progress(v_job_id, v_step, 'Resolved external author positions', 'INFO', v_rows, NULL);
+        END IF;
+
+        -- Person -> publication link rows (one per uid + article_id).
         INSERT INTO analysis_summary_author_new (pmid, personIdentifier, authorPosition, authors)
-        SELECT t.syn_pmid, e.uid, NULL, NULL
+        SELECT t.syn_pmid, e.uid, p.author_position, p.authors
         FROM external_article e
         JOIN temp_external_pmid t ON t.article_id = e.article_id
+        LEFT JOIN temp_external_position p ON p.uid = e.uid AND p.article_id = e.article_id
         WHERE e.suppressed = 0;
         SET v_rows = ROW_COUNT();
         CALL log_progress(v_job_id, v_step, 'Inserted external author-link rows', 'INFO', v_rows, NULL);
 
         DROP TABLE IF EXISTS temp_external_pmid;
+        DROP TABLE IF EXISTS temp_external_position;
 
         IF v_error_occurred THEN
             -- External injection is supplementary; log and clear the flag so a hiccup
