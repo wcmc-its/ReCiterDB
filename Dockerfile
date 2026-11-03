@@ -22,6 +22,7 @@ COPY update/conflictsImport.py ./
 COPY update/dataTransformer.py ./
 COPY update/executeFeatureGenerator.py ./
 COPY update/retrieveExternalArticles.py ./
+COPY update/externalAbstractImport.py ./
 COPY update/run_all.py ./
 COPY update/updateOrcidSuggestions.py ./
 
