@@ -856,6 +856,17 @@ CREATE TABLE IF NOT EXISTS `reporting_abstracts` (
   UNIQUE KEY `idx_pmid` (`pmid`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- External-source abstracts (v3.3): see table_reporting_external_abstracts_v3.3.sql.
+CREATE TABLE IF NOT EXISTS `reporting_external_abstracts` (
+  `article_id`   VARCHAR(96)  NOT NULL,
+  `abstract`     TEXT         NULL,
+  `abstract_len` INT          NULL,
+  `source`       VARCHAR(16)  NOT NULL,
+  `fetched_at`   DATETIME     NOT NULL,
+  PRIMARY KEY (`article_id`),
+  KEY `idx_rea_fetched_at` (`fetched_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS `reporting_ad_hoc_feature_generator_execution` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(128) DEFAULT NULL,
