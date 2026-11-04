@@ -9,6 +9,12 @@ Fetch-once, like abstractImport.py: only article_ids with no row are fetched. A 
 no abstract gets a row with abstract NULL and is rechecked after RECHECK_DAYS. A failed
 OpenAlex batch writes nothing, so it is simply retried next run. Rows are never deleted.
 
+Crossref fallback: a work OpenAlex has no abstract for is looked up on Crossref by DOI
+(external_article.doi). That fills SSRN preprints; Elsevier journals withhold abstracts
+from Crossref too. A tried row gets source='crossref' whether or not Crossref had text,
+so each NULL row is tried once per RECHECK_DAYS cycle (the OpenAlex recheck resets source
+to 'openalex').
+
 SCOPUS: ids are not fetched yet (that needs the Scopus abstract API); the table and the
 `source` column are ready for them.
 
@@ -16,7 +22,8 @@ SCOPUS: ids are not fetched yet (that needs the Scopus abstract API); the table 
   python3 externalAbstractImport.py --apply    # fetch and write
   python3 externalAbstractImport.py --selftest # offline checks, no DB or network
 """
-import argparse, os, re, sys, time
+import argparse, html, os, re, sys, time
+from urllib.parse import quote
 from datetime import datetime, timezone
 
 import requests
@@ -25,6 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 TABLE = "reporting_external_abstracts"
 OPENALEX_WORKS = "https://api.openalex.org/works"
+CROSSREF_WORKS = "https://api.crossref.org/works/"
 BATCH = 50              # OpenAlex caps an `openalex:` OR-filter at 50 ids
 SLEEP = 0.2             # polite throttle between calls
 RECHECK_DAYS = 30       # recheck "no abstract" rows after this long
@@ -44,6 +52,36 @@ def reconstruct(index):
             words[p] = word
     text = " ".join(words[p] for p in sorted(words)).strip()
     return text[:MAX_CHARS] or None
+
+
+def jats_to_text(jats):
+    """Crossref abstracts are JATS XML: drop tags, unescape entities, collapse whitespace."""
+    if not jats:
+        return None
+    text = re.sub(r"<[^>]+>", " ", jats)
+    text = re.sub(r"\s+", " ", html.unescape(text)).strip()
+    text = re.sub(r"^Abstract\s+", "", text)
+    return text[:MAX_CHARS] or None
+
+
+def crossref_abstract(doi):
+    """Abstract text for a DOI from Crossref, or None (absent, 404, or any error)."""
+    mailto = (os.environ.get("OPENALEX_MAILTO") or "").strip()
+    ua = "ReCiterDB externalAbstractImport" + (f" (mailto:{mailto})" if mailto else "")
+    for attempt in range(3):
+        try:
+            r = requests.get(CROSSREF_WORKS + quote(doi, safe="/"), timeout=30,
+                             headers={"User-Agent": ua, "Accept": "application/json"})
+        except (requests.ConnectionError, requests.Timeout):
+            time.sleep(2 * (attempt + 1))
+            continue
+        if r.status_code == 200:
+            return jats_to_text(r.json().get("message", {}).get("abstract"))
+        if r.status_code in (429, 500, 502, 503, 504):
+            time.sleep(2 * (attempt + 1))
+            continue
+        return None
+    return None
 
 
 def rows_for_batch(work_ids, results, now):
@@ -99,6 +137,38 @@ def pending_ids(conn, text):
     return sorted(good)
 
 
+def crossref_pending(conn, text):
+    """(article_id, doi) for NULL rows OpenAlex wrote that Crossref hasn't been tried on."""
+    rows = conn.execute(text(f"""
+        SELECT a.article_id, MIN(e.doi) AS doi
+          FROM {TABLE} a
+          JOIN external_article e ON e.article_id = a.article_id
+         WHERE a.abstract IS NULL AND a.source = 'openalex'
+           AND e.doi IS NOT NULL AND e.doi <> ''
+         GROUP BY a.article_id
+    """)).fetchall()
+    return [(r[0], r[1].strip()) for r in rows]
+
+
+def run_crossref(eng, text, upsert, apply, limit):
+    with eng.connect() as conn:
+        todo = crossref_pending(conn, text)[:limit]
+    print(f"{len(todo)} works to try on Crossref ({'apply' if apply else 'dry run'})")
+    if not apply:
+        return
+    hits = 0
+    for article_id, doi in todo:
+        abstract = crossref_abstract(doi)
+        hits += bool(abstract)
+        with eng.begin() as conn:
+            conn.execute(upsert, [{"article_id": article_id, "abstract": abstract,
+                                   "abstract_len": len(abstract) if abstract else None,
+                                   "source": "crossref",
+                                   "fetched_at": datetime.now(timezone.utc).replace(tzinfo=None)}])
+        time.sleep(SLEEP)
+    print(f"crossref: {hits} of {len(todo)} filled")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="write (default: dry run)")
@@ -121,8 +191,6 @@ def main():
             return
         ids = pending_ids(conn, text)[: args.limit]
     print(f"{len(ids)} OpenAlex works to fetch ({'apply' if args.apply else 'dry run'})")
-    if not args.apply or not ids:
-        return
 
     upsert = text(f"""
         INSERT INTO {TABLE} (article_id, abstract, abstract_len, source, fetched_at)
@@ -131,7 +199,7 @@ def main():
             abstract_len = VALUES(abstract_len), source = VALUES(source),
             fetched_at = VALUES(fetched_at)""")
     written = with_text = failed = 0
-    for i in range(0, len(ids), BATCH):
+    for i in range(0, len(ids) if args.apply else 0, BATCH):
         batch = ids[i:i + BATCH]
         try:
             body = _get({"filter": "openalex:" + "|".join(batch),
@@ -146,8 +214,10 @@ def main():
         written += len(rows)
         with_text += sum(1 for r in rows if r["abstract"])
         time.sleep(SLEEP)
-    print(f"wrote {written} rows ({with_text} with an abstract, "
-          f"{written - with_text} without); {failed} failed batches")
+    if args.apply:
+        print(f"wrote {written} rows ({with_text} with an abstract, "
+              f"{written - with_text} without); {failed} failed batches")
+    run_crossref(eng, text, upsert, args.apply, args.limit)
 
 
 def _selftest():
@@ -180,6 +250,11 @@ def _selftest():
     check("WORK_ID accepts real ids, rejects malformed",
           WORK_ID.match("W4417001897") and not WORK_ID.match("W1")
           and not WORK_ID.match("W44;drop"))
+    check("jats_to_text strips tags, unescapes, collapses space",
+          jats_to_text("<jats:title>Abstract</jats:title>\n<jats:p>A &amp; B\n  <jats:italic>c</jats:italic></jats:p>")
+          == "A & B c")
+    check("jats_to_text: none/empty -> None",
+          jats_to_text(None) is None and jats_to_text("<jats:p> </jats:p>") is None)
     return ok
 
 
