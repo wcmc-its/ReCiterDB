@@ -2,7 +2,7 @@
 """ETL: scan the ExternalArticle DynamoDB table -> reciterdb.external_article (MySQL).
 
 Projects the manually-added external-source publications (Publication Manager
-"Add publication" -> OpenAlex / Scopus, ReCiter #661/#662) into the reporting DB so
+"Add publication" -> OpenAlex / Scopus / Crossref, ReCiter #661/#662) into the reporting DB so
 external pubs surface in reciterdb reporting (ReCiterDB #101).
 
 Pure projection: TRUNCATE + reload each run (source of truth is DynamoDB). Suppressed
@@ -19,6 +19,7 @@ import os
 import sys
 import json
 import logging
+import re
 
 import boto3
 import pymysql
@@ -34,7 +35,7 @@ CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS `external_article` (
   `uid`                 VARCHAR(64)  NOT NULL,
   `article_id`          VARCHAR(96)  NOT NULL,
-  `source_type`         ENUM('SCOPUS','WOS','OPENALEX') NOT NULL,
+  `source_type`         ENUM('SCOPUS','WOS','OPENALEX','CROSSREF') NOT NULL,
   `doi`                 VARCHAR(255) NULL,
   `pmid`                BIGINT       NULL,
   `title`               TEXT         NULL,
@@ -114,11 +115,39 @@ def to_row(it):
     }
 
 
+ARTICLE_ID_MAX = 96   # external_article.article_id VARCHAR(96)
+
+
+def loadable(rows, sources):
+    """Rows the table can hold. A sourceType the live ENUM lacks (e.g. CROSSREF before
+    alter_external_article_add_crossref_v3.4.sql is applied) or an over-long id would fail
+    the whole batch under strict SQL mode AFTER the TRUNCATE (an implicit commit), leaving
+    the table empty and dropping every external pub from STEP 6b. Skip and log those."""
+    keep, skipped = [], []
+    for r in rows:
+        ok = (r["source_type"] in sources and r["article_id"]
+              and len(r["article_id"]) <= ARTICLE_ID_MAX)
+        (keep if ok else skipped).append(r)
+    for r in skipped[:20]:
+        logger.warning(f"skipping unloadable ExternalArticle {r['uid']} {r['article_id']!r} "
+                       f"sourceType={r['source_type']!r}")
+    if skipped:
+        logger.warning(f"skipped {len(skipped)} ExternalArticle rows (allowed sources: {sorted(sources)})")
+    return keep
+
+
+def _enum_members(c):
+    c.execute("SELECT column_type FROM information_schema.columns WHERE table_schema = DATABASE() "
+              "AND table_name = %s AND column_name = 'source_type'", (MYSQL_TABLE,))
+    return set(re.findall(r"'([^']*)'", c.fetchone()[0]))
+
+
 def load(rows):
     conn = _conn()
     try:
         with conn.cursor() as c:
             c.execute(CREATE_SQL)
+            rows = loadable(rows, _enum_members(c))
             c.execute(f"TRUNCATE TABLE `{MYSQL_TABLE}`")
             if rows:
                 collist = ", ".join(f"`{col}`" for col in COLS)
@@ -129,13 +158,14 @@ def load(rows):
         conn.commit()
     finally:
         conn.close()
+    return rows
 
 
 def main():
     items = scan_external_articles()
     rows = [to_row(it) for it in items]
     logger.info(f"Scanned {len(items)} ExternalArticle items")
-    load(rows)
+    rows = load(rows)
     suppressed = sum(r["suppressed"] for r in rows)
     logger.info(f"Loaded {len(rows)} rows into {MYSQL_TABLE} ({suppressed} suppressed)")
 

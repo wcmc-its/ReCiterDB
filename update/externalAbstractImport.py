@@ -15,6 +15,11 @@ from Crossref too. A tried row gets source='crossref' whether or not Crossref ha
 so each NULL row is tried once per RECHECK_DAYS cycle (the OpenAlex recheck resets source
 to 'openalex').
 
+CROSSREF: external articles (a curator added a DOI that only Crossref had; the id is
+"CROSSREF:" + the lowercased DOI) are fetched from Crossref directly by that DOI, on the
+same fetch-once / RECHECK_DAYS terms. They never go through OpenAlex: a CROSSREF: paper
+stays CROSSREF: even after OpenAlex picks it up.
+
 SCOPUS: ids are not fetched yet (that needs the Scopus abstract API); the table and the
 `source` column are ready for them.
 
@@ -40,6 +45,8 @@ MAX_CHARS = 15000       # same cap as reporting_abstracts.abstractVarchar
 # Well-formed OpenAlex work ids only: one malformed id (e.g. "W1") makes OpenAlex 400 the
 # whole 50-id batch, while a well-formed id that doesn't exist is just absent from results.
 WORK_ID = re.compile(r"^W\d{4,15}$")
+CROSSREF_PREFIX = "CROSSREF:"
+DOI = re.compile(r"^10\.\d{4,9}/\S+$")
 
 
 def reconstruct(index):
@@ -150,9 +157,35 @@ def crossref_pending(conn, text):
     return [(r[0], r[1].strip()) for r in rows]
 
 
+def doi_from_crossref_id(article_id):
+    """'CROSSREF:10.1016/j.x.1' -> '10.1016/j.x.1'; None if not a well-formed CROSSREF: id."""
+    if not article_id or not article_id.startswith(CROSSREF_PREFIX):
+        return None
+    doi = article_id[len(CROSSREF_PREFIX):].strip()
+    return doi if DOI.match(doi) else None
+
+
+def crossref_id_pending(conn, text):
+    """(article_id, doi) for CROSSREF: ids with no row, or a NULL row older than RECHECK_DAYS.
+    The DOI is the id minus its prefix, so external_article.doi is not needed."""
+    rows = conn.execute(text(f"""
+        SELECT DISTINCT e.article_id
+          FROM external_article e
+          LEFT JOIN {TABLE} a ON a.article_id = e.article_id
+         WHERE e.article_id LIKE 'CROSSREF:%'
+           AND (a.article_id IS NULL
+                OR (a.abstract IS NULL AND a.fetched_at < NOW() - INTERVAL {RECHECK_DAYS} DAY))
+    """)).fetchall()
+    out = [(r[0], doi_from_crossref_id(r[0])) for r in rows]
+    bad = [a for a, d in out if not d]
+    if bad:
+        print(f"skipping {len(bad)} malformed CROSSREF ids: {bad[:5]}")
+    return sorted((a, d) for a, d in out if d)
+
+
 def run_crossref(eng, text, upsert, apply, limit):
     with eng.connect() as conn:
-        todo = crossref_pending(conn, text)[:limit]
+        todo = (crossref_id_pending(conn, text) + crossref_pending(conn, text))[:limit]
     print(f"{len(todo)} works to try on Crossref ({'apply' if apply else 'dry run'})")
     if not apply:
         return
@@ -255,6 +288,12 @@ def _selftest():
           == "A & B c")
     check("jats_to_text: none/empty -> None",
           jats_to_text(None) is None and jats_to_text("<jats:p> </jats:p>") is None)
+    check("doi_from_crossref_id strips the prefix, keeps slashes",
+          doi_from_crossref_id("CROSSREF:10.1016/j.surg.2026.110815") == "10.1016/j.surg.2026.110815")
+    check("doi_from_crossref_id rejects other prefixes and non-DOIs",
+          doi_from_crossref_id("OPENALEX:W4417001897") is None
+          and doi_from_crossref_id("CROSSREF:") is None
+          and doi_from_crossref_id("CROSSREF:not-a-doi") is None)
     return ok
 
 
