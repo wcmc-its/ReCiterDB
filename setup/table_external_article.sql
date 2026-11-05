@@ -30,6 +30,11 @@ CREATE TABLE IF NOT EXISTS `external_article` (
   `method`              VARCHAR(64)  NULL,
   `suppressed`          TINYINT(1)   NOT NULL DEFAULT 0,
   `superseded_by_pmid`  BIGINT       NULL,
+  `isbn`                VARCHAR(128) NULL,                -- v3.5: comma-joined ISBNs
+  `publisher`           VARCHAR(255) NULL,                -- v3.5
+  `editors`             TEXT         NULL,                -- v3.5: JSON array of names
+  `byline`              VARCHAR(1000) NULL,               -- v3.5: STEP 6b fallback byline
+  `author_position`     VARCHAR(20)  NULL,                -- v3.5: 'first'/'last'/NULL
   PRIMARY KEY (`uid`, `article_id`),
   KEY `ix_source` (`source_type`),
   KEY `ix_doi` (`doi`),
