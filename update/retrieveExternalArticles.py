@@ -174,8 +174,12 @@ def to_row(it, last_names=None, review_isbns=None):
     authors = it.get("authors")
     raw = _raw(it)
     # Crossref's structured author list beats the flat strings; editors only come from there.
-    byline, position = byline_and_position(raw.get("author") or authors,
-                                           (last_names or {}).get(it.get("uid")))
+    last_name = (last_names or {}).get(it.get("uid"))
+    byline, position = byline_and_position(raw.get("author") or authors, last_name)
+    if byline is None and raw.get("editor"):
+        # An edited book listing only editors: cite them Vancouver-style, "Smith A, Lee B, editors".
+        byline, position = byline_and_position(raw["editor"], last_name)
+        byline = f"{byline}, editors" if len(byline) <= BYLINE_MAX - 9 else byline
     editors = [" ".join(_split_name(e)[::-1]).strip() for e in raw.get("editor") or []]
     isbn = ",".join(raw.get("ISBN") or []) or (review_isbns or {}).get(it.get("articleId"))
     return {

@@ -43,4 +43,7 @@ assert len(long_line) <= 1000 and long_line.endswith(", ..., ((Koretzky G)), et 
 assert ", Surname" in long_line and not long_line.split(", ..., ")[0].endswith(("Surname", "S"))
 short_cut, _ = byline_and_position(many[:200], None)
 assert len(short_cut) <= 1000 and short_cut.endswith(", et al.") and "((" not in short_cut
+edited = to_row({"uid": "aa1", "articleId": "CROSSREF:10.1/ed", "sourceType": "CROSSREF", "rawRecord": json.dumps(
+    {"editor": [{"given": "Ada", "family": "Lovelace"}, {"given": "Charles", "family": "Babbage"}]})}, {"aa1": "Babbage"})
+assert (edited["byline"], edited["author_position"]) == ("Lovelace A, ((Babbage C)), editors", "last"), edited["byline"]
 print("PASS test_external_article_book_fields")
