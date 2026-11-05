@@ -2,7 +2,7 @@
 -- external_article — reporting projection of the ExternalArticle DynamoDB table
 -- =============================================================================
 -- Manually-added non-PubMed publications (Publication Manager "Add publication" ->
--- OpenAlex / Scopus, ReCiter #661/#662). This MySQL table is a pure PROJECTION of the
+-- OpenAlex / Scopus / Crossref, ReCiter #661/#662). This MySQL table is a pure PROJECTION of the
 -- DynamoDB `ExternalArticle` table, refreshed by update/retrieveExternalArticles.py
 -- (truncate + reload each nightly run) so external pubs surface in reciterdb reporting
 -- (ReCiterDB #101).
@@ -16,8 +16,8 @@
 -- =============================================================================
 CREATE TABLE IF NOT EXISTS `external_article` (
   `uid`                 VARCHAR(64)  NOT NULL,
-  `article_id`          VARCHAR(96)  NOT NULL,            -- SCOPUS:/OPENALEX:/WOS:<id>
-  `source_type`         ENUM('SCOPUS','WOS','OPENALEX') NOT NULL,
+  `article_id`          VARCHAR(96)  NOT NULL,            -- SCOPUS:/OPENALEX:/WOS:<id>, CROSSREF:<lowercased doi>
+  `source_type`         ENUM('SCOPUS','WOS','OPENALEX','CROSSREF') NOT NULL,
   `doi`                 VARCHAR(255) NULL,
   `pmid`                BIGINT       NULL,                -- normally absent; blocked at add time
   `title`               TEXT         NULL,
