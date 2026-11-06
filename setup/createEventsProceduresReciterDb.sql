@@ -4528,13 +4528,29 @@ proc_main: BEGIN
             CALL log_progress(v_job_id, v_step, 'Resolved external author positions', 'INFO', v_rows, NULL);
         END IF;
 
-        -- Person -> publication link rows (one per uid + article_id).
-        INSERT INTO analysis_summary_author_new (pmid, personIdentifier, authorPosition, authors)
-        SELECT t.syn_pmid, e.uid, p.author_position, p.authors
-        FROM external_article e
-        JOIN temp_external_pmid t ON t.article_id = e.article_id
-        LEFT JOIN temp_external_position p ON p.uid = e.uid AND p.article_id = e.article_id
-        WHERE e.suppressed = 0;
+        -- Person -> publication link rows (one per uid + article_id). A record with no
+        -- accepted review row (a manual Add-tab add) falls back to the byline and position
+        -- the ETL built from its stored author list (v3.5 columns). Before v3.5 is applied
+        -- those columns are absent, so the pre-v3.5 statement runs instead.
+        IF EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = DATABASE() AND table_name = 'external_article'
+                     AND column_name = 'byline') THEN
+            INSERT INTO analysis_summary_author_new (pmid, personIdentifier, authorPosition, authors)
+            SELECT t.syn_pmid, e.uid,
+                   IF(p.uid IS NULL, e.author_position, p.author_position),
+                   IF(p.uid IS NULL, e.byline, p.authors)
+            FROM external_article e
+            JOIN temp_external_pmid t ON t.article_id = e.article_id
+            LEFT JOIN temp_external_position p ON p.uid = e.uid AND p.article_id = e.article_id
+            WHERE e.suppressed = 0;
+        ELSE
+            INSERT INTO analysis_summary_author_new (pmid, personIdentifier, authorPosition, authors)
+            SELECT t.syn_pmid, e.uid, p.author_position, p.authors
+            FROM external_article e
+            JOIN temp_external_pmid t ON t.article_id = e.article_id
+            LEFT JOIN temp_external_position p ON p.uid = e.uid AND p.article_id = e.article_id
+            WHERE e.suppressed = 0;
+        END IF;
         SET v_rows = ROW_COUNT();
         CALL log_progress(v_job_id, v_step, 'Inserted external author-link rows', 'INFO', v_rows, NULL);
 
