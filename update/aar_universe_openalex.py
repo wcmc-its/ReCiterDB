@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Adversarial Attribution Review — OpenAlex lane detector (conference abstracts + preprints).
+Adversarial Attribution Review — OpenAlex lane detector (conference abstracts, conference
+papers, preprints).
 
 A sibling of aar_universe_scopus.py for the scholarly output neither PubMed nor the Scopus
-lane finds: WCM conference abstracts and preprints. It reuses that lane by import (PubMed
+lane finds: WCM conference abstracts, conference papers (proceedings: LNCS/MICCAI, IEEE,
+CHI) and preprints. It reuses that lane by import (PubMed
 resolution, roster, candidate call, row helpers, recheck) and adds only the OpenAlex fetch
 and parse. Same self-contained contract: identity_index + aar_db + the Scopus lane module,
 no xgboost/S3/models.
 
 Per-work pipeline:
-  1. Fetch OpenAlex works with a WCM institution id, type conference-abstract|preprint,
+  1. Fetch OpenAlex works with a WCM institution id, type in WORK_TYPES,
      publication date in the window. Keyless `page=` paging (cursor paging 401s without an
      API key); OpenAlex caps page paging at 10,000 results, which is logged if hit.
   2. Drop works OpenAlex already links to a PubMed record (ids.pmid), and works whose DOI
@@ -92,7 +94,10 @@ OPENALEX_WORKS = "https://api.openalex.org/works"
 # Weill Cornell Medicine + Weill Cornell Medical Center. NOT WCM-Qatar (I4210152471).
 # Same set as Scholars-Profile-System etl/fundable-work/work.ts WCM_OPENALEX_IDS.
 WCM_OPENALEX_IDS = ("I4387153466", "I4405272987")
-WORK_TYPES = ("conference-abstract", "preprint")
+# conference-paper added 2026-11-06 for SPS fundable work (SPS #3310), which fetches the same
+# types from OpenAlex itself and takes attribution from these rows. ~69 WCM works a year
+# without a PMID, fewer after the Scopus-lane DOI dedup (LNCS and IEEE are Scopus-indexed).
+WORK_TYPES = ("conference-abstract", "conference-paper", "preprint")
 SELECT = ("id,doi,ids,title,display_name,type,publication_date,publication_year,"
           "primary_location,authorships")
 PER_PAGE = 200            # OpenAlex maximum
@@ -738,9 +743,9 @@ def _selftest():
     check("ids.pmid URL -> bare PMID",
           _openalex_pmid({"ids": {"pmid": "https://pubmed.ncbi.nlm.nih.gov/41234567"}})
           == "41234567")
-    check("filter names both WCM ids, both types and the date window",
+    check("filter names both WCM ids, every work type and the date window",
           build_filter("2026-01-01", "2026-03-31")
-          == "institutions.id:I4387153466|I4405272987,type:conference-abstract|preprint,"
+          == "institutions.id:I4387153466|I4405272987,type:conference-abstract|conference-paper|preprint,"
              "from_publication_date:2026-01-01,to_publication_date:2026-03-31")
     check("WCM-Qatar is not in the WCM set", "I4210152471" not in WCM_OPENALEX_IDS)
 
