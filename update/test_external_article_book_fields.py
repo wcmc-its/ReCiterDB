@@ -8,7 +8,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from retrieveExternalArticles import byline_and_position, to_row  # noqa: E402
+from retrieveExternalArticles import byline_and_position, scopus_venue, to_row  # noqa: E402
 
 raw = {"ISBN": ["9781421455150", "9781421455143"], "publisher": "Johns Hopkins University Press",
        "author": [{"given": "Gary Alan", "family": "Koretzky"}],
@@ -46,4 +46,19 @@ assert len(short_cut) <= 1000 and short_cut.endswith(", et al.") and "((" not in
 edited = to_row({"uid": "aa1", "articleId": "CROSSREF:10.1/ed", "sourceType": "CROSSREF", "rawRecord": json.dumps(
     {"editor": [{"given": "Ada", "family": "Lovelace"}, {"given": "Charles", "family": "Babbage"}]})}, {"aa1": "Babbage"})
 assert (edited["byline"], edited["author_position"]) == ("Lovelace A, ((Babbage C)), editors", "last"), edited["byline"]
+
+# Scopus venue punctuation (Scopus's API now strips it): Scimago by ISSN when the names agree.
+sci = {"1552-5260": "Alzheimer's and Dementia", "2213-8587": "Lancet Diabetes and Endocrinology,The",
+       "0000-0001": "Some Other Journal"}
+assert scopus_venue("Alzheimer S and Dementia", "1552-5260", sci) == "Alzheimer's and Dementia"
+assert scopus_venue("Lancet Diabetes and Endocrinology", "2213-8587", sci) == "Lancet Diabetes and Endocrinology"
+assert scopus_venue("Journal of Men S Health", "0000-0001", sci) == "Journal of Men's Health"  # ISSN disagrees
+assert scopus_venue("Firestein Kelley S Textbook of Rheumatology 2 Volume Set") == \
+    "Firestein Kelley's Textbook of Rheumatology 2 Volume Set"
+assert scopus_venue("Vitamin D S") == "Vitamin D S" and scopus_venue(None) is None
+row = to_row({"uid": "x", "articleId": "SCOPUS:1", "sourceType": "SCOPUS", "journalOrVenue": "Alzheimer S and Dementia"},
+             {}, {}, {"SCOPUS:1": "1552-5260"}, sci)
+assert row["journal_or_venue"] == "Alzheimer's and Dementia"
+assert to_row({"uid": "x", "articleId": "OPENALEX:W1", "sourceType": "OPENALEX", "journalOrVenue": "Men S Health"}
+              )["journal_or_venue"] == "Men S Health"  # only Scopus rows are repaired
 print("PASS test_external_article_book_fields")

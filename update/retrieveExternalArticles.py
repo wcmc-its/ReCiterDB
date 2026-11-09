@@ -170,7 +170,25 @@ def _fit(shorts, hit):
     return ", ".join(keep) + tail
 
 
-def to_row(it, last_names=None, review_isbns=None):
+def _venue_key(s):
+    return re.sub(r"[^a-z0-9]", "", s.lower().replace("&", "and"))
+
+
+def scopus_venue(name, issn=None, titles=None):
+    """Put back the punctuation Scopus's API now strips from source titles ("Journal of
+    Men S Health"). With an ISSN, take the Scimago title (built from Scopus, punctuation
+    intact) only when it is the same name once punctuation is ignored, so a stale or
+    shared ISSN can't relabel the venue. Otherwise only "X S Y" -> "X's Y" is recoverable."""
+    if not name:
+        return name
+    t = re.sub(r",\s*The$", "", (titles or {}).get(issn) or "")
+    if t and _venue_key(t) == _venue_key(name):
+        return t
+    # ponytail: possessive heuristic only; book commas/colons/hyphens stay lost (no ISBN title source)
+    return re.sub(r"\b([A-Z][a-z]+) S (?=\w)", r"\1's ", name)
+
+
+def to_row(it, last_names=None, review_isbns=None, review_issns=None, scimago=None):
     authors = it.get("authors")
     raw = _raw(it)
     # Crossref's structured author list beats the flat strings; editors only come from there.
@@ -182,6 +200,9 @@ def to_row(it, last_names=None, review_isbns=None):
         byline = f"{byline}, editors" if len(byline) <= BYLINE_MAX - 9 else byline
     editors = [" ".join(_split_name(e)[::-1]).strip() for e in raw.get("editor") or []]
     isbn = ",".join(raw.get("ISBN") or []) or (review_isbns or {}).get(it.get("articleId"))
+    venue = _clean(it.get("journalOrVenue"))
+    if it.get("sourceType") == "SCOPUS":
+        venue = scopus_venue(venue, (review_issns or {}).get(it.get("articleId")), scimago)
     return {
         "uid": it.get("uid"),
         "article_id": it.get("articleId"),
@@ -189,7 +210,7 @@ def to_row(it, last_names=None, review_isbns=None):
         "doi": it.get("doi"),
         "pmid": _to_int(it.get("pmid")),
         "title": _clean(it.get("title")),
-        "journal_or_venue": _clean(it.get("journalOrVenue")),
+        "journal_or_venue": venue,
         "authors": json.dumps(authors) if authors is not None else None,
         "pub_date": it.get("pubDate"),
         "publication_type": it.get("publicationType"),
@@ -240,9 +261,10 @@ def _live_columns(c):
 
 
 def lookups():
-    """(uid -> person.lastName, 'SCOPUS:<id>' -> authorship_review.isbn). Both optional: a
-    missing table gives {} so the load itself never fails on them."""
-    last_names, isbns = {}, {}
+    """(uid -> person.lastName, 'SCOPUS:<id>' -> authorship_review.isbn / .issn,
+    ISSN -> Scimago title). All optional: a missing table gives {} so the load itself
+    never fails on them."""
+    last_names, isbns, issns, scimago = {}, {}, {}, {}
     conn = _conn()
     try:
         with conn.cursor() as c:
@@ -250,6 +272,12 @@ def lookups():
                 ("SELECT personIdentifier, lastName FROM person WHERE lastName IS NOT NULL", last_names, None),
                 ("SELECT external_id, MAX(isbn) FROM authorship_review WHERE source = 'scopus' "
                  "AND isbn IS NOT NULL AND isbn <> '' GROUP BY external_id", isbns, "SCOPUS:"),
+                ("SELECT external_id, MAX(issn) FROM authorship_review WHERE source = 'scopus' "
+                 "AND issn IS NOT NULL AND issn <> '' GROUP BY external_id", issns, "SCOPUS:"),
+                ("SELECT issn, title FROM (SELECT issn1 issn, title FROM journal_impact_scimago "
+                 "UNION ALL SELECT issn2, title FROM journal_impact_scimago UNION ALL SELECT issn3, title "
+                 "FROM journal_impact_scimago) s WHERE issn <> '' AND title <> ''",
+                 scimago, None),
             ):
                 try:
                     c.execute(sql)
@@ -258,7 +286,7 @@ def lookups():
                     logger.warning(f"lookup skipped ({e})")
     finally:
         conn.close()
-    return last_names, isbns
+    return last_names, isbns, issns, scimago
 
 
 def load(rows):
@@ -289,8 +317,8 @@ def load(rows):
 
 def main():
     items = scan_external_articles()
-    last_names, review_isbns = lookups()
-    rows = [to_row(it, last_names, review_isbns) for it in items]
+    last_names, review_isbns, review_issns, scimago = lookups()
+    rows = [to_row(it, last_names, review_isbns, review_issns, scimago) for it in items]
     logger.info(f"Scanned {len(items)} ExternalArticle items")
     rows = load(rows)
     suppressed = sum(r["suppressed"] for r in rows)
