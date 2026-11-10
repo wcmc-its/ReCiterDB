@@ -46,6 +46,7 @@ import os
 import re
 import sys
 
+import cornell_hr_feed
 from ldap3 import ALL, Connection, Server, SUBTREE
 from ldap3.extend.standard.PagedSearch import paged_search_generator
 
@@ -963,7 +964,7 @@ CORNELL_POPULATION = """(is_faculty OR is_rte_faculty OR is_researcher OR is_pos
 CORNELL_SELECT_SQL = """
 SELECT netid, name, name_first, name_last,
        primary_department, primary_job_title, primary_business_title
-FROM identity_cornell
+FROM {table}
 WHERE {population}
   AND name_first IS NOT NULL AND name_first <> ''
   AND name_last  IS NOT NULL AND name_last  <> ''
@@ -1217,6 +1218,21 @@ def _cornell_marked(roster, ours):
     return marked
 
 
+def _cornell_roster_table(cur):
+    """The roster to read: the HR-refreshed view, or the bare spreadsheet table
+    if the view doesn't exist yet or won't run -- a stale roster beats Cornell
+    dropping out of tonight's build. Read-only: the view is created by the
+    cornell_hr_feed side-table load, never here, so --dry-run stays DDL-free."""
+    try:
+        cur.execute(f"SELECT 1 FROM {cornell_hr_feed.VIEW} LIMIT 1")
+        cur.fetchall()
+        return cornell_hr_feed.VIEW
+    except Exception as exc:                        # noqa: BLE001
+        logger.warning("cornell: %s unavailable (%s: %s) - reading identity_cornell",
+                       cornell_hr_feed.VIEW, type(exc).__name__, exc)
+        return "identity_cornell"
+
+
 def cornell_ithaca():
     """The Cornell Ithaca research population, gated by three checks.
 
@@ -1230,7 +1246,8 @@ def cornell_ithaca():
         with conn.cursor() as cur:
             cur.execute("SELECT MAX(update_date) FROM identity_cornell")
             extract = cur.fetchone()[0]
-            cur.execute(CORNELL_SELECT_SQL.format(population=CORNELL_POPULATION))
+            table = _cornell_roster_table(cur)
+            cur.execute(CORNELL_SELECT_SQL.format(table=table, population=CORNELL_POPULATION))
             names = [d[0] for d in cur.description]
             roster = [dict(zip(names, r)) for r in cur.fetchall()]
             # `identity` is small enough (35,868 rows, 2026-09-07) to read whole;
@@ -1851,7 +1868,19 @@ def grad_school_faculty(dry_run=False):
     return n
 
 
-SIDE_TABLES = {GRAD_SCHOOL_TABLE: grad_school_faculty}
+def cornell_hr_appointments(dry_run=False):
+    """Mirror Cornell's monthly HR extract from S3; see cornell_hr_feed."""
+    db = db_conn()
+    try:
+        return cornell_hr_feed.load(db, dry_run)
+    finally:
+        db.close()
+
+
+# Cornell HR loads after the identity upsert, so cornell_ithaca() reads last
+# month's appointments on the night a new file lands. Fine for a monthly feed.
+SIDE_TABLES = {GRAD_SCHOOL_TABLE: grad_school_faculty,
+               cornell_hr_feed.APPOINTMENT_TABLE: cornell_hr_appointments}
 
 
 def load_side_tables(dry_run=False):

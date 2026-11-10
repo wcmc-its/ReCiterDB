@@ -30,6 +30,7 @@ COPY update/updateOrcidSuggestions.py ./
 # saved search "reciter identity update". Own CronJob (k8-cronjob-identity.yaml),
 # runs at 12:00 UTC ahead of the reciterdb job -- deliberately NOT in run_all.py.
 COPY update/buildIdentity.py ./
+COPY update/cornell_hr_feed.py ./
 
 # netid -> WCM cwid bridge for the gated Cornell Ithaca identity source. Read from
 # buildIdentity.py's own directory, so it must land beside it here. .gitignore has
