@@ -56,16 +56,18 @@ MAX_BLANK_NETID = 0.01
 
 # Which appointment wins when a person has no Primary row (5 people on 11-09).
 TYPE_RANK = {"Primary": 0, "Joint": 1, "Dual": 2, "Administrative": 3}
-# Units that count as an extra department. Administrative appointments are
+# Units that count as an extra department (a second Primary too). Administrative appointments are
 # offices (Provost, a Dean's office), not places a byline names.
-EXTRA_UNIT_TYPES = ("Joint", "Dual")
+EXTRA_UNIT_TYPES = ("Primary", "Joint", "Dual")
 
+# Collation pinned to identity_cornell's (utf8mb4_unicode_ci); a schema default
+# that differs (MySQL 8: utf8mb4_0900_ai_ci) breaks the view's join and UNION.
 APPOINTMENT_DDL = f"""CREATE TABLE IF NOT EXISTS {APPOINTMENT_TABLE} (
   {", ".join(f"{c} VARCHAR(200) NULL" for c in HR_COLUMNS)},
   source_key VARCHAR(300) NOT NULL,
   loaded_at DATETIME NOT NULL,
   KEY idx_netid (netid)
-)"""
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"""
 
 HR_DDL = f"""CREATE TABLE IF NOT EXISTS {HR_TABLE} (
   netid VARCHAR(100) NOT NULL PRIMARY KEY,
@@ -80,7 +82,7 @@ HR_DDL = f"""CREATE TABLE IF NOT EXISTS {HR_TABLE} (
   is_researcher BOOLEAN NOT NULL DEFAULT FALSE,
   source_key VARCHAR(300) NOT NULL,
   loaded_at DATETIME NOT NULL
-)"""
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"""
 
 # Every column either consumer selects or filters on. HR overrides department and
 # title, and switches on the role flags HR asserts; it never switches one off,
@@ -223,15 +225,24 @@ def load(conn, dry_run=False, s3=None):
     if s3 is None:
         import boto3
         s3 = boto3.client("s3")
+    if not dry_run:
+        # Creates the view on the first run after deploy, so both consumers have
+        # it (== the spreadsheet) before any extract lands under the prefix.
+        with conn.cursor() as cur:
+            ensure_schema(cur)
     key = latest_key(s3)
     if not key:
         logger.info("%s: no extract under s3://%s/%s/ - nothing to load",
                     APPOINTMENT_TABLE, BUCKET, PREFIX)
         return 0
+    current = None
     with conn.cursor() as cur:
-        ensure_schema(cur)
-        cur.execute(f"SELECT MAX(source_key) FROM {HR_TABLE}")
-        current = cur.fetchone()[0]
+        try:
+            cur.execute(f"SELECT MAX(source_key) FROM {HR_TABLE}")
+            current = cur.fetchone()[0]
+        except Exception:                           # noqa: BLE001 - dry run before first load
+            if not dry_run:
+                raise
     if current == key:
         logger.info("%s: %s already loaded", APPOINTMENT_TABLE, key)
         return 0

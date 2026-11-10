@@ -1220,10 +1220,12 @@ def _cornell_marked(roster, ours):
 
 def _cornell_roster_table(cur):
     """The roster to read: the HR-refreshed view, or the bare spreadsheet table
-    if the view can't be created (e.g. no CREATE VIEW grant) -- a stale roster
-    beats Cornell dropping out of tonight's build."""
+    if the view doesn't exist yet or won't run -- a stale roster beats Cornell
+    dropping out of tonight's build. Read-only: the view is created by the
+    cornell_hr_feed side-table load, never here, so --dry-run stays DDL-free."""
     try:
-        cornell_hr_feed.ensure_schema(cur)
+        cur.execute(f"SELECT 1 FROM {cornell_hr_feed.VIEW} LIMIT 1")
+        cur.fetchall()
         return cornell_hr_feed.VIEW
     except Exception as exc:                        # noqa: BLE001
         logger.warning("cornell: %s unavailable (%s: %s) - reading identity_cornell",

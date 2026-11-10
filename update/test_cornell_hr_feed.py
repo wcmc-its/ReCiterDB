@@ -27,10 +27,12 @@ def test_parse_and_derive():
         line("pd2", "Primary", unit="Chemistry", group="Post Doctoral", cat="Post Doctoral", rank="Postdoc"),
         line("np3", "Dual", unit="Law School", rank="Lecturer"),
         line("np3", "Administrative", unit="Provosts Office"),
+        line("tp4", "Primary", unit="Communication"),
+        line("tp4", "Primary", slot="2", unit="Nutritional Sciences"),
         "",
     ])
     rows = f.parse("﻿" + text)
-    assert len(rows) == 6 and rows[0]["academic_tenure_status"] is None
+    assert len(rows) == 8 and rows[0]["academic_tenure_status"] is None
     p = f.derive(rows)
     a = p["abc1"]
     assert a["primary_department"] == "School of Integrative Plant Science"   # tenure home wins
@@ -39,6 +41,8 @@ def test_parse_and_derive():
     assert p["pd2"]["is_postdoc"] and p["pd2"]["primary_department"] == "Chemistry"
     assert p["np3"]["primary_department"] == "Law School"                     # no Primary row: Dual wins
     assert p["np3"]["other_departments"] is None
+    assert p["tp4"]["primary_department"] == "Communication"                  # slot 1 is main
+    assert p["tp4"]["other_departments"] == "Nutritional Sciences"            # second Primary kept
 
 
 def test_refusals():
