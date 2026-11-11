@@ -383,6 +383,44 @@ def run_orcid_suggestions():
         logger.exception(f"ORCID suggestions failed (ignored — yesterday's rows stand): {e}")
 
 
+def author_id_suggestions_cmd(mode):
+    """The command for AUTHOR_ID_SUGGESTIONS=off|dry-run|apply, or None when off. Anything
+    unrecognised is off: a typo in a CronJob env patch must not start writing."""
+    mode = (mode or "off").strip().lower()
+    if mode == "apply":
+        return "python3 authorIdSuggestions.py --apply"
+    if mode == "dry-run":
+        return "python3 authorIdSuggestions.py --dry-run"
+    return None
+
+
+def run_author_id_suggestions():
+    """Nightly author-id suggestions (3f) -> person_author_id: each person's Scopus Author IDs
+    (voted from DynamoDB ScopusArticle, no Scopus quota) and OpenAlex author ids (voted via
+    /works?filter=pmid:), over their newest 50 ACCEPTED papers. Strong, unshared ids are
+    auto-confirmed (method AUTO); CONFIRMED, REJECTED and curator rows are never touched.
+    Re-votes only people whose accepted set changed, plus never-voted people on their
+    crc32(uid) % 7 weekday, so the first pass spreads over a week.
+
+    SHIPS OFF: AUTHOR_ID_SUGGESTIONS unset (or anything but dry-run/apply) skips it. Before
+    setting it: apply setup/table_person_author_id_import_harvest_v3.8.sql (--apply refuses
+    without it) and add ScopusArticle GetItem/BatchGetItem/DescribeTable to the
+    reciterdb-nightly-read inline policy (without it every Scopus vote fails and only
+    OpenAlex votes are written). Set the env with `kubectl set env`, never `kubectl apply`.
+    Same isolation contract as the lanes: timed out, and any failure is logged and can
+    NEVER fail the nightly."""
+    try:
+        cmd = author_id_suggestions_cmd(os.getenv("AUTHOR_ID_SUGGESTIONS"))
+        if not cmd:
+            logger.info("Author-id suggestions: AUTHOR_ID_SUGGESTIONS=%s — skipped",
+                        os.getenv("AUTHOR_ID_SUGGESTIONS") or "off")
+            return
+        run_script("authorIdSuggestions", cmd,
+                   timeout_seconds=int(os.getenv("AUTHOR_ID_SUGGESTIONS_TIMEOUT_SECONDS", "1800")))
+    except Exception as e:
+        logger.exception(f"Author-id suggestions failed (ignored — yesterday's rows stand): {e}")
+
+
 # ------------- AAR PubMed lane (daily by default, isolated) -------------
 def run_pubmed_lane_if_due():
     """PubMed orphan-authorship detector + IO/FB scoring (AAR).
@@ -613,6 +651,8 @@ def main():
         run_pubmed_lane_if_due()              # DAILY by default (AAR_PUBMED_LANE_CADENCE)
         run_conflicts_refresh_if_due()        # weekly (Sun): refill empty COI rows (#130)
         run_orcid_suggestions()               # nightly: pubsource_orcid_person from accepted articles
+        run_author_id_suggestions()           # OFF unless AUTHOR_ID_SUGGESTIONS=dry-run|apply:
+                                              # person_author_id (Scopus AU-ID / OpenAlex author)
         run_aar_close_attributed()            # nightly: dismiss already-attributed open AAR rows (#186)
         run_aar_reconcile_drift_if_due()      # OFF unless AAR_DRIFT_CADENCE is set: refresh open AAR
                                               # rows whose stored evidence columns no longer match
