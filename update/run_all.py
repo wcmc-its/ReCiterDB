@@ -425,7 +425,9 @@ def run_pubmed_lane_if_due():
 
 # ------------- External-source article projection (ReCiterDB #101) -------------
 def run_external_article_etl():
-    """Project the ExternalArticle DynamoDB table -> reciterdb.external_article.
+    """Sync the ExternalArticle DynamoDB table -> reciterdb.external_record, then rebuild
+    reciterdb.external_article from it (v3.6, PM #1104). EXTERNAL_DYNAMO_SYNC=off on the
+    CronJob (the cutover switch) skips the DynamoDB scan and only rebuilds the projection.
 
     Isolated (try/except + timeout) so a scan/load hiccup can never fail the nightly
     reporting rebuild. Runs every night BEFORE `nightlyIndexing` (see main()) so the
