@@ -27,8 +27,8 @@
 --   (analysis_summary_* is rebuilt in full each night), so there is no backfill.
 --
 -- Apply directly to BOTH reciterdb instances (the producer and the dev instance behind
---   reciter-pm-dev). Merging the PR does NOT run DDL. Idempotent: every ALTER is guarded by
---   an information_schema check, so a re-run (or a run on a DB without the table) is a no-op.
+--   reciter-pm-dev). Merging the PR does NOT run DDL. Idempotent: the one ALTER adds only missing
+--   columns (per information_schema), so a re-run (or a run without the table) is a no-op.
 --
 -- Apply with:
 --   mysql -h "$DB_HOST" -u "$DB_USERNAME" -p "$DB_NAME" < setup/alter_analysis_summary_article_pubtype_v3.7.sql
@@ -51,70 +51,35 @@ CREATE TABLE IF NOT EXISTS `pub_type_map` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- -----------------------------------------------------------------------------
--- analysis_summary_article columns, one guarded ALTER each.
+-- analysis_summary_article columns: ONE guarded ALTER that adds whichever of the nine
+-- are missing, so the table is rebuilt at most once (a rebuild per column took minutes
+-- each on the dev instance). No-op when all nine exist or the table is absent.
 -- -----------------------------------------------------------------------------
-SET @sql = (SELECT IF(
-    (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = @db AND table_name = 'analysis_summary_article') = 1
-    AND (SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = @db AND table_name = 'analysis_summary_article' AND column_name = 'pubType') = 0,
-    'ALTER TABLE analysis_summary_article ADD COLUMN `pubType` VARCHAR(40) NULL DEFAULT NULL',
-    'SELECT ''analysis_summary_article.pubType present (or table absent)'''));
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+DROP TEMPORARY TABLE IF EXISTS v37_cols;
+CREATE TEMPORARY TABLE v37_cols (ord INT PRIMARY KEY, name VARCHAR(64), ddl VARCHAR(200));
+INSERT INTO v37_cols VALUES
+  (1, 'pubType',          'ADD COLUMN `pubType` VARCHAR(40) NULL DEFAULT NULL'),
+  (2, 'pubTypeGroup',     'ADD COLUMN `pubTypeGroup` VARCHAR(16) NULL DEFAULT NULL'),
+  (3, 'pubTypeCounted',   'ADD COLUMN `pubTypeCounted` TINYINT NULL DEFAULT NULL'),
+  (4, 'pubDate',          'ADD COLUMN `pubDate` DATE NULL DEFAULT NULL'),
+  (5, 'pubDatePrecision', 'ADD COLUMN `pubDatePrecision` ENUM(''year'',''month'',''day'') NULL DEFAULT NULL'),
+  (6, 'dateAdded',        'ADD COLUMN `dateAdded` DATE NULL DEFAULT NULL'),
+  (7, 'publisher',        'ADD COLUMN `publisher` VARCHAR(255) NULL DEFAULT NULL'),
+  (8, 'isbn',             'ADD COLUMN `isbn` VARCHAR(128) NULL DEFAULT NULL'),
+  (9, 'editors',          'ADD COLUMN `editors` TEXT NULL DEFAULT NULL');
 
+SET @adds = (SELECT GROUP_CONCAT(c.ddl ORDER BY c.ord SEPARATOR ', ')
+             FROM v37_cols c
+             WHERE NOT EXISTS (SELECT 1 FROM information_schema.columns k
+                               WHERE k.table_schema = @db AND k.table_name = 'analysis_summary_article'
+                                 AND k.column_name = c.name));
 SET @sql = (SELECT IF(
     (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = @db AND table_name = 'analysis_summary_article') = 1
-    AND (SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = @db AND table_name = 'analysis_summary_article' AND column_name = 'pubTypeGroup') = 0,
-    'ALTER TABLE analysis_summary_article ADD COLUMN `pubTypeGroup` VARCHAR(16) NULL DEFAULT NULL',
-    'SELECT ''analysis_summary_article.pubTypeGroup present (or table absent)'''));
+    AND @adds IS NOT NULL,
+    CONCAT('ALTER TABLE analysis_summary_article ', @adds),
+    'SELECT ''analysis_summary_article already has the v3.7 columns (or the table is absent)'''));
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
-SET @sql = (SELECT IF(
-    (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = @db AND table_name = 'analysis_summary_article') = 1
-    AND (SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = @db AND table_name = 'analysis_summary_article' AND column_name = 'pubTypeCounted') = 0,
-    'ALTER TABLE analysis_summary_article ADD COLUMN `pubTypeCounted` TINYINT NULL DEFAULT NULL',
-    'SELECT ''analysis_summary_article.pubTypeCounted present (or table absent)'''));
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
-SET @sql = (SELECT IF(
-    (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = @db AND table_name = 'analysis_summary_article') = 1
-    AND (SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = @db AND table_name = 'analysis_summary_article' AND column_name = 'pubDate') = 0,
-    'ALTER TABLE analysis_summary_article ADD COLUMN `pubDate` DATE NULL DEFAULT NULL',
-    'SELECT ''analysis_summary_article.pubDate present (or table absent)'''));
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
-SET @sql = (SELECT IF(
-    (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = @db AND table_name = 'analysis_summary_article') = 1
-    AND (SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = @db AND table_name = 'analysis_summary_article' AND column_name = 'pubDatePrecision') = 0,
-    'ALTER TABLE analysis_summary_article ADD COLUMN `pubDatePrecision` ENUM(''year'',''month'',''day'') NULL DEFAULT NULL',
-    'SELECT ''analysis_summary_article.pubDatePrecision present (or table absent)'''));
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
-SET @sql = (SELECT IF(
-    (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = @db AND table_name = 'analysis_summary_article') = 1
-    AND (SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = @db AND table_name = 'analysis_summary_article' AND column_name = 'dateAdded') = 0,
-    'ALTER TABLE analysis_summary_article ADD COLUMN `dateAdded` DATE NULL DEFAULT NULL',
-    'SELECT ''analysis_summary_article.dateAdded present (or table absent)'''));
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
-SET @sql = (SELECT IF(
-    (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = @db AND table_name = 'analysis_summary_article') = 1
-    AND (SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = @db AND table_name = 'analysis_summary_article' AND column_name = 'publisher') = 0,
-    'ALTER TABLE analysis_summary_article ADD COLUMN `publisher` VARCHAR(255) NULL DEFAULT NULL',
-    'SELECT ''analysis_summary_article.publisher present (or table absent)'''));
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
-SET @sql = (SELECT IF(
-    (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = @db AND table_name = 'analysis_summary_article') = 1
-    AND (SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = @db AND table_name = 'analysis_summary_article' AND column_name = 'isbn') = 0,
-    'ALTER TABLE analysis_summary_article ADD COLUMN `isbn` VARCHAR(128) NULL DEFAULT NULL',
-    'SELECT ''analysis_summary_article.isbn present (or table absent)'''));
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
-SET @sql = (SELECT IF(
-    (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = @db AND table_name = 'analysis_summary_article') = 1
-    AND (SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = @db AND table_name = 'analysis_summary_article' AND column_name = 'editors') = 0,
-    'ALTER TABLE analysis_summary_article ADD COLUMN `editors` TEXT NULL DEFAULT NULL',
-    'SELECT ''analysis_summary_article.editors present (or table absent)'''));
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+DROP TEMPORARY TABLE IF EXISTS v37_cols;
 
 -- -----------------------------------------------------------------------------
 -- Verification: 9 columns on analysis_summary_article, and the pub_type_map table.
