@@ -381,10 +381,30 @@ CREATE TABLE IF NOT EXISTS `analysis_summary_article` (
   `trendingPubsScore` float(7,2) DEFAULT NULL,
   `source_type` varchar(16) DEFAULT 'PUBMED',
   `article_id` varchar(96) DEFAULT NULL,
+  `pubType` varchar(40) DEFAULT NULL,
+  `pubTypeGroup` varchar(16) DEFAULT NULL,
+  `pubTypeCounted` tinyint DEFAULT NULL,
+  `pubDate` date DEFAULT NULL,
+  `pubDatePrecision` enum('year','month','day') DEFAULT NULL,
+  `dateAdded` date DEFAULT NULL,
+  `publisher` varchar(255) DEFAULT NULL,
+  `isbn` varchar(128) DEFAULT NULL,
+  `editors` text DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `x` (`doi`) USING BTREE,
   KEY `z` (`pmid`) USING BTREE,
   KEY `w` (`issn`) USING BTREE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- v3.7: raw source work type -> PM's 18-type taxonomy. Seeded by setup/seed_pub_type_map.sql
+-- (generated from PM src/lib/pubTypes.ts by update/pub_type_map_seed.py).
+CREATE TABLE IF NOT EXISTS `pub_type_map` (
+  `source` varchar(16) NOT NULL,
+  `source_type` varchar(64) NOT NULL,
+  `pub_type` varchar(40) DEFAULT NULL,
+  `pub_type_group` varchar(16) DEFAULT NULL,
+  `counted` tinyint NOT NULL DEFAULT 1,
+  PRIMARY KEY (`source`,`source_type`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `analysis_summary_author` (

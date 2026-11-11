@@ -3615,6 +3615,54 @@ proc_main: BEGIN
     SET v_rows = ROW_COUNT();
     CALL log_progress(v_job_id, v_step, 'Inserted article records', 'INFO', v_rows, NULL);
 
+    -- 5c (v3.7, PM #1105): canonical type and normalized dates on PubMed rows.
+    -- pubType/pubTypeGroup/pubTypeCounted come from pub_type_map's RECITER rows, keyed on
+    -- publicationTypeCanonical normalized like PM's normSourceType (trim, lower, [space_]+ ->
+    -- '-'); an unmapped value keeps pubType NULL and counts. publicationTypeCanonical itself
+    -- is left alone (Scholars reads it). Dates are built with MAKEDATE + INTERVAL from
+    -- regex-checked parts, never STR_TO_DATE, so a malformed string gives NULL instead of a
+    -- strict-mode error (an impossible day such as Feb 30 rolls into March). Skipped until v3.7 is applied; a failure here is logged and
+    -- cleared, so it can't abort the nightly (the columns just stay NULL).
+    IF v_error_occurred = 0
+       AND EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = DATABASE() AND table_name = 'analysis_summary_article_new'
+                     AND column_name = 'pubType')
+       AND EXISTS (SELECT 1 FROM information_schema.tables
+                   WHERE table_schema = DATABASE() AND table_name = 'pub_type_map') THEN
+        CALL log_progress(v_job_id, v_step, 'Setting pubType and normalized dates', 'RUNNING', NULL, NULL);
+        UPDATE analysis_summary_article_new a
+        LEFT JOIN pub_type_map m
+               ON m.source = 'RECITER'
+              AND m.source_type = LOWER(REGEXP_REPLACE(TRIM(a.publicationTypeCanonical), '[[:space:]_]+', '-'))
+        SET a.pubType          = m.pub_type,
+            a.pubTypeGroup     = m.pub_type_group,
+            a.pubTypeCounted   = COALESCE(m.counted, 1),
+            a.pubDate          = CASE WHEN a.publicationDateStandardized REGEXP '^[12][0-9]{3}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])'
+                                            THEN MAKEDATE(LEFT(a.publicationDateStandardized, 4), 1) + INTERVAL (CAST(SUBSTRING(a.publicationDateStandardized, 6, 2) AS SIGNED) - 1) MONTH
+                                                                      + INTERVAL (CAST(SUBSTRING(a.publicationDateStandardized, 9, 2) AS SIGNED) - 1) DAY
+                                       WHEN a.publicationDateStandardized REGEXP '^[12][0-9]{3}-(0[1-9]|1[0-2])($|[^0-9])'
+                                            THEN MAKEDATE(LEFT(a.publicationDateStandardized, 4), 1) + INTERVAL (CAST(SUBSTRING(a.publicationDateStandardized, 6, 2) AS SIGNED) - 1) MONTH
+                                       WHEN a.publicationDateStandardized REGEXP '^[12][0-9]{3}($|[^0-9])' THEN MAKEDATE(LEFT(a.publicationDateStandardized, 4), 1) END,
+            a.pubDatePrecision = CASE WHEN a.publicationDateStandardized REGEXP '^[12][0-9]{3}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])' THEN 'day'
+                                       WHEN a.publicationDateStandardized REGEXP '^[12][0-9]{3}-(0[1-9]|1[0-2])($|[^0-9])' THEN 'month'
+                                       WHEN a.publicationDateStandardized REGEXP '^[12][0-9]{3}($|[^0-9])' THEN 'year' END,
+            a.dateAdded        = CASE WHEN a.datePublicationAddedToEntrez REGEXP '^[12][0-9]{3}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])'
+                                            THEN MAKEDATE(LEFT(a.datePublicationAddedToEntrez, 4), 1) + INTERVAL (CAST(SUBSTRING(a.datePublicationAddedToEntrez, 6, 2) AS SIGNED) - 1) MONTH
+                                                                      + INTERVAL (CAST(SUBSTRING(a.datePublicationAddedToEntrez, 9, 2) AS SIGNED) - 1) DAY
+                                       WHEN a.datePublicationAddedToEntrez REGEXP '^[12][0-9]{3}-(0[1-9]|1[0-2])($|[^0-9])'
+                                            THEN MAKEDATE(LEFT(a.datePublicationAddedToEntrez, 4), 1) + INTERVAL (CAST(SUBSTRING(a.datePublicationAddedToEntrez, 6, 2) AS SIGNED) - 1) MONTH
+                                       WHEN a.datePublicationAddedToEntrez REGEXP '^[12][0-9]{3}($|[^0-9])' THEN MAKEDATE(LEFT(a.datePublicationAddedToEntrez, 4), 1) END;
+        SET v_rows = ROW_COUNT();
+        IF v_error_occurred THEN
+            CALL log_progress(v_job_id, v_step, 'pubType/date fill failed (ignored - columns left NULL)', 'ERROR', NULL, v_error_message);
+            SET v_error_occurred = 0;
+        ELSE
+            CALL log_progress(v_job_id, v_step, 'Set pubType and normalized dates', 'INFO', v_rows, NULL);
+        END IF;
+    ELSE
+        CALL log_progress(v_job_id, v_step, 'Skipping pubType/dates (v3.7 not applied)', 'INFO', 0, NULL);
+    END IF;
+
     -- Update with journal impact scores (only if table exists)
     IF EXISTS (SELECT 1 FROM information_schema.tables
                WHERE table_schema = DATABASE() AND table_name = 'journal_impact_scimago') THEN
@@ -4418,8 +4466,8 @@ proc_main: BEGIN
     -- source_type, NOT this internal pmid (rebuilt every nightly).
     -- Isolated: skipped when external_article is absent; an injection error is
     -- logged and cleared so it can never abort the swap.
-    -- ponytail: external rows get no NIH/Scopus/Mendeley enrichment or RTF (out of
-    -- v1 scope); inject earlier (after the STEP 3 article INSERT) if they ever need it.
+    -- External rows get pubType, normalized dates, book fields, ISSN and Scimago SJR
+    -- (v3.7, below); still no NIH/Scopus/Mendeley enrichment or RTF (5e adds enrichment).
     -- ========================================================================
     SET v_step = '6b. Union external-source publications';
 
@@ -4468,6 +4516,114 @@ proc_main: BEGIN
         GROUP BY t.syn_pmid;
         SET v_rows = ROW_COUNT();
         CALL log_progress(v_job_id, v_step, 'Inserted external article rows', 'INFO', v_rows, NULL);
+
+        -- 5c (v3.7, PM #1105): type, dates and book fields on external rows, then ISSN and
+        -- Scimago SJR. Each piece checks for the columns it needs, so this runs unchanged on
+        -- a DB without v3.5 / v3.7. pubType maps (source_type, raw type) through pub_type_map
+        -- (generated from PM's pubTypes.ts). pubDatePrecision: Scopus and OpenAlex pad a
+        -- year-only date to YYYY-01-01, so a Jan 1 date from them reads as year precision
+        -- (plan D3). dateAdded is the earliest external_article.date_added for the article,
+        -- i.e. when a curator first added it (plan D2), not when the source created it.
+        IF EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = DATABASE() AND table_name = 'analysis_summary_article_new'
+                     AND column_name = 'pubType')
+           AND EXISTS (SELECT 1 FROM information_schema.tables
+                       WHERE table_schema = DATABASE() AND table_name = 'pub_type_map') THEN
+            UPDATE analysis_summary_article_new a
+            LEFT JOIN pub_type_map m
+                   ON m.source = a.source_type
+                  AND m.source_type = LOWER(REGEXP_REPLACE(TRIM(a.publicationTypeCanonical), '[[:space:]_]+', '-'))
+            LEFT JOIN (SELECT article_id, MIN(date_added) AS date_added
+                       FROM external_article WHERE suppressed = 0
+                       GROUP BY article_id) d ON d.article_id = a.article_id
+            SET a.pubType          = m.pub_type,
+                a.pubTypeGroup     = m.pub_type_group,
+                a.pubTypeCounted   = COALESCE(m.counted, 1),
+                a.pubDate          = CASE WHEN a.publicationDateStandardized REGEXP '^[12][0-9]{3}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])'
+                                                THEN MAKEDATE(LEFT(a.publicationDateStandardized, 4), 1) + INTERVAL (CAST(SUBSTRING(a.publicationDateStandardized, 6, 2) AS SIGNED) - 1) MONTH
+                                                                          + INTERVAL (CAST(SUBSTRING(a.publicationDateStandardized, 9, 2) AS SIGNED) - 1) DAY
+                                           WHEN a.publicationDateStandardized REGEXP '^[12][0-9]{3}-(0[1-9]|1[0-2])($|[^0-9])'
+                                                THEN MAKEDATE(LEFT(a.publicationDateStandardized, 4), 1) + INTERVAL (CAST(SUBSTRING(a.publicationDateStandardized, 6, 2) AS SIGNED) - 1) MONTH
+                                           WHEN a.publicationDateStandardized REGEXP '^[12][0-9]{3}($|[^0-9])' THEN MAKEDATE(LEFT(a.publicationDateStandardized, 4), 1) END,
+                a.pubDatePrecision = CASE WHEN a.publicationDateStandardized REGEXP '^[12][0-9]{3}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])' THEN IF(a.source_type IN ('SCOPUS', 'OPENALEX') AND SUBSTRING(a.publicationDateStandardized, 6, 5) = '01-01', 'year', 'day')
+                                           WHEN a.publicationDateStandardized REGEXP '^[12][0-9]{3}-(0[1-9]|1[0-2])($|[^0-9])' THEN 'month'
+                                           WHEN a.publicationDateStandardized REGEXP '^[12][0-9]{3}($|[^0-9])' THEN 'year' END,
+                a.dateAdded        = CASE WHEN d.date_added REGEXP '^[12][0-9]{3}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])'
+                                                THEN MAKEDATE(LEFT(d.date_added, 4), 1) + INTERVAL (CAST(SUBSTRING(d.date_added, 6, 2) AS SIGNED) - 1) MONTH
+                                                                          + INTERVAL (CAST(SUBSTRING(d.date_added, 9, 2) AS SIGNED) - 1) DAY
+                                           WHEN d.date_added REGEXP '^[12][0-9]{3}-(0[1-9]|1[0-2])($|[^0-9])'
+                                                THEN MAKEDATE(LEFT(d.date_added, 4), 1) + INTERVAL (CAST(SUBSTRING(d.date_added, 6, 2) AS SIGNED) - 1) MONTH
+                                           WHEN d.date_added REGEXP '^[12][0-9]{3}($|[^0-9])' THEN MAKEDATE(LEFT(d.date_added, 4), 1) END
+            WHERE a.pmid < 0;
+            SET v_rows = ROW_COUNT();
+            CALL log_progress(v_job_id, v_step, 'Set external pubType and normalized dates', 'INFO', v_rows, NULL);
+        END IF;
+
+        -- Book / CV fields (external_article v3.5 columns -> analysis_summary_article v3.7).
+        IF EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = DATABASE() AND table_name = 'analysis_summary_article_new'
+                     AND column_name = 'publisher')
+           AND EXISTS (SELECT 1 FROM information_schema.columns
+                       WHERE table_schema = DATABASE() AND table_name = 'external_article'
+                         AND column_name = 'publisher') THEN
+            UPDATE analysis_summary_article_new a
+            JOIN (SELECT article_id, MAX(publisher) AS publisher, MAX(isbn) AS isbn, MAX(editors) AS editors
+                  FROM external_article WHERE suppressed = 0
+                  GROUP BY article_id) d ON d.article_id = a.article_id
+            SET a.publisher = LEFT(d.publisher, 255),
+                a.isbn      = LEFT(d.isbn, 128),
+                a.editors   = d.editors
+            WHERE a.pmid < 0;
+            SET v_rows = ROW_COUNT();
+            CALL log_progress(v_job_id, v_step, 'Set external publisher/isbn/editors', 'INFO', v_rows, NULL);
+        END IF;
+
+        -- ISSN from the producer's review rows (authorship_review.issn, v2.1), one per article.
+        -- Grouped into a keyed temp table first: authorship_review has no index on
+        -- external_id, so a direct join on the computed key would scan it per row.
+        IF EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = DATABASE() AND table_name = 'authorship_review'
+                     AND column_name = 'issn') THEN
+            DROP TABLE IF EXISTS temp_external_issn;
+            CREATE TABLE temp_external_issn (
+                article_id VARCHAR(96) NOT NULL,
+                issn       VARCHAR(9)  NOT NULL,
+                PRIMARY KEY (article_id)
+            ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+            INSERT INTO temp_external_issn (article_id, issn)
+            SELECT CONCAT(UPPER(source), ':', external_id), MAX(issn)
+            FROM authorship_review
+            WHERE source IN ('scopus', 'openalex') AND external_id IS NOT NULL AND issn <> ''
+            GROUP BY 1;
+            UPDATE analysis_summary_article_new a
+            JOIN temp_external_issn i ON i.article_id = a.article_id
+            SET a.issn = i.issn
+            WHERE a.pmid < 0 AND a.issn IS NULL;
+            SET v_rows = ROW_COUNT();
+            CALL log_progress(v_job_id, v_step, 'Set external ISSN', 'INFO', v_rows, NULL);
+            DROP TABLE IF EXISTS temp_external_issn;
+        END IF;
+
+        -- Scimago SJR for external rows: STEP 3's three ISSN matches, limited to pmid < 0.
+        -- Runs after STEPs 4-6, so counts, percentiles and h-index are unaffected.
+        IF EXISTS (SELECT 1 FROM information_schema.tables
+                   WHERE table_schema = DATABASE() AND table_name = 'journal_impact_scimago') THEN
+            UPDATE analysis_summary_article_new a
+            JOIN journal_impact_scimago i ON i.issn1 = a.issn
+            SET journalImpactScore1 = i.sjr
+            WHERE a.pmid < 0 AND a.journalImpactScore1 IS NULL AND a.issn IS NOT NULL;
+
+            UPDATE analysis_summary_article_new a
+            JOIN journal_impact_scimago i ON i.issn2 = a.issn
+            SET journalImpactScore1 = i.sjr
+            WHERE a.pmid < 0 AND a.journalImpactScore1 IS NULL AND a.issn IS NOT NULL;
+
+            UPDATE analysis_summary_article_new a
+            JOIN journal_impact_scimago i ON i.issn3 = a.issn
+            SET journalImpactScore1 = i.sjr
+            WHERE a.pmid < 0 AND a.journalImpactScore1 IS NULL AND a.issn IS NOT NULL;
+            CALL log_progress(v_job_id, v_step, 'Set external Scimago SJR', 'INFO', NULL, NULL);
+        END IF;
 
         -- Where each person sits in an external byline, from the authorship_review row a
         -- curator accepted (resolution_cwid = who it went to). authorPosition uses the
