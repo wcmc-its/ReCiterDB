@@ -17,7 +17,9 @@ Writes (person_author_id):
   - CONFIRMED with method AUTO when votes >= 5, share >= 0.8, no other uid holds the id as
     SUGGESTED/CONFIRMED, and this person has not REJECTED it.
   - Never touched: rows whose status is CONFIRMED or REJECTED, or whose method is CURATOR.
-  - A re-voted person's SUGGESTED PUB_VOTE rows that no longer get a vote are deleted.
+  - A re-voted person's SUGGESTED PUB_VOTE rows that no longer get a vote are deleted. A
+    vote in which no paper resolved (and no ORCID lookup hit) is skipped, not written, so
+    a source returning nothing cannot wipe suggestions.
 Cadence: a person is re-voted when crc32(uid) % 7 equals today's weekday (UTC) and they have
   never been voted, or whenever their newest-50 accepted-PMID set changed since the last vote
   (person_author_id_vote). The first run is spread over 7 nights.
@@ -533,8 +535,15 @@ def run(a):
                 f = vote_one(u, t, ps, scopus_items, orcids.get(u), ctx, stats)
                 if f is None:
                     continue
-                fresh[(u, t)] = f
                 bands[t][band_of(f)] += 1
+                if not f["resolvable"] and not f["lookup"]:
+                    # Nothing resolved and no ORCID lookup: no signal, not a verdict. Writing it
+                    # would delete the person's SUGGESTED rows and record the PMID set as voted,
+                    # so a source glitch (OpenAlex answering 200 with no results) would wipe
+                    # suggestions until the accepted set next changes. Leave both alone.
+                    stats["unresolved_skipped"] += 1
+                    continue
+                fresh[(u, t)] = f
                 if sum(1 for n in f["votes"].values() if n >= 2) >= 2:
                     bands[t]["split"] += 1
                 top = f["votes"].most_common(1)[0][0] if f["votes"] else None
