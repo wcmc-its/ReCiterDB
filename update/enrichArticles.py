@@ -30,6 +30,7 @@ later lookup replaces the older one; a lookup that misses keeps the older one.
   python3 enrichArticles.py --fetch --limit 200      # dry run that calls the APIs, writes nothing
   python3 enrichArticles.py --apply                  # fetch and write
   python3 enrichArticles.py --apply --all            # backfill: also refresh every stale count
+  python3 enrichArticles.py --apply --max-seconds 1140  # start no batch after 19 min
   python3 enrichArticles.py --selftest               # offline checks, no DB or network
 
 Env: DB_HOST/DB_NAME/DB_USERNAME/DB_PASSWORD; SCOPUS_API_KEY, SCOPUS_INST_TOKEN;
@@ -201,6 +202,19 @@ def chunks(seq, n):
 
 
 # ---- HTTP -------------------------------------------------------------------
+DEADLINE = None         # time.time() after which no new batch starts (--max-seconds)
+
+
+def out_of_time(pass_name):
+    """True once --max-seconds has passed. Checked before every batch, because run_all's
+    ENRICH_TIMEOUT_SECONDS is only checked when this script prints a line, and a pass
+    prints nothing until it ends. Rows not reached are left unstamped: next run retries."""
+    if DEADLINE is not None and time.time() >= DEADLINE:
+        print(f"  {pass_name}: --max-seconds reached, stopping; the rest is retried next run")
+        return True
+    return False
+
+
 class BadBatch(Exception):
     """HTTP 400 for a batch: one value in it is malformed for the API."""
 
@@ -398,6 +412,8 @@ def run_openalex(due, eng, text, write, now):
         by_kind[kind].append((r["article_id"], val))
     for kind, items in by_kind.items():
         for batch in chunks(items, OA_BATCH):
+            if out_of_time("openalex"):
+                return {"looked_up": n, "hits": hits, "stats": stats}
             try:
                 found = fetch_openalex(kind, [v for _, v in batch], stats)
             except Exception as e:  # noqa: BLE001 — failed batch: nothing stamped, retried next run
@@ -418,6 +434,8 @@ def run_openalex(due, eng, text, write, now):
 def run_scopus(due, eng, text, write, now):
     stats, hits, n = Stats(), 0, 0
     for batch in chunks([(r["article_id"], scopus_eid(r["article_id"])) for r in due], SCOPUS_BATCH):
+        if out_of_time("scopus"):
+            break
         try:
             found = fetch_scopus([e for _, e in batch], stats)
         except Exception as e:  # noqa: BLE001
@@ -438,6 +456,8 @@ def run_scopus(due, eng, text, write, now):
 def run_idconv(due, eng, text, write, now):
     stats, hits, n = Stats(), 0, 0
     for batch in chunks([(r["article_id"], r["doi"]) for r in due], IDCONV_BATCH):
+        if out_of_time("idconv"):
+            break
         try:
             found = fetch_idconv([d for _, d in batch], stats)
         except Exception as e:  # noqa: BLE001
@@ -469,6 +489,8 @@ def main():
                     help="refresh every stale count tonight, not only this weekday's seventh")
     ap.add_argument("--passes", default=",".join(PASSES),
                     help=f"comma list, subset of {','.join(PASSES)}")
+    ap.add_argument("--max-seconds", type=int, default=0,
+                    help="stop starting new batches after this many seconds (0 = no limit)")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.selftest:
@@ -478,6 +500,9 @@ def main():
     bad = [p for p in passes if p not in PASSES]
     if bad:
         ap.error(f"unknown pass(es): {bad}")
+    global DEADLINE
+    if args.max_seconds > 0:
+        DEADLINE = time.time() + args.max_seconds
     refresh_days = int(os.environ.get("ENRICH_REFRESH_DAYS", "7"))
     now = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
 
@@ -645,6 +670,15 @@ def _selftest():
         openalex_get = real
     check("fetch_openalex: a 400 batch is split until the bad DOI is alone",
           set(got) == {"10.1000/a", "10.1000/c", "10.1000/d"} and calls[0] == 4)
+
+    global DEADLINE
+    saved, DEADLINE = DEADLINE, time.time() - 1
+    try:
+        res = run_scopus([{"article_id": "SCOPUS:85134358470"}], None, None, False, now)
+    finally:
+        DEADLINE = saved
+    check("--max-seconds: a pass past the deadline starts no batch and stamps nothing",
+          res["looked_up"] == 0 and res["stats"].calls == 0)
     return ok
 
 

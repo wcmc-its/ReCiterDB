@@ -46,6 +46,8 @@ assert cmd("aply") is None and cmd("on") is None and cmd("true") is None
 assert cmd("apply") == "python3 enrichArticles.py --apply"
 assert cmd(" Apply ") == "python3 enrichArticles.py --apply"
 assert cmd("dry-run") == "python3 enrichArticles.py --dry-run"
+assert cmd("apply", 1140) == "python3 enrichArticles.py --apply --max-seconds 1140"
+assert cmd("off", 1140) is None
 print("  PASS ARTICLE_ENRICHMENT gate: unset/typo -> off, apply/dry-run recognised")
 
 _ran = []
@@ -56,8 +58,8 @@ assert _ran == [], _ran
 os.environ["ARTICLE_ENRICHMENT"] = "apply"
 os.environ.pop("ENRICH_TIMEOUT_SECONDS", None)
 run_all.run_article_enrichment()
-assert _ran == [("python3 enrichArticles.py --apply", 1200)], _ran
-print("  PASS hook: off by default; apply runs with the 1200s default timeout")
+assert _ran == [("python3 enrichArticles.py --apply --max-seconds 1140", 1200)], _ran
+print("  PASS hook: off by default; apply runs with the 1200s timeout and a 1140s script deadline")
 
 
 def _boom(*a, **k):
