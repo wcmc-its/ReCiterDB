@@ -25,11 +25,14 @@
 --   missing columns (per information_schema), so a re-run (or a run without the table) is a
 --   no-op. Nothing is dropped or rewritten.
 --
--- LOCKING: analysis_summary_article carries FULLTEXT indexes (ft_title, ft_journal), so MariaDB
---   rebuilds it INPLACE under LOCK=SHARED (reads keep working, writes wait); v3.7's rebuild took
---   about 4-5 minutes on dev. analysis_summary_author has no FULLTEXT index. Apply OUTSIDE the
---   reciterdb nightly window (cron 14:30 UTC, about 2.5 hours): STEP 7's RENAME would otherwise
---   queue behind the rebuild.
+-- LOCKING: analysis_summary_article carries two FULLTEXT indexes (ft_title, ft_journal), so
+--   MariaDB 10.6 can't add a column INSTANT or INPLACE ("InnoDB presently supports one FULLTEXT
+--   index creation at a time. Try ALGORITHM=COPY"). It does a full ALGORITHM=COPY rebuild, which
+--   the ALTER below pins to LOCK=SHARED: reads keep working, writes wait, and the statement fails
+--   rather than escalate to an exclusive lock. On dev (about 281k rows, 194 MB) it took 1m14s;
+--   expect a few minutes on prod. analysis_summary_author has no FULLTEXT index, so its ADD COLUMN
+--   is INSTANT (metadata only). Apply OUTSIDE the reciterdb nightly window (cron 14:30 UTC, about
+--   2.5 hours): STEP 7's RENAME would otherwise queue behind the rebuild.
 --
 -- Apply with:
 --   mysql -h "$DB_HOST" -u "$DB_USERNAME" -p "$DB_NAME" < setup/alter_analysis_summary_peer_review_role_v3.10.sql
@@ -57,7 +60,7 @@ SET @adds = (SELECT GROUP_CONCAT(c.ddl ORDER BY c.ord SEPARATOR ', ')
 SET @sql = (SELECT IF(
     (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = @db AND table_name = 'analysis_summary_article') = 1
     AND @adds IS NOT NULL,
-    CONCAT('ALTER TABLE analysis_summary_article ', @adds),
+    CONCAT('ALTER TABLE analysis_summary_article ', @adds, ', LOCK=SHARED'),
     'SELECT ''analysis_summary_article already has the v3.10 columns (or the table is absent)'''));
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
