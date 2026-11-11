@@ -23,6 +23,7 @@ COPY update/dataTransformer.py ./
 COPY update/executeFeatureGenerator.py ./
 COPY update/retrieveExternalArticles.py ./
 COPY update/externalAbstractImport.py ./
+COPY update/enrichArticles.py ./
 COPY update/run_all.py ./
 COPY update/updateOrcidSuggestions.py ./
 COPY update/authorIdSuggestions.py ./

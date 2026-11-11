@@ -492,6 +492,40 @@ def run_external_abstract_import():
         logger.exception(f"External-abstract import failed (ignored — reporting unaffected): {e}")
 
 
+
+def article_enrichment_cmd(mode):
+    """The command for ARTICLE_ENRICHMENT=off|dry-run|apply, or None when off. Anything
+    unrecognised is off: a typo in a CronJob env patch must not start writing."""
+    mode = (mode or "off").strip().lower()
+    if mode == "apply":
+        return "python3 enrichArticles.py --apply"
+    if mode == "dry-run":
+        return "python3 enrichArticles.py --dry-run"
+    return None
+
+
+def run_article_enrichment():
+    """Fill article_enrichment (v3.9, PM #1105 5e) for external_article rows: ISSN, volume,
+    issue, pages and citation counts from OpenAlex and Scopus Search, PMCID from the NCBI ID
+    converter. Runs right after the external-article projection and abstract import, and
+    before nightlyIndexing, so STEP 6b joins tonight's values.
+
+    SHIPS OFF: ARTICLE_ENRICHMENT unset (or anything but dry-run/apply) skips it. Before
+    setting it: apply setup/table_article_enrichment_v3.9.sql (--apply refuses without it)
+    and reload the SP. Set the env with `kubectl set env`, never `kubectl apply`. Isolated:
+    timed out (ENRICH_TIMEOUT_SECONDS, default 1200) and any failure is logged, leaving
+    stale or missing enrichment; it can NEVER fail the nightly."""
+    try:
+        cmd = article_enrichment_cmd(os.getenv("ARTICLE_ENRICHMENT"))
+        if not cmd:
+            logger.info("Article enrichment: ARTICLE_ENRICHMENT=%s — skipped",
+                        os.getenv("ARTICLE_ENRICHMENT") or "off")
+            return
+        run_script("articleEnrichment", cmd,
+                   timeout_seconds=int(os.getenv("ENRICH_TIMEOUT_SECONDS", "1200")))
+    except Exception as e:
+        logger.exception(f"Article enrichment failed (ignored — reporting unaffected): {e}")
+
 # ------------- AAR nightly closer: dismiss already-attributed open rows (#186) -------------
 def run_aar_close_attributed():
     """Nightly DB-side closer for open AAR rows ReCiter has already attributed.
@@ -628,6 +662,7 @@ def main():
     # so a failure here degrades to stale/empty external pubs, never a failed nightly.
     run_external_article_etl()
     run_external_abstract_import()
+    run_article_enrichment()          # OFF unless ARTICLE_ENRICHMENT=dry-run|apply (5e, v3.9)
 
     for name, cmd in scripts:
         #ok = run_script(name, cmd)

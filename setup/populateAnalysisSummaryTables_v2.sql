@@ -1315,7 +1315,9 @@ proc_main: BEGIN
     -- Isolated: skipped when external_article is absent; an injection error is
     -- logged and cleared so it can never abort the swap.
     -- External rows get pubType, normalized dates, book fields, ISSN and Scimago SJR
-    -- (v3.7, below); still no NIH/Scopus/Mendeley enrichment or RTF (5e adds enrichment).
+    -- (v3.7, below), plus ISSN / volume / issue / pages / PMCID and Scopus + OpenAlex
+    -- citation counts from article_enrichment (v3.9, below). Still no NIH or Mendeley
+    -- data and no RTF.
     -- ========================================================================
     SET v_step = '6b. Union external-source publications';
 
@@ -1452,6 +1454,40 @@ proc_main: BEGIN
             DROP TABLE IF EXISTS temp_external_issn;
         END IF;
 
+        -- 5e (v3.9, PM #1105): article_enrichment, filled by update/enrichArticles.py from
+        -- OpenAlex, Scopus Search and the NCBI PMC ID converter. ISSN falls back from the
+        -- review row's to enrichment's print ISSN, then its e-ISSN, before the Scimago match
+        -- below. Scopus counts go to citationCountScopus on SCOPUS rows only (plan D5; Scholars
+        -- shows them). OpenAlex counts go to their own column, which readers use only when
+        -- NIH and Scopus are both NULL. Skipped while the table (or column) is absent.
+        IF EXISTS (SELECT 1 FROM information_schema.tables
+                   WHERE table_schema = DATABASE() AND table_name = 'article_enrichment') THEN
+            UPDATE analysis_summary_article_new a
+            JOIN article_enrichment e ON e.article_id = a.article_id
+            SET a.issn                = COALESCE(a.issn, e.issn, e.eissn),
+                a.volume              = COALESCE(a.volume, e.volume),
+                a.issue               = COALESCE(a.issue, e.issue),
+                a.pages               = COALESCE(a.pages, e.pages),
+                a.pmcid               = COALESCE(NULLIF(a.pmcid, ''), e.pmcid),
+                a.citationCountScopus = IF(a.source_type = 'SCOPUS',
+                                           COALESCE(e.citation_count_scopus, a.citationCountScopus),
+                                           a.citationCountScopus)
+            WHERE a.pmid < 0;
+            SET v_rows = ROW_COUNT();
+            CALL log_progress(v_job_id, v_step, 'Set external enrichment (ISSN, volume, pages, PMCID, Scopus cites)', 'INFO', v_rows, NULL);
+
+            IF EXISTS (SELECT 1 FROM information_schema.columns
+                       WHERE table_schema = DATABASE() AND table_name = 'analysis_summary_article_new'
+                         AND column_name = 'citationCountOpenAlex') THEN
+                UPDATE analysis_summary_article_new a
+                JOIN article_enrichment e ON e.article_id = a.article_id
+                SET a.citationCountOpenAlex = e.citation_count_openalex
+                WHERE a.pmid < 0 AND e.citation_count_openalex IS NOT NULL;
+                SET v_rows = ROW_COUNT();
+                CALL log_progress(v_job_id, v_step, 'Set external OpenAlex citation counts', 'INFO', v_rows, NULL);
+            END IF;
+        END IF;
+
         -- Scimago SJR for external rows: STEP 3's three ISSN matches, limited to pmid < 0.
         -- Runs after STEPs 4-6, so counts, percentiles and h-index are unaffected.
         IF EXISTS (SELECT 1 FROM information_schema.tables
@@ -1471,6 +1507,38 @@ proc_main: BEGIN
             SET journalImpactScore1 = i.sjr
             WHERE a.pmid < 0 AND a.journalImpactScore1 IS NULL AND a.issn IS NOT NULL;
             CALL log_progress(v_job_id, v_step, 'Set external Scimago SJR', 'INFO', NULL, NULL);
+        END IF;
+
+        -- Second chance (v3.9): an external row whose first ISSN isn't in Scimago may match on
+        -- the other one enrichment found (print vs electronic). issn1 / issn2 are indexed.
+        IF EXISTS (SELECT 1 FROM information_schema.tables
+                   WHERE table_schema = DATABASE() AND table_name = 'article_enrichment')
+           AND EXISTS (SELECT 1 FROM information_schema.tables
+                       WHERE table_schema = DATABASE() AND table_name = 'journal_impact_scimago') THEN
+            UPDATE analysis_summary_article_new a
+            JOIN article_enrichment e ON e.article_id = a.article_id
+            JOIN journal_impact_scimago i ON i.issn1 = e.eissn
+            SET a.journalImpactScore1 = i.sjr
+            WHERE a.pmid < 0 AND a.journalImpactScore1 IS NULL AND e.eissn IS NOT NULL;
+
+            UPDATE analysis_summary_article_new a
+            JOIN article_enrichment e ON e.article_id = a.article_id
+            JOIN journal_impact_scimago i ON i.issn2 = e.eissn
+            SET a.journalImpactScore1 = i.sjr
+            WHERE a.pmid < 0 AND a.journalImpactScore1 IS NULL AND e.eissn IS NOT NULL;
+
+            UPDATE analysis_summary_article_new a
+            JOIN article_enrichment e ON e.article_id = a.article_id
+            JOIN journal_impact_scimago i ON i.issn1 = e.issn
+            SET a.journalImpactScore1 = i.sjr
+            WHERE a.pmid < 0 AND a.journalImpactScore1 IS NULL AND e.issn IS NOT NULL;
+
+            UPDATE analysis_summary_article_new a
+            JOIN article_enrichment e ON e.article_id = a.article_id
+            JOIN journal_impact_scimago i ON i.issn2 = e.issn
+            SET a.journalImpactScore1 = i.sjr
+            WHERE a.pmid < 0 AND a.journalImpactScore1 IS NULL AND e.issn IS NOT NULL;
+            CALL log_progress(v_job_id, v_step, 'Set external Scimago SJR from enrichment ISSNs', 'INFO', NULL, NULL);
         END IF;
 
         -- Where each person sits in an external byline, from the authorship_review row a
