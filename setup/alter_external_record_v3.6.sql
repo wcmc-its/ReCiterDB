@@ -160,7 +160,9 @@ CREATE TABLE IF NOT EXISTS `external_dup_verdict` (
   `decided_at`   DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_edv_pair_scope` (`uid`, `key_a`, `key_b`, `scope_key`),
-  CONSTRAINT `ck_edv_ordered_pair` CHECK (`key_a` < `key_b`)
+  -- Binary (code-point) order, not the table's unicode_ci order: unicode_ci sorts '_' and
+  -- '(' before digits, so a pair sorted in JS ('10.1/a1b' < '10.1/a_b') would be refused.
+  CONSTRAINT `ck_edv_ordered_pair` CHECK (CAST(`key_a` AS BINARY) < CAST(`key_b` AS BINARY))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- -----------------------------------------------------------------------------

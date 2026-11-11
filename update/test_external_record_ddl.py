@@ -64,6 +64,11 @@ for needle in [
 ]:
     if needle not in rec:
         fails.append(f"external_record missing: {needle}")
+dv = create_block(migration, "external_dup_verdict") or ""
+# PM orders the pair with a plain JS sort (code-point order); a collation-order CHECK
+# would refuse pairs whose DOIs contain '_' or '(' (unicode_ci sorts them before digits).
+if "CHECK (CAST(`key_a` AS BINARY) < CAST(`key_b` AS BINARY))" not in dv:
+    fails.append("external_dup_verdict: the ordered-pair CHECK must compare in binary order")
 ev = create_block(migration, "external_record_event") or ""
 if ev.count(STATUSES) != 2:
     fails.append("external_record_event from/to_status must use the external_record status ENUM")
