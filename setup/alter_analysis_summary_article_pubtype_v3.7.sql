@@ -30,6 +30,12 @@
 --   reciter-pm-dev). Merging the PR does NOT run DDL. Idempotent: the one ALTER adds only missing
 --   columns (per information_schema), so a re-run (or a run without the table) is a no-op.
 --
+-- LOCKING: the live table carries FULLTEXT indexes (ft_title, ft_journal), so MariaDB can't
+--   add the columns INSTANT or with LOCK=NONE; it rebuilds the table INPLACE under LOCK=SHARED
+--   (reads keep working, writes wait). On dev that took about 4-5 minutes for 267k rows.
+--   Apply OUTSIDE the reciterdb nightly window (cron 14:30 UTC, about 2.5 hours): STEP 7's
+--   RENAME of analysis_summary_article would otherwise queue behind the rebuild.
+--
 -- Apply with:
 --   mysql -h "$DB_HOST" -u "$DB_USERNAME" -p "$DB_NAME" < setup/alter_analysis_summary_article_pubtype_v3.7.sql
 --   mysql -h "$DB_HOST" -u "$DB_USERNAME" -p "$DB_NAME" < setup/seed_pub_type_map.sql
