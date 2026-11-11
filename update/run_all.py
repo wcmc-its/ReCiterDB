@@ -421,6 +421,42 @@ def run_author_id_suggestions():
         logger.exception(f"Author-id suggestions failed (ignored — yesterday's rows stand): {e}")
 
 
+def import_harvest_cmd(mode, max_seconds=0):
+    """The command for IMPORT_HARVEST=off|dry-run|apply, or None when off. Anything
+    unrecognised is off. `apply` maps to --apply, which importHarvest.py refuses (exit 2)
+    until plan PR H3 ships the write path. max_seconds > 0 adds the script's own deadline:
+    run_script's timeout is only checked when the script prints."""
+    mode = (mode or "off").strip().lower()
+    if mode not in ("dry-run", "apply"):
+        return None
+    cmd = f"python3 importHarvest.py --{mode}"
+    return f"{cmd} --max-seconds {int(max_seconds)}" if max_seconds and max_seconds > 0 else cmd
+
+
+def run_import_harvest():
+    """Nightly import harvest (3g): each person's works from ORCID (trusted iDs), CONFIRMED
+    Scopus Author IDs and CONFIRMED OpenAlex author ids, through the import pipeline (scope,
+    PubMed route, rejection memory, existing, auto-merge). DRY-RUN ONLY: writes
+    import_harvest_run, import_harvest_person and doi_pmid_cache, never external_record.
+
+    SHIPS OFF: IMPORT_HARVEST unset (or anything but dry-run/apply) skips it. Needs the v3.8
+    tables (setup/table_person_author_id_import_harvest_v3.8.sql; without them it runs with
+    no stats) and CONFIRMED person_author_id rows (AUTHOR_ID_SUGGESTIONS). Cohort:
+    IMPORT_HARVEST_COHORT (s3://... uid list, or all-confirmed), one crc32(uid) % 7 shard a
+    night. Set the env with `kubectl set env`, never `kubectl apply`. Isolated: timed out
+    (IMPORT_HARVEST_TIMEOUT_SECONDS, default 3600) and any failure is logged; it can NEVER
+    fail the nightly."""
+    try:
+        timeout = int(os.getenv("IMPORT_HARVEST_TIMEOUT_SECONDS", "3600"))
+        cmd = import_harvest_cmd(os.getenv("IMPORT_HARVEST"), max(timeout - 120, 60))
+        if not cmd:
+            logger.info("Import harvest: IMPORT_HARVEST=%s — skipped", os.getenv("IMPORT_HARVEST") or "off")
+            return
+        run_script("importHarvest", cmd, timeout_seconds=timeout)
+    except Exception as e:
+        logger.exception(f"Import harvest failed (ignored — nothing is written outside its stats tables): {e}")
+
+
 # ------------- AAR PubMed lane (daily by default, isolated) -------------
 def run_pubmed_lane_if_due():
     """PubMed orphan-authorship detector + IO/FB scoring (AAR).
@@ -653,6 +689,8 @@ def main():
         run_orcid_suggestions()               # nightly: pubsource_orcid_person from accepted articles
         run_author_id_suggestions()           # OFF unless AUTHOR_ID_SUGGESTIONS=dry-run|apply:
                                               # person_author_id (Scopus AU-ID / OpenAlex author)
+        run_import_harvest()                  # OFF unless IMPORT_HARVEST=dry-run: 3g harvest
+                                              # measurement (stats tables only)
         run_aar_close_attributed()            # nightly: dismiss already-attributed open AAR rows (#186)
         run_aar_reconcile_drift_if_due()      # OFF unless AAR_DRIFT_CADENCE is set: refresh open AAR
                                               # rows whose stored evidence columns no longer match
