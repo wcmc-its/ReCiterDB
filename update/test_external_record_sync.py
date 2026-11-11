@@ -224,6 +224,26 @@ finally:
     etl._conn, etl._table_exists, etl.legacy_main = saved
 check(calls == [True, False], f"pre-DDL fallback to the DynamoDB-only load, got {calls}")
 
+# 9. EXTERNAL_DYNAMO_SYNC=off with an empty external_record never empties external_article.
+loads = []
+saved = (etl._conn, etl._table_exists, etl.read_records, etl._enum_members, etl.load,
+         etl.scan_external_articles, os.environ.get("EXTERNAL_DYNAMO_SYNC"))
+etl._conn, etl._table_exists = (lambda: _Conn()), (lambda c, t: True)
+etl.read_records, etl._enum_members = (lambda c: []), (lambda c, t=None: {"SCOPUS"})
+etl.load = lambda rows: loads.append(rows)
+etl.scan_external_articles = lambda: fails.append("sync off must not scan DynamoDB") or []
+os.environ["EXTERNAL_DYNAMO_SYNC"] = "off"
+try:
+    etl.main([])
+finally:
+    (etl._conn, etl._table_exists, etl.read_records, etl._enum_members, etl.load,
+     etl.scan_external_articles, env) = saved
+    if env is None:
+        os.environ.pop("EXTERNAL_DYNAMO_SYNC", None)
+    else:
+        os.environ["EXTERNAL_DYNAMO_SYNC"] = env
+check(loads == [], f"sync off + empty external_record must not reload external_article, got {loads}")
+
 for f in fails:
     print("FAIL", f)
 print("FAIL test_external_record_sync" if fails else "PASS test_external_record_sync")

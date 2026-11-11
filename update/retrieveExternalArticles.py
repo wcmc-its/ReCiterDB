@@ -790,6 +790,12 @@ def main(argv=None):
                     f"({sum(o['status'] != r['status'] for o, r in plan['updates'])} status changes), "
                     f"{len(plan['removals'])} to REMOVED, {plan['skipped_touched']} PM-owned skipped, "
                     f"{plan['unchanged']} unchanged, {plan['dup_keys']} duplicate keys")
+        if not sync and not existing:
+            # EXTERNAL_DYNAMO_SYNC=off before any sync has run: rebuilding from an empty
+            # external_record would TRUNCATE external_article and drop every external pub.
+            logger.error(f"EXTERNAL_DYNAMO_SYNC=off but {ER_TABLE} is empty: {MYSQL_TABLE} left "
+                         "as it is. Run with --sync-only (or the sync on) first.")
+            return
 
         if args.dry_run:
             final = apply_plan(existing, plan, now) if sync else existing
