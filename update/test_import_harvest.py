@@ -63,6 +63,10 @@ for value, want in cases:
 assert import_harvest_cmd("dry-run", 3480) == "python3 importHarvest.py --dry-run --max-seconds 3480"
 print("  PASS --max-seconds passed through")
 
+hsrc = open(os.path.join(HERE, "importHarvest.py")).read()
+assert 'if tables["doi_pmid_cache"]:' in hsrc and hsrc.index('if tables["doi_pmid_cache"]:') < hsrc.index("write_cache(cur, resolver.new")
+print("  PASS doi_pmid_cache write skipped when the table is absent")
+
 src = open(os.path.join(HERE, "run_all.py")).read()
 block = src[src.index("if overall_success and aar_lanes_safe():"):src.index("upload_log_to_s3()\n\n    if not overall_success")]
 assert block.index("run_author_id_suggestions()") < block.index("run_import_harvest()")

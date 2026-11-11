@@ -992,7 +992,8 @@ def run(a):
                 line.append(f"{source}={n['fetched']}f/{n['new_pending']}p/{n['skipped_pubmed']}pm/{n['automerged']}am"
                             + ("/CAPPED" if capped else ""))
             if stats_on:
-                write_cache(cur, resolver.new, now)
+                if tables["doi_pmid_cache"]:      # absent: lookups still work, uncached
+                    write_cache(cur, resolver.new, now)
                 resolver.new = {}
                 cx.commit()
             log(f"importHarvest: {k}/{len(due)} {uid} " + (" ".join(line) or "no sources"))
