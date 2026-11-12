@@ -789,8 +789,8 @@ def main(argv=None):
     items, legacy, records = [], [], []
     if sync:
         items = scan_external_articles()
-        last_names, review_isbns = lookups()
-        legacy = [to_row(it, last_names, review_isbns) for it in items]
+        last_names, review_isbns, review_issns, scimago = lookups()
+        legacy = [to_row(it, last_names, review_isbns, review_issns, scimago) for it in items]
         for r in legacy:
             r["status"] = legacy_status(r)
         positions = review_positions()
