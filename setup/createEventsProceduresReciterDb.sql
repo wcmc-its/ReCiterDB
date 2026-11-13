@@ -4960,13 +4960,15 @@ join person p on p.personIdentifier = a.personIdentifier
 set a.email = p.primaryEmail
 where (a.email is null or a.email = '') and p.primaryEmail is not null;
 
--- Add new users from person table
+-- Add new users from person table. Cornell Ithaca people (never run: dateAdded null)
+-- are in person only so Find People lists them; they get no account or roles.
 
 insert into admin_users (personIdentifier, nameFirst, nameMiddle, nameLast, email)
 select personIdentifier, firstName, middleName, lastName, primaryEmail
 from person p 
 where p.primaryEmail not in (select email from admin_users where email is not null and email != '')
-and personIdentifier not in (select personIdentifier from admin_users);
+and personIdentifier not in (select personIdentifier from admin_users)
+and not (p.dateAdded is null and p.personIdentifier in (select personIdentifier from person_person_type where personType = 'cornell-ithaca'));
 
 -- Create roles for them
 
@@ -4977,7 +4979,8 @@ join admin_users a on a.personIdentifier = p.personIdentifier
 where a.userID  not in 
 (select userID
 from admin_users_roles
-where roleID = 4);
+where roleID = 4)
+and not (p.dateAdded is null and p.personIdentifier in (select personIdentifier from person_person_type where personType = 'cornell-ithaca'));
 
 -- Let's give self-curators the ability to generate reports for everyone
 
@@ -4988,7 +4991,8 @@ join admin_users a on a.personIdentifier = p.personIdentifier
 left join (select userID
 from admin_users_roles
 where roleID = 3) x on x.userID = a.userID
-where x.userID is null;
+where x.userID is null
+and not (p.dateAdded is null and p.personIdentifier in (select personIdentifier from person_person_type where personType = 'cornell-ithaca'));
 
 
 END;

@@ -275,10 +275,31 @@ def load_person_temp(cursor, csv_file_path):
     logger.info(f"{current_time} -- Loaded {row_count} rows into person_temp successfully.")
     return cursor
 
+def cornell_ithaca_people_sql(person_table, type_table):
+    """person rows come only from Analysis, and Cornell Ithaca people are never run, so
+    they never reached Find People. One row per cornell-ithaca identity without one;
+    update_person() then fills the names. Metrics stay NULL and dateAdded NULL marks
+    the row as never run: PM keys on that to keep them out of Curate (which would run
+    ReCiter on them). NOT EXISTS because update_person() runs twice a night and dual
+    WCM/Cornell appointees already have their Analysis row."""
+    return f"""
+    INSERT INTO `{person_table}` (personIdentifier, `precision`, recall,
+        countSuggestedArticles, countPendingArticles, overallAccuracy)
+    SELECT DISTINCT i.personIdentifier, NULL, NULL, NULL, NULL, NULL
+    FROM person_temp i
+    JOIN `{type_table}` t ON t.personIdentifier = i.personIdentifier
+                         AND t.personType = 'cornell-ithaca'
+    WHERE NOT EXISTS (SELECT 1 FROM `{person_table}` p
+                      WHERE p.personIdentifier = i.personIdentifier);
+    """
+
 def update_person(cursor):
     current_time = time.strftime("%Y-%m-%d %H:%M:%S")
     target_table = shadow_table_name('person')
     logger.info(f"{current_time} -- Starting update_person (target: `{target_table}`).")
+    cursor = execute_with_reconnect(
+        cursor, cornell_ithaca_people_sql(target_table, shadow_table_name('person_person_type')))
+    logger.info(f"{current_time} -- Added {cursor.rowcount} Cornell Ithaca people to `{target_table}`.")
     update_query = f"""
     UPDATE `{target_table}` p
     JOIN person_temp i ON i.personIdentifier = p.personIdentifier
