@@ -205,6 +205,7 @@ For local development, export env vars in your terminal session or use a MySQL o
 | `analysis_summary_author` | One row per person+pmid: author list string, author position (first/last) |
 | `analysis_summary_author_list` | One row per author+pmid: individual author name and rank |
 | `analysis_summary_person` | One row per person: h-index (NIH + Scopus), article counts, percentile rankings |
+| `analysis_summary_person_peer` | Bibliometric report v2 (v3.11): one row per person x role set x top-N with the exact top-N average and the cohort rank. Swapped with the tables above. |
 
 **Data source tables** (populated by ETL scripts):
 
