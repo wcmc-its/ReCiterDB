@@ -307,6 +307,8 @@ CREATE TABLE IF NOT EXISTS `analysis_nih` (
   `apt` float(4,2) DEFAULT NULL,
   `x_coord` float(5,4) DEFAULT NULL,
   `y_coord` float(5,4) DEFAULT NULL,
+  `has_percentile` tinyint DEFAULT NULL,  -- v3.11 (R1): 1 = iCite returned nih_percentile, 0 = null
+  `has_rcr` tinyint DEFAULT NULL,         -- v3.11 (R1): 1 = iCite returned relative_citation_ratio, 0 = null
   PRIMARY KEY (`id`),
   UNIQUE KEY `idx_pmid` (`pmid`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -377,6 +379,12 @@ CREATE TABLE IF NOT EXISTS `analysis_summary_article` (
   `citationCountNIH` int(11) DEFAULT NULL,
   `percentileNIH` float(5,2) DEFAULT NULL,
   `relativeCitationRatioNIH` float(6,2) DEFAULT NULL,
+  `provisionalNIH` tinyint DEFAULT NULL,           -- v3.11 (R2): iCite provisional 1/0
+  `hasPercentileNIH` tinyint DEFAULT NULL,         -- v3.11 (R2): 1 = iCite percentile present
+  `pctExact` decimal(5,2) DEFAULT NULL,            -- v3.11 (R2): exact percentile, NULL when missing
+  `researchArticleV2` tinyint DEFAULT NULL,        -- v3.11 (R2): bibliometric v2 research article
+  `ratedV2` tinyint DEFAULT NULL,                  -- v3.11 (R2): bibliometric v2 rated research article
+  `recentV2` tinyint DEFAULT NULL,                 -- v3.11 (R2): bibliometric v2 too recent to rate
   `readersMendeley` int(11) DEFAULT NULL,
   `trendingPubsScore` float(7,2) DEFAULT NULL,
   `source_type` varchar(16) DEFAULT 'PUBMED',
@@ -411,6 +419,8 @@ CREATE TABLE IF NOT EXISTS `analysis_summary_author` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `personIdentifier` varchar(128) DEFAULT NULL,
   `pmid` int(11) DEFAULT 0,
+  `authorRoleV2` enum('first','senior','middle','not_set') DEFAULT NULL,  -- v3.11 (R2)
+  `soleAuthor` tinyint DEFAULT NULL,                                       -- v3.11 (R2)
   `authors` varchar(1000) DEFAULT NULL,
   `authorsRTF` varchar(1000) DEFAULT NULL,
   `authorPosition` varchar(20) DEFAULT NULL,
@@ -481,6 +491,24 @@ CREATE TABLE IF NOT EXISTS `analysis_summary_person_scope` (
   `personIdentifier` varchar(20) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_personIdentifier` (`personIdentifier`) USING BTREE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Bibliometric report v2 cohort cells (v3.11, R2): see alter_analysis_summary_bibliometric_v2_v3.11.sql.
+CREATE TABLE IF NOT EXISTS `analysis_summary_person_peer` (
+  `personIdentifier` varchar(128) NOT NULL,
+  `facultyRank` varchar(200) DEFAULT NULL,
+  `cohortEligible` tinyint NOT NULL DEFAULT 0,
+  `roleSet` enum('any','first_or_senior','first','senior') NOT NULL,
+  `topN` tinyint NOT NULL,
+  `ratedCount` int(11) NOT NULL DEFAULT 0,
+  `recentCount` int(11) NOT NULL DEFAULT 0,
+  `avgTop` decimal(6,3) DEFAULT NULL,
+  `cohortRank` int(11) DEFAULT NULL,
+  `cohortM` int(11) DEFAULT NULL,
+  `runDate` date NOT NULL,
+  `iciteLoadedAt` datetime DEFAULT NULL,
+  PRIMARY KEY (`personIdentifier`, `roleSet`, `topN`),
+  KEY `idx_peer_cohort` (`facultyRank`, `roleSet`, `topN`, `avgTop`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ============================================================================

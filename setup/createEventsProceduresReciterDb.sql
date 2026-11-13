@@ -3255,6 +3255,9 @@ proc_main: BEGIN
     DECLARE v_step VARCHAR(100);
     DECLARE v_job_id VARCHAR(50);
     DECLARE v_rows INT;
+    -- >>> R2 (v3.11, PM #1105 5h): bibliometric v2
+    DECLARE v_v2_ok INT DEFAULT 0;   -- 1 while STEPs 2v2 / 3v2 have filled the v2 columns tonight
+    -- <<< R2 (v3.11)
 
     -- Error handler - captures any SQL exception
     DECLARE CONTINUE HANDLER FOR SQLEXCEPTION
@@ -3524,6 +3527,53 @@ proc_main: BEGIN
     CALL log_progress(v_job_id, v_step, 'Complete', 'DONE', NULL, CONCAT(TIMESTAMPDIFF(SECOND, v_start_time, NOW()), 's elapsed'));
 
     -- ========================================================================
+    -- >>> R2 (v3.11, PM #1105 5h): STEP 2v2 bibliometric v2 author role
+    -- authorRoleV2 / soleAuthor on PubMed rows, read from authorPosition AFTER the overrides and
+    -- STEP 2b, so PubMed EqualContrib shared first / co-senior positions carry over:
+    --   senior = the only author (MAX(rank) = 1 in person_article_author) or 'last'
+    --   first  = 'first' and not the only author
+    --   middle = any other PubMed row (NULL authorPosition)
+    -- External rows (pmid < 0) arrive in 6b and get their role in 6v2. authorPosition itself is
+    -- unchanged (the v1 RTF reads it; a sole author stays 'first' there). Skipped until v3.11 is
+    -- applied. A failure is logged and cleared and turns the v2 steps off for the night, so it
+    -- can't abort the swap (STEP 5v2 then installs an empty cell table).
+    -- ========================================================================
+    SET v_step = '2v2. Bibliometric v2 author role';
+    IF v_error_occurred = 0
+       AND EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = DATABASE() AND table_name = 'analysis_summary_author_new'
+                     AND column_name = 'authorRoleV2')
+       AND EXISTS (SELECT 1 FROM information_schema.tables
+                   WHERE table_schema = DATABASE() AND table_name = 'analysis_summary_person_peer') THEN
+        CALL log_progress(v_job_id, v_step, 'Setting authorRoleV2 and soleAuthor', 'RUNNING', NULL, NULL);
+        DROP TABLE IF EXISTS temp_v2_sole_pmid;
+        CREATE TABLE temp_v2_sole_pmid (pmid INT NOT NULL PRIMARY KEY) ENGINE=InnoDB;
+        INSERT INTO temp_v2_sole_pmid (pmid)
+        SELECT pmid FROM person_article_author GROUP BY pmid HAVING MAX(`rank`) = 1;
+
+        UPDATE analysis_summary_author_new a
+        LEFT JOIN temp_v2_sole_pmid s ON s.pmid = a.pmid
+        SET a.soleAuthor   = IF(s.pmid IS NULL, 0, 1),
+            a.authorRoleV2 = CASE WHEN s.pmid IS NOT NULL OR a.authorPosition = 'last' THEN 'senior'
+                                  WHEN a.authorPosition = 'first' THEN 'first'
+                                  ELSE 'middle' END
+        WHERE a.pmid > 0;
+        SET v_rows = ROW_COUNT();
+        DROP TABLE IF EXISTS temp_v2_sole_pmid;
+
+        IF v_error_occurred THEN
+            CALL log_progress(v_job_id, v_step, 'Author role fill failed (ignored - v2 steps off tonight)', 'ERROR', NULL, v_error_message);
+            SET v_error_occurred = 0;
+        ELSE
+            SET v_v2_ok = 1;
+            CALL log_progress(v_job_id, v_step, 'Set authorRoleV2 and soleAuthor', 'INFO', v_rows, NULL);
+        END IF;
+    ELSE
+        CALL log_progress(v_job_id, v_step, 'Skipped (v3.11 not applied)', 'INFO', 0, NULL);
+    END IF;
+    -- <<< R2 (v3.11): STEP 2v2
+
+    -- ========================================================================
     -- STEP 2c: Populate analysis_summary_author_list_new
     -- ========================================================================
     SET v_step = '2c. Populate author_list';
@@ -3768,6 +3818,97 @@ proc_main: BEGIN
     END IF;
 
     CALL log_progress(v_job_id, v_step, 'Complete', 'DONE', NULL, CONCAT(TIMESTAMPDIFF(SECOND, v_start_time, NOW()), 's elapsed'));
+
+    -- ========================================================================
+    -- >>> R2 (v3.11, PM #1105 5h): STEP 3v2 bibliometric v2 article flags
+    -- Copies iCite's provisional flag and has_percentile (R1) from analysis_nih, then sets the
+    -- three v2 flags on PubMed rows:
+    --   researchArticleV2: iCite is_research_article, publicationTypeCanonical not a preprint,
+    --     review, letter, comment, editorial, conference paper, erratum or retraction (iCite
+    --     flags thousands of letters and reviews as research), and counted (pubTypeCounted <> 0).
+    --   ratedV2: research article, YEAR(pubDate) (else articleYear) >= 1980, a percentile is
+    --     present, and not provisional (iCite gives provisional papers percentiles, and 0.0).
+    --   recentV2: counted, not rated, and provisional or (no percentile and pubDate within the
+    --     24 months before the run date, CURDATE()).
+    -- "Percentile present" is analysis_nih.has_percentile; while that column is absent or NULL
+    -- (a load from before R1) it falls back to nih_percentile > 0. pctExact is ROUND(pct, 2) as
+    -- DECIMAL(5,2), so STEP 5v2 and PM average and compare exact values (no FLOAT ties).
+    -- Display-only columns: STEPs 4-6 are unaffected. Needs 2v2, v3.7 (pubTypeCounted, pubDate)
+    -- and analysis_nih. A failure is logged and cleared and turns the v2 steps off for the night.
+    -- ========================================================================
+    SET v_step = '3v2. Bibliometric v2 article flags';
+    IF v_error_occurred = 0 AND v_v2_ok = 1
+       AND EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = DATABASE() AND table_name = 'analysis_summary_article_new'
+                     AND column_name = 'ratedV2')
+       AND EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = DATABASE() AND table_name = 'analysis_summary_article_new'
+                     AND column_name = 'pubTypeCounted')
+       AND EXISTS (SELECT 1 FROM information_schema.tables
+                   WHERE table_schema = DATABASE() AND table_name = 'analysis_nih') THEN
+        SET v_v2_ok = 0;
+        CALL log_progress(v_job_id, v_step, 'Copying iCite provisional and has_percentile', 'RUNNING', NULL, NULL);
+        IF EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = DATABASE() AND table_name = 'analysis_nih'
+                     AND column_name = 'has_percentile') THEN
+            UPDATE analysis_summary_article_new a
+            JOIN analysis_nih n ON n.pmid = a.pmid
+            SET a.provisionalNIH   = CASE n.provisional WHEN 'True' THEN 1 WHEN 'False' THEN 0 END,
+                a.hasPercentileNIH = COALESCE(n.has_percentile, IF(n.nih_percentile > 0, 1, 0)),
+                a.pctExact         = IF(COALESCE(n.has_percentile, IF(n.nih_percentile > 0, 1, 0)) = 1,
+                                        CAST(ROUND(n.nih_percentile, 2) AS DECIMAL(5,2)), NULL)
+            WHERE a.pmid > 0;
+        ELSE
+            UPDATE analysis_summary_article_new a
+            JOIN analysis_nih n ON n.pmid = a.pmid
+            SET a.provisionalNIH   = CASE n.provisional WHEN 'True' THEN 1 WHEN 'False' THEN 0 END,
+                a.hasPercentileNIH = IF(n.nih_percentile > 0, 1, 0),
+                a.pctExact         = IF(n.nih_percentile > 0, CAST(ROUND(n.nih_percentile, 2) AS DECIMAL(5,2)), NULL)
+            WHERE a.pmid > 0;
+        END IF;
+        SET v_rows = ROW_COUNT();
+        CALL log_progress(v_job_id, v_step, 'Copied iCite provisional and has_percentile', 'INFO', v_rows, NULL);
+
+        UPDATE analysis_summary_article_new a
+        SET a.researchArticleV2 = IF(a.publicationTypeNIH = 'Research Article'
+                                     AND COALESCE(a.publicationTypeCanonical, '') NOT IN
+                                         ('Preprint', 'Review', 'Letter', 'Comment', 'Editorial Article', 'Editorial',
+                                          'Conference Paper', 'Erratum', 'Retraction', 'Retracted')
+                                     AND COALESCE(a.pubTypeCounted, 1) <> 0, 1, 0)
+        WHERE a.pmid > 0;
+
+        UPDATE analysis_summary_article_new a
+        SET a.ratedV2 = IF(a.researchArticleV2 = 1
+                           AND COALESCE(YEAR(a.pubDate), NULLIF(a.articleYear, 0)) >= 1980
+                           AND a.hasPercentileNIH = 1
+                           AND COALESCE(a.provisionalNIH, 0) <> 1, 1, 0)
+        WHERE a.pmid > 0;
+
+        UPDATE analysis_summary_article_new a
+        SET a.recentV2 = IF(COALESCE(a.pubTypeCounted, 1) <> 0
+                            AND a.ratedV2 = 0
+                            AND (a.provisionalNIH = 1
+                                 OR (COALESCE(a.hasPercentileNIH, 0) = 0
+                                     AND a.pubDate >= CURDATE() - INTERVAL 24 MONTH)), 1, 0)
+        WHERE a.pmid > 0;
+
+        SELECT COUNT(*), SUM(researchArticleV2), SUM(ratedV2), SUM(recentV2)
+        INTO v_rows, @v2_research, @v2_rated, @v2_recent
+        FROM analysis_summary_article_new WHERE pmid > 0;
+
+        IF v_error_occurred THEN
+            CALL log_progress(v_job_id, v_step, 'Article flag fill failed (ignored - v2 steps off tonight)', 'ERROR', NULL, v_error_message);
+            SET v_error_occurred = 0;
+        ELSE
+            SET v_v2_ok = 1;
+            CALL log_progress(v_job_id, v_step, 'Set researchArticleV2 / ratedV2 / recentV2', 'INFO', v_rows,
+                              CONCAT('research ', @v2_research, ', rated ', @v2_rated, ', recent ', @v2_recent));
+        END IF;
+    ELSE
+        SET v_v2_ok = 0;   -- article flags not filled tonight: 5v2 leaves the cell table empty, 6v2 skips
+        CALL log_progress(v_job_id, v_step, 'Skipped (v3.11 / v3.7 not applied, or 2v2 off)', 'INFO', 0, NULL);
+    END IF;
+    -- <<< R2 (v3.11): STEP 3v2
 
     -- ========================================================================
     -- STEP 4: Populate analysis_summary_person_new
@@ -4303,6 +4444,203 @@ proc_main: BEGIN
     CALL log_progress(v_job_id, v_step, 'Complete', 'DONE', NULL, CONCAT(TIMESTAMPDIFF(SECOND, v_start_time, NOW()), 's elapsed'));
 
     -- ========================================================================
+    -- >>> R2 (v3.11, PM #1105 5h): STEP 5v2 bibliometric v2 cohort cells
+    -- Builds analysis_summary_person_peer_new: one row per person x role set x N for everyone
+    -- with at least one rated research article (ratedV2).
+    --   Role sets (authorRoleV2): any; first_or_senior; first; senior. N = 5 and 10.
+    --   avgTop: exact mean of the N highest pctExact, articles picked with ROW_NUMBER() over
+    --     (pct DESC, RCR DESC, pmid) so a tie at place N never pulls in more than N (v1 used
+    --     RANK()); NULL when ratedCount < N. DECIMAL(6,3) holds a mean of 5 or 10 two-decimal
+    --     values exactly.
+    --   Rank: the faculty rank code read from person_person_type tonight (not the v1 scope
+    --     table); a person with two codes gets the one identity.primaryTitle names, else the
+    --     most senior (the count is logged). cohortEligible = weillfulltime plus a rank.
+    --   cohortM: eligible members of the same rank with an avgTop in the cell (subject included).
+    --   cohortRank: RANK() over avgTop in that cohort (1 + the number strictly higher); NULL when
+    --     cohortM < 20 (PM prints "Cohort too small to rank").
+    --   runDate = CURDATE(); iciteLoadedAt = analysis_nih CREATE_TIME (each load swaps in a new
+    --     table, so that is the iCite snapshot time).
+    -- The staging table always exists once v3.11 is applied: if 2v2 / 3v2 were off or this step
+    -- fails, it stays EMPTY, so STEP 7 never leaves cells from another night next to tonight's
+    -- article flags. Errors are logged and cleared. v1 STEP 5 columns are untouched.
+    -- ========================================================================
+    SET v_step = '5v2. Bibliometric v2 cohort cells';
+    IF v_error_occurred = 0
+       AND EXISTS (SELECT 1 FROM information_schema.tables
+                   WHERE table_schema = DATABASE() AND table_name = 'analysis_summary_person_peer') THEN
+        DROP TABLE IF EXISTS analysis_summary_person_peer_new;
+        CREATE TABLE analysis_summary_person_peer_new LIKE analysis_summary_person_peer;
+
+        IF v_error_occurred = 0 AND v_v2_ok = 1 THEN
+            CALL log_progress(v_job_id, v_step, 'Resolving faculty rank and cohort eligibility', 'RUNNING', NULL, NULL);
+            SET @v2_icite_loaded_at = (SELECT create_time FROM information_schema.tables
+                                       WHERE table_schema = DATABASE() AND table_name = 'analysis_nih');
+
+            -- Rank levels: 4 full, 3 associate, 2 assistant, 1 instructor or lecturer.
+            DROP TABLE IF EXISTS temp_v2_rank;
+            CREATE TABLE temp_v2_rank (
+                personIdentifier VARCHAR(128) NOT NULL,
+                nRanks     INT NOT NULL,
+                rankMask   INT NOT NULL,
+                maxLevel   INT NULL,
+                titleLevel INT NULL,
+                rankLevel  INT NULL,
+                fullTime   TINYINT NOT NULL,
+                PRIMARY KEY (personIdentifier)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+            INSERT INTO temp_v2_rank (personIdentifier, nRanks, rankMask, maxLevel, fullTime)
+            SELECT personIdentifier, COUNT(DISTINCT lvl), BIT_OR(COALESCE(1 << lvl, 0)), MAX(lvl), MAX(ft)
+            FROM (SELECT personIdentifier,
+                         CASE personType WHEN 'academic-faculty-fullprofessor' THEN 4
+                                         WHEN 'academic-faculty-associate'     THEN 3
+                                         WHEN 'academic-faculty-assistant'     THEN 2
+                                         WHEN 'academic-faculty-instructor'    THEN 1
+                                         WHEN 'academic-faculty-lecturer'      THEN 1 END AS lvl,
+                         IF(personType = 'academic-faculty-weillfulltime', 1, 0) AS ft
+                  FROM person_person_type
+                  WHERE personIdentifier IS NOT NULL) t
+            GROUP BY personIdentifier;
+
+            IF EXISTS (SELECT 1 FROM information_schema.columns
+                       WHERE table_schema = DATABASE() AND table_name = 'identity'
+                         AND column_name = 'primaryTitle') THEN
+                UPDATE temp_v2_rank r
+                JOIN identity i ON i.cwid = r.personIdentifier
+                SET r.titleLevel = CASE WHEN i.primaryTitle LIKE '%Associate Professor%' THEN 3
+                                        WHEN i.primaryTitle LIKE '%Assistant Professor%' THEN 2
+                                        WHEN i.primaryTitle LIKE '%Professor%' THEN 4
+                                        WHEN i.primaryTitle LIKE '%Instructor%'
+                                          OR i.primaryTitle LIKE '%Lecturer%' THEN 1 END
+                WHERE r.nRanks > 1;
+            END IF;
+            UPDATE temp_v2_rank
+            SET rankLevel = IF(nRanks > 1 AND titleLevel IS NOT NULL AND (rankMask & (1 << titleLevel)) <> 0,
+                               titleLevel, maxLevel);
+            SELECT COUNT(*) INTO v_rows FROM temp_v2_rank WHERE nRanks > 1;
+            CALL log_progress(v_job_id, v_step, 'People holding two rank codes (tie-break applied)', 'INFO', v_rows, NULL);
+
+            -- Rated and recent research articles per person, with the role from 2v2.
+            DROP TABLE IF EXISTS temp_v2_works;
+            CREATE TABLE temp_v2_works (
+                personIdentifier VARCHAR(128) NOT NULL,
+                pmid   INT NOT NULL,
+                role   VARCHAR(10) NOT NULL,
+                rated  TINYINT NOT NULL,
+                recent TINYINT NOT NULL,
+                pct    DECIMAL(5,2) NULL,
+                rcr    FLOAT(6,2) NULL,
+                PRIMARY KEY (personIdentifier, pmid)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+            INSERT IGNORE INTO temp_v2_works (personIdentifier, pmid, role, rated, recent, pct, rcr)
+            SELECT au.personIdentifier, au.pmid, COALESCE(au.authorRoleV2, 'not_set'),
+                   ar.ratedV2, ar.recentV2, ar.pctExact, ar.relativeCitationRatioNIH
+            FROM analysis_summary_author_new au
+            JOIN analysis_summary_article_new ar ON ar.pmid = au.pmid
+            WHERE au.pmid > 0 AND au.personIdentifier IS NOT NULL
+              AND ar.researchArticleV2 = 1 AND (ar.ratedV2 = 1 OR ar.recentV2 = 1);
+            SET v_rows = ROW_COUNT();
+            CALL log_progress(v_job_id, v_step, 'Collected rated and recent research articles', 'INFO', v_rows, NULL);
+
+            DROP TABLE IF EXISTS temp_v2_roleset;
+            CREATE TABLE temp_v2_roleset (
+                roleSet VARCHAR(20) NOT NULL,
+                role    VARCHAR(10) NOT NULL,
+                PRIMARY KEY (roleSet, role)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+            INSERT INTO temp_v2_roleset (roleSet, role) VALUES
+                ('any', 'first'), ('any', 'senior'), ('any', 'middle'), ('any', 'not_set'),
+                ('first_or_senior', 'first'), ('first_or_senior', 'senior'),
+                ('first', 'first'),
+                ('senior', 'senior');
+
+            INSERT INTO analysis_summary_person_peer_new
+                (personIdentifier, facultyRank, cohortEligible, roleSet, topN,
+                 ratedCount, recentCount, avgTop, runDate, iciteLoadedAt)
+            SELECT p.personIdentifier,
+                   CASE rk.rankLevel WHEN 4 THEN 'Full Professor'
+                                     WHEN 3 THEN 'Associate Professor'
+                                     WHEN 2 THEN 'Assistant Professor'
+                                     WHEN 1 THEN 'Instructor or Lecturer' END,
+                   IF(rk.fullTime = 1 AND rk.rankLevel IS NOT NULL, 1, 0),
+                   rs.roleSet, n.topN,
+                   COALESCE(c.ratedCount, 0), COALESCE(c.recentCount, 0),
+                   t.avgTop,
+                   CURDATE(), @v2_icite_loaded_at
+            FROM (SELECT DISTINCT personIdentifier FROM temp_v2_works WHERE rated = 1) p
+            CROSS JOIN (SELECT DISTINCT roleSet FROM temp_v2_roleset) rs
+            CROSS JOIN (SELECT 5 AS topN UNION ALL SELECT 10) n
+            LEFT JOIN temp_v2_rank rk ON rk.personIdentifier = p.personIdentifier
+            LEFT JOIN (SELECT w.personIdentifier, s.roleSet,
+                              SUM(w.rated) AS ratedCount, SUM(w.recent) AS recentCount
+                       FROM temp_v2_works w
+                       JOIN temp_v2_roleset s ON s.role = w.role
+                       GROUP BY w.personIdentifier, s.roleSet) c
+                   ON c.personIdentifier = p.personIdentifier AND c.roleSet = rs.roleSet
+            LEFT JOIN (SELECT x.personIdentifier, x.roleSet, k.topN,
+                              CAST(SUM(x.pct) / k.topN AS DECIMAL(6,3)) AS avgTop
+                       FROM (SELECT w.personIdentifier, s.roleSet, w.pct,
+                                    ROW_NUMBER() OVER (PARTITION BY w.personIdentifier, s.roleSet
+                                                       ORDER BY w.pct DESC, w.rcr DESC, w.pmid ASC) AS rn
+                             FROM temp_v2_works w
+                             JOIN temp_v2_roleset s ON s.role = w.role
+                             WHERE w.rated = 1) x
+                       JOIN (SELECT 5 AS topN UNION ALL SELECT 10) k ON x.rn <= k.topN
+                       GROUP BY x.personIdentifier, x.roleSet, k.topN
+                       HAVING COUNT(*) = k.topN) t
+                   ON t.personIdentifier = p.personIdentifier AND t.roleSet = rs.roleSet AND t.topN = n.topN;
+            SET v_rows = ROW_COUNT();
+            CALL log_progress(v_job_id, v_step, 'Inserted person x role set x N cells', 'INFO', v_rows, NULL);
+
+            DROP TABLE IF EXISTS temp_v2_cohort;
+            CREATE TABLE temp_v2_cohort (
+                personIdentifier VARCHAR(128) NOT NULL,
+                roleSet    VARCHAR(20) NOT NULL,
+                topN       TINYINT NOT NULL,
+                cohortRank INT NOT NULL,
+                cohortM    INT NOT NULL,
+                PRIMARY KEY (personIdentifier, roleSet, topN)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+            INSERT INTO temp_v2_cohort (personIdentifier, roleSet, topN, cohortRank, cohortM)
+            SELECT personIdentifier, roleSet, topN,
+                   RANK() OVER (PARTITION BY facultyRank, roleSet, topN ORDER BY avgTop DESC),
+                   COUNT(*) OVER (PARTITION BY facultyRank, roleSet, topN)
+            FROM analysis_summary_person_peer_new
+            WHERE cohortEligible = 1 AND avgTop IS NOT NULL;
+
+            UPDATE analysis_summary_person_peer_new p
+            JOIN temp_v2_cohort c
+              ON c.personIdentifier = p.personIdentifier AND c.roleSet = p.roleSet AND c.topN = p.topN
+            SET p.cohortM    = c.cohortM,
+                p.cohortRank = IF(c.cohortM >= 20, c.cohortRank, NULL);
+            SELECT COUNT(*) INTO v_rows FROM analysis_summary_person_peer_new WHERE cohortRank IS NOT NULL;
+            CALL log_progress(v_job_id, v_step, 'Ranked cells (cohort of 20 or more)', 'INFO', v_rows, NULL);
+
+            DROP TABLE IF EXISTS temp_v2_rank;
+            DROP TABLE IF EXISTS temp_v2_works;
+            DROP TABLE IF EXISTS temp_v2_roleset;
+            DROP TABLE IF EXISTS temp_v2_cohort;
+        ELSE
+            CALL log_progress(v_job_id, v_step, 'v2 columns not filled tonight: cell table left empty', 'INFO', 0, NULL);
+        END IF;
+
+        IF v_error_occurred THEN
+            CALL log_progress(v_job_id, v_step, 'Cohort cells failed (ignored - cell table left empty)', 'ERROR', NULL, v_error_message);
+            SET v_error_occurred = 0;
+            DROP TABLE IF EXISTS temp_v2_rank;
+            DROP TABLE IF EXISTS temp_v2_works;
+            DROP TABLE IF EXISTS temp_v2_roleset;
+            DROP TABLE IF EXISTS temp_v2_cohort;
+            DROP TABLE IF EXISTS analysis_summary_person_peer_new;
+            CREATE TABLE analysis_summary_person_peer_new LIKE analysis_summary_person_peer;
+        ELSE
+            CALL log_progress(v_job_id, v_step, 'Complete', 'DONE', NULL, CONCAT(TIMESTAMPDIFF(SECOND, v_start_time, NOW()), 's elapsed'));
+        END IF;
+    ELSE
+        CALL log_progress(v_job_id, v_step, 'Skipped (v3.11 not applied)', 'INFO', 0, NULL);
+    END IF;
+    -- <<< R2 (v3.11): STEP 5v2
+
+    -- ========================================================================
     -- STEP 6: COMPUTE H-INDEX USING EFFICIENT SET-BASED QUERY
     -- This replaces the slow row-by-row REPEAT loop
     -- ========================================================================
@@ -4730,6 +5068,36 @@ proc_main: BEGIN
     -- This is the key improvement - production tables are only unavailable
     -- for the brief moment of the RENAME operation
     -- ========================================================================
+    -- >>> R2 (v3.11, PM #1105 5h): STEP 6v2 bibliometric v2 flags on external rows
+    -- (Sits under the STEP 7 banner, but runs before the swap: kept apart from v3.10's STEP 6c.)
+    -- 6b adds external works (pmid < 0) after STEPs 2v2 / 3v2 ran, so their v2 values are set
+    -- here: never research or rated (no iCite); recent when counted and pubDate is within the
+    -- 24 months before the run date; role first / senior from 6b's position, else 'not_set'.
+    -- Display-only; the cohort cells (5v2) read PubMed rows only. A failure is logged and cleared.
+    -- ========================================================================
+    SET v_step = '6v2. Bibliometric v2 external rows';
+    IF v_error_occurred = 0 AND v_v2_ok = 1 THEN
+        UPDATE analysis_summary_author_new
+        SET authorRoleV2 = CASE authorPosition WHEN 'first' THEN 'first' WHEN 'last' THEN 'senior' ELSE 'not_set' END
+        WHERE pmid < 0;
+        SET v_rows = ROW_COUNT();
+        UPDATE analysis_summary_article_new
+        SET researchArticleV2 = 0,
+            ratedV2           = 0,
+            recentV2          = IF(COALESCE(pubTypeCounted, 1) <> 0
+                                   AND pubDate >= CURDATE() - INTERVAL 24 MONTH, 1, 0)
+        WHERE pmid < 0;
+        IF v_error_occurred THEN
+            CALL log_progress(v_job_id, v_step, 'External v2 fill failed (ignored - columns left NULL)', 'ERROR', NULL, v_error_message);
+            SET v_error_occurred = 0;
+        ELSE
+            CALL log_progress(v_job_id, v_step, 'Set external authorRoleV2 and recentV2', 'INFO', v_rows, NULL);
+        END IF;
+    ELSE
+        CALL log_progress(v_job_id, v_step, 'Skipped (v2 steps off tonight)', 'INFO', 0, NULL);
+    END IF;
+    -- <<< R2 (v3.11): STEP 6v2
+
     SET v_step = '7. Atomic table swap';
     CALL log_progress(v_job_id, v_step, 'Dropping old backup tables', 'RUNNING', NULL, NULL);
 
@@ -4738,11 +5106,34 @@ proc_main: BEGIN
     DROP TABLE IF EXISTS analysis_summary_article_backup;
     DROP TABLE IF EXISTS analysis_summary_person_backup;
     DROP TABLE IF EXISTS analysis_summary_author_list_backup;
+    -- >>> R2 (v3.11, PM #1105 5h): the cohort cell table swaps with the tables it was computed from
+    DROP TABLE IF EXISTS analysis_summary_person_peer_backup;
+    -- <<< R2 (v3.11)
 
     CALL log_progress(v_job_id, v_step, 'Performing atomic RENAME', 'RUNNING', NULL, 'This swaps all 4 tables instantly');
 
     -- Atomic swap: current -> backup, new -> current
     -- This is a single atomic operation in MySQL/MariaDB
+    -- >>> R2 (v3.11, PM #1105 5h): with a staged cell table (5v2), the SAME atomic RENAME also
+    -- swaps analysis_summary_person_peer, so subject and cohort always come from one snapshot.
+    -- Without one (v3.11 not applied) the original 4-table RENAME below runs unchanged.
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_schema = DATABASE() AND table_name = 'analysis_summary_person_peer_new')
+       AND EXISTS (SELECT 1 FROM information_schema.tables
+                   WHERE table_schema = DATABASE() AND table_name = 'analysis_summary_person_peer') THEN
+        RENAME TABLE
+            analysis_summary_author TO analysis_summary_author_backup,
+            analysis_summary_author_new TO analysis_summary_author,
+            analysis_summary_article TO analysis_summary_article_backup,
+            analysis_summary_article_new TO analysis_summary_article,
+            analysis_summary_person TO analysis_summary_person_backup,
+            analysis_summary_person_new TO analysis_summary_person,
+            analysis_summary_author_list TO analysis_summary_author_list_backup,
+            analysis_summary_author_list_new TO analysis_summary_author_list,
+            analysis_summary_person_peer TO analysis_summary_person_peer_backup,
+            analysis_summary_person_peer_new TO analysis_summary_person_peer;
+    ELSE
+    -- <<< R2 (v3.11)
     RENAME TABLE
         analysis_summary_author TO analysis_summary_author_backup,
         analysis_summary_author_new TO analysis_summary_author,
@@ -4752,6 +5143,9 @@ proc_main: BEGIN
         analysis_summary_person_new TO analysis_summary_person,
         analysis_summary_author_list TO analysis_summary_author_list_backup,
         analysis_summary_author_list_new TO analysis_summary_author_list;
+    -- >>> R2 (v3.11)
+    END IF;
+    -- <<< R2 (v3.11)
 
     IF v_error_occurred THEN
         CALL log_progress(v_job_id, v_step, 'RENAME failed - CRITICAL', 'ERROR', NULL, v_error_message);
@@ -4791,6 +5185,14 @@ BEGIN
     DROP TABLE IF EXISTS temp_maxrank;
     DROP TABLE IF EXISTS temp_equalcontrib_all;
     DROP TABLE IF EXISTS analysis_temp_equalcontrib_v2;
+    -- >>> R2 (v3.11, PM #1105 5h): bibliometric v2 staging and temp tables
+    DROP TABLE IF EXISTS analysis_summary_person_peer_new;
+    DROP TABLE IF EXISTS temp_v2_sole_pmid;
+    DROP TABLE IF EXISTS temp_v2_rank;
+    DROP TABLE IF EXISTS temp_v2_works;
+    DROP TABLE IF EXISTS temp_v2_roleset;
+    DROP TABLE IF EXISTS temp_v2_cohort;
+    -- <<< R2 (v3.11)
     SELECT 'Staging tables cleaned up' AS status;
 END//
 
@@ -4807,11 +5209,27 @@ BEGIN
         DROP TABLE IF EXISTS analysis_summary_person;
         DROP TABLE IF EXISTS analysis_summary_author_list;
 
+        -- >>> R2 (v3.11, PM #1105 5h): the cohort cell table goes back in the same RENAME as the
+        -- tables it was computed from. No backup yet (first night after v3.11): left as is.
+        IF EXISTS (SELECT 1 FROM information_schema.tables
+                   WHERE table_name = 'analysis_summary_person_peer_backup' AND table_schema = DATABASE()) THEN
+            DROP TABLE IF EXISTS analysis_summary_person_peer;
+            RENAME TABLE
+                analysis_summary_author_backup TO analysis_summary_author,
+                analysis_summary_article_backup TO analysis_summary_article,
+                analysis_summary_person_backup TO analysis_summary_person,
+                analysis_summary_author_list_backup TO analysis_summary_author_list,
+                analysis_summary_person_peer_backup TO analysis_summary_person_peer;
+        ELSE
+        -- <<< R2 (v3.11)
         RENAME TABLE
             analysis_summary_author_backup TO analysis_summary_author,
             analysis_summary_article_backup TO analysis_summary_article,
             analysis_summary_person_backup TO analysis_summary_person,
             analysis_summary_author_list_backup TO analysis_summary_author_list;
+        -- >>> R2 (v3.11)
+        END IF;
+        -- <<< R2 (v3.11)
 
         IF v_error = 0 THEN
             SELECT 'SUCCESS: Restored from backup tables' AS status;

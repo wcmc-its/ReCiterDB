@@ -610,6 +610,15 @@ def run_aar_reconcile_drift_if_due():
 
 
 # ------------- Main Flow -------------
+# --- R1 (PM #1105) ---
+# Main-loop steps whose failure is logged but does not stop the pipeline. retrieveNIH exits
+# non-zero when its iCite load, validation or swap fails, and leaves the previous analysis_nih
+# in place; the reporting rebuild is still worth running on it. These failures do not change
+# the job's exit code: the CronJob restarts on failure, which would re-run the whole nightly.
+NON_BLOCKING_SCRIPTS = {"retrieveNIH"}
+# --- end R1 ---
+
+
 def main():
     scripts = [
         ("executeFeatureGenerator", "python3 executeFeatureGenerator.py"),
@@ -622,6 +631,7 @@ def main():
     ]
 
     overall_success = True
+    soft_failures = []  # R1 (PM #1105): failed NON_BLOCKING_SCRIPTS steps, reported at the end
 
     # External-source projection MUST run before nightlyIndexing so the reporting SP
     # (STEP 6b) unions freshly-loaded external_article rows (ReCiterDB #101). Isolated,
@@ -632,6 +642,12 @@ def main():
     for name, cmd in scripts:
         #ok = run_script(name, cmd)
         ok = run_script(name, cmd, timeout_seconds=int(os.getenv("SCRIPT_TIMEOUT_SECONDS", "15000")))
+        # --- R1 (PM #1105): a failed iCite load must not stop the reporting rebuild ---
+        if not ok and name in NON_BLOCKING_SCRIPTS:
+            soft_failures.append(name)
+            logger.error(f"{name} failed; continuing (its tables keep the previous load).")
+            continue
+        # --- end R1 ---
         if not ok:
             overall_success = False
             logger.error("Stopping pipeline due to script failure.")
@@ -658,12 +674,22 @@ def main():
                                               # rows whose stored evidence columns no longer match
                                               # what the matcher would write (#186)
 
+    # --- R1 (PM #1105): name the non-blocking steps that failed, last, so the log shows them ---
+    for name in soft_failures:
+        logger.error(f"❌ NON-BLOCKING STEP FAILED: {name} — its data is stale (see the step log above)")
+    # --- end R1 ---
+
     upload_log_to_s3()
 
     if not overall_success:
         logger.error("One or more scripts failed ❌")
         sys.exit(1)
 
+    # --- R1 (PM #1105): don't call a run with a failed non-blocking step a full success ---
+    if soft_failures:
+        logger.warning(f"Pipeline completed, but non-blocking step(s) failed: {', '.join(soft_failures)}")
+        sys.exit(0)
+    # --- end R1 ---
     logger.info("All scripts completed successfully 🎉")
     sys.exit(0)
 
