@@ -1574,6 +1574,72 @@ proc_main: BEGIN
     END IF;
 
     -- ========================================================================
+    -- STEP 6c: PEER REVIEW AND ROLE DEFAULTS (v3.10, PM #1105 5d-1)
+    -- Runs after 6b, so it covers PubMed and external rows alike, and reads only the v3.7
+    -- pubType that STEP 3 and 6b already set. The rules are PM's src/lib/pubTypes.ts:
+    --   peerReviewed (defaultPeerReviewed): 1 for Academic Article, Review and Conference
+    --     Paper; 1 for Educational Material when the venue matches /mededportal/i; else 0
+    --     (Non-Peer-Reviewed Writing, every other type and an unmapped NULL pubType).
+    --     peerReviewedSource = 'type-default' on every row. 'curator' arrives with 5d-2,
+    --     which reads the override from external_record.
+    --   analysis_summary_author.role (defaultRole): 'Editor' when the work is an Edited Book
+    --     or Conference Proceedings, else 'Author'.
+    -- Display-only columns: counts, percentiles and h-index (STEPs 4-6) are unaffected.
+    -- Skipped until v3.10 (and v3.7) are applied; a failure is logged and cleared, so it can't
+    -- abort the swap (the columns just stay NULL).
+    -- ========================================================================
+    SET v_step = '6c. Peer review and role defaults';
+
+    -- An error left over from an earlier step is not ours to clear: skip 6c entirely then.
+    IF v_error_occurred = 0 THEN
+        IF EXISTS (SELECT 1 FROM information_schema.columns
+                       WHERE table_schema = DATABASE() AND table_name = 'analysis_summary_article_new'
+                         AND column_name = 'peerReviewed')
+           AND EXISTS (SELECT 1 FROM information_schema.columns
+                       WHERE table_schema = DATABASE() AND table_name = 'analysis_summary_article_new'
+                         AND column_name = 'pubType') THEN
+            UPDATE analysis_summary_article_new a
+            SET a.peerReviewed       = CASE
+                                           WHEN a.pubType IN ('Academic Article', 'Review', 'Conference Paper') THEN 1
+                                           WHEN a.pubType = 'Educational Material'
+                                                AND LOWER(COALESCE(a.journalTitleVerbose, '')) LIKE '%mededportal%' THEN 1
+                                           ELSE 0
+                                       END,
+                a.peerReviewedSource = 'type-default';
+            SET v_rows = ROW_COUNT();
+            CALL log_progress(v_job_id, v_step, 'Set peerReviewed (type default)', 'INFO', v_rows, NULL);
+        ELSE
+            CALL log_progress(v_job_id, v_step, 'Skipping peerReviewed (v3.10 or v3.7 not applied)', 'INFO', 0, NULL);
+        END IF;
+
+        IF EXISTS (SELECT 1 FROM information_schema.columns
+                       WHERE table_schema = DATABASE() AND table_name = 'analysis_summary_author_new'
+                         AND column_name = 'role')
+           AND EXISTS (SELECT 1 FROM information_schema.columns
+                       WHERE table_schema = DATABASE() AND table_name = 'analysis_summary_article_new'
+                         AND column_name = 'pubType') THEN
+            -- pmid is unique in analysis_summary_article_new (STEP 3 groups by pmid; 6b uses one
+            -- synthetic pmid per article), so the join gives at most one type per author row.
+            UPDATE analysis_summary_author_new au
+            LEFT JOIN analysis_summary_article_new a ON a.pmid = au.pmid
+            SET au.role = IF(a.pubType IN ('Edited Book', 'Conference Proceedings'), 'Editor', 'Author');
+            SET v_rows = ROW_COUNT();
+            CALL log_progress(v_job_id, v_step, 'Set author role (type default)', 'INFO', v_rows, NULL);
+        ELSE
+            CALL log_progress(v_job_id, v_step, 'Skipping author role (v3.10 or v3.7 not applied)', 'INFO', 0, NULL);
+        END IF;
+
+        IF v_error_occurred THEN
+            CALL log_progress(v_job_id, v_step, 'Peer review/role fill failed (ignored - columns left NULL)', 'ERROR', NULL, v_error_message);
+            SET v_error_occurred = 0;
+        ELSE
+            CALL log_progress(v_job_id, v_step, 'Complete', 'DONE', NULL, NULL);
+        END IF;
+    ELSE
+        CALL log_progress(v_job_id, v_step, 'Skipped (an earlier step left an error)', 'INFO', 0, NULL);
+    END IF;
+
+    -- ========================================================================
     -- STEP 7: ATOMIC TABLE SWAP
     -- This is the key improvement - production tables are only unavailable
     -- for the brief moment of the RENAME operation
