@@ -1054,7 +1054,14 @@ def _cornell_filter(netids):
 
 
 def cornell_directory_lookup(netids, batch_size=CORNELL_DIRECTORY_BATCH):
-    """The netids Cornell's live directory still returns, lowercased.
+    """The netids Cornell's live directory still returns, lowercased."""
+    return set(cornell_directory_entries(netids, batch_size=batch_size))
+
+
+def cornell_directory_entries(netids, attributes=("uid",),
+                              batch_size=CORNELL_DIRECTORY_BATCH):
+    """netid (lowercased) -> {attribute: first value} for every netid the live
+    directory returns.
 
     Its own bind and its own Connection, deliberately: ldap_conn() above is a
     module-level singleton bound to ED with LDAP_BIND_PASSWORD, and ldap_search()
@@ -1087,12 +1094,13 @@ def cornell_directory_lookup(netids, batch_size=CORNELL_DIRECTORY_BATCH):
     except Exception as exc:            # noqa: BLE001 - the detail echoes the DN
         raise SystemExit(f"Cornell directory bind failed ({type(exc).__name__}).")
 
-    found = set()
+    found = {}
     batches = _cornell_batches(netids, batch_size)
     try:
         for n, batch in enumerate(batches, 1):
             conn.search(CORNELL_DIRECTORY_BASE, _cornell_filter(batch),
-                        search_scope=SUBTREE, attributes=["uid"], time_limit=120)
+                        search_scope=SUBTREE, attributes=list(attributes),
+                        time_limit=120)
             desc = (conn.result or {}).get("description")
             if desc != "success":
                 raise SystemExit(
@@ -1105,9 +1113,11 @@ def cornell_directory_lookup(netids, batch_size=CORNELL_DIRECTORY_BATCH):
                     f"{CORNELL_DIRECTORY_MAX_ENTRIES} cap, so the answer is "
                     f"truncated. Lower CORNELL_DIRECTORY_BATCH.")
             for entry in conn.entries:
-                uid = (entry.entry_attributes_as_dict.get("uid") or [""])[0]
+                attrs = entry.entry_attributes_as_dict
+                uid = (attrs.get("uid") or [""])[0]
                 if uid:
-                    found.add(uid.strip().lower())
+                    found.setdefault(uid.strip().lower(), {
+                        a: (attrs.get(a) or [None])[0] for a in attributes})
             if n % 25 == 0 or n == len(batches):
                 logger.info("cornell directory: %d/%d batches, %d resolved",
                             n, len(batches), len(found))
@@ -1877,10 +1887,92 @@ def cornell_hr_appointments(dry_run=False):
         db.close()
 
 
+CORNELL_DIRECTORY_TABLE = "identity_cornell_directory"
+# cornellEduCWID is the attribute the 2026-09-03 bridge CSV was built from.
+CORNELL_DIRECTORY_ATTRS = ("uid", "cn", "givenName", "sn", "cornellEduCWID")
+CORNELL_DIRECTORY_DDL = f"""CREATE TABLE IF NOT EXISTS {CORNELL_DIRECTORY_TABLE} (
+  netid VARCHAR(100) NOT NULL PRIMARY KEY,
+  display_name VARCHAR(200), given_name VARCHAR(100), surname VARCHAR(100),
+  cwid VARCHAR(20),
+  loaded_at DATETIME NOT NULL,
+  KEY idx_cwid (cwid)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"""
+
+
+def _directory_row(netid, attrs):
+    """One table row from a directory entry: trimmed, length-capped, blanks as NULL."""
+    def v(attr, size):
+        return str(attrs.get(attr) or "").strip()[:size] or None
+    cwid = v("cornellEduCWID", 20)
+    return (netid, v("cn", 200), v("givenName", 100), v("sn", 100), cwid and cwid.lower())
+
+
+def cornell_directory(dry_run=False):
+    """Name and WCM CWID from Cornell's live directory for every roster netid.
+
+    The roster (identity_cornell_current) has no name for ~3,200 netids that
+    arrived with only an ORCID iD, and the directory's cornellEduCWID is
+    Cornell's own record of who also holds a WCM identity. Scholars (report 22,
+    cross-campus duplicates) reads this table for both. Absent netids are simply
+    missing; the cornell_ithaca() gate is unchanged.
+    """
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            table = _cornell_roster_table(cur)
+            cur.execute(f"SELECT DISTINCT LOWER(TRIM(netid)) FROM {table} "
+                        "WHERE netid REGEXP '^[A-Za-z]+[0-9]+$'")
+            netids = [n for (n,) in cur.fetchall()]
+            try:
+                cur.execute(f"SELECT COUNT(*) FROM {CORNELL_DIRECTORY_TABLE}")
+                previous = cur.fetchone()[0]
+            except Exception:                       # noqa: BLE001 - first run
+                previous = 0
+    finally:
+        conn.close()
+
+    entries = cornell_directory_entries(netids, CORNELL_DIRECTORY_ATTRS)
+    rows = [_directory_row(n, a) for n, a in sorted(entries.items())]
+    named = sum(1 for r in rows if r[1] or r[3])
+    bridged = sum(1 for r in rows if r[4])
+    logger.info("%s: %d of %d roster netids in the directory, %d named, %d with a WCM CWID",
+                CORNELL_DIRECTORY_TABLE, len(rows), len(netids), named, bridged)
+    if len(rows) < previous // 2:
+        raise SystemExit(f"{CORNELL_DIRECTORY_TABLE}: {len(rows)} entries, under half "
+                         f"of the {previous} loaded last time - keeping previous")
+    if named < len(rows) // 2:
+        raise SystemExit(f"{CORNELL_DIRECTORY_TABLE}: only {named} of {len(rows)} entries "
+                         "carry a name - wrong attribute names? keeping previous")
+    if dry_run:
+        logger.info("%s: --dry-run, not written", CORNELL_DIRECTORY_TABLE)
+        return len(rows)
+
+    now = datetime.datetime.utcnow().replace(microsecond=0)
+    db = db_conn()
+    try:
+        cur = db.cursor()
+        cur.execute(CORNELL_DIRECTORY_DDL)
+        db.commit()
+        # DELETE, not TRUNCATE, so a failed INSERT rolls back to the previous rows.
+        cur.execute(f"DELETE FROM {CORNELL_DIRECTORY_TABLE}")
+        cur.executemany(
+            f"INSERT INTO {CORNELL_DIRECTORY_TABLE} "
+            "(netid, display_name, given_name, surname, cwid, loaded_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            [r + (now,) for r in rows])
+        db.commit()
+    finally:
+        db.close()
+    logger.info("%s: reloaded, %d rows", CORNELL_DIRECTORY_TABLE, len(rows))
+    return len(rows)
+
+
 # Cornell HR loads after the identity upsert, so cornell_ithaca() reads last
 # month's appointments on the night a new file lands. Fine for a monthly feed.
 SIDE_TABLES = {GRAD_SCHOOL_TABLE: grad_school_faculty,
-               cornell_hr_feed.APPOINTMENT_TABLE: cornell_hr_appointments}
+               cornell_hr_feed.APPOINTMENT_TABLE: cornell_hr_appointments,
+               # after the HR load, which creates the roster view it reads
+               CORNELL_DIRECTORY_TABLE: cornell_directory}
 
 
 def load_side_tables(dry_run=False):
@@ -2200,6 +2292,11 @@ def demo():
     assert len(_cornell_batches(range(15030))) == 151, "one batch per 100 rostered"
     assert _cornell_filter(["a1", "b2"]) == "(|(uid=a1)(uid=b2))"
     assert _cornell_filter(["a*b"]) == r"(|(uid=a\2ab))", "filter metachars escaped"
+    assert _directory_row("ab12", {"cn": " Ann B. ", "givenName": "Ann", "sn": "B",
+                                   "cornellEduCWID": "ABC1001"}) == \
+        ("ab12", "Ann B.", "Ann", "B", "abc1001"), "trimmed, cwid lowercased"
+    assert _directory_row("ab12", {"cn": "", "cornellEduCWID": None}) == \
+        ("ab12", None, None, None, None), "blanks become NULL"
 
     # -- optional-source isolation -----------------------------------------
     # With the gate on, every Cornell abort site used to take the nightly WCM
