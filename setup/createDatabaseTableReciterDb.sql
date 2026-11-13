@@ -391,6 +391,8 @@ CREATE TABLE IF NOT EXISTS `analysis_summary_article` (
   `isbn` varchar(128) DEFAULT NULL,
   `editors` text DEFAULT NULL,
   `citationCountOpenAlex` int(11) DEFAULT NULL,
+  `peerReviewed` tinyint DEFAULT NULL,
+  `peerReviewedSource` enum('type-default','curator') DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `x` (`doi`) USING BTREE,
   KEY `z` (`pmid`) USING BTREE,
@@ -415,6 +417,7 @@ CREATE TABLE IF NOT EXISTS `analysis_summary_author` (
   `authors` varchar(1000) DEFAULT NULL,
   `authorsRTF` varchar(1000) DEFAULT NULL,
   `authorPosition` varchar(20) DEFAULT NULL,
+  `role` varchar(20) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `z` (`pmid`) USING BTREE,
   KEY `y` (`personIdentifier`) USING BTREE
