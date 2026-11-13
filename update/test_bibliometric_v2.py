@@ -161,4 +161,9 @@ ok("DROP TABLE IF EXISTS analysis_summary_person_peer_new;" in read("cleanup_sta
 ok("analysis_summary_person_peer_backup TO analysis_summary_person_peer" in read("restore_from_backup_v2.sql"),
    "setup/restore_from_backup_v2.sql lacks the cell table")
 
+# 6. a skipped 3v2 (v3.7 or analysis_nih absent) turns the later v2 steps off, like a failed one
+b3 = next(b for b in blocks if "SET v_step = '3v2." in b)
+ok(re.search(r"\n    ELSE\n        SET v_v2_ok = 0;", b3) is not None,
+   "STEP 3v2's skip branch must reset v_v2_ok so 5v2 and 6v2 don't run on unfilled flags")
+
 print(f"PASS test_bibliometric_v2 ({checks} checks)")

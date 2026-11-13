@@ -3905,6 +3905,7 @@ proc_main: BEGIN
                               CONCAT('research ', @v2_research, ', rated ', @v2_rated, ', recent ', @v2_recent));
         END IF;
     ELSE
+        SET v_v2_ok = 0;   -- article flags not filled tonight: 5v2 leaves the cell table empty, 6v2 skips
         CALL log_progress(v_job_id, v_step, 'Skipped (v3.11 / v3.7 not applied, or 2v2 off)', 'INFO', 0, NULL);
     END IF;
     -- <<< R2 (v3.11): STEP 3v2
