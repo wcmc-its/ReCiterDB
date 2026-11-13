@@ -390,6 +390,7 @@ CREATE TABLE IF NOT EXISTS `analysis_summary_article` (
   `publisher` varchar(255) DEFAULT NULL,
   `isbn` varchar(128) DEFAULT NULL,
   `editors` text DEFAULT NULL,
+  `citationCountOpenAlex` int(11) DEFAULT NULL,
   `peerReviewed` tinyint DEFAULT NULL,
   `peerReviewedSource` enum('type-default','curator') DEFAULT NULL,
   PRIMARY KEY (`id`),
@@ -888,6 +889,28 @@ CREATE TABLE IF NOT EXISTS `reporting_external_abstracts` (
   `fetched_at`   DATETIME     NOT NULL,
   PRIMARY KEY (`article_id`),
   KEY `idx_rea_fetched_at` (`fetched_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- External-article enrichment (v3.9): see table_article_enrichment_v3.9.sql.
+CREATE TABLE IF NOT EXISTS `article_enrichment` (
+  `article_id`              VARCHAR(96)  NOT NULL,
+  `doi`                     VARCHAR(255) NULL,
+  `issn`                    VARCHAR(9)   NULL,
+  `eissn`                   VARCHAR(9)   NULL,
+  `volume`                  VARCHAR(100) NULL,
+  `issue`                   VARCHAR(100) NULL,
+  `pages`                   VARCHAR(100) NULL,
+  `openalex_id`             VARCHAR(20)  NULL,
+  `openalex_created`        DATE         NULL,
+  `citation_count_scopus`   INT          NULL,
+  `citation_count_openalex` INT          NULL,
+  `pmcid`                   VARCHAR(20)  NULL,
+  `scopus_fetched_at`       DATETIME     NULL,
+  `openalex_fetched_at`     DATETIME     NULL,
+  `idconv_fetched_at`       DATETIME     NULL,
+  PRIMARY KEY (`article_id`),
+  KEY `idx_ae_scopus_fetched` (`scopus_fetched_at`),
+  KEY `idx_ae_openalex_fetched` (`openalex_fetched_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `reporting_ad_hoc_feature_generator_execution` (

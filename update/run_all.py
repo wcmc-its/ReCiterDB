@@ -492,6 +492,46 @@ def run_external_abstract_import():
         logger.exception(f"External-abstract import failed (ignored — reporting unaffected): {e}")
 
 
+
+def article_enrichment_cmd(mode, max_seconds=0):
+    """The command for ARTICLE_ENRICHMENT=off|dry-run|apply, or None when off. Anything
+    unrecognised is off: a typo in a CronJob env patch must not start writing.
+    max_seconds > 0 adds --max-seconds, the script's own per-batch deadline: run_script's
+    timeout is only checked when the script prints, and a pass prints only when it ends."""
+    mode = (mode or "off").strip().lower()
+    if mode == "apply":
+        cmd = "python3 enrichArticles.py --apply"
+    elif mode == "dry-run":
+        cmd = "python3 enrichArticles.py --dry-run"
+    else:
+        return None
+    return f"{cmd} --max-seconds {int(max_seconds)}" if max_seconds and max_seconds > 0 else cmd
+
+
+def run_article_enrichment():
+    """Fill article_enrichment (v3.9, PM #1105 5e) for external_article rows: ISSN, volume,
+    issue, pages and citation counts from OpenAlex and Scopus Search, PMCID from the NCBI ID
+    converter. Runs right after the external-article projection and abstract import, and
+    before nightlyIndexing, so STEP 6b joins tonight's values.
+
+    SHIPS OFF: ARTICLE_ENRICHMENT unset (or anything but dry-run/apply) skips it. Before
+    setting it: apply setup/table_article_enrichment_v3.9.sql (--apply refuses without it)
+    and reload the SP. Set the env with `kubectl set env`, never `kubectl apply`. Isolated:
+    timed out (ENRICH_TIMEOUT_SECONDS, default 1200) and any failure is logged, leaving
+    stale or missing enrichment; it can NEVER fail the nightly."""
+    try:
+        timeout = int(os.getenv("ENRICH_TIMEOUT_SECONDS", "1200"))
+        # The script stops starting batches a minute before the hard timeout (one batch can
+        # take a while under retries), so it normally ends on its own and prints its stats.
+        cmd = article_enrichment_cmd(os.getenv("ARTICLE_ENRICHMENT"), max(timeout - 60, 60))
+        if not cmd:
+            logger.info("Article enrichment: ARTICLE_ENRICHMENT=%s — skipped",
+                        os.getenv("ARTICLE_ENRICHMENT") or "off")
+            return
+        run_script("articleEnrichment", cmd, timeout_seconds=timeout)
+    except Exception as e:
+        logger.exception(f"Article enrichment failed (ignored — reporting unaffected): {e}")
+
 # ------------- AAR nightly closer: dismiss already-attributed open rows (#186) -------------
 def run_aar_close_attributed():
     """Nightly DB-side closer for open AAR rows ReCiter has already attributed.
@@ -628,6 +668,7 @@ def main():
     # so a failure here degrades to stale/empty external pubs, never a failed nightly.
     run_external_article_etl()
     run_external_abstract_import()
+    run_article_enrichment()          # OFF unless ARTICLE_ENRICHMENT=dry-run|apply (5e, v3.9)
 
     for name, cmd in scripts:
         #ok = run_script(name, cmd)

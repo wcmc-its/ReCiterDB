@@ -105,4 +105,14 @@ spec:
                 configMapKeyRef:
                   name: reciterdb-configmap
                   key: S3_KEY_PREFIX
+            # OpenAlex polite-pool contact for externalAbstractImport.py, the AAR OpenAlex lane
+            # and enrichArticles.py (5e). optional: the key may be absent from the configmap.
+            # ARTICLE_ENRICHMENT (off|dry-run|apply) is deliberately NOT listed: it ships off
+            # and is turned on live with `kubectl set env` (see the v3.9 migration header).
+            - name: OPENALEX_MAILTO
+              valueFrom:
+                configMapKeyRef:
+                  name: reciterdb-configmap
+                  key: OPENALEX_MAILTO
+                  optional: true
           restartPolicy: OnFailure
