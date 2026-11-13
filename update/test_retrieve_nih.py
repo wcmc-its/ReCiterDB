@@ -252,10 +252,36 @@ for _h in list(run_all.logger.handlers):
     if isinstance(_h, run_all.logging.StreamHandler) and not isinstance(_h, run_all.logging.FileHandler):
         run_all.logger.removeHandler(_h)
 
+class _ListHandler(run_all.logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+logging.disable(logging.NOTSET)  # capture the closing lines; the console handler is gone
+run_all.logger.propagate = False  # keep them off retrieveNIH's root console handler
+_lh = _ListHandler()
+run_all.logger.addHandler(_lh)
 code, ran = run_all_main({"retrieveNIH"})
+run_all.logger.removeHandler(_lh)
 check("nightlyIndexing" in ran and ran[-1] == "conflictsImport",
       f"retrieveNIH failure: the rest of the pipeline still runs ({ran})")
 check(code == 0, f"retrieveNIH failure does not fail the job (no restart of the nightly) ({code})")
+check(not any("All scripts completed successfully" in m for m in _lh.messages)
+      and any("non-blocking step(s) failed: retrieveNIH" in m for m in _lh.messages),
+      "a run with a failed retrieveNIH is not logged as a full success")
+
+_lh = _ListHandler()
+run_all.logger.addHandler(_lh)
+code, ran = run_all_main(set())
+run_all.logger.removeHandler(_lh)
+check(code == 0 and any("All scripts completed successfully" in m for m in _lh.messages),
+      f"a clean run still logs full success ({code})")
+run_all.logger.propagate = True
+logging.disable(logging.CRITICAL)
 
 code, ran = run_all_main({"retrieveArticles"})
 check("retrieveNIH" not in ran and code == 1, f"other failures still stop the pipeline ({ran}, {code})")

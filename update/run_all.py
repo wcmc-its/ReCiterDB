@@ -685,6 +685,11 @@ def main():
         logger.error("One or more scripts failed ❌")
         sys.exit(1)
 
+    # --- R1 (PM #1105): don't call a run with a failed non-blocking step a full success ---
+    if soft_failures:
+        logger.warning(f"Pipeline completed, but non-blocking step(s) failed: {', '.join(soft_failures)}")
+        sys.exit(0)
+    # --- end R1 ---
     logger.info("All scripts completed successfully 🎉")
     sys.exit(0)
 
