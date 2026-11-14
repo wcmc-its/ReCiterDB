@@ -1303,7 +1303,7 @@ proc_main: BEGIN
 
     -- ========================================================================
     -- STEP 6b: UNION EXTERNAL-SOURCE PUBLICATIONS (ReCiterDB #101, Option B)
-    -- Inject non-suppressed external_article rows (manually-added Scopus/OpenAlex/
+    -- Inject the counted external_article rows (manually-added Scopus/OpenAlex/
     -- WOS pubs) into the person-publication staging tables. Runs AFTER all
     -- bibliometric computation (STEPs 4-6) and BEFORE the atomic swap, so external
     -- pubs appear in the live publication list WITHOUT affecting any count /
@@ -1318,6 +1318,17 @@ proc_main: BEGIN
     -- (v3.7, below), plus ISSN / volume / issue / pages / PMCID and Scopus + OpenAlex
     -- citation counts from article_enrichment (v3.9, below). Still no NIH or Mendeley
     -- data and no RTF.
+    -- Which links count (R3, PM #1104 plan 3b-3e) is decided once, in temp_external_live:
+    --   - status = 'ACCEPTED' once the projection has the v3.6 status column (a NULL
+    --     status falls back to suppressed = 0); before v3.6, suppressed = 0. The other six
+    --     states (PENDING, REJECTED, REMOVED, MERGED, AUTOMERGED, SUPERSEDED) stay out.
+    --   - an external_record row with a type_notice (erratum / retraction) stays out
+    --     (plan decision 4).
+    --   - supersede guard (plan decision 3): a link whose normalized DOI is also an
+    --     ACCEPTED person_article row for the same person stays out, so a PubMed twin is
+    --     never counted twice even when a reconcile was missed.
+    --   - author position comes from external_record.target_author_index / author_count
+    --     when set, before the authorship_review lookup.
     -- ========================================================================
     SET v_step = '6b. Union external-source publications';
 
@@ -1332,11 +1343,87 @@ proc_main: BEGIN
             syn_pmid   INT NOT NULL,
             PRIMARY KEY (article_id)
         );
-        -- One synthetic negative pmid per DISTINCT non-suppressed article_id, so a
+        -- The counted links, one row per (uid, article_id); every statement below joins
+        -- to it instead of filtering external_article itself.
+        DROP TABLE IF EXISTS temp_external_live;
+        CREATE TABLE temp_external_live (
+            uid                 VARCHAR(64) NOT NULL,
+            article_id          VARCHAR(96) NOT NULL,
+            target_author_index SMALLINT    NULL,
+            author_count        SMALLINT    NULL,
+            pm_touched          TINYINT     NOT NULL DEFAULT 0,
+            PRIMARY KEY (uid, article_id)
+        ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+        IF EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = DATABASE() AND table_name = 'external_article'
+                     AND column_name = 'status') THEN
+            INSERT INTO temp_external_live (uid, article_id)
+            SELECT uid, article_id
+            FROM external_article
+            WHERE status = 'ACCEPTED' OR (status IS NULL AND suppressed = 0);
+        ELSE
+            INSERT INTO temp_external_live (uid, article_id)
+            SELECT uid, article_id
+            FROM external_article
+            WHERE suppressed = 0;
+        END IF;
+        SET v_rows = ROW_COUNT();
+        CALL log_progress(v_job_id, v_step, 'Selected accepted external links', 'INFO', v_rows, NULL);
+
+        -- The system of record (v3.6) carries the person's position in the byline and the
+        -- erratum / retraction notice; the projection carries neither.
+        IF EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = DATABASE() AND table_name = 'external_record'
+                     AND column_name = 'target_author_index')
+           AND EXISTS (SELECT 1 FROM information_schema.columns
+                       WHERE table_schema = DATABASE() AND table_name = 'external_record'
+                         AND column_name = 'type_notice') THEN
+            UPDATE temp_external_live l
+            JOIN external_record r ON r.uid = l.uid AND r.article_id = l.article_id
+            SET l.target_author_index = r.target_author_index,
+                l.author_count        = r.author_count,
+                l.pm_touched          = r.pm_touched;
+
+            DELETE l FROM temp_external_live l
+            JOIN external_record r ON r.uid = l.uid AND r.article_id = l.article_id
+            WHERE r.type_notice IS NOT NULL;
+            SET v_rows = ROW_COUNT();
+            CALL log_progress(v_job_id, v_step, 'Left out erratum / retraction notices', 'INFO', v_rows, NULL);
+        END IF;
+
+        -- Supersede guard. DOIs normalized as external_record.doi_norm is; only the people
+        -- who have external links are read from person_article.
+        DROP TABLE IF EXISTS temp_external_twin_doi;
+        CREATE TABLE temp_external_twin_doi (
+            uid      VARCHAR(64)  NOT NULL,
+            doi_norm VARCHAR(255) NOT NULL,
+            PRIMARY KEY (uid, doi_norm)
+        ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        INSERT IGNORE INTO temp_external_twin_doi (uid, doi_norm)
+        SELECT d.uid, d.doi_norm
+        FROM (SELECT pa.personIdentifier AS uid,
+                     LEFT(REGEXP_REPLACE(LOWER(TRIM(pa.doi)), '^(https?://(dx\\.)?doi\\.org/|doi:[[:space:]]*)', ''), 255) AS doi_norm
+              FROM (SELECT DISTINCT uid FROM temp_external_live) u
+              JOIN person_article pa ON pa.personIdentifier = u.uid
+              WHERE pa.userAssertion = 'ACCEPTED' AND pa.doi IS NOT NULL) d
+        WHERE d.doi_norm <> '';
+
+        DELETE l FROM temp_external_live l
+        JOIN external_article e ON e.uid = l.uid AND e.article_id = l.article_id
+        JOIN temp_external_twin_doi d
+          ON d.uid = l.uid
+         AND d.doi_norm = LEFT(REGEXP_REPLACE(LOWER(TRIM(e.doi)), '^(https?://(dx\\.)?doi\\.org/|doi:[[:space:]]*)', ''), 255)
+        WHERE e.doi IS NOT NULL;
+        SET v_rows = ROW_COUNT();
+        CALL log_progress(v_job_id, v_step, 'Left out links whose DOI is an accepted PubMed article (supersede guard)', 'INFO', v_rows, NULL);
+        DROP TABLE IF EXISTS temp_external_twin_doi;
+
+        -- One synthetic negative pmid per DISTINCT counted article_id, so a
         -- paper co-added by several WCM authors shares a single article row.
         INSERT INTO temp_external_pmid (article_id, syn_pmid)
         SELECT article_id, -1 * ROW_NUMBER() OVER (ORDER BY article_id)
-        FROM (SELECT DISTINCT article_id FROM external_article WHERE suppressed = 0) d;
+        FROM (SELECT DISTINCT article_id FROM temp_external_live) d;
 
         -- Article-detail rows (one per synthetic pmid). Text fields LEFT()-clamped to
         -- the target column widths so a long external title/venue can't error under
@@ -1361,8 +1448,8 @@ proc_main: BEGIN
             -- syn_pmid (temp_external_pmid PK is article_id), so MAX() is exact.
             MAX(t.article_id)
         FROM external_article e
+        JOIN temp_external_live l ON l.uid = e.uid AND l.article_id = e.article_id
         JOIN temp_external_pmid t ON t.article_id = e.article_id
-        WHERE e.suppressed = 0
         GROUP BY t.syn_pmid;
         SET v_rows = ROW_COUNT();
         CALL log_progress(v_job_id, v_step, 'Inserted external article rows', 'INFO', v_rows, NULL);
@@ -1383,9 +1470,10 @@ proc_main: BEGIN
             LEFT JOIN pub_type_map m
                    ON m.source = a.source_type
                   AND m.source_type = LOWER(REGEXP_REPLACE(TRIM(a.publicationTypeCanonical), '[[:space:]_]+', '-'))
-            LEFT JOIN (SELECT article_id, MIN(date_added) AS date_added
-                       FROM external_article WHERE suppressed = 0
-                       GROUP BY article_id) d ON d.article_id = a.article_id
+            LEFT JOIN (SELECT e.article_id, MIN(e.date_added) AS date_added
+                       FROM external_article e
+                       JOIN temp_external_live l ON l.uid = e.uid AND l.article_id = e.article_id
+                       GROUP BY e.article_id) d ON d.article_id = a.article_id
             SET a.pubType          = m.pub_type,
                 a.pubTypeGroup     = m.pub_type_group,
                 a.pubTypeCounted   = COALESCE(m.counted, 1),
@@ -1417,9 +1505,10 @@ proc_main: BEGIN
                        WHERE table_schema = DATABASE() AND table_name = 'external_article'
                          AND column_name = 'publisher') THEN
             UPDATE analysis_summary_article_new a
-            JOIN (SELECT article_id, MAX(publisher) AS publisher, MAX(isbn) AS isbn, MAX(editors) AS editors
-                  FROM external_article WHERE suppressed = 0
-                  GROUP BY article_id) d ON d.article_id = a.article_id
+            JOIN (SELECT e.article_id, MAX(e.publisher) AS publisher, MAX(e.isbn) AS isbn, MAX(e.editors) AS editors
+                  FROM external_article e
+                  JOIN temp_external_live l ON l.uid = e.uid AND l.article_id = e.article_id
+                  GROUP BY e.article_id) d ON d.article_id = a.article_id
             SET a.publisher = LEFT(d.publisher, 255),
                 a.isbn      = LEFT(d.isbn, 128),
                 a.editors   = d.editors
@@ -1600,34 +1689,42 @@ proc_main: BEGIN
             CALL log_progress(v_job_id, v_step, 'Resolved external author positions', 'INFO', v_rows, NULL);
         END IF;
 
-        -- Person -> publication link rows (one per uid + article_id). A record with no
-        -- accepted review row (a manual Add-tab add) falls back to the byline and position
-        -- the ETL built from its stored author list (v3.5 columns). Before v3.5 is applied
-        -- those columns are absent, so the pre-v3.5 statement runs instead.
+        -- Person -> publication link rows (one per uid + article_id).
+        -- authorPosition: external_record.target_author_index / author_count when set (1 =
+        -- 'first', = author_count = 'last', else middle = NULL), then the accepted review
+        -- row's label, then the v3.5 author_position the ETL built from the stored author list.
+        -- authors: a row Publication Manager wrote (pm_touched) uses its own byline, which PM
+        -- builds around target_author_index; otherwise the review row's, then the v3.5 byline.
+        -- Before v3.5 is applied those columns are absent, so the pre-v3.5 statement runs.
         IF EXISTS (SELECT 1 FROM information_schema.columns
                    WHERE table_schema = DATABASE() AND table_name = 'external_article'
                      AND column_name = 'byline') THEN
             INSERT INTO analysis_summary_author_new (pmid, personIdentifier, authorPosition, authors)
             SELECT t.syn_pmid, e.uid,
-                   IF(p.uid IS NULL, e.author_position, p.author_position),
-                   IF(p.uid IS NULL, e.byline, p.authors)
+                   CASE WHEN l.target_author_index IS NOT NULL
+                             THEN CASE WHEN l.target_author_index = 1 THEN 'first'
+                                       WHEN l.target_author_index = l.author_count THEN 'last' END
+                        WHEN p.uid IS NULL THEN e.author_position
+                        ELSE p.author_position END,
+                   IF(p.uid IS NULL OR l.pm_touched = 1, e.byline, p.authors)
             FROM external_article e
+            JOIN temp_external_live l ON l.uid = e.uid AND l.article_id = e.article_id
             JOIN temp_external_pmid t ON t.article_id = e.article_id
-            LEFT JOIN temp_external_position p ON p.uid = e.uid AND p.article_id = e.article_id
-            WHERE e.suppressed = 0;
+            LEFT JOIN temp_external_position p ON p.uid = e.uid AND p.article_id = e.article_id;
         ELSE
             INSERT INTO analysis_summary_author_new (pmid, personIdentifier, authorPosition, authors)
             SELECT t.syn_pmid, e.uid, p.author_position, p.authors
             FROM external_article e
+            JOIN temp_external_live l ON l.uid = e.uid AND l.article_id = e.article_id
             JOIN temp_external_pmid t ON t.article_id = e.article_id
-            LEFT JOIN temp_external_position p ON p.uid = e.uid AND p.article_id = e.article_id
-            WHERE e.suppressed = 0;
+            LEFT JOIN temp_external_position p ON p.uid = e.uid AND p.article_id = e.article_id;
         END IF;
         SET v_rows = ROW_COUNT();
         CALL log_progress(v_job_id, v_step, 'Inserted external author-link rows', 'INFO', v_rows, NULL);
 
         DROP TABLE IF EXISTS temp_external_pmid;
         DROP TABLE IF EXISTS temp_external_position;
+        DROP TABLE IF EXISTS temp_external_live;
 
         IF v_error_occurred THEN
             -- External injection is supplementary; log and clear the flag so a hiccup
