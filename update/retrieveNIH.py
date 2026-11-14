@@ -105,6 +105,42 @@ def get_nih_records(nih_api_url, max_retries=5, backoff_factor=1):
     logger.error(f"Failed to retrieve data after {max_retries} attempts for URL {nih_api_url}")
     return []
 
+# --- has_percentile / has_rcr (PM #1105 plan PR R1) ---------------------------------------
+# iCite returns null for a missing percentile or RCR. The CSV writes None as '', and LOAD DATA
+# turns '' into 0 in a FLOAT column, so nih_percentile 0.00 means either "missing" or "genuinely
+# zero". These two flags record which: 1 = iCite returned a value (0.0 included), 0 = it
+# returned null. nih_percentile and relative_citation_ratio themselves are written exactly as
+# before (None -> '' -> 0), so every existing reader (v1 bibliometric report, SPS) is unchanged.
+# Rows loaded before the columns existed read NULL (unknown).
+NIH_FLAG_COLUMNS = ['has_percentile', 'has_rcr']
+
+
+def nih_flag_values(record):
+    """[has_percentile, has_rcr] for one iCite record: 1 when iCite returned a value, else 0."""
+    return [0 if get_dict_value(record, "nih_percentile") is None else 1,
+            0 if get_dict_value(record, "relative_citation_ratio") is None else 1]
+
+
+def staging_has_flag_columns(mysql_cursor, table_name="analysis_nih_new"):
+    """True when table_name carries both flag columns. The staging table is CREATE TABLE ...
+    LIKE analysis_nih, so this is True once setup/alter_analysis_nih_has_flags_v3.11.sql has
+    been applied to the live table. Until then the loader skips the flags (see
+    nih_load_columns) instead of failing the load."""
+    mysql_cursor.execute(
+        "SELECT COUNT(*) AS cnt FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() AND table_name = %s AND column_name IN (%s, %s)",
+        (table_name, NIH_FLAG_COLUMNS[0], NIH_FLAG_COLUMNS[1]))
+    return mysql_cursor.fetchone()['cnt'] == len(NIH_FLAG_COLUMNS)
+
+
+def nih_load_columns(base_columns, flags_present):
+    """LOAD DATA column list for the analysis_nih CSV, which always carries the two flag
+    fields last. Without the columns, the flags are read into user variables and dropped."""
+    if flags_present:
+        return list(base_columns) + NIH_FLAG_COLUMNS
+    return list(base_columns) + ['@' + c for c in NIH_FLAG_COLUMNS]
+# --- end has_percentile / has_rcr ----------------------------------------------------------
+
 def write_records_to_csv(records, csv_files):
     """Write records to CSV files for analysis_nih, analysis_nih_cites, and analysis_nih_cites_clin."""
     nih_writer, cites_writer, cites_clin_writer = csv_files
@@ -134,7 +170,7 @@ def write_records_to_csv(records, csv_files):
                 get_dict_value(record, "apt"),
                 get_dict_value(record, "x_coord"),
                 get_dict_value(record, "y_coord")
-            ]
+            ] + nih_flag_values(record)  # has_percentile, has_rcr (R1): always the last two fields
             nih_writer.writerow(nih_record)
             nih_count += 1
 
@@ -167,7 +203,7 @@ def write_records_to_csv(records, csv_files):
 
 def load_data_into_db(mysql_db, mysql_cursor, table_name, csv_file_path, columns):
     """Use LOAD DATA LOCAL INFILE to bulk load data into the database."""
-    columns_str = ', '.join(f'`{col}`' for col in columns)
+    columns_str = ', '.join(col if col.startswith('@') else f'`{col}`' for col in columns)
     sql = f"""
     LOAD DATA LOCAL INFILE '{csv_file_path}'
     INTO TABLE {table_name}
@@ -341,8 +377,10 @@ def check_production_integrity(mysql_cursor, table_name, key_column='pmid'):
 
 #########
 
-if __name__ == '__main__':
-	
+def main():
+    """Run the iCite load. Returns the process exit code: 0 only when the new data was
+    validated and swapped in. Any load, validation or swap failure returns 1 (R1), so the
+    step is logged as failed instead of leaving a stale table behind a success line."""
     DB_USERNAME = os.getenv('DB_USERNAME')
     DB_PASSWORD = os.getenv('DB_PASSWORD')
     DB_HOST = os.getenv('DB_HOST')
@@ -372,7 +410,7 @@ if __name__ == '__main__':
         reciter_db.commit()
         reciter_db_cursor.close()
         reciter_db.close()
-        exit(1)
+        return 1
 
     # Prepare columns for analysis_nih table
     analysis_nih_columns = [
@@ -468,7 +506,12 @@ if __name__ == '__main__':
     # Check if CSV files are not empty before loading into STAGING tables
     if os.path.getsize(nih_csv_path) > 0:
         # Load data into the STAGING table (not production)
-        load_data_into_db(reciter_db, reciter_db_cursor, "analysis_nih_new", nih_csv_path, analysis_nih_columns)
+        flags_present = staging_has_flag_columns(reciter_db_cursor, "analysis_nih_new")
+        if not flags_present:
+            logger.warning("analysis_nih has no has_percentile/has_rcr columns; loading without "
+                           "them. Apply setup/alter_analysis_nih_has_flags_v3.11.sql to fill them.")
+        load_data_into_db(reciter_db, reciter_db_cursor, "analysis_nih_new", nih_csv_path,
+                          nih_load_columns(analysis_nih_columns, flags_present))
     else:
         logger.error(f"No data in {nih_csv_path}. Skipping data load for analysis_nih.")
         load_success = False
@@ -502,6 +545,7 @@ if __name__ == '__main__':
         else:
             logger.error("Atomic table swap failed. Attempting to restore from backup...")
             restore_from_backup(reciter_db, reciter_db_cursor, NIH_TABLES)
+            load_success = False
     else:
         logger.error("Data load failed. Cleaning up staging tables...")
         cleanup_staging_tables(reciter_db_cursor, NIH_TABLES)
@@ -518,3 +562,13 @@ if __name__ == '__main__':
     reciter_db_cursor.close()
     reciter_db.close()
     logger.info("Database connection closed.")
+
+    if not load_success:
+        logger.error("FAILED: iCite data was NOT refreshed; analysis_nih keeps the previous load. "
+                     "Exiting non-zero.")
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
