@@ -27,6 +27,7 @@ COPY update/enrichArticles.py ./
 COPY update/run_all.py ./
 COPY update/updateOrcidSuggestions.py ./
 COPY update/authorIdSuggestions.py ./
+COPY update/importHarvest.py ./
 
 # Nightly identity build from ED (LDAP) + ASMS (MSSQL). Replaces the Splunk
 # saved search "reciter identity update". Own CronJob (k8-cronjob-identity.yaml),
