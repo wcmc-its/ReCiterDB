@@ -18,7 +18,12 @@ And home to the CAMPUS SCOPE (Cornell Ithaca onboarding, risks R1/R6). One index
 exactly one campus's roster; `candidates()` is untouched by the scoping, because the
 records of every other campus are never indexed in the first place. See `CAMPUS_WCM`.
 
-Env: DB_USERNAME/DB_PASSWORD/DB_HOST/DB_NAME (reciterdb, read-only).
+And to the VENUE TERM (v3.13): on the external lanes a candidate whose department
+publishes in the venue's subfield gains a little `confidence`, and one whose department
+never does loses a little. Cornell Ithaca only, off unless AAR_VENUE_FIT=on. See
+`venue_fit_enabled`.
+
+Env: DB_USERNAME/DB_PASSWORD/DB_HOST/DB_NAME (reciterdb, read-only); AAR_VENUE_FIT.
 """
 import logging, os, re, unicodedata
 
@@ -484,6 +489,44 @@ def temporal_penalty(years_after_wcm):
                      TEMPORAL_PENALTY_CAP), 3)
 
 
+# ---- venue fit ---------------------------------------------------------------
+# The Scopus and OpenAlex lanes have no identity-only score: name and affiliation text
+# are all a candidate is ranked on, and an initials-only byline leaves the name saying
+# very little. What the paper was published IN is evidence the row already carries and
+# the matcher never read. `venue_fit.DeptVenueFit` scores a (department, venue subfield)
+# pair from the campus's own accepted authorships, and `venue_fit.venue_term` turns the
+# score into a bounded term: +0.15 where the department publishes there well above the
+# campus rate, -0.20 where it essentially never does, nothing in between or when the
+# venue or the department is unknown.
+#
+# IT REACHES RANKING ONLY THROUGH `confidence`, exactly like the temporal penalty above
+# and for the same reason. `_rank_key` is unchanged, so the term reorders candidates the
+# given-name tier and the affiliation match leave tied and nothing else. That is the
+# measured optimum and not caution: replayed over 2,772 adjudicated multi-candidate
+# Cornell rows (2026-11-16) the term in this position fixed 88 top picks and broke 17,
+# while letting a good fit outrank the given-name tier fixed 62 and broke 130.
+#
+# RANK, DO NOT DECIDE. The term never drops a candidate, never accepts or rejects a row,
+# and is smaller than the 0.25 a tier or an affiliation match is worth. The people it
+# penalises are the interdisciplinary and the newly hired, whose papers really are in an
+# unusual field for their department; they stay on the card.
+#
+# CORNELL ITHACA ONLY, AND OFF BY DEFAULT. Every measurement behind the term is on Ithaca
+# Scopus rows. WCM rows have not been replayed, and until they are a WCM index never
+# holds a fit table, whatever it is handed; `load()` builds one only for the Ithaca roster
+# and only when AAR_VENUE_FIT is "on".
+#
+# NOTHING CHANGES UNTIL BOTH HALVES ARE PRESENT. A candidate gains the `venue_fit` key,
+# and its confidence the term, only when the index holds a fit table AND the caller passed
+# a venue subfield AND the table can score that department. In every other case -- the
+# feature off, a WCM index, the PubMed lane (which passes no subfield), a venue with no
+# category, a department under 20 training rows -- the candidate dict is byte-for-byte
+# what it was, and so is the candidate_cwids_json the lanes store from it.
+def venue_fit_enabled():
+    """AAR_VENUE_FIT=on. Anything else, a typo included, is off."""
+    return (os.environ.get("AAR_VENUE_FIT") or "").strip().lower() == "on"
+
+
 # ---- candidate label -------------------------------------------------------
 def _display_name(rec, via="directory"):
     """The label a curator reads for a candidate: ONE name, the FULL name of the source
@@ -642,8 +685,12 @@ class IdentityIndex:
     the sibling modules' self-tests is therefore WCM, exactly as before, and so is
     every row `_record` builds today (see `_campus_person_types`)."""
 
-    def __init__(self, records, campus=CAMPUS_WCM, alternate_names=None):
+    def __init__(self, records, campus=CAMPUS_WCM, alternate_names=None, dept_venue_fit=None):
         self.campus = campus
+        # The department x subfield table behind the venue term (see the venue-fit block
+        # above), or None: no term, no `venue_fit` key, today's output. Kept only on an
+        # Ithaca index -- the scope decision is enforced here, not left to each caller.
+        self.dept_venue_fit = dept_venue_fit if campus == CAMPUS_ITHACA else None
         self.by_surname = {}
         self.n_other_campus = 0          # observability: how many the scope excluded
         self.n_alt_names = 0             # ...and how many alternate-name copies were indexed
@@ -800,9 +847,38 @@ class IdentityIndex:
             for cwid, names in accepted_byline_names(c.execute(
                     text(_ACCEPTED_BYLINES_SQL), {"min": ACCEPTED_BYLINE_MIN}).mappings()).items():
                 alternate_names[cwid] = names + alternate_names.get(cwid, [])
+            # Last on this connection, so a failed venue query cannot disturb a read the
+            # roster depends on.
+            dept_venue_fit = cls._load_dept_venue_fit(c, campus)
         return cls([cls._record(r, campus_types.get(r["cwid"], ()), r["cwid"] in linked)
                     for r in rows],
-                   campus=campus, alternate_names=alternate_names)
+                   campus=campus, alternate_names=alternate_names,
+                   dept_venue_fit=dept_venue_fit)
+
+    @staticmethod
+    def _load_dept_venue_fit(conn, campus):
+        """The campus's `venue_fit.DeptVenueFit`, or None when the venue term does not
+        apply: AAR_VENUE_FIT is not "on", or this is not the Ithaca roster.
+
+        The opposite failure rule from `_campus_person_types`, on purpose. A roster with
+        unknown campus labels is wrong, so that query aborts the load. A roster with no
+        fit table is merely the roster of the day before the feature existed, so ANY
+        failure here -- no venue_fit module, no table, a bad query -- is logged and
+        returns None, and the lane runs without the term."""
+        if campus != CAMPUS_ITHACA or not venue_fit_enabled():
+            return None
+        try:
+            import venue_fit
+            fit = venue_fit.load_dept_fit(conn, campus)
+            logging.getLogger(__name__).info(
+                "venue fit: %d training rows, %d departments with >= %d",
+                fit.total, sum(1 for n in fit.n_d.values() if n >= venue_fit.MIN_DEPT),
+                venue_fit.MIN_DEPT)
+            return fit
+        except Exception as e:                                       # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "venue fit unavailable (%r); matching without the venue term", e)
+            return None
 
     @staticmethod
     def _record(r, campus_types=(), cornell_linked=False):
@@ -859,8 +935,15 @@ class IdentityIndex:
         }
 
     def candidates(self, last, fore=None, initials=None, affiliations=None, top_k=5,
-                   pub_year=None, _swapped=False):
+                   pub_year=None, venue_subfield=None, _swapped=False):
         """Ranked candidate CWIDs for one authorship (no identity-only score yet).
+
+        `venue_subfield` is the Science-Metrix subfield of the paper's venue
+        (`venue_fit.subfield_for`); pass it to enable the venue term. It does anything
+        only on an index that holds a fit table (`dept_venue_fit`): each candidate the
+        table can score gains a `venue_fit` key and the term in its `confidence`.
+        Omitted, or on an index with no table, the output is exactly what it was. Like
+        the temporal penalty it reaches the sort through `confidence` alone.
 
         `pub_year` is the paper's publication year; pass it to enable the temporal
         penalty (omitted -> `years_after_wcm` is None everywhere and ranking is exactly
@@ -891,7 +974,7 @@ class IdentityIndex:
             # real surname ("Scott") never gets here. Widen if a measured case needs it.
             if fore and not _swapped:
                 out, _ = self.candidates(fore, last, None, affiliations, top_k, pub_year,
-                                         _swapped=True)
+                                         venue_subfield, _swapped=True)
                 out = [c for c in out if c["given_match"] == "full"]
                 for c in out:
                     c["cohort_size"] = len(out)
@@ -1039,11 +1122,13 @@ class IdentityIndex:
         cohort = list(best.values())
 
         cohort_size = len(cohort)
+        fit_table = self.dept_venue_fit if venue_subfield else None
         out = []
         for rec, given_match, via in cohort:
             affil_match, where = self._affil_match(rec, affil_toks)
             gap = (pub_year - rec["end_year"]) if (pub_year and rec["end_year"]) else None
             penalty = temporal_penalty(gap)
+            fit = fit_table.fit(rec["dept"], venue_subfield) if fit_table else None
             out.append({
                 "cwid": rec["cwid"],
                 "name": _display_name(rec, via),
@@ -1058,7 +1143,8 @@ class IdentityIndex:
                 "cohort_size": cohort_size,
                 "years_after_wcm": gap,
                 "confidence": self._confidence(given_match, cohort_size, affil_match,
-                                               rec["historical"], penalty),
+                                               rec["historical"], penalty,
+                                               fit_table.term(fit) if fit_table else 0.0),
             })
             if self.campus != CAMPUS_WCM:
                 # Only off-WCM candidates say which campus they are: a WCM entry stays
@@ -1066,6 +1152,10 @@ class IdentityIndex:
                 # replay that diffs it), and "no campus key is WCM" is already this
                 # file's rule for records.
                 out[-1]["campus"] = self.campus
+            if fit is not None:
+                # Same rule, same reason: the key exists only where there is a number.
+                # A candidate the table cannot score carries no key and no term.
+                out[-1]["venue_fit"] = fit
         out.sort(key=_rank_key, reverse=True)
         return out[:top_k], cohort_size
 
@@ -1127,16 +1217,19 @@ class IdentityIndex:
         return False, None
 
     @staticmethod
-    def _confidence(given_match, cohort_size, affil_match, historical, penalty=0.0):
+    def _confidence(given_match, cohort_size, affil_match, historical, penalty=0.0,
+                    venue=0.0):
         """Explainable ordering aid, NOT a probability. `historical` is the flat
         person-type flag (alumni/inactive/emeritus); `penalty` is the already-capped
         temporal term from `temporal_penalty`, applied exactly once and ONLY here —
-        this is the single route by which staleness reaches either sort key."""
+        this is the single route by which staleness reaches either sort key. `venue` is
+        the signed, already-bounded term from `venue_fit.venue_term` (+0.15 / -0.20 / 0),
+        added before the clip and likewise the venue's only route to either key."""
         base = 0.50 if given_match == "full" else 0.25 if given_match == "initial" else 0.15
         rarity = 0.40 / max(cohort_size, 1)
         affil = 0.25 if affil_match else 0.0
         hist = -0.10 if historical else 0.0
-        return round(max(0.0, min(1.0, base + rarity + affil + hist - penalty)), 3)
+        return round(max(0.0, min(1.0, base + rarity + affil + hist - penalty + venue)), 3)
 
 
 # ---- per-byline campus routing ---------------------------------------------
@@ -1178,6 +1271,10 @@ class CampusRoster:
     combined count is the cohort, as for `both`. No linked match -> the Ithaca answer
     exactly.
 
+    `venue_subfield` is forwarded to both indexes. Only the Ithaca one can hold a fit
+    table (see the venue-fit block above), so on any byline the WCM entries are exactly
+    what they were and only Cornell candidates carry `venue_fit`.
+
     `campus` / `by_surname` answer as the WCM index does, for the callers that assert
     the lane's campus or log the roster size."""
 
@@ -1215,9 +1312,9 @@ class CampusRoster:
                                                           alternate_names=alternate_names))
 
     def candidates(self, last, fore=None, initials=None, affiliations=None, top_k=5,
-                   pub_year=None, campuses=None):
+                   pub_year=None, campuses=None, venue_subfield=None):
         campuses = campuses or byline_campuses(affiliations)
-        args = (last, fore, initials, affiliations, top_k, pub_year)
+        args = (last, fore, initials, affiliations, top_k, pub_year, venue_subfield)
         if CAMPUS_ITHACA not in campuses:
             return self.wcm.candidates(*args)
         self.n_ithaca_bylines += 1
@@ -1229,7 +1326,8 @@ class CampusRoster:
             linked = self.wcm.cornell_linked
             # top_k=None: the whole ranked WCM cohort (candidates() only slices by it).
             w = [d for d in (self.wcm.candidates(last, fore, initials, affiliations,
-                                                 None, pub_year)[0] if linked else [])
+                                                 None, pub_year, venue_subfield)[0]
+                             if linked else [])
                  if d["cwid"] in linked]
             if not w:
                 return c, c_n
@@ -2346,6 +2444,216 @@ def _selftest():
         ("assembly: an explicit `campuses` overrides the text",
          [c["cwid"] for c in roster.candidates("Smith", "John", "J", wcm_aff,
                                                 campuses={CAMPUS_ITHACA})[0]] == ["js123"]),
+    ]
+
+    # --- venue fit (v3.13) -----------------------------------------------------------
+    # Physics has 20 accepted rows, all in Optics; the Law School 100, all in Law. So
+    # (venue_fit's own selftest works these by hand):
+    #   fit(Physics, Optics)    =  1.586  -> +0.15     fit(Physics, Law)       = -1.609 -> -0.20
+    #   fit(Law School, Law)    =  0.189  ->  0        fit(Law School, Optics) = -3.045 -> -0.20
+    from venue_fit import DeptVenueFit
+    table = DeptVenueFit([("Physics", "Optics", 20), ("Law School", "Law", 100)])
+    phys = dict(ithaca("Robert", "Weiss", "rw_c"), dept="Physics")
+    law = dict(ithaca("Rhea", "Weiss", "rh_c", ("cornell-ithaca", "cornell-emeritus")),
+               dept="Law School")
+    hotel = dict(ithaca("Rex", "Weiss", "rx_c"), dept="Hotel Administration")
+    phys_aff = ["Department of Physics, Cornell University, Ithaca, NY"]
+    no_table = IdentityIndex([phys, law], campus=CAMPUS_ITHACA)
+    with_table = IdentityIndex([phys, law], campus=CAMPUS_ITHACA, dept_venue_fit=table)
+    call = ("Weiss", "Robert", "R", phys_aff, 5, 2024)
+    before = no_table.candidates(*call)
+    # What origin/master returned for this call before the venue term existed, captured
+    # by running that code. The other checks compare call against call; this one pins
+    # the bytes, because candidate_cwids_json is stored and diffed by the replay tools.
+    golden = (
+        '[[{"cwid": "rw_c", "name": "Robert Weiss", "name_source": "directory", '
+        '"name_n": null, "dept": "Physics", "division": "", "person_type": "Cornell Faculty", '
+        '"title": "", "given_match": "full", "affil_dept_match": true, "affil_match_on": '
+        '"dept", "cohort_size": 2, "years_after_wcm": null, "confidence": 0.95, "campus": '
+        '"cornell-ithaca"}, {"cwid": "rh_c", "name": "Rhea Weiss", "name_source": '
+        '"directory", "name_n": null, "dept": "Law School", "division": "", "person_type": '
+        '"Cornell Emeritus", "title": "", "given_match": "initial", "affil_dept_match": '
+        'false, "affil_match_on": null, "cohort_size": 2, "years_after_wcm": null, '
+        '"confidence": 0.35, "campus": "cornell-ithaca"}], 2]')
+    import json as _json
+    checks += [
+        # (1) the feature off, in each of the ways it can be off, is today's output.
+        ("venue (1): no table and no subfield is byte-for-byte the pre-change output",
+         _json.dumps(before) == golden),
+        ("venue (1): ...and so is no table WITH a subfield, and a table with NO subfield "
+         "(None or empty)",
+         _json.dumps(no_table.candidates(*call, "Optics")) == golden
+         and _json.dumps(with_table.candidates(*call)) == golden
+         and _json.dumps(with_table.candidates(*call, venue_subfield=None)) == golden
+         and _json.dumps(with_table.candidates(*call, venue_subfield="")) == golden),
+        ("venue (1): the existing fixtures are unmoved by a subfield nobody can score -- "
+         "the temporal Smiths, the 7-person Weiss cohort, the Maliks",
+         smiths.candidates("Smith", None, "J", pub_year=2024, venue_subfield="Optics")
+         == smiths.candidates("Smith", None, "J", pub_year=2024)
+         and crowd.candidates("Weiss", "Robert", "R",
+                              ["Department of Pathology, Weill Cornell Medicine"],
+                              pub_year=2024, top_k=5, venue_subfield="Optics")
+         == (crowded, crowd_size)
+         and maliks.candidates("Malik", "Rayaz A", "RA", malik_affil,
+                               venue_subfield="Optics") == (mal, 2)),
+        ("venue (1): ...nor is a two-campus CampusRoster merge with no table on either side",
+         roster.candidates("Smith", "John", "J", wcm_aff + ith_aff, venue_subfield="Optics")
+         == (both, both_n)),
+        ("venue (1): no candidate carries a `venue_fit` key in any of those",
+         not any("venue_fit" in c for c in before[0] + with_table.candidates(*call)[0]
+                 + no_table.candidates(*call, "Optics")[0])),
+    ]
+
+    # (2) the amounts. No affiliation, so nothing is near the clip: Robert is `full` in a
+    # cohort of 2 (0.70), Rhea `initial` and emerita (0.25 + 0.20 - 0.10 = 0.35).
+    plain = {c["cwid"]: c for c in with_table.candidates("Weiss", "Robert", "R")[0]}
+    optics = {c["cwid"]: c for c in with_table.candidates(
+        "Weiss", "Robert", "R", venue_subfield="Optics")[0]}
+    lawj = {c["cwid"]: c for c in with_table.candidates(
+        "Weiss", "Robert", "R", venue_subfield="Law")[0]}
+    unscored = IdentityIndex([hotel], campus=CAMPUS_ITHACA, dept_venue_fit=table)
+    checks += [
+        ("venue (2): a fitting venue raises confidence by 0.15 and records the fit "
+         "(Physics in an Optics journal: 0.70 -> 0.85, venue_fit 1.586)",
+         plain["rw_c"]["confidence"] == 0.70 and optics["rw_c"]["confidence"] == 0.85
+         and optics["rw_c"]["venue_fit"] == 1.586),
+        ("venue (2): a non-fitting venue lowers it by 0.20 (Physics in a Law journal: "
+         "0.70 -> 0.50, venue_fit -1.609; the Law School in Optics: 0.35 -> 0.15)",
+         lawj["rw_c"]["confidence"] == 0.50 and lawj["rw_c"]["venue_fit"] == -1.609
+         and optics["rh_c"]["confidence"] == 0.15 and optics["rh_c"]["venue_fit"] == -3.045),
+        ("venue (2): a fit between the thresholds is recorded and moves nothing (the Law "
+         "School in a Law journal, 0.189)",
+         lawj["rh_c"]["venue_fit"] == 0.189
+         and lawj["rh_c"]["confidence"] == plain["rh_c"]["confidence"] == 0.35),
+        ("venue (2): a department the table cannot score (under 20 rows, or unknown) "
+         "gets no key and no term -- the candidate is exactly what it was",
+         unscored.candidates("Weiss", "Rex", "R", venue_subfield="Optics")
+         == unscored.candidates("Weiss", "Rex", "R")
+         and "venue_fit" not in unscored.candidates("Weiss", "Rex", "R",
+                                                    venue_subfield="Optics")[0][0]),
+        ("venue (2): the term is added BEFORE the clip: 0.95 + 0.15 is 1.0, not 1.10, and "
+         "a floor-bound candidate stays at 0.0",
+         with_table.candidates(*call, "Optics")[0][0]["confidence"] == 1.0
+         and IdentityIndex._confidence("full", 1, True, False, 0.0, -0.20) == 0.95
+         and IdentityIndex._confidence("unknown", 266, False, True, 0.0, -0.20) == 0.0),
+        ("venue (2): the default term is zero, so every existing _confidence call is unchanged",
+         IdentityIndex._confidence("initial", 2, False, False)
+         == IdentityIndex._confidence("initial", 2, False, False, 0.0, 0.0) == 0.45),
+        ("venue (2): the term changes nothing but confidence and the new key",
+         [{k: v for k, v in c.items() if k not in ("confidence", "venue_fit")}
+          for c in optics.values()] == list(
+              {k: v for k, v in c.items() if k != "confidence"} for c in plain.values())),
+    ]
+
+    # (3) ranking. A second table where the Law School's own venue is a strong fit:
+    # fit(Law School, Law) = 1.586 -> +0.15, fit(Physics, Law) = ln(5/105) = -3.045 -> -0.20.
+    table2 = DeptVenueFit([("Physics", "Optics", 100), ("Law School", "Law", 20)])
+    law2 = dict(ithaca("Rhea", "Weiss", "rh_c"), dept="Law School")
+    ranked_idx = IdentityIndex([phys, law2], campus=CAMPUS_ITHACA, dept_venue_fit=table2)
+    # given-name tier: the byline spells out Robert; the venue says Rhea.
+    tier = ranked_idx.candidates("Weiss", "Robert", "R", venue_subfield="Law")[0]
+    # affiliation tier: initials only, the affiliation names Physics; the venue says Law.
+    aff_tier = ranked_idx.candidates("Weiss", None, "R", phys_aff, venue_subfield="Law")[0]
+    # one tier: initials only, no affiliation. Here, and only here, the venue decides.
+    tied = ranked_idx.candidates("Weiss", None, "R")[0]
+    tied_law = ranked_idx.candidates("Weiss", None, "R", venue_subfield="Law")[0]
+    tied_optics = ranked_idx.candidates("Weiss", None, "R", venue_subfield="Optics")[0]
+    checks += [
+        ("venue (3): a full given-name match keeps the top pick against a rival the "
+         "venue favours, even with the LOWER confidence (0.50 vs 0.60)",
+         [(c["cwid"], c["given_match"], c["confidence"]) for c in tier]
+         == [("rw_c", "full", 0.50), ("rh_c", "initial", 0.60)]),
+        ("venue (3): an affiliation match keeps the top pick the same way (0.50 vs 0.60)",
+         [(c["cwid"], c["affil_dept_match"], c["confidence"]) for c in aff_tier]
+         == [("rw_c", True, 0.50), ("rh_c", False, 0.60)]),
+        ("venue (3): within one tier the venue DOES decide: tied at 0.45, the Law journal "
+         "puts the Law School first",
+         [(c["cwid"], c["confidence"]) for c in tied] == [("rw_c", 0.45), ("rh_c", 0.45)]
+         and [(c["cwid"], c["confidence"]) for c in tied_law]
+         == [("rh_c", 0.60), ("rw_c", 0.25)]),
+        ("venue (3): ...and an Optics journal keeps Physics first by penalising the rival",
+         [(c["cwid"], c["confidence"]) for c in tied_optics]
+         == [("rw_c", 0.45), ("rh_c", 0.25)]),
+        ("venue (3): nobody is ever dropped, and _rank_key still reads only the three "
+         "fields it always read",
+         all(len(x) == 2 for x in (tier, aff_tier, tied_law, tied_optics))
+         and _rank_key(dict(tier[0], venue_fit=99.0)) == _rank_key(tier[0])
+         == (True, False, 0.50)),
+    ]
+
+    # (4) WCM. The scope decision is structural: a WCM index holds no table whatever it
+    # is handed, so a subfield passed to it does nothing.
+    w_phys = dict(rec("Robert", "", "Weiss", cwid="rw_w"), dept="Physics")
+    wcm_handed_table = IdentityIndex([w_phys], dept_venue_fit=table)
+    venue_roster = CampusRoster(IdentityIndex([w_phys], dept_venue_fit=table),
+                                ithaca=with_table)
+    two = venue_roster.candidates("Weiss", "Robert", "R", wcm_aff + ith_aff,
+                                  venue_subfield="Optics")[0]
+    two_plain = venue_roster.candidates("Weiss", "Robert", "R", wcm_aff + ith_aff)[0]
+    linked_roster = CampusRoster(IdentityIndex([dict(w_phys, cornell_linked=True)]),
+                                 ithaca=with_table)
+    linked_c = linked_roster.candidates("Weiss", "Robert", "R", ith_aff,
+                                        venue_subfield="Optics")[0]
+    checks += [
+        ("venue (4): a WCM index never holds a fit table, even when handed one",
+         wcm_handed_table.dept_venue_fit is None and IdentityIndex([]).dept_venue_fit is None
+         and with_table.dept_venue_fit is table),
+        ("venue (4): ...so it ignores venue_subfield entirely",
+         wcm_handed_table.candidates("Weiss", "Robert", "R", venue_subfield="Optics")
+         == wcm_handed_table.candidates("Weiss", "Robert", "R")
+         == IdentityIndex([w_phys]).candidates("Weiss", "Robert", "R")),
+        ("venue (4): a WCM-only byline through a CampusRoster is the bare WCM answer, "
+         "subfield or not",
+         venue_roster.candidates("Weiss", "Robert", "R", wcm_aff, venue_subfield="Optics")
+         == IdentityIndex([w_phys]).candidates("Weiss", "Robert", "R", wcm_aff)),
+        ("venue (4): on a two-campus byline the WCM entry is what it was and only the "
+         "Cornell entries carry the term",
+         [c for c in two if "campus" not in c] == [c for c in two_plain if "campus" not in c]
+         and [c["cwid"] for c in two if "venue_fit" in c] == ["rw_c", "rh_c"]
+         and {c["cwid"]: c["confidence"] for c in two}["rw_c"] == 0.85),
+        ("venue (4): the linked-cwid path threads it too: the Cornell candidates are "
+         "scored, the dual appointee on the WCM roster is not",
+         {c["cwid"]: "venue_fit" in c for c in linked_c}
+         == {"rw_c": True, "rh_c": True, "rw_w": False}),
+        ("venue: the swapped-name retry carries the subfield (LastName='Robert', "
+         "ForeName='Weiss')",
+         [(c["cwid"], c.get("venue_fit")) for c in with_table.candidates(
+             "Robert", "Weiss", None, None, 5, None, "Optics")[0]] == [("rw_c", 1.586)]),
+    ]
+
+    # load(): the table is built only for the Ithaca roster, only when AAR_VENUE_FIT is
+    # "on", and a failure to build it is a roster without the term, never a failed load.
+    import venue_fit as _vf
+    _real_load, _env = _vf.load_dept_fit, os.environ.get("AAR_VENUE_FIT")
+    seen = []
+
+    def _boom(conn, campus):
+        raise RuntimeError("Table 'venue_subfield_inferred' doesn't exist")
+    try:
+        _vf.load_dept_fit = lambda conn, campus: seen.append(campus) or table
+        gated = []
+        for val in (None, "", "off", "true", "ON "):
+            os.environ.pop("AAR_VENUE_FIT", None)
+            if val is not None:
+                os.environ["AAR_VENUE_FIT"] = val
+            gated.append((IdentityIndex._load_dept_venue_fit(None, CAMPUS_ITHACA),
+                          IdentityIndex._load_dept_venue_fit(None, CAMPUS_WCM)))
+        _vf.load_dept_fit = _boom
+        logging.disable(logging.CRITICAL)
+        failed = IdentityIndex._load_dept_venue_fit(None, CAMPUS_ITHACA)
+    finally:
+        logging.disable(logging.NOTSET)
+        _vf.load_dept_fit = _real_load
+        os.environ.pop("AAR_VENUE_FIT", None)
+        if _env is not None:
+            os.environ["AAR_VENUE_FIT"] = _env
+    checks += [
+        ("venue load: unset, empty, off and a typo build nothing and query nothing",
+         gated[:4] == [(None, None)] * 4),
+        ("venue load: 'on' builds the Ithaca table and still none for WCM",
+         gated[4] == (table, None) and seen == [CAMPUS_ITHACA]),
+        ("venue load: a failure is a roster without the term, not a failed load",
+         failed is None),
     ]
 
     ok = True

@@ -88,7 +88,8 @@ import aar_db                                          # noqa: E402
 from aar_universe_scopus import (                      # noqa: E402
     doi_in_pubmed, resolve_no_doi, wcm_lane_candidates, _roster, rolling_window,
     recheck_open_scopus, _compact, _normalize_issn, _position_label, _trunc, _PM_SLEEP,
-    PUBMED_STATS, reset_pubmed_stats, pubmed_unreliable)
+    PUBMED_STATS, reset_pubmed_stats, pubmed_unreliable, load_venue_lookup,
+    stored_venue_subfield)
 
 OPENALEX_WORKS = "https://api.openalex.org/works"
 # Weill Cornell Medicine + Weill Cornell Medical Center. NOT WCM-Qatar (I4210152471).
@@ -308,6 +309,7 @@ def _build_row(w, i, n, author, top, cands, run_ts, dup_map=None):
         "top_fg_score": None, "top_io_score": None,
         "top_confidence": top["confidence"] if top else None,
         "top_years_after_wcm": top.get("years_after_wcm") if top else None,
+        "top_venue_fit": top.get("venue_fit") if top else None,   # v3.13, as on the Scopus lane
         "top_cohort_size": cohort,
         "top_given_match": top["given_match"] if top else None,
         "top_affil_match": int(bool(top["affil_dept_match"])) if top else None,
@@ -589,7 +591,7 @@ def source_enum_ready():
 
 
 # ---- driver -----------------------------------------------------------------
-def run(since, until, apply_writes=False, recheck=True, idx=None):
+def run(since, until, apply_writes=False, recheck=True, idx=None, venue_lookup=None):
     run_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     reset_pubmed_stats()
     if apply_writes and not source_enum_ready():
@@ -643,11 +645,19 @@ def run(since, until, apply_writes=False, recheck=True, idx=None):
     dois = {_doi(w) for w in openalex_only if _doi(w)}
     dup_map = aar_db.dup_flags_by_doi(dois) if dois else {}
     dup_map.update(external_article_uids_by_wid({_work_id(w) for w in openalex_only}))
+    # Venue term (v3.13), as on the Scopus lane: None unless AAR_VENUE_FIT is on, and
+    # resolved from the same issn/journal pair _build_row stores. Only a Cornell candidate
+    # can be scored, so it reaches this lane's rows on bylines that name Ithaca.
+    if venue_lookup is None:
+        venue_lookup = load_venue_lookup()
     rows, unmatched = [], 0
     for w in openalex_only:
+        subfield = stored_venue_subfield(venue_lookup, _source(w).get("issn_l"),
+                                  _source(w).get("display_name"))
         for i, n, au in wcm_authorships(w):
             # frozenset(): no Scopus afids on this lane, so no Ithaca afid list to load.
-            cands, _ = wcm_lane_candidates(idx, au, w.get("publication_year"), frozenset())
+            cands, _ = wcm_lane_candidates(idx, au, w.get("publication_year"), frozenset(),
+                                           subfield)
             top = cands[0] if cands else None
             if top is None:
                 unmatched += 1
@@ -828,7 +838,7 @@ def _selftest():
     # roster replaced. Everything patched is restored in `finally`.
     from identity_index import _norm
     g = globals()
-    saved = {k: g[k] for k in ("_openalex_get", "doi_in_pubmed", "resolve_no_doi",
+    saved = {k: g[k] for k in ("_openalex_get", "doi_in_pubmed", "resolve_no_doi", "load_venue_lookup",
                                "scopus_lane_dois", "source_enum_ready", "time",
                                "dismiss_scopus_held", "recheck_open_scopus", "requests",
                                "external_article_uids_by_wid", "crossref_preprint_of",
@@ -866,6 +876,7 @@ def _selftest():
         g["time"] = _NoSleep
         aar_db.dup_flags_by_doi = lambda ds: {}
         g["external_article_uids_by_wid"] = lambda ws: {}
+        g["load_venue_lookup"] = lambda: None     # the venue term is off; no reciterdb read
 
         def rec(given, surname, cwid):
             return {"cwid": cwid, "given": given, "middle": "", "surname": surname,
@@ -889,7 +900,47 @@ def _selftest():
         check("one matched authorship per kept work (Cooper); Dual is unmatched",
               s["matched_rows"] == 2 and s["unmatched"] == 2)
 
+        # venue term (v3.13): run() resolves the work's venue from issn_l / the source
+        # name and the matcher scores the Cornell candidate; with no lookup nothing moves.
         import contextlib, io
+        from identity_index import CampusRoster, CAMPUS_ITHACA
+        from venue_fit import DeptVenueFit, build_venue_lookup
+        cu = dict(rec("Alissa", "Cooper", "ac_cu"), campus=CAMPUS_ITHACA, dept="Physics",
+                  person_type="Cornell Faculty")
+        table = DeptVenueFit([("Physics", "Optics", 20), ("Law School", "Law", 100)])
+        both = CampusRoster(IdentityIndex([rec("Alissa", "Cooper", "ac1")]),
+                            ithaca=IdentityIndex([cu], campus=CAMPUS_ITHACA,
+                                                 dept_venue_fit=table))
+        ith_work = _fixture()
+        ith_work["authorships"][1]["raw_affiliation_strings"] = [
+            "Weill Cornell Medicine, New York, NY", "Cornell University, Ithaca, NY"]
+        kept = []
+        g["_openalex_get"] = lambda p: {"meta": {"count": 1}, "results": [ith_work]}
+        aar_db.upsert = lambda rows: kept.extend(rows) or len(rows)
+        g["source_enum_ready"] = lambda: True
+        for name in ("dismiss_scopus_held", "dismiss_published"):
+            g[name] = lambda *a: 0
+        g["recheck_open_scopus"] = lambda ts, source="scopus": (0, 0)
+        lookup = build_venue_lookup([(100001, "1556-0864", None, "Optics")], [])
+        with contextlib.redirect_stdout(io.StringIO()):
+            run("2026-01-01", "2026-12-31", apply_writes=True, idx=both, venue_lookup=lookup)
+            run("2026-01-01", "2026-12-31", apply_writes=True, idx=both)
+        scored, plain = kept
+        check("venue term: the work's issn_l resolves a subfield, the Cornell candidate "
+              "is scored and leads its tier, and the row stores top_venue_fit",
+              scored["top_cwid"] == "ac_cu" and scored["top_venue_fit"] == 1.586
+              and [c.get("venue_fit") for c in json.loads(scored["candidate_cwids_json"])]
+              == [1.586, None])
+        check("venue term off (no lookup): the WCM pick stands, nothing carries a venue fit",
+              plain["top_cwid"] == "ac1" and plain["top_venue_fit"] is None
+              and "venue_fit" not in plain["candidate_cwids_json"])
+        g["_openalex_get"] = lambda p: (calls.append(p) or
+                                        {"meta": {"count": 201}, "results": pages[p["page"]]})
+        aar_db.upsert = saved_upsert
+        for name in ("source_enum_ready", "dismiss_scopus_held", "dismiss_published",
+                     "recheck_open_scopus"):
+            g[name] = saved[name]
+
         calls.clear()
         full = [dict(_fixture(), id=f"https://openalex.org/W{k}") for k in range(PER_PAGE)]
         g["_openalex_get"] = lambda p: calls.append(p) or {"meta": {"count": 25000},

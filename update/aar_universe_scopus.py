@@ -50,7 +50,7 @@ import requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from identity_index import (IdentityIndex, CampusRoster, byline_campuses,  # identity roster(s)
-                            CAMPUS_WCM, CAMPUS_ITHACA)
+                            CAMPUS_WCM, CAMPUS_ITHACA, venue_fit_enabled)
 import aar_db                              # shared authorship_review upsert sink
 
 SCOPUS_SEARCH = "https://api.elsevier.com/content/search/scopus"
@@ -336,9 +336,14 @@ def _compact(cands):
             "affil_dept_match", "cohort_size", "confidence", "years_after_wcm")
     # `campus` only when a candidate carries one (Cornell): a WCM entry keeps its exact
     # pre-campus bytes, and PM spreads each entry as an opaque object, so the extra key
-    # rides through to the card untouched.
-    return [dict({k: c.get(k) for k in keep}, **({"campus": c["campus"]} if c.get("campus")
-                                                 else {})) for c in cands]
+    # rides through to the card untouched. `venue_fit` (v3.13) by the same rule: present
+    # only on a candidate the fit table scored, and 0.0 is a score.
+    def extra(c):
+        out = {"campus": c["campus"]} if c.get("campus") else {}
+        if c.get("venue_fit") is not None:
+            out["venue_fit"] = c["venue_fit"]
+        return out
+    return [dict({k: c.get(k) for k in keep}, **extra(c)) for c in cands]
 
 
 def _pub_year(entry):
@@ -527,6 +532,9 @@ def _build_row(entry, i, n, author, top, cands, run_ts, dup_map=None):
         "top_fg_score": None, "top_io_score": None,    # scopus rail shows neither
         "top_confidence": top["confidence"] if top else None,
         "top_years_after_wcm": top.get("years_after_wcm") if top else None,
+        # v3.13: the top candidate's department/venue fit, NULL when the matcher had
+        # none to give (feature off, WCM candidate, venue or department unknown).
+        "top_venue_fit": top.get("venue_fit") if top else None,
         "top_cohort_size": cohort,
         "top_given_match": top["given_match"] if top else None,
         "top_affil_match": int(bool(top["affil_dept_match"])) if top else None,
@@ -647,23 +655,65 @@ def _campuses(au, ithaca_family):
     return out
 
 
-def wcm_lane_candidates(idx, au, pub_year, ithaca_family=None):
+def load_venue_lookup():
+    """The venue -> subfield lookup for this run (venue_fit.load_venue_lookup), or None
+    when there is no venue term to compute: AAR_VENUE_FIT is not "on", or the lookup
+    could not be read. Loaded once per run and handed to `stored_venue_subfield` per document.
+
+    A failure here is logged and returns None, never raised: without the lookup every
+    document's subfield is None, the matcher adds no term, and the lane writes what it
+    wrote before the feature existed."""
+    if not venue_fit_enabled():
+        return None
+    try:
+        import venue_fit
+        with aar_db.engine().connect() as c:
+            lookup = venue_fit.load_venue_lookup(c)
+        print(f"      venue fit: {len(lookup)} venues have a category", flush=True)
+        return lookup
+    except Exception as e:                                       # noqa: BLE001
+        print(f"      WARNING: venue lookup unavailable ({type(e).__name__}: {e}); "
+              f"matching without the venue term", flush=True)
+        return None
+
+
+def stored_venue_subfield(lookup, issn, journal):
+    """The Science-Metrix subfield of a document's venue, or None.
+
+    Resolved from the two values the row STORES -- the normalised ISSN and the journal
+    title cut to its column width, exactly as `_build_row` writes them -- and not from the
+    raw API fields, because the fit table's training rows (venue_fit.load_dept_fit) and
+    backfill_venue_fit.py can only ever read the stored pair. One document must resolve
+    to one subfield from all three."""
+    if not lookup:
+        return None
+    import venue_fit
+    return venue_fit.subfield_for(lookup, _normalize_issn(issn), _trunc(journal, 512))
+
+
+def wcm_lane_candidates(idx, au, pub_year, ithaca_family=None, venue_subfield=None):
     """`idx.candidates` for one WCM-lane author -- the producer's call, and the one the
     replay tools (aar_sweep_stale / aar_report_changed_picks) make on a live re-fetch, so
     a replay reaches the same roster(s) the producer did. A `CampusRoster` gets the
     afid-aware campus set; a bare single-campus index (the Ithaca lane, hand-built
-    selftest rosters) is called exactly as before."""
+    selftest rosters) is called exactly as before.
+
+    `venue_subfield` (`stored_venue_subfield()` for the document) is forwarded
+    only when there is one, so with the venue term off the call is the one it always
+    was."""
     kw = {}
     if isinstance(idx, CampusRoster):
         if ithaca_family is None:
             ithaca_family = load_family_afids(ITHACA_AFID_LIST)
         kw["campuses"] = _campuses(au, ithaca_family)
+    if venue_subfield:
+        kw["venue_subfield"] = venue_subfield
     return idx.candidates(au["last"], au["fore"], au["initials"], au["affiliations"],
                           top_k=5, pub_year=pub_year, **kw)
 
 
 def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True, idx=None,
-        campus=CAMPUS_WCM):
+        campus=CAMPUS_WCM, venue_lookup=None):
     run_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     reset_pubmed_stats()
     family = load_family_afids(afid_list)
@@ -728,16 +778,24 @@ def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True,
     # convention already used for idx above.
     dois = {d.get("prism:doi") for d in scopus_only if d.get("prism:doi")}
     dup_map = aar_db.dup_flags_by_doi(dois) if dois else {}
+    # Venue term (v3.13): None unless AAR_VENUE_FIT is on. Loaded once, like the roster.
+    if venue_lookup is None:
+        venue_lookup = load_venue_lookup()
     rows, unmatched = [], 0
     for d in scopus_only:
+        subfield = stored_venue_subfield(venue_lookup, d.get("prism:issn") or d.get("prism:eIssn"),
+                                  d.get("prism:publicationName"))
         for i, n, au, _ in wcm_authorships(d, family, yield_to):
-            cands, _ = wcm_lane_candidates(idx, au, _pub_year(d), ithaca_family)
+            cands, _ = wcm_lane_candidates(idx, au, _pub_year(d), ithaca_family, subfield)
             top = cands[0] if cands else None
             if top is None:
                 unmatched += 1                         # nothing to assign (v1 skips unmatched)
                 continue
             rows.append(_build_row(d, i, n, au, top, cands, run_ts, dup_map=dup_map))
     print(f"      {len(rows)} matched authorships; {unmatched} unmatched (skipped)", flush=True)
+    if venue_lookup is not None:
+        print(f"      venue fit: {sum(1 for r in rows if r['top_venue_fit'] is not None)} "
+              f"of {len(rows)} rows carry a top_venue_fit", flush=True)
 
     unreliable = pubmed_unreliable()
     print(f"      PubMed: {PUBMED_STATS['failures']} of {PUBMED_STATS['calls']} esearch calls "
@@ -820,6 +878,7 @@ def run_backfill(months, apply_writes=False, afid_list=DEFAULT_AFID_LIST, campus
     (only when applying, and not with --no-recheck). Idempotent per month via the author_key upsert — a run that dies
     partway resumes with `--from <next-month> --to <end-month>`."""
     idx = _roster(campus)
+    venue_lookup = load_venue_lookup()       # once for every month, like the roster
     print(f"Backfill: {len(months)} months, {months[0][0]}-{months[0][1]:02d} .. "
           f"{months[-1][0]}-{months[-1][1]:02d}"
           + ("  [APPLY]" if apply_writes else "  [DRY-RUN]"), flush=True)
@@ -829,7 +888,8 @@ def run_backfill(months, apply_writes=False, afid_list=DEFAULT_AFID_LIST, campus
         aft, bef = month_window(y, m)
         print(f"\n########## {y}-{m:02d}  ({k + 1}/{len(months)}) ##########", flush=True)
         s = run(aft, bef, apply_writes=apply_writes, afid_list=afid_list,
-                recheck=recheck and apply_writes and k == len(months) - 1, idx=idx, campus=campus)
+                recheck=recheck and apply_writes and k == len(months) - 1, idx=idx, campus=campus,
+                venue_lookup=venue_lookup)
         for key in ("family_docs", "scopus_only", "matched_rows", "unmatched"):
             agg[key] += s[key]
         agg["per_month"].append({"month": f"{y}-{m:02d}", "scopus_only": s["scopus_only"],
@@ -1139,6 +1199,140 @@ def _selftest():
           _build_row(entry, 0, 2, _au, _wcm_only[0], _wcm_only, "t")["candidate_cwids_json"]
           == json.dumps(_compact(IdentityIndex(_people).candidates(
               "Dual", "Ann", None, ["Weill Cornell Medicine, New York"])[0])))
+
+    # ---- venue term (v3.13) ---------------------------------------------------------
+    import contextlib, hashlib, io
+    from venue_fit import DeptVenueFit, build_venue_lookup
+    check("row carries every aar_db insert column, top_venue_fit among them, and it is "
+          "None when the top candidate has no venue_fit",
+          set(aar_db._INSERT_COLS) <= set(row) and row["top_venue_fit"] is None)
+    check("_compact stores venue_fit only where a candidate carries one; 0.0 is a score, "
+          "None is not",
+          "venue_fit" not in _compact([top])[0]
+          and "venue_fit" not in _compact([dict(top, venue_fit=None)])[0]
+          and _compact([dict(top, venue_fit=0.0)])[0]["venue_fit"] == 0.0
+          and _compact([dict(top, venue_fit=1.586)])[0]
+          == dict(_compact([top])[0], venue_fit=1.586))
+
+    _lookup = build_venue_lookup([(100001, "0146-9592", None, "Optics")], [("cleo", "Optics")])
+    check("stored_venue_subfield reads what the row stores: Scopus's unhyphenated ISSN, else the "
+          "title; a malformed ISSN is stored NULL and so falls to the title",
+          stored_venue_subfield(_lookup, "01469592", "Optics Letters") == "Optics"
+          and stored_venue_subfield(_lookup, None, "CLEO 2025") == "Optics"
+          and stored_venue_subfield(_lookup, "bad", "CLEO 2025") == "Optics"
+          and stored_venue_subfield(_lookup, "99999999", "CLEO 2025") is None)
+    check("stored_venue_subfield is None without a lookup (the feature off)",
+          stored_venue_subfield(None, "01469592", "CLEO 2025") is None
+          and stored_venue_subfield({}, "01469592", "CLEO 2025") is None)
+
+    # Physics in Optics fits (1.586 -> +0.15). The Cornell Ann Dual is in Physics; the
+    # WCM one is on a roster that never holds a fit table.
+    _table = DeptVenueFit([("Physics", "Optics", 20), ("Law School", "Law", 100)])
+    _cu = dict(_rec("Ann", "Dual", "ad_cu", CAMPUS_ITHACA), dept="Physics")
+    _ith = IdentityIndex([_cu], campus=CAMPUS_ITHACA, dept_venue_fit=_table)
+    _roster3 = CampusRoster(IdentityIndex(_people, dept_venue_fit=_table), ithaca=_ith)
+    _off, _ = wcm_lane_candidates(_roster3, _au, None, _ithaca)
+    _on, _ = wcm_lane_candidates(_roster3, _au, None, _ithaca, "Optics")
+    check("no subfield: the call and its result are what they were (a fit table alone "
+          "changes nothing, and no candidate carries venue_fit)",
+          _off == _roster3.candidates("Dual", "Ann", None, _au["affiliations"],
+                                      campuses=_campuses(_au, _ithaca))[0]
+          and [c["cwid"] for c in _off] == ["ad_wcm", "ad_cu"]
+          and not any("venue_fit" in c for c in _off))
+    check("with a subfield the Cornell candidate is scored and, in the same tier, now "
+          "leads (0.90 + 0.15 -> 1.0 against the WCM 0.90); the WCM candidate is unscored",
+          [(c["cwid"], c["confidence"], c.get("venue_fit")) for c in _on]
+          == [("ad_cu", 1.0, 1.586), ("ad_wcm", 0.9, None)])
+    _row_v = _build_row(entry, 0, 2, _au, _on[0], _on, "2026-11-16 00:00:00")
+    _stored_v = json.loads(_row_v["candidate_cwids_json"])
+    check("the row stores top_venue_fit and the per-candidate venue_fit; the WCM entry's "
+          "stored bytes are the ones it had before the venue term existed",
+          _row_v["top_venue_fit"] == 1.586 and _row_v["top_cwid"] == "ad_cu"
+          and _stored_v[0]["venue_fit"] == 1.586 and "venue_fit" not in _stored_v[1]
+          and _stored_v[1] == _stored[0])
+    check("the Ithaca lane's bare index takes the subfield through the same call",
+          wcm_lane_candidates(_ith, _au, None, None, "Optics")[0][0]["venue_fit"] == 1.586
+          and "venue_fit" not in wcm_lane_candidates(_ith, _au, None)[0][0])
+
+    # load_venue_lookup: nothing is read unless AAR_VENUE_FIT is on, and a failed read is
+    # a run without the term.
+    def _no_db():
+        raise RuntimeError("no reciterdb in a selftest")
+    _real_engine, _env = aar_db.engine, os.environ.pop("AAR_VENUE_FIT", None)
+    aar_db.engine = _no_db
+    try:
+        _buf = io.StringIO()
+        with contextlib.redirect_stdout(_buf):
+            _lk_off = load_venue_lookup()
+            os.environ["AAR_VENUE_FIT"] = "yes"
+            _lk_typo = load_venue_lookup()
+        check("venue lookup: unset or a typo -> None, with no reciterdb read",
+              _lk_off is None and _lk_typo is None and _buf.getvalue() == "")
+        os.environ["AAR_VENUE_FIT"] = "on"
+        with contextlib.redirect_stdout(_buf):
+            _lk_down = load_venue_lookup()
+        check("venue lookup: on but unreadable -> None, logged, never raised",
+              _lk_down is None and "WARNING: venue lookup unavailable" in _buf.getvalue())
+    finally:
+        os.environ.pop("AAR_VENUE_FIT", None)
+        if _env is not None:
+            os.environ["AAR_VENUE_FIT"] = _env
+
+    # aar_db: top_venue_fit is refreshed like top_years_after_wcm, and left out of the
+    # statement while the live table lacks the column (code deployed before v3.13).
+    check("aar_db refreshes top_venue_fit, and it is the only optional column",
+          "top_venue_fit" in aar_db._REFRESH_COLS and "top_venue_fit" in aar_db._INSERT_COLS
+          and aar_db._OPTIONAL_COLS == ("top_venue_fit",))
+    _cols, _sql = aar_db._upsert_sql()
+    _cols0, _sql0 = aar_db._upsert_sql(["top_venue_fit"])
+    check("upsert names top_venue_fit in the insert and in the refresh when the column exists",
+          "top_venue_fit" in _cols and ":top_venue_fit" in _sql
+          and "top_venue_fit=VALUES(top_venue_fit)" in _sql)
+    check("before v3.13 the statement is byte-for-byte the one this module built before "
+          "the column was added (sha256 of that statement)",
+          "top_venue_fit" not in _sql0 and "top_venue_fit" not in _cols0
+          and hashlib.sha256(_sql0.encode()).hexdigest()
+          == "ae978c88e4e000656361d02cd33d1641d33fcfbff41eac32564f6f4e12eec92f")
+
+    class _Sink:
+        """Stands in for the engine and its connection: answers the information_schema
+        read from `have`, records everything else."""
+        def __init__(self, have):
+            self.have, self.stmts = have, []
+
+        def begin(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def execute(self, stmt, params=None):
+            if "information_schema" in str(stmt):
+                return [(c,) for c in self.have]
+            self.stmts.append((str(stmt), params))
+
+    try:
+        _before, _after = _Sink([]), _Sink(["top_venue_fit"])
+        _buf = io.StringIO()
+        with contextlib.redirect_stdout(_buf):
+            aar_db.engine = lambda: _before
+            _n0 = aar_db.upsert([_row_v])
+            aar_db.engine = lambda: _after
+            _n1 = aar_db.upsert([_row_v])
+    finally:
+        aar_db.engine = _real_engine
+    check("upsert before v3.13: the row is written without the column, and says so",
+          _n0 == 1 and "top_venue_fit" not in _before.stmts[0][0]
+          and "top_venue_fit" not in _before.stmts[0][1][0]
+          and _before.stmts[0][1][0]["top_cwid"] == "ad_cu"
+          and "no top_venue_fit column yet" in _buf.getvalue())
+    check("upsert after v3.13: the same row is written with it",
+          _n1 == 1 and "top_venue_fit=VALUES(top_venue_fit)" in _after.stmts[0][0]
+          and _after.stmts[0][1][0]["top_venue_fit"] == 1.586
+          and _buf.getvalue().count("no top_venue_fit column yet") == 1)
 
     for _c, _l in ((CAMPUS_WCM, ITHACA_AFID_LIST), (CAMPUS_ITHACA, DEFAULT_AFID_LIST)):
         try:

@@ -39,7 +39,7 @@ _REFRESH_COLS = [
     "entrez_date", "title", "journal", "issn", "isbn", "doi", "authors_json", "classification",
     "top_cwid", "top_name", "top_person_type", "top_dept",
     "top_fg_score", "top_io_score", "top_confidence", "top_years_after_wcm",
-    "top_cohort_size",
+    "top_venue_fit", "top_cohort_size",
     "top_given_match", "top_affil_match", "n_candidates", "single_candidate",
     "candidate_cwids_json", "dup_flag", "dup_reason", "last_refreshed",
 ]
@@ -56,6 +56,14 @@ _REFRESH_COLS = [
 _INSERT_COLS = ["pmid", "author_key"] + _REFRESH_COLS + [
     "matched_pmid", "matched_pmid_source", "matched_pmid_at",
     "status", "first_seen", "last_checked"]
+# top_venue_fit (v3.13) is the one column here the live table may not have yet. The
+# v2.7 note at the top of this file is what that costs: an INSERT naming a column the
+# table lacks fails outright, and a ReCiterDB merge deploys the image whether or not
+# anyone has applied setup/alter_venue_fit_v3.13.sql. So upsert() asks information_schema
+# once per call and leaves an absent optional column out of its statement. Every lane
+# then writes exactly what it wrote before the column existed, and starts filling it the
+# night after the migration, with no deploy in between.
+_OPTIONAL_COLS = ("top_venue_fit",)
 
 _ENGINE = None
 
@@ -146,22 +154,44 @@ def create_table():
         c.execute(text(DDL))
 
 
+def missing_optional_cols(conn):
+    """The `_OPTIONAL_COLS` the live table does not have (their migration is not applied
+    yet). Same information_schema read as aar_universe_openalex.source_enum_ready."""
+    stmt = text("SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = DATABASE() AND table_name = :t "
+                "AND column_name IN :cols").bindparams(bindparam("cols", expanding=True))
+    have = {str(r[0]).lower() for r in conn.execute(
+        stmt, {"t": TABLE, "cols": list(_OPTIONAL_COLS)})}
+    return [c for c in _OPTIONAL_COLS if c not in have]
+
+
+def _upsert_sql(skip=()):
+    """(insert columns, statement) for upsert(), without the columns in `skip`."""
+    insert_cols = [c for c in _INSERT_COLS if c not in skip]
+    cols = ", ".join(insert_cols)
+    placeholders = ", ".join(f":{c}" for c in insert_cols)
+    updates = ", ".join(f"{c}=VALUES({c})" for c in _REFRESH_COLS if c not in skip)
+    # also advance last_checked on refresh; never touch status/resolution_*/reviewer/note/snooze
+    return insert_cols, (f"INSERT INTO {TABLE} ({cols}) VALUES ({placeholders}) "
+                         f"ON DUPLICATE KEY UPDATE {updates}, last_checked=VALUES(last_checked)")
+
+
 def upsert(rows):
     """Insert/update authorship rows by author_key. Refreshes producer-owned columns;
     PRESERVES curator status/resolution/reviewer/note/snooze on existing rows."""
     if not rows:
         return 0
-    cols = ", ".join(_INSERT_COLS)
-    placeholders = ", ".join(f":{c}" for c in _INSERT_COLS)
-    updates = ", ".join(f"{c}=VALUES({c})" for c in _REFRESH_COLS)
-    # also advance last_checked on refresh; never touch status/resolution_*/reviewer/note/snooze
-    stmt = text(f"INSERT INTO {TABLE} ({cols}) VALUES ({placeholders}) "
-                f"ON DUPLICATE KEY UPDATE {updates}, last_checked=VALUES(last_checked)")
     n = 0
     with engine().begin() as c:
+        skip = missing_optional_cols(c)
+        if skip:
+            print(f"      NOTE: {TABLE} has no {', '.join(skip)} column yet (its migration "
+                  f"is not applied); rows written without it", flush=True)
+        insert_cols, sql = _upsert_sql(skip)
+        stmt = text(sql)
         for i in range(0, len(rows), 500):
             chunk = rows[i:i + 500]
-            c.execute(stmt, [{k: r.get(k) for k in _INSERT_COLS} for r in chunk])
+            c.execute(stmt, [{k: r.get(k) for k in insert_cols} for r in chunk])
             n += len(chunk)
     return n
 

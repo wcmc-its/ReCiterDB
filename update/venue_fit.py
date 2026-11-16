@@ -60,8 +60,9 @@ VENUE_PENALTY = 0.20
 #   * a series that was renamed, or whose acronym moved within the title.
 # Those stay separate keys and each is classified on its own, which costs a model call
 # and nothing else. The opposite error, two unrelated venues sharing a key, needs two
-# titles that differ only by a year or an ordinal; none was found among the 3,373 title
-# venues classified on 2026-11-16.
+# titles that differ only by a year or an ordinal. Folding the 3,373 title venues
+# classified on 2026-11-16 gives 3,123 keys; one of them had been given two different
+# subfields, and that was a single conference series labelled twice.
 #
 # Accents are folded as well as case because the table's collation
 # (utf8mb4_unicode_ci) already treats them as equal: a key Python thought was new would
@@ -202,6 +203,12 @@ class DeptVenueFit:
         return round(math.log((self.n_ds.get((dept, subfield), 0) + ALPHA * p)
                               / (n_d + ALPHA) / p), 3)
 
+    @staticmethod
+    def term(fit):
+        """`venue_term`, reachable from the table itself so that identity_index, which
+        holds a table or None, needs no import of this module to score a candidate."""
+        return venue_term(fit)
+
 
 # The training set: authorships a curator accepted as proposed where the byline spelled
 # the person's given name out and nobody else on the campus shared it. Those are the rows
@@ -242,8 +249,9 @@ def venue_term(fit):
     nothing in between or when the fit is unknown.
 
     Measured on the spelled-out-mismatch class: precision 89.3% at fit >= 1 (n=1,018)
-    and 16.5% below -1 (n=649). The penalty is larger than the bonus because the low band
-    is the more decisive of the two."""
+    and 16.5% below -1 (n=649). The two weights are the ones the re-rank replay was run
+    with (88 top picks fixed, 17 broken); +0.10 / -0.10 fixed 67 and broke 17, and larger
+    weights changed nothing further."""
     if fit is None:
         return 0.0
     if fit >= FIT_BONUS_AT:
