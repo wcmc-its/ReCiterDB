@@ -146,7 +146,7 @@ def subfield_name(subfield):
 
 
 def load_venue_lookup(conn):
-    """`build_venue_lookup` over reciterdb. Before migration v3.13 the inferred table
+    """`build_venue_lookup` over reciterdb. Before migration v3.14 the inferred table
     does not exist; the lookup is then the journals alone, which is what it was worth
     before any container was classified."""
     journals = conn.execute(text(
@@ -160,7 +160,7 @@ def load_venue_lookup(conn):
 
 
 def inferred_table_ready(conn):
-    """Does venue_subfield_inferred exist (migration v3.13 applied)?"""
+    """Does venue_subfield_inferred exist (migration v3.14 applied)?"""
     return bool(conn.execute(text(
         "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() "
         "AND table_name = 'venue_subfield_inferred'")).scalar())
@@ -439,7 +439,7 @@ def _selftest():
     check("load_venue_lookup reads both tables",
           loaded == {"issn:11111111": "Optics", "issn:55555555": "Law", "title:cleo": "Optics"})
     before = _Conn(table_ready=False)
-    check("...and before v3.13 reads the journals alone, without touching the absent table",
+    check("...and before v3.14 reads the journals alone, without touching the absent table",
           load_venue_lookup(before) == {"issn:11111111": "Optics", "issn:55555555": "Law"}
           and not any("FROM venue_subfield_inferred" in s for s in before.sql))
 

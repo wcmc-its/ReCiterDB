@@ -405,7 +405,7 @@ def _load_class_b_modules():
     # duplicate status, and CLASS B has no dup map to recompute them from. They belong
     # to a batched aar_db.dup_flags_by_doi() pass, not to this one.
     #
-    # top_venue_fit (v3.13) is one of them: the top candidate's department/venue fit.
+    # top_venue_fit (v3.14) is one of them: the top candidate's department/venue fit.
     # Left out, a refresh that moved top_cwid would leave the previous person's fit on
     # the row -- the same defect again -- and Publication Manager's bulk accept filters
     # on that column. The scopus replay ranks with the venue term (see
@@ -568,7 +568,7 @@ def _install_capture():
 
 def _drop_absent_optional_cols(engine):
     """Take out of REFRESH_COLS any column the live table does not have yet
-    (aar_db._OPTIONAL_COLS: top_venue_fit before setup/alter_venue_fit_v3.13.sql).
+    (aar_db._OPTIONAL_COLS: top_venue_fit before setup/alter_venue_fit_v3.14.sql).
 
     A ReCiterDB merge deploys this file whether or not the migration has been applied,
     and CLASS B both SELECTs and UPDATEs every REFRESH_COLS column by name -- the
@@ -1303,7 +1303,7 @@ def _selftest():
               for c in ("top_fg_score", "top_io_score", "top_years_after_wcm",
                         "top_venue_fit", "classification")))
 
-    # v3.13: top_venue_fit describes the top candidate, so it moves with top_cwid. A
+    # v3.14: top_venue_fit describes the top candidate, so it moves with top_cwid. A
     # refresh that left it behind would put one person's fit on another person's row.
     check("write_payload writes NULL top_venue_fit for a top candidate with none (every "
           "pubmed row, and a scopus candidate the fit table cannot score)",
@@ -1318,7 +1318,7 @@ def _selftest():
           == [1.586, -3.045])
 
     # ...and the column may not exist yet: code deploys with the merge, the migration is
-    # applied by hand. CLASS B then reads and writes exactly what it did before v3.13.
+    # applied by hand. CLASS B then reads and writes exactly what it did before v3.14.
     class _Eng:
         def __init__(self, have):
             self.have = have
@@ -1340,7 +1340,7 @@ def _selftest():
     try:
         with contextlib.redirect_stdout(io.StringIO()) as _out:
             present = _drop_absent_optional_cols(_Eng(["top_venue_fit"]))
-        check("with the v3.13 column present nothing is dropped and nothing is printed",
+        check("with the v3.14 column present nothing is dropped and nothing is printed",
               present == [] and REFRESH_COLS == full_cols and _out.getvalue() == "")
         with contextlib.redirect_stdout(io.StringIO()) as _out:
             absent = _drop_absent_optional_cols(_Eng([]))
@@ -1351,7 +1351,7 @@ def _selftest():
               and "top_venue_fit" not in _class_b_update_sql()
               and set(pre) == set(REFRESH_COLS) == set(full_cols) - {"top_venue_fit"}
               and "no top_venue_fit column yet" in _out.getvalue())
-        check("...and what is left is the pre-v3.13 statement, column for column",
+        check("...and what is left is the pre-v3.14 statement, column for column",
               _class_b_update_sql() == "UPDATE authorship_review SET "
               + ", ".join(f"{c}=:{c}" for c in full_cols if c != "top_venue_fit")
               + " WHERE id=:id AND status='open'")

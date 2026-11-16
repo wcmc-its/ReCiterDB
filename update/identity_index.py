@@ -18,7 +18,7 @@ And home to the CAMPUS SCOPE (Cornell Ithaca onboarding, risks R1/R6). One index
 exactly one campus's roster; `candidates()` is untouched by the scoping, because the
 records of every other campus are never indexed in the first place. See `CAMPUS_WCM`.
 
-And to the VENUE TERM (v3.13): on the external lanes a candidate whose department
+And to the VENUE TERM (v3.14): on the external lanes a candidate whose department
 publishes in the venue's subfield gains a little `confidence`, and one whose department
 never does loses a little. Cornell Ithaca only, off unless AAR_VENUE_FIT=on. See
 `venue_fit_enabled`.
@@ -2472,7 +2472,7 @@ def _selftest():
                                                 campuses={CAMPUS_ITHACA})[0]] == ["js123"]),
     ]
 
-    # --- venue fit (v3.13) -----------------------------------------------------------
+    # --- venue fit (v3.14) -----------------------------------------------------------
     # Physics has 20 accepted rows, all in Optics; the Law School 100, all in Law. So
     # (venue_fit's own selftest works these by hand):
     #   fit(Physics, Optics)    =  1.586  -> +0.15     fit(Physics, Law)       = -1.609 -> -0.20

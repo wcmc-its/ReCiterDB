@@ -30,13 +30,13 @@ spec:
             - name: AAR_OPENALEX_LANE_CADENCE
               value: "weekly"
             # Venue categories for the external lanes (infer_venue_subfield.py). Ships off.
-            # Before turning it on: apply setup/alter_venue_fit_v3.13.sql, and add
+            # Before turning it on: apply setup/alter_venue_fit_v3.14.sql, and add
             # bedrock:InvokeModel on the Claude Haiku inference profile and its foundation
             # model to the reciterdb role.
             - name: AAR_VENUE_INFER
               value: "off"
             # AAR_VENUE_FIT (the matcher's venue term, Cornell Ithaca only) is deliberately NOT
-            # listed: it ships off and is turned on live with `kubectl set env`, after v3.13
+            # listed: it ships off and is turned on live with `kubectl set env`, after v3.14
             # and a read of backfill_venue_fit.py's dry run.
             # AAR Scopus + PubMed lanes (weekly, gated in run_all.py)
             - name: SCOPUS_API_KEY

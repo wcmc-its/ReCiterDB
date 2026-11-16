@@ -155,7 +155,7 @@ NULL_COLUMNS = [
 _missing = [c for c in NULL_COLUMNS if c not in aar_db._REFRESH_COLS]
 assert not _missing, f"NULL_COLUMNS names columns the producer doesn't refresh: {_missing}"
 
-# top_venue_fit (v3.13) is the top candidate's department/venue fit, and a row this sweep
+# top_venue_fit (v3.14) is the top candidate's department/venue fit, and a row this sweep
 # leaves naming nobody must not go on carrying one: Publication Manager's bulk accept
 # filters on that column. It is nulled WITH the nine whenever the live table has it (see
 # _null_sql), but it is not IN the nine: NULL_COLUMNS is tied by assertion to
@@ -276,7 +276,7 @@ def _classify_scopus(rows, idx, limit=None):
             if hit is None:
                 unresolvable.append(r)
             else:
-                # No venue subfield (v3.13): the venue term re-orders a candidate list
+                # No venue subfield (v3.14): the venue term re-orders a candidate list
                 # and never empties one, and empty-or-not is all this sweep asks.
                 cands, _cohort = scop.wcm_lane_candidates(idx, hit, scop._pub_year(entry))
                 if cands:
@@ -330,7 +330,7 @@ def _apply_updates(engine, stale_entries):
 
 def _null_sql(absent=()):
     """The sweep's UPDATE: the nine, plus each ALSO_NULL column the live table has
-    (`absent` is aar_db.missing_optional_cols). Before migration v3.13 that is the
+    (`absent` is aar_db.missing_optional_cols). Before migration v3.14 that is the
     statement this sweep has always run."""
     sets = ", ".join(f"{c}=NULL" for c in NULL_COLUMNS
                      + [c for c in ALSO_NULL if c not in absent])
@@ -447,7 +447,7 @@ def _selftest():
                            "candidate_cwids_json", "n_candidates"])
     check("every NULL_COLUMNS entry is producer-refreshed (aar_db._REFRESH_COLS)",
           all(c in aar_db._REFRESH_COLS for c in NULL_COLUMNS))
-    check("a swept row loses its top_venue_fit with its top pick (v3.13): no fit is left "
+    check("a swept row loses its top_venue_fit with its top pick (v3.14): no fit is left "
           "on a row that names nobody",
           _null_sql() == "UPDATE authorship_review SET "
           + ", ".join(f"{c}=NULL" for c in NULL_COLUMNS)

@@ -66,7 +66,7 @@ WHAT THIS DOES
   fails to resolve (retraction, EID/author-list drift) is reported as unresolvable and
   left out of all three buckets, same convention as aar_sweep_stale.py.
 
-VENUE TERM (v3.13): the scopus replay ranks as the producer ranks. It reads the same
+VENUE TERM (v3.14): the scopus replay ranks as the producer ranks. It reads the same
   AAR_VENUE_FIT switch, resolves each row's venue from the issn/journal the row stores
   and passes the subfield to the matcher, so a row the producer scored with the venue
   term replays to itself. Run it with the CronJob's value of AAR_VENUE_FIT: with the
@@ -769,7 +769,7 @@ def _selftest():
           _drift_cols(dict(stored, candidate_cwids_json="{not json"), base)
           == ["candidate_cwids_json"])
 
-    # ---- venue term (v3.13): the scopus replay ranks as the producer ranks -------
+    # ---- venue term (v3.14): the scopus replay ranks as the producer ranks -------
     # Two Cornell R. Weisses, initials-only byline, an Optics journal. Physics fits it
     # (+0.15), the Law School does not (-0.20), so the producer's row names the physicist
     # at 0.60 where the same byline without the term names the lawyer first at 0.45.

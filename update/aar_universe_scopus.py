@@ -336,7 +336,7 @@ def _compact(cands):
             "affil_dept_match", "cohort_size", "confidence", "years_after_wcm")
     # `campus` only when a candidate carries one (Cornell): a WCM entry keeps its exact
     # pre-campus bytes, and PM spreads each entry as an opaque object, so the extra key
-    # rides through to the card untouched. `venue_fit` (v3.13) by the same rule: present
+    # rides through to the card untouched. `venue_fit` (v3.14) by the same rule: present
     # only on a candidate the fit table scored, and 0.0 is a score.
     def extra(c):
         out = {"campus": c["campus"]} if c.get("campus") else {}
@@ -532,7 +532,7 @@ def _build_row(entry, i, n, author, top, cands, run_ts, dup_map=None):
         "top_fg_score": None, "top_io_score": None,    # scopus rail shows neither
         "top_confidence": top["confidence"] if top else None,
         "top_years_after_wcm": top.get("years_after_wcm") if top else None,
-        # v3.13: the top candidate's department/venue fit, NULL when the matcher had
+        # v3.14: the top candidate's department/venue fit, NULL when the matcher had
         # none to give (feature off, WCM candidate, venue or department unknown).
         "top_venue_fit": top.get("venue_fit") if top else None,
         "top_cohort_size": cohort,
@@ -779,7 +779,7 @@ def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True,
     # convention already used for idx above.
     dois = {d.get("prism:doi") for d in scopus_only if d.get("prism:doi")}
     dup_map = aar_db.dup_flags_by_doi(dois) if dois else {}
-    # Venue term (v3.13): None unless AAR_VENUE_FIT is on. Loaded once, like the roster.
+    # Venue term (v3.14): None unless AAR_VENUE_FIT is on. Loaded once, like the roster.
     if venue_lookup is None:
         venue_lookup = load_venue_lookup()
     rows, unmatched = [], 0
@@ -1201,7 +1201,7 @@ def _selftest():
           == json.dumps(_compact(IdentityIndex(_people).candidates(
               "Dual", "Ann", None, ["Weill Cornell Medicine, New York"])[0])))
 
-    # ---- venue term (v3.13) ---------------------------------------------------------
+    # ---- venue term (v3.14) ---------------------------------------------------------
     import contextlib, hashlib, io
     from venue_fit import DeptVenueFit, build_venue_lookup
     check("row carries every aar_db insert column, top_venue_fit among them, and it is "
@@ -1293,7 +1293,7 @@ def _selftest():
             os.environ["AAR_VENUE_FIT"] = _env
 
     # aar_db: top_venue_fit is refreshed like top_years_after_wcm, and left out of the
-    # statement while the live table lacks the column (code deployed before v3.13).
+    # statement while the live table lacks the column (code deployed before v3.14).
     check("aar_db refreshes top_venue_fit, and it is the only optional column",
           "top_venue_fit" in aar_db._REFRESH_COLS and "top_venue_fit" in aar_db._INSERT_COLS
           and aar_db._OPTIONAL_COLS == ("top_venue_fit",))
@@ -1302,7 +1302,7 @@ def _selftest():
     check("upsert names top_venue_fit in the insert and in the refresh when the column exists",
           "top_venue_fit" in _cols and ":top_venue_fit" in _sql
           and "top_venue_fit=VALUES(top_venue_fit)" in _sql)
-    check("before v3.13 the statement is byte-for-byte the one this module built before "
+    check("before v3.14 the statement is byte-for-byte the one this module built before "
           "the column was added (sha256 of that statement)",
           "top_venue_fit" not in _sql0 and "top_venue_fit" not in _cols0
           and hashlib.sha256(_sql0.encode()).hexdigest()
@@ -1338,12 +1338,12 @@ def _selftest():
             _n1 = aar_db.upsert([_row_v])
     finally:
         aar_db.engine = _real_engine
-    check("upsert before v3.13: the row is written without the column, and says so",
+    check("upsert before v3.14: the row is written without the column, and says so",
           _n0 == 1 and "top_venue_fit" not in _before.stmts[0][0]
           and "top_venue_fit" not in _before.stmts[0][1][0]
           and _before.stmts[0][1][0]["top_cwid"] == "ad_cu"
           and "no top_venue_fit column yet" in _buf.getvalue())
-    check("upsert after v3.13: the same row is written with it",
+    check("upsert after v3.14: the same row is written with it",
           _n1 == 1 and "top_venue_fit=VALUES(top_venue_fit)" in _after.stmts[0][0]
           and _after.stmts[0][1][0]["top_venue_fit"] == 1.586
           and _buf.getvalue().count("no top_venue_fit column yet") == 1)

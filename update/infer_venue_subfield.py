@@ -446,9 +446,9 @@ def main():
         print("journal_science_metrix holds no subfields, so there is nothing to classify "
               "against. Load it first (--import-science-metrix). Nothing written.")
         return
-    # Only the journal import can run before v3.13: every other mode writes the new table.
+    # Only the journal import can run before v3.14: every other mode writes the new table.
     if args.apply and not args.import_science_metrix and not table_ready:
-        print("venue_subfield_inferred does not exist: apply setup/alter_venue_fit_v3.13.sql "
+        print("venue_subfield_inferred does not exist: apply setup/alter_venue_fit_v3.14.sql "
               "first. Nothing written.")
         sys.exit(2)
 

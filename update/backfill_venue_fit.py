@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 One-off backfill of the venue term onto OPEN Scopus and OpenAlex rows whose top pick is
-a Cornell person (v3.13).
+a Cornell person (v3.14).
 
 WHY THIS EXISTS. Producer columns do not self-heal. The lanes write a row's proposal
 when they sweep the document, and a Scopus sweep only reaches documents loaded in the
@@ -57,7 +57,7 @@ SAFETY, the same rules as aar_reconcile_open.py:
     and the write is skipped, not overwritten; and it re-checks last_refreshed, so a row
     the nightly producer rewrote in between is skipped too. `applied` in the ledger is
     the UPDATE's own row count, per row.
-  * --apply refuses until setup/alter_venue_fit_v3.13.sql is applied.
+  * --apply refuses until setup/alter_venue_fit_v3.14.sql is applied.
 
 The --apply run is a prod write; it is handed to the owner to run, out of hours and not
 alongside the nightly (14:30 UTC).
@@ -332,7 +332,7 @@ def main():
         column_ready = not aar_db.missing_optional_cols(c)
         if args.apply and not column_ready:
             print("authorship_review has no top_venue_fit column: apply "
-                  "setup/alter_venue_fit_v3.13.sql first. Nothing written.")
+                  "setup/alter_venue_fit_v3.14.sql first. Nothing written.")
             sys.exit(2)
         lookup = venue_fit.load_venue_lookup(c)
         table = venue_fit.load_dept_fit(c, CAMPUS_ITHACA, lookup)

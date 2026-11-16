@@ -56,10 +56,10 @@ _REFRESH_COLS = [
 _INSERT_COLS = ["pmid", "author_key"] + _REFRESH_COLS + [
     "matched_pmid", "matched_pmid_source", "matched_pmid_at",
     "status", "first_seen", "last_checked"]
-# top_venue_fit (v3.13) is the one column here the live table may not have yet. The
+# top_venue_fit (v3.14) is the one column here the live table may not have yet. The
 # v2.7 note at the top of this file is what that costs: an INSERT naming a column the
 # table lacks fails outright, and a ReCiterDB merge deploys the image whether or not
-# anyone has applied setup/alter_venue_fit_v3.13.sql. So upsert() asks information_schema
+# anyone has applied setup/alter_venue_fit_v3.14.sql. So upsert() asks information_schema
 # once per call and leaves an absent optional column out of its statement. Every lane
 # then writes exactly what it wrote before the column existed, and starts filling it the
 # night after the migration, with no deploy in between.

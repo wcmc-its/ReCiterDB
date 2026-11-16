@@ -309,7 +309,7 @@ def _build_row(w, i, n, author, top, cands, run_ts, dup_map=None):
         "top_fg_score": None, "top_io_score": None,
         "top_confidence": top["confidence"] if top else None,
         "top_years_after_wcm": top.get("years_after_wcm") if top else None,
-        "top_venue_fit": top.get("venue_fit") if top else None,   # v3.13, as on the Scopus lane
+        "top_venue_fit": top.get("venue_fit") if top else None,   # v3.14, as on the Scopus lane
         "top_cohort_size": cohort,
         "top_given_match": top["given_match"] if top else None,
         "top_affil_match": int(bool(top["affil_dept_match"])) if top else None,
@@ -645,7 +645,7 @@ def run(since, until, apply_writes=False, recheck=True, idx=None, venue_lookup=N
     dois = {_doi(w) for w in openalex_only if _doi(w)}
     dup_map = aar_db.dup_flags_by_doi(dois) if dois else {}
     dup_map.update(external_article_uids_by_wid({_work_id(w) for w in openalex_only}))
-    # Venue term (v3.13), as on the Scopus lane: None unless AAR_VENUE_FIT is on, and
+    # Venue term (v3.14), as on the Scopus lane: None unless AAR_VENUE_FIT is on, and
     # resolved from the same issn/journal pair _build_row stores. Only a Cornell candidate
     # can be scored, and only where no WCM candidate shares the list, so it reaches this
     # lane's rows on bylines that name Ithaca and match nobody on the WCM roster.
@@ -901,7 +901,7 @@ def _selftest():
         check("one matched authorship per kept work (Cooper); Dual is unmatched",
               s["matched_rows"] == 2 and s["unmatched"] == 2)
 
-        # venue term (v3.13): run() resolves the work's venue from issn_l / the source
+        # venue term (v3.14): run() resolves the work's venue from issn_l / the source
         # name and the matcher scores a Cornell candidate the WCM roster has no namesake
         # for; with a WCM namesake on the list, or with no lookup, nothing moves.
         import contextlib, io

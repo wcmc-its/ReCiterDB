@@ -195,7 +195,7 @@ def run_venue_infer_if_enabled():
     classified tonight, and tonight's matcher already reads it.
 
     SHIPS OFF: AAR_VENUE_INFER unset (or anything but "on") skips it. Before setting it:
-    (1) apply setup/alter_venue_fit_v3.13.sql (--apply refuses without the table);
+    (1) apply setup/alter_venue_fit_v3.14.sql (--apply refuses without the table);
     (2) add bedrock:InvokeModel on the Claude Haiku inference profile and its foundation
     model to the reciterdb role (without it every call fails and nothing is classified);
     (3) run the one-off --import-science-metrix and --import-json loads, or the first
@@ -808,7 +808,7 @@ def main():
     if overall_success and aar_lanes_safe():
         run_venue_infer_if_enabled()          # OFF unless AAR_VENUE_INFER=on: Science-Metrix
                                               # subfields for new Scopus/OpenAlex venues, ahead
-                                              # of the lanes that read them (v3.13)
+                                              # of the lanes that read them (v3.14)
         run_scopus_lane_if_due()              # weekly (Sun) unless AAR_SCOPUS_LANE_CADENCE=daily
         run_scopus_ithaca_lane_if_due()       # OFF unless AAR_SCOPUS_ITHACA_LANE=on: the same
                                               # weekly (Sun) Scopus lane over the Cornell Ithaca
