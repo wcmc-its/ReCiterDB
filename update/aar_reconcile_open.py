@@ -391,7 +391,7 @@ def _load_class_b_modules():
     # trigger through the candidate entries, so a row that needs them rewritten is
     # already caught by candidate_cwids_json; last_refreshed changes on every write by
     # definition and would make every row drift forever.
-    # ...plus the four columns that DESCRIBE THE TOP CANDIDATE. CLASS B's whole job is
+    # ...plus the columns that DESCRIBE THE TOP CANDIDATE. CLASS B's whole job is
     # to move top_cwid to a different person; leaving these behind detaches a row's
     # score from the person the row names. Measured 2026-09-05: 512 open rows carried a
     # top_fg_score/top_io_score pair belonging to a different candidate in their own
@@ -404,14 +404,23 @@ def _load_class_b_modules():
     # dup_flag/dup_reason are deliberately NOT here: they describe the ARTICLE's
     # duplicate status, and CLASS B has no dup map to recompute them from. They belong
     # to a batched aar_db.dup_flags_by_doi() pass, not to this one.
+    #
+    # top_venue_fit (v3.14) is one of them: the top candidate's department/venue fit.
+    # Left out, a refresh that moved top_cwid would leave the previous person's fit on
+    # the row -- the same defect again -- and Publication Manager's bulk accept filters
+    # on that column. The scopus replay ranks with the venue term (see
+    # aar_report_changed_picks), so the value written is the new top candidate's own; on
+    # the pubmed lane, which has no venue term, it is NULL. It is also the one column
+    # here the live table may not have yet: see _drop_absent_optional_cols.
     _TOP_CANDIDATE_COLS = [
-        "top_fg_score", "top_io_score", "top_years_after_wcm", "classification"]
+        "top_fg_score", "top_io_score", "top_years_after_wcm", "top_venue_fit",
+        "classification"]
     REFRESH_COLS = list(sweep.NULL_COLUMNS) + _TOP_CANDIDATE_COLS + [
         "top_cohort_size", "single_candidate", "last_refreshed"]
     _EXTRA = [c for c in REFRESH_COLS if c not in sweep.NULL_COLUMNS]
     assert set(sweep.NULL_COLUMNS) <= set(REFRESH_COLS) and _EXTRA == _TOP_CANDIDATE_COLS + [
         "top_cohort_size", "single_candidate", "last_refreshed"], (
-        f"REFRESH_COLS is not aar_sweep_stale.NULL_COLUMNS plus the four top-candidate "
+        f"REFRESH_COLS is not aar_sweep_stale.NULL_COLUMNS plus the top-candidate "
         f"columns plus exactly the three row-level producer columns: {REFRESH_COLS}")
     # A column that describes the top candidate MUST be refreshed by a writer that moves
     # top_cwid. This is the guard the original omission slipped past.
@@ -557,13 +566,34 @@ def _install_capture():
     rcp._row_result = _row_result_capture
 
 
+def _drop_absent_optional_cols(engine):
+    """Take out of REFRESH_COLS any column the live table does not have yet
+    (aar_db._OPTIONAL_COLS: top_venue_fit before setup/alter_venue_fit_v3.14.sql).
+
+    A ReCiterDB merge deploys this file whether or not the migration has been applied,
+    and CLASS B both SELECTs and UPDATEs every REFRESH_COLS column by name -- the
+    nightly aarReconcileDrift step included. Naming a column the table lacks would fail
+    that step every night until someone ran the migration. So, as aar_db.upsert does,
+    the column is left out while it is absent: the pass then reads and writes exactly
+    what it did before the column existed, and picks it up on the first run after the
+    migration with no deploy in between. Returns the columns dropped."""
+    with engine.connect() as c:
+        absent = aar_db.missing_optional_cols(c)
+    if absent:
+        REFRESH_COLS[:] = [c for c in REFRESH_COLS if c not in absent]
+        print(f"NOTE: authorship_review has no {', '.join(absent)} column yet (its "
+              f"migration is not applied); CLASS B refreshes without it\n", flush=True)
+    return absent
+
+
 def _write_payload(rec, run_ts):
     """The refresh payload for one CLASS-B record, built from the captured full
     candidate list -- asserted against what the replay itself classified before being
     trusted (see REUSE).
 
     Every column in REFRESH_COLS, not just #180's nine. top_fg_score, top_io_score,
-    top_years_after_wcm and classification describe the TOP CANDIDATE, and CLASS B's
+    top_years_after_wcm, top_venue_fit and classification describe the TOP CANDIDATE,
+    and CLASS B's
     entire purpose is to move top_cwid to a different person -- omitting them left a
     row naming one person while carrying another's score (see _load_class_b_modules).
     `classification` mirrors aar_orchestrator._db_rows verbatim so the two writers
@@ -591,7 +621,7 @@ def _write_payload(rec, run_ts):
     trunc = orch._trunc
     cohort = top.get("cohort_size")
     fg = top.get("final_score")
-    return {
+    payload = {
         "top_cwid": top["cwid"],
         "top_name": trunc(top["name"], 255),
         "top_person_type": trunc(top["person_type"], 64),
@@ -604,12 +634,18 @@ def _write_payload(rec, run_ts):
         "top_fg_score": fg,
         "top_io_score": top.get("io_score"),
         "top_years_after_wcm": top.get("years_after_wcm"),
+        # as aar_universe_scopus._build_row: the top candidate's own, NULL when it has none
+        "top_venue_fit": top.get("venue_fit"),
         # verbatim from aar_orchestrator._db_rows
         "classification": "absent" if fg is None else "buried",
         "top_cohort_size": cohort,
         "single_candidate": int(cohort == 1) if cohort else None,
         "last_refreshed": run_ts,
     }
+    # Exactly the columns this run writes, in their order: REFRESH_COLS has lost any
+    # column the live table lacks (_drop_absent_optional_cols), and a column added there
+    # without a value here fails as a KeyError instead of a silent NULL.
+    return {c: payload[c] for c in REFRESH_COLS}
 
 
 def _class_b_all_changed(engine, idx, io_scorer, limit=None, lane="both"):
@@ -978,6 +1014,7 @@ def main():
         print(f"Identity roster: {n_roster} people\n")
         io_scorer = matcher.IdentityOnlyScorer()
         _install_capture()
+        _drop_absent_optional_cols(engine)
 
     if args.check:
         _check_ids(engine, idx, io_scorer, args.check)
@@ -1183,7 +1220,7 @@ def _selftest():
                            "top_given_match", "top_affil_match", "top_confidence",
                            "candidate_cwids_json", "n_candidates",
                            "top_fg_score", "top_io_score", "top_years_after_wcm",
-                           "classification",
+                           "top_venue_fit", "classification",
                            "top_cohort_size", "single_candidate", "last_refreshed"])
     check("...and #180's own nine are still exactly its nine, untouched by that",
           sweep.NULL_COLUMNS == ["top_cwid", "top_name", "top_person_type", "top_dept",
@@ -1264,7 +1301,62 @@ def _selftest():
     check("every top-candidate column is in the SET clause CLASS B actually emits",
           all(f"{c}=:{c}" in _class_b_update_sql()
               for c in ("top_fg_score", "top_io_score", "top_years_after_wcm",
-                        "classification")))
+                        "top_venue_fit", "classification")))
+
+    # v3.14: top_venue_fit describes the top candidate, so it moves with top_cwid. A
+    # refresh that left it behind would put one person's fit on another person's row.
+    check("write_payload writes NULL top_venue_fit for a top candidate with none (every "
+          "pubmed row, and a scopus candidate the fit table cannot score)",
+          "top_venue_fit" in payload and payload["top_venue_fit"] is None)
+    FULL_CANDS_BY_ID[1003] = [dict(FULL_CANDS_BY_ID[1000][0], venue_fit=1.586),
+                              dict(FULL_CANDS_BY_ID[1000][1], venue_fit=-3.045)]
+    fitted = _write_payload({"id": 1003, "source": "scopus", "new_cwid": "abc123"}, RUN_TS)
+    check("...and the TOP candidate's own fit when it has one, never the runner-up's, "
+          "with the per-candidate fits in the stored list",
+          fitted["top_venue_fit"] == 1.586
+          and [c.get("venue_fit") for c in json.loads(fitted["candidate_cwids_json"])]
+          == [1.586, -3.045])
+
+    # ...and the column may not exist yet: code deploys with the merge, the migration is
+    # applied by hand. CLASS B then reads and writes exactly what it did before v3.14.
+    class _Eng:
+        def __init__(self, have):
+            self.have = have
+
+        def connect(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def execute(self, _stmt, _params=None):
+            return [(c,) for c in self.have]
+
+    import contextlib, io
+    full_cols = list(REFRESH_COLS)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as _out:
+            present = _drop_absent_optional_cols(_Eng(["top_venue_fit"]))
+        check("with the v3.14 column present nothing is dropped and nothing is printed",
+              present == [] and REFRESH_COLS == full_cols and _out.getvalue() == "")
+        with contextlib.redirect_stdout(io.StringIO()) as _out:
+            absent = _drop_absent_optional_cols(_Eng([]))
+        pre = _write_payload({"id": 1003, "source": "scopus", "new_cwid": "abc123"}, RUN_TS)
+        check("before the migration top_venue_fit leaves the SELECT list, the UPDATE and "
+              "the payload together, and the run says so",
+              absent == ["top_venue_fit"] and "top_venue_fit" not in REFRESH_COLS
+              and "top_venue_fit" not in _class_b_update_sql()
+              and set(pre) == set(REFRESH_COLS) == set(full_cols) - {"top_venue_fit"}
+              and "no top_venue_fit column yet" in _out.getvalue())
+        check("...and what is left is the pre-v3.14 statement, column for column",
+              _class_b_update_sql() == "UPDATE authorship_review SET "
+              + ", ".join(f"{c}=:{c}" for c in full_cols if c != "top_venue_fit")
+              + " WHERE id=:id AND status='open'")
+    finally:
+        REFRESH_COLS[:] = full_cols
     check("write_payload's top_affil_match is coerced to 0/1",
           payload["top_affil_match"] == 1)
 
@@ -1302,12 +1394,12 @@ def _selftest():
           "_load_class_b_modules too)",
           set(rcp._DRIFT_COLS) | {"top_cwid"} == set(sweep.NULL_COLUMNS))
     check("...and every trigger column is written by the refresh it triggers, while the "
-          "three #205 added and the four top-candidate columns are payload-only and "
+          "three #205 added and the top-candidate columns are payload-only and "
           "never trigger",
           set(rcp._DRIFT_COLS) < set(REFRESH_COLS)
           and set(REFRESH_COLS) - set(rcp._DRIFT_COLS) - {"top_cwid"}
-          == {"top_fg_score", "top_io_score", "top_years_after_wcm", "classification",
-              "top_cohort_size", "single_candidate", "last_refreshed"})
+          == {"top_fg_score", "top_io_score", "top_years_after_wcm", "top_venue_fit",
+              "classification", "top_cohort_size", "single_candidate", "last_refreshed"})
     # top_fg_score/top_io_score must stay payload-only for the same reason #182 gave:
     # they wobble run to run, so as triggers they would make every row drift forever.
     # They are written when something ELSE drifts, never the reason a row is rewritten.

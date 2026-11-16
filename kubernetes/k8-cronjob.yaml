@@ -35,6 +35,9 @@ spec:
             # model to the reciterdb role.
             - name: AAR_VENUE_INFER
               value: "off"
+            # AAR_VENUE_FIT (the matcher's venue term, Cornell Ithaca only) is deliberately NOT
+            # listed: it ships off and is turned on live with `kubectl set env`, after v3.14
+            # and a read of backfill_venue_fit.py's dry run.
             # AAR Scopus + PubMed lanes (weekly, gated in run_all.py)
             - name: SCOPUS_API_KEY
               valueFrom:

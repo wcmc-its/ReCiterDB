@@ -60,6 +60,9 @@ COPY update/scopus_afids_cornell_ithaca.csv ./
 # venues on Bedrock ahead of the lanes (OFF unless AAR_VENUE_INFER=on in run_all.py).
 COPY update/venue_fit.py ./
 COPY update/infer_venue_subfield.py ./
+# Manual one-off, not run by run_all.py: brings OPEN Cornell rows already in the queue
+# to what the matcher writes once AAR_VENUE_FIT is on (dry run by default).
+COPY update/backfill_venue_fit.py ./
 
 # AAR OpenAlex lane (WCM conference abstracts + preprints; OFF unless
 # AAR_OPENALEX_LANE_CADENCE is set in run_all.py). Imports aar_universe_scopus above.
