@@ -28,6 +28,10 @@ COPY update/run_all.py ./
 COPY update/updateOrcidSuggestions.py ./
 COPY update/authorIdSuggestions.py ./
 COPY update/importHarvest.py ./
+# Research-security collection (OFF unless RESEARCH_SECURITY_MODE is set; v3.13).
+# collectAffiliations.py imports watchlist_patterns, enrichArticles and aar_universe.
+COPY update/watchlist_patterns.py ./
+COPY update/collectAffiliations.py ./
 
 # Nightly identity build from ED (LDAP) + ASMS (MSSQL). Replaces the Splunk
 # saved search "reciter identity update". Own CronJob (k8-cronjob-identity.yaml),
