@@ -457,6 +457,43 @@ def run_import_harvest():
         logger.exception(f"Import harvest failed (ignored — nothing is written outside its stats tables): {e}")
 
 
+def research_security_cmd(mode, max_seconds=0):
+    """The command for RESEARCH_SECURITY_MODE=off|dry-run|apply, or None when off. Anything
+    unrecognised is off: a typo in a CronJob env patch must not start writing. The script
+    reads the mode from the same env var, so the command carries only its deadline."""
+    mode = (mode or "off").strip().lower()
+    if mode not in ("dry-run", "apply"):
+        return None
+    cmd = "python3 collectAffiliations.py"
+    return f"{cmd} --max-seconds {int(max_seconds)}" if max_seconds and max_seconds > 0 else cmd
+
+
+def run_research_security():
+    """Research-security collection (v3.13): every co-author's affiliation text and each
+    article's grant list (DynamoDB PubMedArticle, then efetch, then OpenAlex) for articles
+    with an accepted or pending WCM / Cornell author, screened against the watch lists in
+    watchlist_patterns.py into watchlist_match and watchlist_funding_flag. Runs after the
+    reporting rebuild because its scope is the fresh analysis_summary tables.
+
+    SHIPS OFF: RESEARCH_SECURITY_MODE unset (or anything but dry-run/apply) skips it. Before
+    apply: run setup/table_research_security_v3.13.sql (apply refuses without it) and read
+    a dry run's counts. Set the env with `kubectl set env`, never `kubectl apply`. Isolated:
+    timed out (RESEARCH_SECURITY_TIMEOUT_SECONDS, default 3600) and any failure is logged,
+    leaving yesterday's match tables in place; it can NEVER fail the nightly."""
+    try:
+        timeout = int(os.getenv("RESEARCH_SECURITY_TIMEOUT_SECONDS", "3600"))
+        # Collection stops ten minutes before the hard timeout, leaving the rebuild of the
+        # two match tables (a regex pass over every stored string) time to finish.
+        cmd = research_security_cmd(os.getenv("RESEARCH_SECURITY_MODE"), max(timeout - 600, 60))
+        if not cmd:
+            logger.info("Research security: RESEARCH_SECURITY_MODE=%s — skipped",
+                        os.getenv("RESEARCH_SECURITY_MODE") or "off")
+            return
+        run_script("researchSecurity", cmd, timeout_seconds=timeout)
+    except Exception as e:
+        logger.exception(f"Research-security collection failed (ignored — reporting unaffected): {e}")
+
+
 # ------------- AAR PubMed lane (daily by default, isolated) -------------
 def run_pubmed_lane_if_due():
     """PubMed orphan-authorship detector + IO/FB scoring (AAR).
@@ -752,6 +789,12 @@ def main():
         run_aar_reconcile_drift_if_due()      # OFF unless AAR_DRIFT_CADENCE is set: refresh open AAR
                                               # rows whose stored evidence columns no longer match
                                               # what the matcher would write (#186)
+
+    # After the fatal scripts (it reads the rebuilt analysis_summary tables) and after the
+    # AAR closer (so tonight's dismissed review rows are out of the pending tier). Outside
+    # the AAR guard: it is incremental, and a short person_article only delays collection.
+    if overall_success:
+        run_research_security()               # OFF unless RESEARCH_SECURITY_MODE=dry-run|apply (v3.13)
 
     # --- R1 (PM #1105): name the non-blocking steps that failed, last, so the log shows them ---
     for name in soft_failures:
