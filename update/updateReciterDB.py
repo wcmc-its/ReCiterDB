@@ -280,8 +280,8 @@ def cornell_ithaca_people_sql(person_table, type_table):
     they never reached Find People. One row per cornell-ithaca identity without one;
     update_person() then fills the names. Metrics stay NULL and dateAdded NULL marks
     the row as never run: PM keys on that to keep them out of Curate (which would run
-    ReCiter on them). NOT EXISTS because update_person() runs twice a night and dual
-    WCM/Cornell appointees already have their Analysis row."""
+    ReCiter on them). Runs once, from the final update_person pass, after every Analysis
+    batch is loaded, so NOT EXISTS skips anyone who already has their Analysis row."""
     return f"""
     INSERT INTO `{person_table}` (personIdentifier, `precision`, recall,
         countSuggestedArticles, countPendingArticles, overallAccuracy)
@@ -293,13 +293,18 @@ def cornell_ithaca_people_sql(person_table, type_table):
                       WHERE p.personIdentifier = i.personIdentifier);
     """
 
-def update_person(cursor):
+def update_person(cursor, add_cornell=False):
+    """add_cornell only from call_update_person_only() (retrieveArticles Step 6), after every
+    Analysis batch is in person_new. In Step 1 person_new is still empty, so the stub insert's
+    NOT EXISTS excluded nobody and every Cornell person ReCiter had run on got a stub AND an
+    Analysis row (844 duplicated cwids on prod, 11-16)."""
     current_time = time.strftime("%Y-%m-%d %H:%M:%S")
     target_table = shadow_table_name('person')
     logger.info(f"{current_time} -- Starting update_person (target: `{target_table}`).")
-    cursor = execute_with_reconnect(
-        cursor, cornell_ithaca_people_sql(target_table, shadow_table_name('person_person_type')))
-    logger.info(f"{current_time} -- Added {cursor.rowcount} Cornell Ithaca people to `{target_table}`.")
+    if add_cornell:
+        cursor = execute_with_reconnect(
+            cursor, cornell_ithaca_people_sql(target_table, shadow_table_name('person_person_type')))
+        logger.info(f"{current_time} -- Added {cursor.rowcount} Cornell Ithaca people to `{target_table}`.")
     update_query = f"""
     UPDATE `{target_table}` p
     JOIN person_temp i ON i.personIdentifier = p.personIdentifier
@@ -575,7 +580,7 @@ def call_update_person_only():
     cursor = connection.cursor()
     try:
         logger.info("Calling update_person ONLY, without loading person_temp...")
-        cursor = update_person(cursor)  # uses the existing person_temp table
+        cursor = update_person(cursor, add_cornell=True)  # uses the existing person_temp table
         connection.commit()
     except Exception as e:
         logger.error(f"Error in call_update_person_only: {e}")
