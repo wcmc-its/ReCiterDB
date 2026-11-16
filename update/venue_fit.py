@@ -67,21 +67,35 @@ VENUE_PENALTY = 0.20
 # (utf8mb4_unicode_ci) already treats them as equal: a key Python thought was new would
 # otherwise collide with a stored one on insert, and be sent to the model again every
 # night.
+#
+# A key has to be a NAME. Two kinds of title leave something behind that is not one, and
+# both would make unrelated venues share a row:
+#   * a title that is only a year and punctuation. "(2023)" folds to "( )", "2019/2020"
+#     to "/", "2023-2024" to "-", and the first one classified would then answer for
+#     every other title of that shape. So a key with no letter in it is the empty key.
+#   * a placeholder a source writes where it has no title (_NO_TITLE). The research
+#     prototype sent the literal "undefined" to the model and got back "General Science &
+#     Technology", the subfield that holds Nature and Science.
+# The empty key is never looked up, never classified and never stored.
 _YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
 _ORDINAL = re.compile(r"\b\d+(?:st|nd|rd|th)\b")
+_NO_TITLE = frozenset({"undefined", "null", "none", "nan", "n/a", "unknown"})
 VENUE_KEY_MAX = 512  # venue_subfield_inferred.venue_key VARCHAR(512)
 
 
 def venue_key(title):
     """Container title -> the key `venue_subfield_inferred` stores it under: lowercased,
     accents folded, 4-digit years and edition ordinals removed, whitespace collapsed.
-    '' for anything that is not a string or has nothing left."""
+    '' for anything that is not a string, has no letter left, or is a placeholder for a
+    missing title."""
     if not isinstance(title, str):
         return ""
     s = unicodedata.normalize("NFKD", title)
     s = "".join(ch for ch in s if not unicodedata.combining(ch)).lower()
-    s = _ORDINAL.sub(" ", _YEAR.sub(" ", s))
-    return " ".join(s.split())[:VENUE_KEY_MAX]
+    s = " ".join(_ORDINAL.sub(" ", _YEAR.sub(" ", s)).split())[:VENUE_KEY_MAX]
+    if s in _NO_TITLE or not any(ch.isalpha() for ch in s):
+        return ""
+    return s
 
 
 def issn_key(issn):
@@ -102,9 +116,13 @@ def build_venue_lookup(journal_rows, inferred_rows):
 
     Where two journal rows claim the same ISSN the LOWEST smsid wins. Science-Metrix's own
     rows sit below 800001 and inferred journals at or above it, so a category the
-    publisher list assigns always beats one a model guessed from the title."""
+    publisher list assigns always beats one a model guessed from the title.
+
+    Subfields are stripped (`subfield_name`): the source list spells one of them with a
+    trailing space, and the department table must count it as one subfield, not two."""
     lookup = {}
     for _smsid, issn, eissn, subfield in sorted(journal_rows, key=lambda r: r[0]):
+        subfield = subfield_name(subfield)
         if not subfield:
             continue
         for raw in (issn, eissn):
@@ -112,9 +130,18 @@ def build_venue_lookup(journal_rows, inferred_rows):
             if k:
                 lookup.setdefault("issn:" + k, subfield)
     for key, subfield in inferred_rows:
+        subfield = subfield_name(subfield)
         if key and subfield:
             lookup.setdefault("title:" + key, subfield)
     return lookup
+
+
+def subfield_name(subfield):
+    """A subfield as this module and infer_venue_subfield.py compare it: stripped, ''
+    when there is none. ReCiter's ScienceMetrix.json spells 'Econometrics ' with a
+    trailing space on all 22 of its rows; MariaDB's padded comparison hides that, Python's
+    does not."""
+    return subfield.strip() if isinstance(subfield, str) else ""
 
 
 def load_venue_lookup(conn):
@@ -175,44 +202,67 @@ class DeptVenueFit:
     a physics department's fit for an optics journal means something different on a
     medical campus.
 
-    The rows are (dept, subfield, n). Department is matched as an exact string, the
-    `top_dept` the producer stored against the `dept` the roster carries today, so a
-    renamed department starts again from no rows."""
+    THE SCORED PERSON'S OWN ROWS ARE LEFT OUT. `fit(dept, subfield, cwid)` subtracts the
+    training rows that are that person's from n_ds and n_d before anything else, the
+    MIN_DEPT floor included, so the answer is what the REST of the department publishes.
+    Every figure the term was sized on was measured this way (venue_fit_go_nogo.py:
+    "the scored person's own training rows are subtracted, so the fit is the
+    department's, not theirs"), and it is what stops a person's accepted papers from
+    vouching for their own next one: a department whose 20 rows are all one author's
+    gives that author no fit at all. p_s is the campus share and is not adjusted, as in
+    that script. With no cwid nothing is subtracted.
+
+    The rows are (dept, subfield, n) or (dept, subfield, n, cwid). Department is matched
+    as an exact string, the `top_dept` the producer stored against the `dept` the roster
+    carries today, so a renamed department starts again from no rows; a person's own rows
+    are found by cwid, case-folded, under the department they were accepted in."""
 
     def __init__(self, rows):
         self.n_ds, self.n_d, self.n_s = Counter(), Counter(), Counter()
-        for dept, subfield, n in rows:
+        self.own_ds, self.own_d = Counter(), Counter()
+        for dept, subfield, n, *who in rows:
             if not dept or not subfield or not n:
                 continue
             self.n_ds[(dept, subfield)] += n
             self.n_d[dept] += n
             self.n_s[subfield] += n
+            cwid = _cwid_key(who[0]) if who else ""
+            if cwid:
+                self.own_ds[(cwid, dept, subfield)] += n
+                self.own_d[(cwid, dept)] += n
         self.total = sum(self.n_s.values())
 
-    def fit(self, dept, subfield):
+    def fit(self, dept, subfield, cwid=None):
         """The fit, rounded to 3 places, or None when it cannot be stated: no
         department, no subfield, or a department with fewer than MIN_DEPT training rows
-        (156 of 255 Ithaca departments on 2026-11-16)."""
+        (156 of 255 Ithaca departments on 2026-11-16) once `cwid`'s own are left out."""
         if not dept or not subfield:
             return None
-        n_d = self.n_d.get(dept, 0)
+        who = _cwid_key(cwid)
+        n_d = self.n_d.get(dept, 0) - self.own_d.get((who, dept), 0)
         if n_d < MIN_DEPT:
             return None
+        n_ds = self.n_ds.get((dept, subfield), 0) - self.own_ds.get((who, dept, subfield), 0)
         p = (self.n_s.get(subfield, 0) + 1) / (self.total + len(self.n_s) + 1)
-        return round(math.log((self.n_ds.get((dept, subfield), 0) + ALPHA * p)
-                              / (n_d + ALPHA) / p), 3)
+        return round(math.log((n_ds + ALPHA * p) / (n_d + ALPHA) / p), 3)
+
+
+def _cwid_key(cwid):
+    """cwid as `own_*` is keyed: top_cwid's collation is case-insensitive."""
+    return str(cwid).strip().lower() if cwid else ""
 
 
 # The training set: authorships a curator accepted as proposed where the byline spelled
 # the person's given name out and nobody else on the campus shared it. Those are the rows
 # whose attribution owes nothing to the venue, which is what keeps the table from simply
 # learning its own output back. It does not make them error-free: most were bulk-accepted
-# and their error rate has not been sampled.
+# and their error rate has not been sampled. top_cwid is the accepted person (an accept
+# takes the proposal as it stands), kept so `fit` can leave a person's own rows out.
 _TRAINING_SQL = (
-    "SELECT top_dept, issn, journal, COUNT(*) AS n FROM authorship_review "
+    "SELECT top_dept, top_cwid, issn, journal, COUNT(*) AS n FROM authorship_review "
     "WHERE status = 'accepted' AND single_candidate = 1 AND top_given_match = 'full' "
     "AND source IN ('scopus', 'openalex') AND top_dept IS NOT NULL AND top_dept <> '' "
-    "AND {campus} GROUP BY top_dept, issn, journal")
+    "AND {campus} GROUP BY top_dept, top_cwid, issn, journal")
 # authorship_review has no campus column. Every Cornell person-type label starts with
 # "Cornell" and no WCM label does (identity_index asserts the two sets are disjoint).
 _ITHACA_ROWS = "top_person_type LIKE 'Cornell%'"
@@ -228,10 +278,11 @@ def load_dept_fit(conn, campus, lookup=None):
         lookup = load_venue_lookup(conn)
     where = _ITHACA_ROWS if campus == CAMPUS_ITHACA else _WCM_ROWS
     rows = []
-    for dept, issn, journal, n in conn.execute(text(_TRAINING_SQL.format(campus=where))):
+    for dept, cwid, issn, journal, n in conn.execute(
+            text(_TRAINING_SQL.format(campus=where))):
         subfield = subfield_for(lookup, issn, journal)
         if subfield:
-            rows.append((dept, subfield, n))
+            rows.append((dept, subfield, n, cwid))
     return DeptVenueFit(rows)
 
 
@@ -288,6 +339,17 @@ def _selftest():
           venue_key("WOOT2016") == "woot2016")
     check("nothing left, or not a string, is the empty key",
           venue_key("2024") == "" and venue_key(None) == "" and venue_key(float("nan")) == "")
+    check("a title that is only years and punctuation has no key: unrelated venues "
+          "must not meet under '( )', '/' or '-'",
+          all(venue_key(t) == "" for t in ("(2023)", "2019/2020", "2023-2024", "[2022]",
+                                           "2023.", "13th", "- / -")))
+    check("...a title needs one letter, in any script, and digits beside it are kept",
+          venue_key("4OR") == "4or" and venue_key("2D Materials") == "2d materials"
+          and venue_key("物理学报 2024") == "物理学报")
+    check("a placeholder for a missing title is not a venue, with or without a year",
+          all(venue_key(t) == "" for t in ("undefined", "Undefined 2024", " NULL ", "None",
+                                           "N/A", "unknown", "NaN"))
+          and venue_key("Undefined Behavior Workshop") == "undefined behavior workshop")
     check("the key fits the column", len(venue_key("x" * 600)) == VENUE_KEY_MAX)
     check("ISSN key: hyphenated and bare forms agree, anything else is None",
           issn_key("0732-183X") == issn_key("0732183x") == "0732183X"
@@ -316,6 +378,18 @@ def _selftest():
     check("an ISSN takes precedence over the title: an unmapped ISSN is unknown even when "
           "the title is a known container",
           subfield_for(lookup, "9999-9999", "CLEO 2025") is None)
+    junk = build_venue_lookup([(100001, "1111-1111", None, "Econometrics ")],
+                              [("undefined", "General Science & Technology"), ("( )", "Law"),
+                               ("cleo", " Optics ")])
+    check("a stored row under a placeholder or punctuation-only key is never reached",
+          subfield_for(junk, None, "undefined") is None
+          and subfield_for(junk, "", "Undefined 2024") is None
+          and subfield_for(junk, None, "(1999)") is None)
+    check("a subfield is read stripped, from either table ('Econometrics ' is one "
+          "subfield, not two)",
+          subfield_for(junk, "1111-1111", None) == "Econometrics"
+          and subfield_for(junk, None, "CLEO 2025") == "Optics"
+          and subfield_name(None) == "" and subfield_name("  ") == "")
     check("unknown venue, empty title, empty lookup -> None",
           subfield_for(lookup, None, "Never Seen") is None
           and subfield_for(lookup, None, "2024") is None
@@ -345,10 +419,11 @@ def _selftest():
             if "FROM venue_subfield_inferred" in sql:
                 return _Result([("cleo", "Optics")])
             if "FROM authorship_review" in sql:
-                return _Result([("Physics", "1111-1111", "J Opt", 12),
-                                ("Physics", None, "CLEO 2022", 8),
-                                ("Physics", "9999-9999", "Unmapped", 50),
-                                ("Law School", "5555-5555", "L Rev", 100)])
+                return _Result([("Physics", "abc1", "1111-1111", "J Opt", 12),
+                                ("Physics", "ABC1", None, "CLEO 2022", 3),
+                                ("Physics", "xyz2", None, "CLEO 2022", 5),
+                                ("Physics", "abc1", "9999-9999", "Unmapped", 50),
+                                ("Law School", None, "5555-5555", "L Rev", 100)])
             raise AssertionError(f"unexpected SQL: {sql}")
 
     conn = _Conn()
@@ -393,6 +468,48 @@ def _selftest():
           all(c in _TRAINING_SQL for c in (
               "status = 'accepted'", "single_candidate = 1", "top_given_match = 'full'",
               "source IN ('scopus', 'openalex')")))
+
+    # --- the scored person's own rows are left out
+    # Physics is abc1's 15 rows (12 + 3, two spellings of the cwid) and xyz2's 5.
+    #   for abc1: n_d = 20 - 15 = 5  -> under MIN_DEPT, no fit
+    #   for xyz2: n_d = 20 - 5 = 15  -> under MIN_DEPT, no fit
+    #   for anyone else in Physics, and with no cwid: the whole department, 1.586
+    check("the training query keeps the accepted person, and counts are kept per person",
+          "top_cwid" in _TRAINING_SQL.split("FROM")[0]
+          and "GROUP BY top_dept, top_cwid, issn, journal" in _TRAINING_SQL
+          and fit.own_d == {("abc1", "Physics"): 15, ("xyz2", "Physics"): 5})
+    check("a person whose own rows are what lifts the department over 20 gets no fit; "
+          "a colleague with none, or a call with no cwid, gets the department's",
+          fit.fit("Physics", "Optics", "abc1") is None
+          and fit.fit("Physics", "Optics", "ABC1 ") is None
+          and fit.fit("Physics", "Optics", "xyz2") is None
+          and fit.fit("Physics", "Optics", "new9") == fit.fit("Physics", "Optics") == 1.586
+          and fit.fit("Physics", "Optics", None) == 1.586)
+    # Chemistry: 60 rows, 40 Optics (30 of them pat7's) and 20 Law. Campus: 180 rows,
+    # Optics 60, Law 120, 2 subfields -> p_optics = 61/183.
+    #   whole department: ln((40 + 5p) / 65 / p)            = ln(1.9231) =  0.654
+    #   without pat7:     ln((10 + 5p) / 35 / p)            = ln(1.0000) =  0.000
+    #   pat7 in Law:      ln((20 + 5q) / 35 / q), q=121/183 = ln(1.0071) =  0.007
+    #   pat7's rows under another department do not count against Physics
+    big = DeptVenueFit([("Chemistry", "Optics", 30, "pat7"), ("Chemistry", "Optics", 10, "x"),
+                        ("Chemistry", "Law", 20, "y"), ("Physics", "Optics", 20, "z"),
+                        ("Law School", "Law", 100)])
+    check("own rows come off both the subfield count and the department count, by hand: "
+          "0.654 for the department, 0.0 without the person's 30 Optics rows",
+          big.fit("Chemistry", "Optics") == 0.654 and big.fit("Chemistry", "Optics", "pat7") == 0.0
+          and big.fit("Chemistry", "Optics", "pat7")
+          == round(math.log((10 + 5 * 61 / 183) / 35 / (61 / 183)), 3))
+    check("...in a subfield the person never published in only the department count "
+          "moves, and their rows elsewhere touch no other department",
+          big.fit("Chemistry", "Law", "pat7") == 0.007
+          and big.fit("Chemistry", "Law", "pat7")
+          == round(math.log((20 + 5 * 121 / 183) / 35 / (121 / 183)), 3)
+          and big.fit("Physics", "Optics", "pat7") == big.fit("Physics", "Optics"))
+    solo = DeptVenueFit([("Optics Lab", "Optics", 20, "one1"), ("Law School", "Law", 100, "l")])
+    check("a department whose 20 rows are all one author's gives that author nothing, "
+          "and the bonus to a namesake beside them",
+          solo.fit("Optics Lab", "Optics", "one1") is None
+          and venue_term(solo.fit("Optics Lab", "Optics", "two2")) == 0.15)
 
     # --- the under-20 rule and missing inputs
     small = DeptVenueFit([("Tiny", "Optics", 19), ("Big", "Optics", 20), ("Big", "Law", 1)])

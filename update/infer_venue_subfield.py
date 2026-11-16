@@ -18,6 +18,8 @@ What it does, in its default mode:
      (every distinct subfield in journal_science_metrix) in the system prompt.
   3. Keeps an answer only when its subfield is one of those, copied verbatim. Anything
      else is dropped and the venue stays unclassified, to be tried again next run.
+     A title that names nothing ("undefined", "(2023)") is never sent: see
+     venue_fit.venue_key.
   4. Writes ISSN venues into journal_science_metrix with smsid >= 800001, domain, field
      and subfield_id copied from the lowest-smsid row of that subfield, exactly as the
      earlier person_article augmentation did; and no-ISSN venues into
@@ -51,7 +53,7 @@ Usage:
   python3 infer_venue_subfield.py --import-json f.json [--apply]
   python3 infer_venue_subfield.py --import-science-metrix ScienceMetrix.json [--apply]
 """
-import argparse, json, os, sys
+import argparse, json, os, sys, time
 from collections import Counter
 from datetime import datetime
 
@@ -66,19 +68,33 @@ DEFAULT_LIMIT = 500
 DEFAULT_MODEL = "us.anthropic.claude-haiku-5-5"
 INFERRED_SMSID_FLOOR = 800001    # Science-Metrix's own rows sit below this
 MAX_TOKENS = 8000                # 40 short answers, plus the model's own reasoning
+# Seconds after which no further batch is started. run_all.py kills the step at 1800 and
+# a killed run writes nothing, so a slow or throttled Bedrock would otherwise pay for the
+# same venues every night and never store one. One batch can still take about nine
+# minutes at worst (three attempts at the 180 s read timeout), which fits in the gap.
+TIME_BUDGET = 1200
 
 
 # ---- taxonomy -------------------------------------------------------------------
 def taxonomy_from_rows(rows):
     """(subfield, domain, field, subfield_id) rows in smsid order -> {subfield: (domain,
-    field, subfield_id)}, first row wins. In smsid order the first row of a subfield is
-    one of Science-Metrix's own, which matters because the inferred rows above 800001
-    disagree with each other about domain and field (128 of 176 subfields carry more
-    than one pairing in ReCiter's ScienceMetrix.json)."""
+    field, subfield_id, stored spelling)}, first row wins. In smsid order the first row
+    of a subfield is one of Science-Metrix's own, which matters because the inferred rows
+    above 800001 disagree with each other about domain and field (128 of 176 subfields
+    carry more than one pairing in ReCiter's ScienceMetrix.json).
+
+    The key is the subfield stripped (venue_fit.subfield_name), which is what the model
+    is shown and what its answer is matched on. The source list spells 'Econometrics '
+    with a trailing space; matched as stored, a model answering "Econometrics" would be
+    rejected every night and no venue could ever be classified there. The stored
+    spelling is kept beside it and is what gets written, so an inferred row carries the
+    same bytes as the Science-Metrix rows of its subfield and joins to them under any
+    collation."""
     out = {}
     for subfield, domain, field, subfield_id in rows:
-        if subfield:
-            out.setdefault(subfield, (domain, field, subfield_id))
+        name = venue_fit.subfield_name(subfield)
+        if name:
+            out.setdefault(name, (domain, field, subfield_id, subfield))
     return out
 
 
@@ -89,7 +105,7 @@ def load_taxonomy(conn):
 
 
 def system_prompt(taxonomy):
-    lines = "\n".join(f"{d} > {f} > {s}" for s, (d, f, _id) in sorted(
+    lines = "\n".join(f"{d} > {f} > {s}" for s, (d, f, _id, _stored) in sorted(
         taxonomy.items(), key=lambda kv: (kv[1][0] or "", kv[1][1] or "", kv[0])))
     return ("You classify publication venues (journals, conference proceedings, books) into "
             "the Science-Metrix taxonomy. For each venue choose exactly one subfield from "
@@ -109,13 +125,19 @@ def unclassified(rows, lookup):
     """(issn, title, pub_type, n) rows -> {lookup key: venue}, most rows first, for the
     venues `lookup` has no category for. A venue is keyed exactly as
     `venue_fit.subfield_for` will look it up: by ISSN when it has one, else by its
-    normalised title. Its display title and type are those of its most-used spelling."""
+    normalised title. Its display title and type are those of its most-used spelling.
+
+    A spelling with no venue key (empty, "undefined", "(2023)") is passed over even when
+    the row has an ISSN: the title is all the model is shown, and one that names nothing
+    can only be guessed at. An ISSN venue is then classified from another spelling, or
+    waits for one."""
     out = {}
     for issn, title, ptype, n in sorted(rows, key=lambda r: -(r[3] or 0)):
         title = (title or "").strip()
+        named = venue_fit.venue_key(title)
         k = venue_fit.issn_key(issn)
-        key = "issn:" + k if k else "title:" + venue_fit.venue_key(title)
-        if not title or key == "title:" or key in lookup:
+        key = "issn:" + k if k else "title:" + named
+        if not named or key in lookup:
             continue
         v = out.setdefault(key, {"issn": f"{k[:4]}-{k[4:]}" if k else None,
                                  "title": title, "type": ptype, "n": 0})
@@ -140,11 +162,12 @@ def batch_items(venues):
 
 def parse_answer(answer, n, taxonomy):
     """Model text -> {index: subfield}, keeping only what can be trusted: an integer
-    index inside the batch and a subfield that is in the taxonomy, verbatim. A near miss
-    ("Optics & Photonics" for "Optoelectronics & Photonics") is rejected, not repaired:
-    the venue stays unclassified and is asked again next run. The first answer for an
-    index wins. Text around the JSON object (a code fence, a sentence) is ignored;
-    anything that does not parse is no answers at all."""
+    index inside the batch and a subfield that is in the taxonomy, verbatim apart from
+    surrounding whitespace. A near miss ("Optics & Photonics" for "Optoelectronics &
+    Photonics") is rejected, not repaired: the venue stays unclassified and is asked
+    again next run. The first answer for an index wins. Text around the JSON object (a
+    code fence, a sentence) is ignored; anything that does not parse is no answers at
+    all."""
     start, end = (answer or "").find("{"), (answer or "").rfind("}")
     if start < 0 or end <= start:
         return {}
@@ -156,9 +179,9 @@ def parse_answer(answer, n, taxonomy):
     for o in results if isinstance(results, list) else []:
         if not isinstance(o, dict):
             continue
-        i, subfield = o.get("i"), o.get("subfield")
+        i, subfield = o.get("i"), venue_fit.subfield_name(o.get("subfield"))
         if (isinstance(i, int) and not isinstance(i, bool) and 0 <= i < n
-                and isinstance(subfield, str) and subfield in taxonomy):
+                and subfield in taxonomy):
             out.setdefault(i, subfield)
     return out
 
@@ -178,12 +201,15 @@ def classify_batch(client, model, system, venues, taxonomy):
     return parse_answer(answer, len(venues), taxonomy)
 
 
-def classify(todo, taxonomy, client, model):
+def classify(todo, taxonomy, client, model, budget=TIME_BUDGET, clock=time.monotonic):
     """{key: venue} -> ({key: subfield}, error or None). Stops at the first Bedrock
     failure: boto has already retried it, and a missing permission fails every batch the
-    same way. What was answered before the failure is kept."""
-    system, keys, answers = system_prompt(taxonomy), list(todo), {}
+    same way. Stops as well once `budget` seconds have gone (see TIME_BUDGET). Either
+    way what was answered before the stop is kept, and the caller writes it."""
+    system, keys, answers, start = system_prompt(taxonomy), list(todo), {}, clock()
     for b in range(0, len(keys), BATCH):
+        if clock() - start > budget:
+            return answers, f"time budget of {budget}s reached"
         batch = keys[b:b + BATCH]
         try:
             got = classify_batch(client, model, system, [todo[k] for k in batch], taxonomy)
@@ -205,11 +231,12 @@ def import_json_venues(data, lookup, taxonomy):
     `venue_fit.venue_key`, which folds editions of one series together, so several
     entries can land on one key; the subfield most of them carry wins, the first seen on
     a tie. Entries already in `lookup`, and entries whose subfield is not in the
-    taxonomy, are skipped and counted."""
+    taxonomy, are skipped and counted. So is an entry whose title has no venue key: the
+    file classifies the literal title "undefined", and that answer is about no venue."""
     venues, votes, stats = {}, {}, Counter()
     for raw, v in data.items():
         kind, _, rest = raw.partition(":")
-        subfield = (v or {}).get("subfield")
+        subfield = venue_fit.subfield_name((v or {}).get("subfield"))
         title = ((v or {}).get("title") or (rest if kind == "title" else "")).strip()
         if kind == "issn":
             k = venue_fit.issn_key(rest)
@@ -219,7 +246,7 @@ def import_json_venues(data, lookup, taxonomy):
             key = "title:" + vk if vk else None
         else:
             key = None
-        if not key or not title:
+        if not key or not venue_fit.venue_key(title):
             stats["skipped: unusable key or title"] += 1
         elif subfield not in taxonomy:
             stats["rejected: subfield not in the taxonomy"] += 1
@@ -292,18 +319,19 @@ def science_metrix_rows(data, existing_issn_keys, existing_smsids):
 
 # ---- writes ---------------------------------------------------------------------
 def plan_writes(venues, answers, taxonomy, model, now):
-    """Classified venues -> (journal rows still needing an smsid, title rows)."""
+    """Classified venues -> (journal rows still needing an smsid, title rows). The
+    subfield written is the table's own spelling of it (see `taxonomy_from_rows`)."""
     journals, titles = [], []
     for key, subfield in answers.items():
         v = venues[key]
-        domain, field, subfield_id = taxonomy[subfield]
+        domain, field, subfield_id, stored = taxonomy[subfield]
         if key.startswith("issn:"):
             journals.append({"publication_name": v["title"][:500], "issn": v["issn"],
                              "eissn": None, "domain": domain, "field": field,
-                             "subfield": subfield, "subfield_id": subfield_id})
+                             "subfield": stored, "subfield_id": subfield_id})
         else:
             titles.append({"venue_key": key[len("title:"):], "title": v["title"][:512],
-                           "subfield": subfield, "model": model[:64], "inferred_at": now})
+                           "subfield": stored, "model": model[:64], "inferred_at": now})
     return journals, titles
 
 
@@ -443,7 +471,7 @@ def main():
         except Exception as e:                                   # noqa: BLE001
             answers, error = {}, f"{type(e).__name__}: {e}"
         if error:
-            print(f"WARNING: Bedrock failed ({error}); the remaining venues stay "
+            print(f"WARNING: stopped early ({error}); the remaining venues stay "
                   f"unclassified and are tried again next run", flush=True)
         print(f"{len(answers)} of {len(todo)} venues classified; "
               f"{len(todo) - len(answers)} unanswered or rejected")
@@ -470,16 +498,23 @@ def _selftest():
         ("Optics", "Natural Sciences", "Physics & Astronomy", 120),
         ("Law", "Economic & Social Sciences", "Social Sciences", 77),
         ("Optics", "Applied Sciences", "Engineering", 999),        # an inferred row's pairing
-        (None, "x", "y", 1), ("", "x", "y", 2)])
-    check("taxonomy: one entry per subfield, the first (lowest smsid) row's domain/field/id",
-          taxonomy == {"Optics": ("Natural Sciences", "Physics & Astronomy", 120),
-                       "Law": ("Economic & Social Sciences", "Social Sciences", 77)})
+        ("Econometrics ", "Economic & Social Sciences", "Economics & Business", 30),
+        (None, "x", "y", 1), ("", "x", "y", 2), ("  ", "x", "y", 3)])
+    check("taxonomy: one entry per subfield, the first (lowest smsid) row's domain/field/id, "
+          "keyed stripped with the table's own spelling kept beside it",
+          taxonomy == {"Optics": ("Natural Sciences", "Physics & Astronomy", 120, "Optics"),
+                       "Law": ("Economic & Social Sciences", "Social Sciences", 77, "Law"),
+                       "Econometrics": ("Economic & Social Sciences", "Economics & Business",
+                                        30, "Econometrics ")})
 
     # --- prompt building
     system = system_prompt(taxonomy)
-    check("system prompt lists every subfield as Domain > Field > Subfield, sorted",
+    check("system prompt lists every subfield as Domain > Field > Subfield, sorted, with "
+          "no trailing space for the model to copy or drop",
+          "Economic & Social Sciences > Economics & Business > Econometrics\n"
           "Economic & Social Sciences > Social Sciences > Law\n"
-          "Natural Sciences > Physics & Astronomy > Optics" in system)
+          "Natural Sciences > Physics & Astronomy > Optics" in system
+          and "Econometrics \n" not in system)
     check("...asks for the verbatim subfield and a JSON object only",
           "copied verbatim" in system and '{"results": [{"i": <index>, "subfield"' in system
           and "only the JSON object" in system)
@@ -492,10 +527,21 @@ def _selftest():
         (None, "SIGGRAPH 2023 Conference Papers", "Conference Paper", 3),
         (None, "SIGGRAPH 2024 Conference Papers", "Conference Paper", 9),
         ("", "Handbook of Optics", "Book Chapter", 1),
+        (None, "undefined", "Article", 900), (None, "(2023)", "Book", 800),
+        ("3333-3333", "undefined", "Article", 700),                # ISSN, but nothing to show
         (None, "2024", "Book", 1), (None, "  ", "Book", 1), (None, None, "Book", 1)], lookup)
     check("venues with a category are left out; the rest are keyed as subfield_for reads them",
           list(todo) == ["title:siggraph conference papers", "issn:22222222",
                          "title:handbook of optics"])
+    check("a title that names nothing is never sent to the model, however many rows carry "
+          "it and whether or not it has an ISSN ('undefined', '(2023)')",
+          not any(v["title"] in ("undefined", "(2023)") for v in todo.values())
+          and "issn:33333333" not in todo)
+    check("...but an ISSN venue with one real spelling is classified from that one",
+          unclassified([("3333-3333", "undefined", "Article", 700),
+                        ("3333-3333", "Journal of Things", "Article", 2)], lookup)
+          == {"issn:33333333": {"issn": "3333-3333", "title": "Journal of Things",
+                                "type": "Article", "n": 2}})
     check("two editions are one venue: rows summed, the most-used spelling shown",
           todo["title:siggraph conference papers"]
           == {"issn": None, "title": "SIGGRAPH 2024 Conference Papers",
@@ -514,6 +560,11 @@ def _selftest():
     check("a code fence and prose around the object are ignored",
           parse_answer("Here you go:\n```json\n" + good + "\n```", 3, taxonomy)
           == {0: "Optics", 1: "Law"})
+    check("an answer is matched stripped, so the subfield the table spells with a "
+          "trailing space can be chosen",
+          parse_answer('{"results": [{"i": 0, "subfield": "Econometrics"}, '
+                       '{"i": 1, "subfield": "Econometrics "}, {"i": 2, "subfield": " Law"}]}',
+                       3, taxonomy) == {0: "Econometrics", 1: "Econometrics", 2: "Law"})
     check("a subfield not in the taxonomy is rejected, not repaired (case, near miss, "
           "the Domain > Field > Subfield line)",
           parse_answer('{"results": [{"i": 0, "subfield": "optics"}, '
@@ -578,6 +629,13 @@ def _selftest():
     answers, error = classify(many, taxonomy, client, "m")
     check("a Bedrock failure stops the run, is reported, and keeps the batch already answered",
           len(client.calls) == 2 and len(answers) == 40 and "AccessDenied" in error)
+    ticks = iter([0, 10, TIME_BUDGET + 1, TIME_BUDGET + 2])
+    client = _Bedrock()
+    answers, error = classify(many, taxonomy, client, "m", clock=lambda: next(ticks))
+    check("past the time budget no further batch is started, and the batch already "
+          "answered is kept for writing (a step killed at its timeout writes nothing)",
+          len(client.calls) == 1 and len(answers) == 40 and "time budget" in error
+          and TIME_BUDGET < 1800)
     check("the default model is the Haiku inference profile, overridable by env",
           DEFAULT_MODEL == "us.anthropic.claude-haiku-5-5")
 
@@ -594,6 +652,13 @@ def _selftest():
           titles == [{"venue_key": "handbook of optics", "title": "Handbook of Optics",
                       "subfield": "Optics", "model": "model-x",
                       "inferred_at": "2026-11-16 00:00:00"}])
+    econ_j, econ_t = plan_writes(todo, {"issn:22222222": "Econometrics",
+                                        "title:handbook of optics": "Econometrics"},
+                                 taxonomy, "model-x", "t")
+    check("the subfield written is the table's own spelling, trailing space included, so "
+          "an inferred row joins to the Science-Metrix rows of its subfield",
+          econ_j[0]["subfield"] == econ_t[0]["subfield"] == "Econometrics "
+          and econ_j[0]["subfield_id"] == 30)
 
     class _Conn:
         def __init__(self, top):
@@ -629,6 +694,10 @@ def _selftest():
         "title:Tie 2021": {"title": "Tie 2021", "subfield": "Optics"},
         "title:Tasting Qualities": {"title": "Tasting Qualities", "subfield": "Astrology"},
         "title:2024": {"title": "2024", "subfield": "Law"},
+        "title:undefined": {"title": "undefined", "subfield": "Law"},
+        "title:(2023)": {"title": "(2023)", "subfield": "Law"},
+        "issn:7777-7777": {"title": "undefined", "subfield": "Law"},
+        "issn:8888-8888": {"title": "Econometric Notes", "subfield": "Econometrics"},
         "doi:10.1/x": {"title": "Not a venue key", "subfield": "Law"},
     }
     venues, answers, stats = import_json_venues(data, lookup, taxonomy)
@@ -640,14 +709,21 @@ def _selftest():
           and venues["title:websci proceedings"]["title"] == "Websci 2019 Proceedings")
     check("import: a tie keeps the first subfield seen", answers["title:tie"] == "Law")
     check("import: entries that already have a category, a subfield outside the taxonomy, "
-          "an empty key and an unknown key kind are skipped and counted",
-          set(answers) == {"issn:00021466", "title:websci proceedings", "title:tie"}
+          "an empty key, a title that names nothing ('undefined', '(2023)', under an "
+          "ISSN too) and an unknown key kind are skipped and counted",
+          set(answers) == {"issn:00021466", "issn:88888888", "title:websci proceedings",
+                           "title:tie"}
           and stats == {"skipped: already has a category": 2,
                         "rejected: subfield not in the taxonomy": 1,
-                        "skipped: unusable key or title": 2,
+                        "skipped: unusable key or title": 5,
                         "folded into another title's key": 3,
                         "keys with conflicting subfields (majority kept)": 2})
     journals, titles = plan_writes(venues, answers, taxonomy, "import:f.json", "t")
+    check("import: a subfield the file spells without the table's trailing space is "
+          "accepted and written as the table spells it",
+          answers["issn:88888888"] == "Econometrics"
+          and [j["subfield"] for j in journals if j["issn"] == "8888-8888"] == ["Econometrics "])
+    journals = [j for j in journals if j["issn"] != "8888-8888"]
     check("import: goes through the same planned writes as a model answer",
           [j["issn"] for j in journals] == ["0002-1466"]
           and sorted(t["venue_key"] for t in titles) == ["tie", "websci proceedings"]
