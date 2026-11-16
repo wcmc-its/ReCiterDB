@@ -1,0 +1,187 @@
+{
+  "_comment": "Generated from Publication Manager src/lib/externalRecordShape.ts titleYearKey / pubTypes.ts normTitle. Each row: title, date, normTitle(title), yearOf(date), titleYearKey(title, date). ReCiterDB update/importHarvest.py must reproduce every row (update/test_import_harvest.py).",
+  "pm_commit": "ffc553ae",
+  "vectors": [
+    {
+      "title": "Nail-unit melanoma: in ADULTS.",
+      "date": "2020-03-01",
+      "norm": "nail unit melanoma in adults",
+      "year": "2020",
+      "key": "a6fb2766c36f938c3b1b208608ef24bbb989e37b"
+    },
+    {
+      "title": "A Title",
+      "date": "2024-01-01",
+      "norm": "a title",
+      "year": "2024",
+      "key": "d2c0924a0ca5799570823f800c0239f201e89389"
+    },
+    {
+      "title": "a   title!",
+      "date": "2024",
+      "norm": "a title",
+      "year": "2024",
+      "key": "d2c0924a0ca5799570823f800c0239f201e89389"
+    },
+    {
+      "title": "  Leading and trailing  ",
+      "date": "2019-12",
+      "norm": "leading and trailing",
+      "year": "2019",
+      "key": "dffc035b257717910381a39334959c61b5e29f20"
+    },
+    {
+      "title": "Café au lait macules — a review",
+      "date": "2021-05-04",
+      "norm": "caf au lait macules a review",
+      "year": "2021",
+      "key": "3b475c0143c249b4aca3119fe767216b37ebe761"
+    },
+    {
+      "title": "Naïve T cells & CD8+/CD4+ ratio (β-cells)",
+      "date": "2018",
+      "norm": "na ve t cells cd8 cd4 ratio cells",
+      "year": "2018",
+      "key": "f8a761a08e6187e1b74a1677cbedacd41b78a8f5"
+    },
+    {
+      "title": "COVID-19: \"Lessons\" learned; part 2?",
+      "date": "May 2024",
+      "norm": "covid 19 lessons learned part 2",
+      "year": "2024",
+      "key": "dac4b012ae503b82be07026798b4a31527fd4d55"
+    },
+    {
+      "title": "Title with\ttab\nand newline",
+      "date": "2023-01-01T00:00:00Z",
+      "norm": "title with tab and newline",
+      "year": "2023",
+      "key": "7f331aa84bcadb324860cd70ada008e5d70a600a"
+    },
+    {
+      "title": "日本語のタイトル",
+      "date": "2022",
+      "norm": "",
+      "year": "2022",
+      "key": null
+    },
+    {
+      "title": "",
+      "date": "2020",
+      "norm": "",
+      "year": "2020",
+      "key": null
+    },
+    {
+      "title": "Title",
+      "date": null,
+      "norm": "title",
+      "year": null,
+      "key": null
+    },
+    {
+      "title": "Title",
+      "date": "n.d.",
+      "norm": "title",
+      "year": null,
+      "key": null
+    },
+    {
+      "title": "ÉTUDE CLINIQUE",
+      "date": "2017-07-07",
+      "norm": "tude clinique",
+      "year": "2017",
+      "key": "3f2e8ec4f36ad119c6be308a7bc9d3c275aba63f"
+    },
+    {
+      "title": "x",
+      "date": "0099",
+      "norm": "x",
+      "year": "0099",
+      "key": "0a72ea7bf1e412fa23e0ebc2731c0be849820721"
+    },
+    {
+      "title": "İstanbul study of Straße K-cells",
+      "date": "2015-01-01",
+      "norm": "i stanbul study of stra e k cells",
+      "year": "2015",
+      "key": "031933dec3f8c669923e031e13599ccf2e8e55d3"
+    },
+    {
+      "title": "ＦＵＬＬＷＩＤＴＨ title",
+      "date": "2016",
+      "norm": "title",
+      "year": "2016",
+      "key": "bd786b72b765a06ba755e6325587000c8a1c9e9b"
+    }
+  ],
+  "doi_vectors": [
+    {
+      "doi": " https://dx.doi.org/10.1/AB ",
+      "norm": "10.1/ab"
+    },
+    {
+      "doi": "DOI: 10.5/X",
+      "norm": "10.5/x"
+    },
+    {
+      "doi": "http://doi.org/10.1000/xyz123",
+      "norm": "10.1000/xyz123"
+    },
+    {
+      "doi": "",
+      "norm": null
+    },
+    {
+      "doi": "10.1016/J.CLINIMAG.2026.110903",
+      "norm": "10.1016/j.clinimag.2026.110903"
+    }
+  ],
+  "rejection_key_vectors": [
+    {
+      "record": {
+        "article_id": "OPENALEX:https://openalex.org/W1",
+        "doi": "DOI: 10.5/X",
+        "orcid_put_code": "12",
+        "scopus_eid": "2-s2.0-9",
+        "title": "T",
+        "pub_date": "2021"
+      },
+      "keys": [
+        "DOI=10.5/x",
+        "ORCID_PUTCODE=12",
+        "SOURCE_ID=OPENALEX:W1",
+        "SOURCE_ID=SCOPUS:2-s2.0-9",
+        "TITLE_YEAR=49c12e80e7d086c9d9f9ecd4c766a2315809f568"
+      ]
+    },
+    {
+      "record": {
+        "article_id": "SCOPUS:105004692561",
+        "scopus_eid": "105004692561",
+        "title": "Hello world",
+        "pub_date": "2025-02-01"
+      },
+      "keys": [
+        "SOURCE_ID=SCOPUS:105004692561",
+        "TITLE_YEAR=603994ec135741ffa5e988b6b6bac0c5a5419efe"
+      ]
+    },
+    {
+      "record": {
+        "article_id": "ORCID:231163445",
+        "orcid_put_code": "231163445",
+        "doi": "10.1016/j.clinimag.2026.110903",
+        "openalex_id": "W7133722723",
+        "title": "Liver steatosis",
+        "pub_date": "2026-10"
+      },
+      "keys": [
+        "DOI=10.1016/j.clinimag.2026.110903",
+        "ORCID_PUTCODE=231163445",
+        "SOURCE_ID=OPENALEX:W7133722723",
+        "TITLE_YEAR=a73ad1f1be589ba8cdf1cb2222828473562dea78"
+      ]
+    }
+  ]
+}
