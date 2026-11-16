@@ -85,6 +85,10 @@ CREATE TABLE IF NOT EXISTS `authorship_review` (
   `accept_conflict`        VARCHAR(500) NULL COMMENT 'ExternalArticleDupCheck 409 verdict from a curator/bulk Accept; NULL = never conflicted',  -- PM-owned, never producer-written: ExternalArticleDupCheck's
                                                              -- title+year collision message when a curator's Accept comes
                                                              -- back 409, holding the row in PM's "duplicates" queue
+  `accept_conflict_matches` JSON        NULL COMMENT 'PM: what the dup check matched when accept_conflict was set; NULL = nothing stored',  -- (v3.12) PM-owned like
+                                                             -- accept_conflict: {uid, name, via, checked_at, matches:[{source,
+                                                             -- type, id, idLabel, doi, title, journal, pubYear, where, detail}]}.
+                                                             -- See setup/alter_authorship_review_add_accept_conflict_matches_v3.12.sql
   -- matched_pmid* (v2.7, #951 Layer 1): the PubMed record the Scopus-lane producer
   -- believes is the same work as this authorship (DOI or title-heuristic hit).
   -- matched_pmid/_source/_at are producer-owned (aar_db._INSERT_COLS, NOT

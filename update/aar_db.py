@@ -108,6 +108,7 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
   dup_flag               TINYINT(1)   NOT NULL DEFAULT 0,
   dup_reason             VARCHAR(255) NULL,
   accept_conflict        VARCHAR(500) NULL COMMENT 'ExternalArticleDupCheck 409 verdict from a curator/bulk Accept; NULL = never conflicted',  -- PM-owned, never producer-written
+  accept_conflict_matches JSON        NULL COMMENT 'PM: what the dup check matched when accept_conflict was set; NULL = nothing stored',  -- v3.12, PM-owned like accept_conflict
   matched_pmid           BIGINT       NULL,
   matched_pmid_source    ENUM('scopus','doi','title') NULL,
   matched_pmid_at        DATETIME     NULL,
