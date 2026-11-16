@@ -700,7 +700,8 @@ def wcm_lane_candidates(idx, au, pub_year, ithaca_family=None, venue_subfield=No
 
     `venue_subfield` (`stored_venue_subfield()` for the document) is forwarded
     only when there is one, so with the venue term off the call is the one it always
-    was."""
+    was. A `CampusRoster` uses it only for an author the WCM roster offers nobody for
+    (see `CampusRoster.candidates`): a list with a WCM candidate on it carries no term."""
     kw = {}
     if isinstance(idx, CampusRoster):
         if ithaca_family is None:
@@ -1239,20 +1240,33 @@ def _selftest():
                                       campuses=_campuses(_au, _ithaca))[0]
           and [c["cwid"] for c in _off] == ["ad_wcm", "ad_cu"]
           and not any("venue_fit" in c for c in _off))
-    check("with a subfield the Cornell candidate is scored and, in the same tier, now "
-          "leads (0.90 + 0.15 -> 1.0 against the WCM 0.90); the WCM candidate is unscored",
-          [(c["cwid"], c["confidence"], c.get("venue_fit")) for c in _on]
-          == [("ad_cu", 1.0, 1.586), ("ad_wcm", 0.9, None)])
-    _row_v = _build_row(entry, 0, 2, _au, _on[0], _on, "2026-11-16 00:00:00")
-    _stored_v = json.loads(_row_v["candidate_cwids_json"])
-    check("the row stores top_venue_fit and the per-candidate venue_fit; the WCM entry's "
-          "stored bytes are the ones it had before the venue term existed",
-          _row_v["top_venue_fit"] == 1.586 and _row_v["top_cwid"] == "ad_cu"
-          and _stored_v[0]["venue_fit"] == 1.586 and "venue_fit" not in _stored_v[1]
-          and _stored_v[1] == _stored[0])
+    check("a byline that offers a WCM candidate carries no venue term: only the Cornell "
+          "side could earn it, so the WCM pick keeps its exact tie (0.90 each) and the "
+          "stored row is the one it was",
+          _on == _off and [(c["cwid"], c["confidence"]) for c in _on]
+          == [("ad_wcm", 0.9), ("ad_cu", 0.9)]
+          and _build_row(entry, 0, 2, _au, _on[0], _on, "t")
+          == _build_row(entry, 0, 2, _au, _off[0], _off, "t"))
+    # The WCM lane reaches the term only where the WCM roster has no namesake at all.
+    _roster4 = CampusRoster(IdentityIndex([_rec("Bea", "Other", "bo_wcm")]), ithaca=_ith)
+    _solo, _ = wcm_lane_candidates(_roster4, _au, None, _ithaca, "Optics")
+    check("...and one on which the WCM roster offers nobody is the Ithaca answer, scored "
+          "(0.90 + 0.15 -> 1.0)",
+          [(c["cwid"], c["confidence"], c.get("venue_fit")) for c in _solo]
+          == [("ad_cu", 1.0, 1.586)]
+          and "venue_fit" not in wcm_lane_candidates(_roster4, _au, None, _ithaca)[0][0])
+    _on, _ = wcm_lane_candidates(_ith, _au, None, None, "Optics")
     check("the Ithaca lane's bare index takes the subfield through the same call",
-          wcm_lane_candidates(_ith, _au, None, None, "Optics")[0][0]["venue_fit"] == 1.586
-          and "venue_fit" not in wcm_lane_candidates(_ith, _au, None)[0][0])
+          _on == _solo and "venue_fit" not in wcm_lane_candidates(_ith, _au, None)[0][0])
+    _row_v = _build_row(entry, 0, 1, _au, _on[0], _on, "2026-11-16 00:00:00")
+    _stored_v = json.loads(_row_v["candidate_cwids_json"])
+    check("the row stores top_venue_fit and the per-candidate venue_fit, and is otherwise "
+          "the row the lane wrote before the venue term existed",
+          _row_v["top_venue_fit"] == 1.586 and _row_v["top_cwid"] == "ad_cu"
+          and _row_v["top_confidence"] == 1.0 and _stored_v[0]["venue_fit"] == 1.586
+          and {k: v for k, v in _stored_v[0].items() if k not in ("venue_fit", "confidence")}
+          == {k: v for k, v in _compact(wcm_lane_candidates(_ith, _au, None)[0])[0].items()
+              if k != "confidence"})
 
     # load_venue_lookup: nothing is read unless AAR_VENUE_FIT is on, and a failed read is
     # a run without the term.

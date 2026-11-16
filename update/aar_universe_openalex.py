@@ -647,7 +647,8 @@ def run(since, until, apply_writes=False, recheck=True, idx=None, venue_lookup=N
     dup_map.update(external_article_uids_by_wid({_work_id(w) for w in openalex_only}))
     # Venue term (v3.13), as on the Scopus lane: None unless AAR_VENUE_FIT is on, and
     # resolved from the same issn/journal pair _build_row stores. Only a Cornell candidate
-    # can be scored, so it reaches this lane's rows on bylines that name Ithaca.
+    # can be scored, and only where no WCM candidate shares the list, so it reaches this
+    # lane's rows on bylines that name Ithaca and match nobody on the WCM roster.
     if venue_lookup is None:
         venue_lookup = load_venue_lookup()
     rows, unmatched = [], 0
@@ -901,16 +902,17 @@ def _selftest():
               s["matched_rows"] == 2 and s["unmatched"] == 2)
 
         # venue term (v3.13): run() resolves the work's venue from issn_l / the source
-        # name and the matcher scores the Cornell candidate; with no lookup nothing moves.
+        # name and the matcher scores a Cornell candidate the WCM roster has no namesake
+        # for; with a WCM namesake on the list, or with no lookup, nothing moves.
         import contextlib, io
         from identity_index import CampusRoster, CAMPUS_ITHACA
         from venue_fit import DeptVenueFit, build_venue_lookup
         cu = dict(rec("Alissa", "Cooper", "ac_cu"), campus=CAMPUS_ITHACA, dept="Physics",
                   person_type="Cornell Faculty")
         table = DeptVenueFit([("Physics", "Optics", 20), ("Law School", "Law", 100)])
-        both = CampusRoster(IdentityIndex([rec("Alissa", "Cooper", "ac1")]),
-                            ithaca=IdentityIndex([cu], campus=CAMPUS_ITHACA,
-                                                 dept_venue_fit=table))
+        ith = IdentityIndex([cu], campus=CAMPUS_ITHACA, dept_venue_fit=table)
+        both = CampusRoster(IdentityIndex([rec("Alissa", "Cooper", "ac1")]), ithaca=ith)
+        solo = CampusRoster(IdentityIndex([rec("Bea", "Other", "bo1")]), ithaca=ith)
         ith_work = _fixture()
         ith_work["authorships"][1]["raw_affiliation_strings"] = [
             "Weill Cornell Medicine, New York, NY", "Cornell University, Ithaca, NY"]
@@ -923,14 +925,22 @@ def _selftest():
         g["recheck_open_scopus"] = lambda ts, source="scopus": (0, 0)
         lookup = build_venue_lookup([(100001, "1556-0864", None, "Optics")], [])
         with contextlib.redirect_stdout(io.StringIO()):
+            run("2026-01-01", "2026-12-31", apply_writes=True, idx=solo, venue_lookup=lookup)
             run("2026-01-01", "2026-12-31", apply_writes=True, idx=both, venue_lookup=lookup)
             run("2026-01-01", "2026-12-31", apply_writes=True, idx=both)
-        scored, plain = kept
-        check("venue term: the work's issn_l resolves a subfield, the Cornell candidate "
-              "is scored and leads its tier, and the row stores top_venue_fit",
+        scored, mixed, plain = kept
+        check("venue term: the work's issn_l resolves a subfield, a Cornell candidate with "
+              "no WCM namesake is scored, and the row stores top_venue_fit",
               scored["top_cwid"] == "ac_cu" and scored["top_venue_fit"] == 1.586
               and [c.get("venue_fit") for c in json.loads(scored["candidate_cwids_json"])]
-              == [1.586, None])
+              == [1.586])
+        same = lambda a, b: all(a[k] == b[k] for k in a if k != "matched_pmid_at")
+        check("venue term: a list with a WCM candidate on it carries none -- the WCM pick "
+              "stands and the row is the one written with the term off",
+              mixed["top_cwid"] == "ac1" and mixed["top_venue_fit"] is None
+              and "venue_fit" not in mixed["candidate_cwids_json"] and same(mixed, plain)
+              and [c["cwid"] for c in json.loads(mixed["candidate_cwids_json"])]
+              == ["ac1", "ac_cu"])
         check("venue term off (no lookup): the WCM pick stands, nothing carries a venue fit",
               plain["top_cwid"] == "ac1" and plain["top_venue_fit"] is None
               and "venue_fit" not in plain["candidate_cwids_json"])

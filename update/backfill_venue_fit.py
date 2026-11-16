@@ -13,8 +13,9 @@ to what the matcher would say about them now.
 
 WHAT IT DOES, per row, from what the row already stores and nothing else:
   1. resolves the venue's subfield from the stored issn / journal (venue_fit.subfield_for);
-  2. for each stored candidate on the Cornell roster, looks up the department's fit for
-     that subfield, records it as `venue_fit` and adds the venue term to `confidence`;
+  2. for each stored candidate, looks up the department's fit for that subfield with the
+     candidate's own accepted rows left out (venue_fit.DeptVenueFit), records it as
+     `venue_fit` and adds the venue term to `confidence`;
   3. re-sorts the stored candidates with the matcher's own key (identity_index._rank_key:
      full given name, affiliation match, confidence);
   4. rewrites the top_* columns from whoever is first, and the candidate list.
@@ -23,8 +24,12 @@ NO SCOPUS RE-FETCH, and that sets its limits:
   * Only the candidates the row stored can be re-ranked: at most five. Someone the
     producer ranked sixth is not in candidate_cwids_json and cannot be promoted here,
     however well the venue fits. n_candidates is left alone for the same reason.
-  * A WCM candidate on a two-campus row is carried through unscored, as the matcher
-    carries it: the WCM roster has no fit table in this release.
+  * A row with a WCM candidate on it is SKIPPED, as the matcher leaves it alone
+    (identity_index.CampusRoster): only the Cornell side could earn the term, so a mixed
+    list carries none. The stored list is the top five, so a row whose only WCM
+    candidates ranked sixth or lower reads here as all-Cornell and is scored where the
+    producer would not score it; the next sweep that reaches it writes the producer's
+    answer.
   * `confidence` is the stored value plus the term, clipped. The matcher clips once,
     after adding every term, and the stored value has already been clipped; the two
     agree except at the 1.0 ceiling, where the stored value is rebuilt from the
@@ -34,9 +39,17 @@ A row any of whose candidates already carries `venue_fit` is SKIPPED. Its confid
 already contains the term, written by the producer or by an earlier run of this script,
 and adding it again would double it. That is what makes a second run a no-op.
 
+A row held in Publication Manager's duplicates queue (accept_conflict set) is left
+alone: a curator's Accept is parked on the person the row names.
+
 SAFETY, the same rules as aar_reconcile_open.py:
   * Dry run by default. It reads, counts, prints a sample and writes a JSONL ledger with
     the full before and after of every row it would touch.
+  * The ledger is on disk BEFORE the first UPDATE and rewritten after it with each
+    row's `applied`. A ledger that cannot be written stops the run with nothing changed.
+    Every run writes its own file (the default name carries the time and the mode) and
+    an existing file is never overwritten, so the dry run that follows an apply cannot
+    truncate the record of it.
   * --apply writes producer-owned columns only (WRITE_COLS, checked at import against
     aar_db._REFRESH_COLS). It never names status, resolution_cwid, reviewer, note or
     snooze_until.
@@ -49,8 +62,13 @@ SAFETY, the same rules as aar_reconcile_open.py:
 The --apply run is a prod write; it is handed to the owner to run, out of hours and not
 alongside the nightly (14:30 UTC).
 
+ORDER. Dry-run at any time. Set AAR_VENUE_FIT=on on the CronJob BEFORE --apply, not
+after: while the feature is off every sweep re-upserts the open rows in its window with
+no term and top_venue_fit NULL, which would undo this pass for those rows and move their
+picks twice.
+
 Env: DB_USERNAME/DB_PASSWORD/DB_HOST/DB_NAME (reciterdb). AAR_VENUE_FIT is not read: this
-is the explicit tool, and it can be dry-run before the feature is switched on.
+is the explicit tool, and its own environment says nothing about the CronJob's.
 
 Usage:
   python3 backfill_venue_fit.py --selftest          # offline checks, no DB
@@ -86,7 +104,7 @@ _READ_COLS = ["id", "source", "author_key", "wcm_author", "issn", "journal"] + [
     c for c in WRITE_COLS if c != "top_venue_fit"]
 _SELECT_SQL = ("SELECT {cols} FROM authorship_review WHERE status='open' "
                "AND source IN ('scopus', 'openalex') AND top_person_type LIKE 'Cornell%' "
-               "AND candidate_cwids_json IS NOT NULL ORDER BY id")
+               "AND candidate_cwids_json IS NOT NULL AND accept_conflict IS NULL ORDER BY id")
 # Cornell labels whose holder is `historical` whatever else they hold (identity_index
 # CORNELL_HISTORICAL_TYPES, by label because the label is what a stored candidate keeps).
 _TERMINAL_LABELS = frozenset(label for _t, label, hist in CORNELL_PERSON_TYPES if hist)
@@ -147,6 +165,7 @@ def replay_row(row, lookup, table, run_ts):
 
       skipped: no stored candidates      nothing to re-rank
       skipped: already has venue fit     the term is already in its confidence
+      skipped: WCM candidate on the row  a mixed list carries no term (the matcher's rule)
       skipped: venue has no category     no subfield, so no term (the matcher's answer too)
       skipped: no scorable department    no Cornell candidate's department has 20 rows
       PICK_CHANGE                        a different person leads the row
@@ -162,14 +181,15 @@ def replay_row(row, lookup, table, run_ts):
         return "skipped: no stored candidates", None
     if any("venue_fit" in c for c in cands):
         return "skipped: already has venue fit", None
+    if any(c.get("campus") != CAMPUS_ITHACA for c in cands):
+        return "skipped: WCM candidate on the row", None
     subfield = venue_fit.subfield_for(lookup, row["issn"], row["journal"])
     if not subfield:
         return "skipped: venue has no category", None
 
     scored, out = 0, []
     for c in cands:
-        fit = (table.fit(c.get("dept"), subfield)
-               if c.get("campus") == CAMPUS_ITHACA else None)
+        fit = table.fit(c.get("dept"), subfield, c.get("cwid"))
         if fit is None:
             out.append(c)
             continue
@@ -208,11 +228,13 @@ def replay_row(row, lookup, table, run_ts):
 
 
 def _update_sql():
-    """The only write. status='open' keeps a curator's decision; the source list keeps it
-    off the PubMed lane; last_refreshed <=> the value this run read keeps it off a row
-    the nightly producer rewrote in between (NULL-safe: old rows carry none)."""
+    """The only write. status='open' and accept_conflict IS NULL keep a curator's
+    decision, made or parked; the source list keeps it off the PubMed lane;
+    last_refreshed <=> the value this run read keeps it off a row the nightly producer
+    rewrote in between (NULL-safe: old rows carry none)."""
     sets = ", ".join(f"{c}=:{c}" for c in WRITE_COLS)
     return (f"UPDATE authorship_review SET {sets} WHERE id=:id AND status='open' "
+            "AND accept_conflict IS NULL "
             "AND source IN ('scopus', 'openalex') AND last_refreshed <=> :seen_refreshed")
 
 
@@ -229,9 +251,44 @@ def apply_entries(conn, entries):
 
 
 def _write_ledger(path, entries):
-    with open(path, "w") as fh:
+    """Whole file or nothing: written beside `path` and moved into place, so a failed
+    rewrite leaves the previous complete ledger where it was."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
         for e in entries:
             fh.write(json.dumps(e, default=str) + "\n")
+    os.replace(tmp, path)
+
+
+def ledger_then_apply(eng, entries, path, apply_writes):
+    """The ledger, then the write, then the ledger again -- in that order, as
+    aar_reconcile_open does it. Returns the number of rows updated.
+
+    The first write is the before/after of every row with applied=false, and it happens
+    before any UPDATE: if it fails the run stops having changed nothing, and if the run
+    dies later the before-state of every row it may have touched is already on disk. The
+    second records what the UPDATEs did, per row. Should that one fail, the rows ARE
+    written and the file still holds their full before/after with applied=false, which
+    is said out loud before the error is re-raised."""
+    _write_ledger(path, entries)
+    if not (apply_writes and entries):
+        return 0
+    with eng.begin() as c:
+        n = apply_entries(c, entries)
+    try:
+        _write_ledger(path, entries)
+    except OSError:
+        print(f"\nWARNING: {n} rows were UPDATED but the ledger could not be rewritten. "
+              f"{path} still holds the full before/after of every row, with applied=false "
+              f"on all of them.", flush=True)
+        raise
+    return n
+
+
+def default_ledger_path(now, apply_writes):
+    """One file per run: the time to the second, and whether it wrote."""
+    return os.path.join(HERE, f"backfill_venue_fit_ledger_{now:%Y%m%d_%H%M%S}_"
+                              f"{'apply' if apply_writes else 'dryrun'}.jsonl")
 
 
 def _print_sample(entries, rule, n):
@@ -251,8 +308,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--apply", action="store_true", help="write (default: dry run)")
-    ap.add_argument("--ledger", default=os.path.join(HERE, "backfill_venue_fit_ledger.jsonl"),
-                    help="JSONL ledger of every row touched, before and after")
+    ap.add_argument("--ledger", default=None,
+                    help="JSONL ledger of every row touched, before and after (default: "
+                         "backfill_venue_fit_ledger_<time>_<dryrun|apply>.jsonl beside this "
+                         "script; an existing file is refused, never overwritten)")
     ap.add_argument("--limit", type=int, default=None, help="consider only the first N rows")
     ap.add_argument("--sample", type=int, default=15, help="rows to print per class")
     ap.add_argument("--selftest", action="store_true", help="offline checks, no DB")
@@ -260,7 +319,14 @@ def main():
     if args.selftest:
         sys.exit(0 if _selftest() else 1)
 
-    run_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now()
+    run_ts = now.strftime("%Y-%m-%d %H:%M:%S")
+    ledger = args.ledger or default_ledger_path(now, args.apply)
+    if os.path.exists(ledger):
+        print(f"{ledger} already exists and a ledger is never overwritten: it may be the "
+              f"only before/after record of an earlier run. Pass another --ledger. "
+              f"Nothing read, nothing written.")
+        sys.exit(2)
     eng = aar_db.engine()
     with eng.connect() as c:
         column_ready = not aar_db.missing_optional_cols(c)
@@ -291,15 +357,16 @@ def main():
     for rule in ("PICK_CHANGE", "CONFIDENCE_CHANGE"):
         _print_sample(entries, rule, args.sample)
 
+    n = ledger_then_apply(eng, entries, ledger, args.apply)
     if args.apply and entries:
-        with eng.begin() as c:
-            n = apply_entries(c, entries)
         print(f"\nAPPLIED: {n} of {len(entries)} rows updated"
               + (f" ({len(entries) - n} skipped: resolved by a curator or rewritten by the "
                  f"producer since they were read)" if n != len(entries) else ""))
-    _write_ledger(args.ledger, entries)
-    print(f"\nledger: {args.ledger} ({len(entries)} rows)")
-    if not args.apply:
+    print(f"\nledger: {ledger} ({len(entries)} rows)")
+    if args.apply:
+        print("AAR_VENUE_FIT must be on for the CronJob, or its next sweep rewrites these "
+              "rows without the term (see ORDER in this script's docstring).")
+    else:
         print("DRY-RUN: nothing written (pass --apply)")
 
 
@@ -394,15 +461,23 @@ def _selftest():
     check("...and so does an affiliation match", e["after"]["top_cwid"] == "rw2"
           and e["after"]["top_affil_match"] == 1)
 
-    # --- two campuses: the WCM candidate is carried through unscored
+    # --- two campuses: a mixed list carries no term, so the row is left as it is
     wcm = cand("wcm1", "Physics", campus=None, person_type="Full-Time Faculty", confidence=0.45)
-    verdict, e = replay_row(row([law, wcm]), lookup, table, ts)
-    stored = json.loads(e["after"]["candidate_cwids_json"])
-    check("a WCM candidate is never scored, even in a department the table knows, and "
-          "takes the row only because the Cornell top pick was penalised below it",
-          verdict == "PICK_CHANGE" and [c["cwid"] for c in stored] == ["wcm1", "rh1"]
-          and stored[0] == wcm and e["after"]["top_venue_fit"] is None
-          and e["after"]["top_person_type"] == "Full-Time Faculty")
+    check("a row with a WCM candidate on it is skipped wherever that candidate ranks: "
+          "the Cornell pick is not penalised below a rival the venue cannot touch",
+          replay_row(row([law, wcm]), lookup, table, ts)
+          == replay_row(row([phys, law, wcm]), lookup, table, ts)
+          == ("skipped: WCM candidate on the row", None))
+
+    # --- the candidate's own accepted rows are left out of their fit
+    own = venue_fit.DeptVenueFit([("Physics", "Optics", 15, "rw2"), ("Physics", "Optics", 5, "zz"),
+                                  ("Law School", "Law", 100)])
+    verdict, e = replay_row(row([law, phys, cand("rx4", "Physics")]), lookup, own, ts)
+    check("the fit is asked for with the candidate's cwid: the person whose own rows carry "
+          "the department gets none, a colleague gets the department's",
+          [(c["cwid"], c.get("venue_fit"), c["confidence"])
+           for c in json.loads(e["after"]["candidate_cwids_json"])]
+          == [("rx4", 1.586, 0.6), ("rw2", None, 0.45), ("rh1", -3.045, 0.25)])
 
     # --- rows left alone
     check("a row whose candidates already carry venue_fit is skipped (the term is not "
@@ -504,9 +579,10 @@ def _selftest():
 
     # --- the write
     sql = _update_sql()
-    check("the UPDATE re-checks status='open', the external sources, and that the "
-          "producer has not rewritten the row since it was read",
-          sql.endswith("WHERE id=:id AND status='open' AND source IN ('scopus', 'openalex') "
+    check("the UPDATE re-checks status='open', that no Accept is parked on the row, the "
+          "external sources, and that the producer has not rewritten it since it was read",
+          sql.endswith("WHERE id=:id AND status='open' AND accept_conflict IS NULL "
+                       "AND source IN ('scopus', 'openalex') "
                        "AND last_refreshed <=> :seen_refreshed"))
     set_clause = sql.split(" WHERE ")[0]
     check("it writes exactly WRITE_COLS and no curator-owned column",
@@ -517,9 +593,11 @@ def _selftest():
                                                 "single_candidate", "top_cohort_size")))
     check("every written column is one the producer refreshes; top_venue_fit is among them",
           all(c in aar_db._REFRESH_COLS for c in WRITE_COLS) and "top_venue_fit" in WRITE_COLS)
-    check("the SELECT takes open external rows with a Cornell top pick, and nothing else",
+    check("the SELECT takes open external rows with a Cornell top pick that are not held "
+          "in the duplicates queue, and nothing else",
           all(s in _SELECT_SQL for s in ("status='open'", "source IN ('scopus', 'openalex')",
-                                         "top_person_type LIKE 'Cornell%'")))
+                                         "top_person_type LIKE 'Cornell%'",
+                                         "accept_conflict IS NULL")))
 
     class _Conn:
         """Answers each UPDATE with the row count queued for it."""
@@ -543,6 +621,102 @@ def _selftest():
           and conn.params[0]["seen_refreshed"] == "2026-11-01 00:00:00"
           and conn.params[0]["last_refreshed"] == ts and conn.params[0]["top_cwid"] == "rw2"
           and set(conn.params[0]) == set(WRITE_COLS) | {"id", "seen_refreshed"})
+
+    # --- the ledger comes first, and is never overwritten
+    import tempfile
+
+    class _Engine:
+        """Records the order of events; each UPDATE reports one row."""
+        def __init__(self):
+            self.events, self.rowcount = [], 1
+
+        def begin(self):
+            return self
+
+        def __enter__(self):
+            self.events.append("BEGIN")
+            return self
+
+        def __exit__(self, *exc):
+            self.events.append("COMMIT" if exc[0] is None else "ROLLBACK")
+            return False
+
+        def execute(self, _stmt, params):
+            self.events.append(f"UPDATE {params['id']}")
+            return self
+
+    def fresh():
+        return [replay_row(row([law, phys], id=i), lookup, table, ts)[1] for i in (1, 2)]
+
+    def read(path):
+        with open(path) as fh:
+            return [json.loads(line) for line in fh]
+
+    with tempfile.TemporaryDirectory() as d:
+        eng, path = _Engine(), os.path.join(d, "no-such-dir", "ledger.jsonl")
+        try:
+            ledger_then_apply(eng, fresh(), path, True)
+            raised = False
+        except OSError:
+            raised = True
+        check("a ledger that cannot be written stops the run before any UPDATE",
+              raised and eng.events == [])
+
+        eng, path = _Engine(), os.path.join(d, "dry.jsonl")
+        n = ledger_then_apply(eng, fresh(), path, False)
+        check("a dry run writes the ledger and nothing else",
+              n == 0 and eng.events == [] and [e["applied"] for e in read(path)] == [False, False])
+
+        eng, path, seen = _Engine(), os.path.join(d, "apply.jsonl"), []
+        real_apply = globals()["apply_entries"]
+
+        def spy(conn, entries):
+            seen.extend(read(path))             # what is on disk when the writes begin
+            return real_apply(conn, entries)
+        globals()["apply_entries"] = spy
+        try:
+            n = ledger_then_apply(eng, fresh(), path, True)
+        finally:
+            globals()["apply_entries"] = real_apply
+        check("on --apply the full before/after is on disk, applied=false, before the "
+              "first UPDATE",
+              [(e["id"], e["applied"], e["before"]["top_cwid"], e["after"]["top_cwid"])
+               for e in seen] == [(1, False, "rh1", "rw2"), (2, False, "rh1", "rw2")]
+              and eng.events == ["BEGIN", "UPDATE 1", "UPDATE 2", "COMMIT"])
+        check("...and is rewritten afterwards with what each UPDATE did",
+              n == 2 and [e["applied"] for e in read(path)] == [True, True]
+              and not os.path.exists(path + ".tmp"))
+
+        real_write, calls = globals()["_write_ledger"], []
+
+        def fail_second(p_, entries):
+            calls.append(p_)
+            if len(calls) == 2:
+                raise OSError(28, "No space left on device")
+            return real_write(p_, entries)
+        globals()["_write_ledger"] = fail_second
+        eng, path = _Engine(), os.path.join(d, "second.jsonl")
+        import contextlib, io
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                ledger_then_apply(eng, fresh(), path, True)
+            raised = False
+        except OSError:
+            raised = True
+        finally:
+            globals()["_write_ledger"] = real_write
+        check("if the rewrite fails after the UPDATEs, the first ledger is intact and the "
+              "run says so before failing",
+              raised and "COMMIT" in eng.events and len(read(path)) == 2
+              and "rows were UPDATED" in buf.getvalue())
+
+    a = default_ledger_path(datetime(2026, 11, 16, 9, 30, 5), True)
+    b = default_ledger_path(datetime(2026, 11, 16, 9, 31, 0), False)
+    check("each run's default ledger is its own file: an apply and the dry run after it "
+          "cannot share a path",
+          a != b and a.endswith("backfill_venue_fit_ledger_20261116_093005_apply.jsonl")
+          and b.endswith("backfill_venue_fit_ledger_20261116_093100_dryrun.jsonl"))
 
     print("\nSELFTEST", "PASS" if ok else "FAIL")
     return ok

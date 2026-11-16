@@ -506,22 +506,40 @@ def temporal_penalty(years_after_wcm):
 # Cornell rows (2026-11-16) the term in this position fixed 88 top picks and broke 17,
 # while letting a good fit outrank the given-name tier fixed 62 and broke 130.
 #
-# RANK, DO NOT DECIDE. The term never drops a candidate, never accepts or rejects a row,
-# and is smaller than the 0.25 a tier or an affiliation match is worth. The people it
-# penalises are the interdisciplinary and the newly hired, whose papers really are in an
-# unusual field for their department; they stay on the card.
+# RANK, DO NOT DECIDE. The term never accepts or rejects a row, removes nobody from the
+# cohort, and is smaller than the 0.25 a tier or an affiliation match is worth. The
+# people it penalises are the interdisciplinary and the newly hired, whose papers really
+# are in an unusual field for their department. In a cohort of five or fewer they stay
+# on the card. In a larger one the card shows the top five, as it always has, and a
+# penalised candidate can now be the one who falls to sixth: `cohort_size` still counts
+# them, the stored list does not name them.
+#
+# THE CANDIDATE'S OWN PAPERS DO NOT VOUCH FOR THEM. The fit is asked for with the
+# candidate's cwid, and the table leaves that person's own accepted rows out (see
+# `venue_fit.DeptVenueFit`): the number is what the rest of the department publishes.
 #
 # CORNELL ITHACA ONLY, AND OFF BY DEFAULT. Every measurement behind the term is on Ithaca
 # Scopus rows. WCM rows have not been replayed, and until they are a WCM index never
 # holds a fit table, whatever it is handed; `load()` builds one only for the Ithaca roster
 # and only when AAR_VENUE_FIT is "on".
 #
+# ...AND ONLY WHERE EVERY CANDIDATE IS A CORNELL ONE. A term that only one side of a
+# comparison can earn is not evidence about that comparison. On a byline that offers
+# both rosters, or a Cornell byline that also keeps a WCM dual appointee, the Cornell
+# candidates could gain 0.15 or lose 0.20 while the WCM ones could do neither, and a WCM
+# person tied with a Cornell namesake would lose the row to the venue alone. So
+# `CampusRoster.candidates` passes the subfield on only when the WCM roster offers
+# nobody and the answer is the Ithaca roster's by itself; a list that mixes campuses is
+# ranked exactly as it was before the term existed. A row with a WCM candidate on it
+# therefore cannot change when the feature is switched on.
+#
 # NOTHING CHANGES UNTIL BOTH HALVES ARE PRESENT. A candidate gains the `venue_fit` key,
 # and its confidence the term, only when the index holds a fit table AND the caller passed
 # a venue subfield AND the table can score that department. In every other case -- the
-# feature off, a WCM index, the PubMed lane (which passes no subfield), a venue with no
-# category, a department under 20 training rows -- the candidate dict is byte-for-byte
-# what it was, and so is the candidate_cwids_json the lanes store from it.
+# feature off, a WCM index, a list that mixes campuses, the PubMed lane (which passes no
+# subfield), a venue with no category, a department under 20 training rows -- the
+# candidate dict is byte-for-byte what it was, and so is the candidate_cwids_json the
+# lanes store from it.
 def venue_fit_enabled():
     """AAR_VENUE_FIT=on. Anything else, a typo included, is off."""
     return (os.environ.get("AAR_VENUE_FIT") or "").strip().lower() == "on"
@@ -1128,7 +1146,8 @@ class IdentityIndex:
             affil_match, where = self._affil_match(rec, affil_toks)
             gap = (pub_year - rec["end_year"]) if (pub_year and rec["end_year"]) else None
             penalty = temporal_penalty(gap)
-            fit = fit_table.fit(rec["dept"], venue_subfield) if fit_table else None
+            fit = (fit_table.fit(rec["dept"], venue_subfield, rec["cwid"])
+                   if fit_table else None)
             out.append({
                 "cwid": rec["cwid"],
                 "name": _display_name(rec, via),
@@ -1271,9 +1290,12 @@ class CampusRoster:
     combined count is the cohort, as for `both`. No linked match -> the Ithaca answer
     exactly.
 
-    `venue_subfield` is forwarded to both indexes. Only the Ithaca one can hold a fit
-    table (see the venue-fit block above), so on any byline the WCM entries are exactly
-    what they were and only Cornell candidates carry `venue_fit`.
+    `venue_subfield` reaches the Ithaca index only when its answer is returned as it
+    stands: the WCM roster offers nobody for the byline (no namesake on `both`, no linked
+    dual appointee on a Cornell-only one). Whenever a WCM candidate is merged in, the
+    subfield is withheld from both rosters and the merged list is what it was before the
+    venue term existed, because only the Cornell side could earn the term (see the
+    venue-fit block above).
 
     `campus` / `by_surname` answer as the WCM index does, for the callers that assert
     the lane's campus or log the roster size."""
@@ -1314,25 +1336,29 @@ class CampusRoster:
     def candidates(self, last, fore=None, initials=None, affiliations=None, top_k=5,
                    pub_year=None, campuses=None, venue_subfield=None):
         campuses = campuses or byline_campuses(affiliations)
-        args = (last, fore, initials, affiliations, top_k, pub_year, venue_subfield)
+        args = (last, fore, initials, affiliations, top_k, pub_year)
         if CAMPUS_ITHACA not in campuses:
             return self.wcm.candidates(*args)
         self.n_ithaca_bylines += 1
-        c, c_n = self.ithaca.candidates(*args)
-        if CAMPUS_WCM in campuses:
+        both = CAMPUS_WCM in campuses
+        if both:
             w, w_n = self.wcm.candidates(*args)
-            head = w + c                 # WCM first: an exact tie keeps the pre-campus pick
         else:
             linked = self.wcm.cornell_linked
             # top_k=None: the whole ranked WCM cohort (candidates() only slices by it).
             w = [d for d in (self.wcm.candidates(last, fore, initials, affiliations,
-                                                 None, pub_year, venue_subfield)[0]
+                                                 None, pub_year)[0]
                              if linked else [])
                  if d["cwid"] in linked]
-            if not w:
-                return c, c_n
             w_n = len(w)
-            head = c + w                 # Cornell first: a Cornell byline's tie is Cornell's
+        if not w:
+            # No WCM candidate to merge: the Ithaca answer as it stands, and the one
+            # answer the venue term may reach (see the venue-fit block above).
+            return self.ithaca.candidates(*args, venue_subfield)
+        c, c_n = self.ithaca.candidates(*args)
+        # both: WCM first, so an exact tie keeps the pre-campus pick. Cornell-only byline:
+        # Cornell first, so its tie is Cornell's.
+        head = w + c if both else c + w
         merged = sorted(head, key=_rank_key, reverse=True)[:top_k]
         for d in merged:
             d["cohort_size"] = w_n + c_n
@@ -2594,6 +2620,23 @@ def _selftest():
                                  ithaca=with_table)
     linked_c = linked_roster.candidates("Weiss", "Robert", "R", ith_aff,
                                         venue_subfield="Optics")[0]
+    linked_plain = linked_roster.candidates("Weiss", "Robert", "R", ith_aff)[0]
+    no_wcm_roster = CampusRoster(IdentityIndex([rec("Ann", "", "Other")]), ithaca=with_table)
+    # One WCM and one Cornell Robert Weiss, alone in their cohorts, on a byline naming
+    # both campuses: 0.50 + 0.40 each, an exact tie.
+    tie_roster = CampusRoster(IdentityIndex([w_phys]),
+                              ithaca=IdentityIndex([phys], campus=CAMPUS_ITHACA,
+                                                   dept_venue_fit=table))
+    tied_two = tie_roster.candidates("Weiss", "Robert", "R", wcm_aff + ith_aff,
+                                     venue_subfield="Optics")[0]
+    tied_two_plain = tie_roster.candidates("Weiss", "Robert", "R", wcm_aff + ith_aff)[0]
+    # Physics has 20 Optics rows and 15 of them are rw_c's own: without them the
+    # department is under 20 rows, so rw_c gets no fit; Rex, in the same department with
+    # no rows of his own, gets the department's 1.586.
+    own_table = DeptVenueFit([("Physics", "Optics", 15, "rw_c"), ("Physics", "Optics", 5, "zz"),
+                              ("Law School", "Law", 100)])
+    own_idx = IdentityIndex([phys, dict(ithaca("Rex", "Weiss", "rx_c"), dept="Physics")],
+                            campus=CAMPUS_ITHACA, dept_venue_fit=own_table)
     checks += [
         ("venue (4): a WCM index never holds a fit table, even when handed one",
          wcm_handed_table.dept_venue_fit is None and IdentityIndex([]).dept_venue_fit is None
@@ -2606,15 +2649,40 @@ def _selftest():
          "subfield or not",
          venue_roster.candidates("Weiss", "Robert", "R", wcm_aff, venue_subfield="Optics")
          == IdentityIndex([w_phys]).candidates("Weiss", "Robert", "R", wcm_aff)),
-        ("venue (4): on a two-campus byline the WCM entry is what it was and only the "
-         "Cornell entries carry the term",
-         [c for c in two if "campus" not in c] == [c for c in two_plain if "campus" not in c]
-         and [c["cwid"] for c in two if "venue_fit" in c] == ["rw_c", "rh_c"]
-         and {c["cwid"]: c["confidence"] for c in two}["rw_c"] == 0.85),
-        ("venue (4): the linked-cwid path threads it too: the Cornell candidates are "
-         "scored, the dual appointee on the WCM roster is not",
-         {c["cwid"]: "venue_fit" in c for c in linked_c}
-         == {"rw_c": True, "rh_c": True, "rw_w": False}),
+        ("venue (4): a Cornell-only byline through a CampusRoster is the Ithaca index's "
+         "own answer, term included -- the one place a roster passes the subfield on",
+         venue_roster.candidates("Weiss", "Robert", "R", ith_aff, venue_subfield="Optics")
+         == with_table.candidates("Weiss", "Robert", "R", ith_aff, venue_subfield="Optics")
+         and [c.get("venue_fit") for c in venue_roster.candidates(
+             "Weiss", "Robert", "R", ith_aff, venue_subfield="Optics")[0]] == [1.586, -3.045]),
+        ("venue (4): a two-campus byline is ranked exactly as before the term existed: "
+         "only the Cornell side could earn it, so nobody does",
+         two == two_plain and not any("venue_fit" in c for c in two)
+         and {c["cwid"] for c in two} == {"rw_w", "rw_c", "rh_c"}),
+        ("venue (4): ...so a WCM person tied with a Cornell namesake keeps the row in a "
+         "venue that fits the Cornell department (WCM first on an exact tie, as before)",
+         [(c["cwid"], c["confidence"]) for c in tied_two] == [("rw_w", 0.9), ("rw_c", 0.9)]
+         and tied_two == tied_two_plain),
+        ("venue (4): a Cornell byline that keeps a linked WCM dual appointee is a mixed "
+         "list too, and carries no term",
+         linked_c == linked_plain and not any("venue_fit" in c for c in linked_c)
+         and {c["cwid"] for c in linked_c} == {"rw_c", "rh_c", "rw_w"}),
+        ("venue (4): a two-campus byline on which the WCM roster has no namesake is the "
+         "Ithaca answer, cohort size included, and so it is scored",
+         no_wcm_roster.candidates("Weiss", "Rhea", "R", wcm_aff + ith_aff,
+                                  venue_subfield="Law")
+         == with_table.candidates("Weiss", "Rhea", "R", wcm_aff + ith_aff,
+                                  venue_subfield="Law")
+         and no_wcm_roster.candidates("Weiss", "Rhea", "R", wcm_aff + ith_aff)
+         == with_table.candidates("Weiss", "Rhea", "R", wcm_aff + ith_aff)
+         and [c.get("venue_fit") for c in no_wcm_roster.candidates(
+             "Weiss", "Rhea", "R", wcm_aff + ith_aff, venue_subfield="Law")[0]]
+         == [0.189, -1.609]),
+        ("venue: the fit is asked for with the candidate's cwid, and a person whose own "
+         "accepted papers are what the department's count rests on gets no term from them",
+         [(c["cwid"], c.get("venue_fit"), c["confidence"]) for c in own_idx.candidates(
+             "Weiss", None, "R", venue_subfield="Optics")[0]]
+         == [("rx_c", 1.586, 0.6), ("rw_c", None, 0.45)]),
         ("venue: the swapped-name retry carries the subfield (LastName='Robert', "
          "ForeName='Weiss')",
          [(c["cwid"], c.get("venue_fit")) for c in with_table.candidates(
