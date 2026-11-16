@@ -155,6 +155,18 @@ NULL_COLUMNS = [
 _missing = [c for c in NULL_COLUMNS if c not in aar_db._REFRESH_COLS]
 assert not _missing, f"NULL_COLUMNS names columns the producer doesn't refresh: {_missing}"
 
+# top_venue_fit (v3.13) is the top candidate's department/venue fit, and a row this sweep
+# leaves naming nobody must not go on carrying one: Publication Manager's bulk accept
+# filters on that column. It is nulled WITH the nine whenever the live table has it (see
+# _null_sql), but it is not IN the nine: NULL_COLUMNS is tied by assertion to
+# aar_report_changed_picks._DRIFT_COLS and is the shape of the #177 ledger. Nothing is
+# lost by leaving it out of the ledger's before-snapshot: the value is the `venue_fit`
+# of the first entry in the snapshot's own candidate_cwids_json.
+ALSO_NULL = ["top_venue_fit"]
+assert set(ALSO_NULL) <= set(aar_db._OPTIONAL_COLS), (
+    "ALSO_NULL names a column aar_db does not treat as optional -- _null_sql only knows "
+    "how to check for those")
+
 
 # ---- scopus reconstruction pre-filter (no network) --------------------------
 def _split_byline(wcm_author):
@@ -264,6 +276,8 @@ def _classify_scopus(rows, idx, limit=None):
             if hit is None:
                 unresolvable.append(r)
             else:
+                # No venue subfield (v3.13): the venue term re-orders a candidate list
+                # and never empties one, and empty-or-not is all this sweep asks.
                 cands, _cohort = scop.wcm_lane_candidates(idx, hit, scop._pub_year(entry))
                 if cands:
                     matched.append(r)
@@ -296,22 +310,31 @@ def _open_rows(engine, source):
 
 
 def _apply_updates(engine, stale_entries):
-    """NULL the 9 columns for the given confirmed-stale rows, by primary key, re-
-    checking status='open' at UPDATE time so a curator action between the SELECT and
-    here wins. Chunked 500/statement, same convention as aar_db.upsert."""
+    """NULL the 9 columns (and top_venue_fit, where the table has it: see ALSO_NULL) for
+    the given confirmed-stale rows, by primary key, re-checking status='open' at UPDATE
+    time so a curator action between the SELECT and here wins. Chunked 500/statement,
+    same convention as aar_db.upsert."""
     from sqlalchemy import text
     if not stale_entries:
         return 0
-    sets = ", ".join(f"{c}=NULL" for c in NULL_COLUMNS)
-    stmt = text(f"UPDATE authorship_review SET {sets} WHERE id=:id AND status='open'")
     n = 0
     ids = [{"id": e["row"]["id"]} for e in stale_entries]
     with engine.begin() as c:
+        stmt = text(_null_sql(aar_db.missing_optional_cols(c)))
         for i in range(0, len(ids), 500):
             chunk = ids[i:i + 500]
             c.execute(stmt, chunk)
             n += len(chunk)
     return n
+
+
+def _null_sql(absent=()):
+    """The sweep's UPDATE: the nine, plus each ALSO_NULL column the live table has
+    (`absent` is aar_db.missing_optional_cols). Before migration v3.13 that is the
+    statement this sweep has always run."""
+    sets = ", ".join(f"{c}=NULL" for c in NULL_COLUMNS
+                     + [c for c in ALSO_NULL if c not in absent])
+    return f"UPDATE authorship_review SET {sets} WHERE id=:id AND status='open'"
 
 
 def _write_ledger(path, entries, run_ts, applied):
@@ -424,6 +447,14 @@ def _selftest():
                            "candidate_cwids_json", "n_candidates"])
     check("every NULL_COLUMNS entry is producer-refreshed (aar_db._REFRESH_COLS)",
           all(c in aar_db._REFRESH_COLS for c in NULL_COLUMNS))
+    check("a swept row loses its top_venue_fit with its top pick (v3.13): no fit is left "
+          "on a row that names nobody",
+          _null_sql() == "UPDATE authorship_review SET "
+          + ", ".join(f"{c}=NULL" for c in NULL_COLUMNS)
+          + ", top_venue_fit=NULL WHERE id=:id AND status='open'")
+    check("...and before the migration the UPDATE is the one it always was",
+          _null_sql(["top_venue_fit"]) == "UPDATE authorship_review SET "
+          + ", ".join(f"{c}=NULL" for c in NULL_COLUMNS) + " WHERE id=:id AND status='open'")
 
     check("_split_byline: 'Riley D Mayne' -> fore='Riley D', last='Mayne'",
           _split_byline("Riley D Mayne") == ("Riley D", "Mayne"))

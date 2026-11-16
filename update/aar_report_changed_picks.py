@@ -66,6 +66,15 @@ WHAT THIS DOES
   fails to resolve (retraction, EID/author-list drift) is reported as unresolvable and
   left out of all three buckets, same convention as aar_sweep_stale.py.
 
+VENUE TERM (v3.13): the scopus replay ranks as the producer ranks. It reads the same
+  AAR_VENUE_FIT switch, resolves each row's venue from the issn/journal the row stores
+  and passes the subfield to the matcher, so a row the producer scored with the venue
+  term replays to itself. Run it with the CronJob's value of AAR_VENUE_FIT: with the
+  switch off in this shell and on in the CronJob, every venue-scored row reads as drift
+  and aar_reconcile_open would write the term back off it. `_replay_venue_lookup` warns
+  about exactly that, and refuses outright when the switch is on but the lookup or the
+  fit table could not be loaded.
+
 SYS.PATH FORK TRAP: same guard as aar_sweep_stale.py -- this file's own directory must
   win over the stale ~/Dropbox/Projects/ReCiter Research/scripts/ copy. Asserted below,
   resolved paths printed.
@@ -121,7 +130,8 @@ _SELECT_COLS = ["id", "source", "pmid", "external_id", "doi", "author_key",
                 "first_seen", "top_cwid", "top_name", "top_given_match",
                 "top_confidence", "classification", "entrez_date",
                 "top_person_type", "top_dept", "top_affil_match",
-                "n_candidates", "candidate_cwids_json"]
+                "n_candidates", "candidate_cwids_json",
+                "issn", "journal"]        # the venue, for the scopus replay's venue term
 
 
 def _cwid_eq(a, b):
@@ -505,9 +515,51 @@ def _scopus_pub_year(r):
     return int(s[:4]) if s[:4].isdigit() else None
 
 
+def _replay_venue_lookup(rows, idx):
+    """The venue lookup the scopus replay ranks with: what the producer's own run would
+    load (`scop.load_venue_lookup`), None when AAR_VENUE_FIT is not on.
+
+    The producer degrades when it cannot load the lookup or the fit table: it writes rows
+    without the term and tries again next sweep. A replay must not, because its result
+    is compared with what is stored and aar_reconcile_open writes the difference. One
+    failed read would turn every venue-scored row into drift and strip the term from the
+    whole open queue. So with the switch on and either half missing this raises.
+
+    With the switch off there is nothing to load, and rows that already carry a venue
+    fit will, correctly, replay without it. That is right when the feature really has
+    been turned off and wrong when this shell merely lacks the CronJob's env, so the
+    number of such rows is printed."""
+    lookup = scop.load_venue_lookup()
+    if scop.venue_fit_enabled():
+        ithaca = getattr(idx, "ithaca", idx)
+        if lookup is None or getattr(ithaca, "dept_venue_fit", None) is None:
+            raise RuntimeError(
+                "AAR_VENUE_FIT is on but the venue lookup or the Ithaca fit table could "
+                "not be loaded (see the warning above). Refusing to replay the scopus "
+                "lane without the venue term: every row scored with it would read as "
+                "drift.")
+        return lookup
+    scored = sum(1 for r in rows if '"venue_fit"' in (r.get("candidate_cwids_json") or ""))
+    if scored:
+        print(f"      WARNING: {scored} open scopus rows carry a venue fit and "
+              f"AAR_VENUE_FIT is not on here. They are replayed WITHOUT the venue term "
+              f"and will read as drift; set AAR_VENUE_FIT=on to replay as the CronJob "
+              f"does.", flush=True)
+    return None
+
+
+def _venue_kw(lookup, r):
+    """{'venue_subfield': ...} for a stored row, or {} so the matcher call is the one it
+    always was. Resolved from the row's own issn/journal, the pair the producer resolved
+    it from (scop.stored_venue_subfield)."""
+    subfield = scop.stored_venue_subfield(lookup, r.get("issn"), r.get("journal"))
+    return {"venue_subfield": subfield} if subfield else {}
+
+
 def _replay_scopus(rows, idx, limit=None):
     rows = rows[:limit] if limit else rows
     family = scop.load_family_afids()
+    venue_lookup = _replay_venue_lookup(rows, idx)
 
     # pass 1: free reconstruction, every row, no network.
     prelim = []
@@ -515,7 +567,8 @@ def _replay_scopus(rows, idx, limit=None):
         fore, last = _split_byline(r["wcm_author"])
         affils = [a for a in (r["author_affiliation"] or "").split(" | ") if a]
         cands, _cohort = idx.candidates(last, fore, None, affils, top_k=5,
-                                        pub_year=_scopus_pub_year(r))
+                                        pub_year=_scopus_pub_year(r),
+                                        **_venue_kw(venue_lookup, r))
         top = cands[0] if cands else None
         rec = _row_result(r, top, "scopus", cands)
         prelim.append((r, rec))
@@ -561,7 +614,9 @@ def _replay_scopus(rows, idx, limit=None):
             if hit is None:
                 unresolvable.append(r)
             else:
-                cands, _cohort = scop.wcm_lane_candidates(idx, hit, scop._pub_year(entry))
+                cands, _cohort = scop.wcm_lane_candidates(
+                    idx, hit, scop._pub_year(entry), None,
+                    _venue_kw(venue_lookup, r).get("venue_subfield"))
                 top = cands[0] if cands else None
                 results.append(_row_result(r, top, "scopus", cands))
         except Exception as e:                          # noqa: BLE001
@@ -713,6 +768,99 @@ def _selftest():
     check("unparseable stored candidate JSON reads as drift (rewriting it is the fix)",
           _drift_cols(dict(stored, candidate_cwids_json="{not json"), base)
           == ["candidate_cwids_json"])
+
+    # ---- venue term (v3.13): the scopus replay ranks as the producer ranks -------
+    # Two Cornell R. Weisses, initials-only byline, an Optics journal. Physics fits it
+    # (+0.15), the Law School does not (-0.20), so the producer's row names the physicist
+    # at 0.60 where the same byline without the term names the lawyer first at 0.45.
+    import contextlib, io
+    from venue_fit import DeptVenueFit, build_venue_lookup
+
+    def person(given, dept, cwid):
+        return {"cwid": cwid, "given": given, "middle": "", "surname": "Weiss",
+                "given_norm": idxmod._norm(given), "surname_norm": "weiss", "pref_norm": "",
+                "dept": dept, "division": "", "program": "", "title": "",
+                "person_type": "Cornell Faculty", "historical": False, "end_year": None,
+                "campus": idxmod.CAMPUS_ITHACA}
+
+    table = DeptVenueFit([("Physics", "Optics", 20), ("Law School", "Law", 100)])
+    people = [person("Rhea", "Law School", "rh_c"), person("Robert", "Physics", "rw_c")]
+    ith = idxmod.IdentityIndex(people, campus=idxmod.CAMPUS_ITHACA, dept_venue_fit=table)
+    lookup = build_venue_lookup([(100001, "0146-9592", None, "Optics")], [])
+    au = {"last": "Weiss", "fore": "R", "initials": "R",
+          "affiliations": ["Cornell University, Ithaca, NY"], "afids": []}
+    produced, _ = scop.wcm_lane_candidates(ith, au, 2024, None, "Optics")
+    ptop = produced[0]
+    venue_row = {"id": 7, "source": "scopus", "pmid": None, "external_id": "85000000001",
+                 "doi": "10.1/x", "author_position": 1, "wcm_author": "R Weiss",
+                 "author_affiliation": "Cornell University, Ithaca, NY",
+                 "entrez_date": "2024-05-01", "issn": "01469592", "journal": "Optics Letters",
+                 "top_cwid": ptop["cwid"], "top_name": ptop["name"],
+                 "top_person_type": ptop["person_type"], "top_dept": ptop["dept"],
+                 "top_given_match": ptop["given_match"],
+                 "top_affil_match": int(bool(ptop["affil_dept_match"])),
+                 "top_confidence": ptop["confidence"], "n_candidates": len(produced),
+                 "candidate_cwids_json": json.dumps(scop._compact(produced))}
+    check("the fixture is a venue-decided row: the physicist leads at 0.60 with the term, "
+          "the lawyer at 0.45 without it",
+          [(c["cwid"], c["confidence"]) for c in produced] == [("rw_c", 0.6), ("rh_c", 0.25)]
+          and [c["cwid"] for c in scop.wcm_lane_candidates(ith, au, 2024)[0]]
+          == ["rh_c", "rw_c"])
+    check("the replay reads the venue off the row itself",
+          {"issn", "journal"} <= set(_SELECT_COLS)
+          and _venue_kw(lookup, venue_row) == {"venue_subfield": "Optics"}
+          and _venue_kw(None, venue_row) == {}
+          and _venue_kw(lookup, dict(venue_row, issn="99999999")) == {})
+
+    saved = (scop.load_venue_lookup, scop.load_family_afids, scop.venue_fit_enabled,
+             scop._scopus_get)
+
+    def _no_network(*_a, **_k):
+        raise AssertionError("a row that replays to itself must not be live re-fetched")
+    scop.load_family_afids, scop._scopus_get = (lambda *a: frozenset()), _no_network
+    buf = io.StringIO()
+    try:
+        scop.venue_fit_enabled, scop.load_venue_lookup = (lambda: True), (lambda: lookup)
+        with contextlib.redirect_stdout(buf):
+            on, on_unres = _replay_scopus([venue_row], ith)
+        check("venue term on: a row the producer scored with it replays to itself -- "
+              "UNCHANGED, no drift, no live re-fetch",
+              on_unres == [] and [(x["classification"], x["drift"], x["new_cwid"])
+                                  for x in on] == [("UNCHANGED", [], "rw_c")])
+
+        for broken, why in (((lambda: None), ith),
+                            ((lambda: lookup), idxmod.IdentityIndex(
+                                people, campus=idxmod.CAMPUS_ITHACA))):
+            scop.load_venue_lookup = broken
+            try:
+                with contextlib.redirect_stdout(buf):
+                    _replay_scopus([venue_row], why)
+                refused = False
+            except RuntimeError:
+                refused = True
+            check("venue term on but the " + ("lookup" if why is ith else "fit table")
+                  + " did not load: the replay refuses instead of reading every scored "
+                    "row as drift", refused)
+
+        # Switched off here: the term is gone from the replay, the pick moves back, the
+        # row is flagged for a live re-fetch (which this fixture cannot resolve) and the
+        # warning names how many rows are in that position.
+        scop.venue_fit_enabled, scop.load_venue_lookup = (lambda: False), (lambda: None)
+        scop._scopus_get = lambda *a, **k: {"search-results": {"entry": []}}
+        real_sleep, time.sleep = time.sleep, lambda _s: None
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                off, off_unres = _replay_scopus([venue_row], ith)
+        finally:
+            time.sleep = real_sleep
+        check("venue term off here: the same row no longer replays to itself, and the "
+              "run warns that 1 stored row carries a venue fit",
+              off == [] and [r["id"] for r in off_unres] == [7]
+              and "WARNING: 1 open scopus rows carry a venue fit" in buf.getvalue())
+    finally:
+        (scop.load_venue_lookup, scop.load_family_afids, scop.venue_fit_enabled,
+         scop._scopus_get) = saved
 
     print("\nSELFTEST", "PASS" if ok else "FAIL")
     return ok
