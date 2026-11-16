@@ -74,6 +74,9 @@ CREATE TABLE IF NOT EXISTS `authorship_review` (
   `top_years_after_wcm`    INT          NULL,                -- paper year - top candidate's WCM end year;
                                                              -- NEGATIVE = paper predates the departure,
                                                              -- NULL = unknown (no end year / no pub year)
+  `top_venue_fit`          FLOAT        NULL,                -- (v3.13) ln(top candidate's department share of the
+                                                             -- venue's subfield / campus share); NULL = unknown.
+                                                             -- See setup/alter_venue_fit_v3.13.sql
   `top_cohort_size`        INT          NULL,                -- homonyms (surname+initial)
   `top_given_match`        VARCHAR(16)  NULL,                -- full|initial
   `top_affil_match`        TINYINT(1)   NULL,
