@@ -290,7 +290,9 @@ def cornell_ithaca_people_sql(person_table, type_table):
     JOIN `{type_table}` t ON t.personIdentifier = i.personIdentifier
                          AND t.personType = 'cornell-ithaca'
     WHERE NOT EXISTS (SELECT 1 FROM `{person_table}` p
-                      WHERE p.personIdentifier = i.personIdentifier);
+                      WHERE p.personIdentifier = i.personIdentifier)
+      -- A name with no letters (Cornell ships mes5 as "." / ".") lists as ". ." in Find People.
+      AND i.lastName REGEXP '[[:alpha:]]';
     """
 
 def update_person(cursor, add_cornell=False):
