@@ -121,4 +121,21 @@ spec:
                   name: reciterdb-configmap
                   key: OPENALEX_MAILTO
                   optional: true
+            # Contact address sent with every NCBI E-utilities call. Unset, the AAR lanes
+            # and collectAffiliations.py fall back to the default in aar_universe.py, which
+            # is a personal address: add an institutional NCBI_EMAIL to reciterdb-configmap.
+            - name: NCBI_EMAIL
+              valueFrom:
+                configMapKeyRef:
+                  name: reciterdb-configmap
+                  key: NCBI_EMAIL
+                  optional: true
+            # Research-security collection (collectAffiliations.py, v3.13) also uses
+            # OPENALEX_MAILTO, NCBI_EMAIL and PUBMED_API_KEY above. RESEARCH_SECURITY_MODE
+            # (off|dry-run|apply) is deliberately NOT listed: it ships off and is turned on
+            # live with `kubectl set env` (see the v3.13 migration header). Optional knobs,
+            # set the same way: RESEARCH_SECURITY_TIMEOUT_SECONDS (default 3600) and
+            # RESEARCH_SECURITY_MAX_HTTP_CALLS (default 500 efetch/OpenAlex batches a run).
+            # - name: RESEARCH_SECURITY_MODE
+            #   value: "dry-run"
           restartPolicy: OnFailure
