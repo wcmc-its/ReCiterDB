@@ -48,7 +48,8 @@ Env: DB_USERNAME/DB_PASSWORD/DB_HOST/DB_NAME (reciterdb, read-only). S3 + pinned
 models inherited from the Step-0 engine for the identity-only ranking layer.
 
 Usage:
-  python aar_matcher.py --selftest
+  python aar_matcher.py --selftest          # offline: ranking checks only
+  python aar_matcher.py --selftest --live   # also reads reciterdb, DynamoDB and S3
   python aar_matcher.py --surname Worgall --given Stefan --pmid 42220538 \
       --affil "Department of Pediatrics, Weill Cornell Medicine, New York, NY"
 """
@@ -371,9 +372,15 @@ def _rank_selftest():
     return ok
 
 
-def _selftest():
+def _selftest(live=False):
+    """Offline unless `live`. Every sibling's --selftest is offline, so this one going
+    to reciterdb, DynamoDB and S3 by default surprised a run that expected no I/O."""
     print("=== Temporal-penalty ranking (offline) ===")
     rank_ok = _rank_selftest()
+    if not live:
+        print("\nSELFTEST", "PASS" if rank_ok else "FAIL",
+              "(offline only; add --live for the Worgall and homonym checks)")
+        return rank_ok
     print("\nLoading identity index from reciterdb ...", flush=True)
     idx = IdentityIndex.load()
     n = sum(len(v) for v in idx.by_surname.values())
@@ -417,6 +424,9 @@ def _selftest():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--live", action="store_true",
+                    help="with --selftest: also run the checks that read reciterdb, "
+                         "DynamoDB and S3")
     ap.add_argument("--surname")
     ap.add_argument("--given")
     ap.add_argument("--initials")
@@ -428,7 +438,7 @@ def main():
     args = ap.parse_args()
 
     if args.selftest:
-        sys.exit(0 if _selftest() else 1)
+        sys.exit(0 if _selftest(args.live) else 1)
     if not args.surname:
         ap.error("use --selftest or --surname [...]")
 
