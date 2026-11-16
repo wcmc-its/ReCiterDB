@@ -961,13 +961,14 @@ CORNELL_POPULATION = """(is_faculty OR is_rte_faculty OR is_researcher OR is_pos
 # warning. The name guard is stricter than the one IdentityIndex.load() applies on
 # the other side (`WHERE i.surname IS NOT NULL AND i.surname <> ''`): a row
 # without both names is un-indexable, so it is not worth writing, and neither is
-# one whose name has no letters (Cornell ships mes5 as "." / ".").
+# one whose surname has no letters (Cornell ships mes5 as "." / "."). The first
+# name may be "." -- that's how Cornell stores a mononym (hh838 "." / "Hemanjali").
 CORNELL_SELECT_SQL = """
 SELECT netid, name, name_first, name_last,
        primary_department, primary_job_title, primary_business_title
 FROM {table}
 WHERE {population}
-  AND name_first REGEXP '[[:alpha:]]'
+  AND name_first IS NOT NULL AND name_first <> ''
   AND name_last  REGEXP '[[:alpha:]]'
 ORDER BY netid
 """
