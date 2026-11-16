@@ -29,6 +29,12 @@ spec:
               value: "on"
             - name: AAR_OPENALEX_LANE_CADENCE
               value: "weekly"
+            # Venue categories for the external lanes (infer_venue_subfield.py). Ships off.
+            # Before turning it on: apply setup/alter_venue_fit_v3.14.sql, and add
+            # bedrock:InvokeModel on the Claude Haiku inference profile and its foundation
+            # model to the reciterdb role.
+            - name: AAR_VENUE_INFER
+              value: "off"
             # AAR Scopus + PubMed lanes (weekly, gated in run_all.py)
             - name: SCOPUS_API_KEY
               valueFrom:

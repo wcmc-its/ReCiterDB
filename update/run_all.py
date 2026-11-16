@@ -187,6 +187,40 @@ def lane_due(cadence, weekday, default):
     return (cadence or default).strip().lower() == "daily" or weekday == 6
 
 
+# ------------- Venue categories for the external AAR lanes (env-gated, isolated) -------------
+def run_venue_infer_if_enabled():
+    """Classify venues on authorship_review that have no Science-Metrix subfield yet
+    (infer_venue_subfield.py), so the Scopus and OpenAlex lanes that run next can score
+    venue fit for them. Runs AHEAD of those lanes: a venue first seen last night is
+    classified tonight, and tonight's matcher already reads it.
+
+    SHIPS OFF: AAR_VENUE_INFER unset (or anything but "on") skips it. Before setting it:
+    (1) apply setup/alter_venue_fit_v3.14.sql (--apply refuses without the table);
+    (2) add bedrock:InvokeModel on the Claude Haiku inference profile and its foundation
+    model to the reciterdb role (without it every call fails and nothing is classified);
+    (3) run the one-off --import-science-metrix and --import-json loads, or the first
+    nights spend their --limit on venues that are already classified in a file. Set the
+    env with `kubectl set env`, never `kubectl apply`.
+
+    Nightly rather than weekly: it is one grouped read of authorship_review and, once the
+    backlog is in, a batch or two of new venues. It calls no rate-limited API the lanes
+    share.
+
+    Fail-neutral as well as isolated. A venue with no category contributes no venue term,
+    which is today's behaviour, so a Bedrock outage costs nothing but a day's delay; the
+    script logs it and exits 0. Same contract as the lanes: timed out, and any failure is
+    caught and logged so it can NEVER fail the nightly job."""
+    try:
+        enabled = (os.getenv("AAR_VENUE_INFER") or "off").strip().lower()
+        if enabled != "on":
+            logger.info("Venue inference: AAR_VENUE_INFER=%s — skipped", enabled)
+            return
+        run_script("venueInfer", "python3 infer_venue_subfield.py --apply",
+                   timeout_seconds=int(os.getenv("VENUE_INFER_TIMEOUT_SECONDS", "1800")))
+    except Exception as e:
+        logger.exception(f"Venue inference failed (ignored — reporting unaffected): {e}")
+
+
 # ------------- AAR Scopus lane (weekly by default, isolated) -------------
 def run_scopus_lane_if_due():
     """Scopus not-in-PubMed authorship detector (AAR / PM#775).
@@ -772,6 +806,9 @@ def main():
     # The AAR lanes all reason from person_article; skip them wholesale if the rebuild above
     # produced a short one rather than let every lane draw conclusions from it.
     if overall_success and aar_lanes_safe():
+        run_venue_infer_if_enabled()          # OFF unless AAR_VENUE_INFER=on: Science-Metrix
+                                              # subfields for new Scopus/OpenAlex venues, ahead
+                                              # of the lanes that read them (v3.14)
         run_scopus_lane_if_due()              # weekly (Sun) unless AAR_SCOPUS_LANE_CADENCE=daily
         run_scopus_ithaca_lane_if_due()       # OFF unless AAR_SCOPUS_ITHACA_LANE=on: the same
                                               # weekly (Sun) Scopus lane over the Cornell Ithaca

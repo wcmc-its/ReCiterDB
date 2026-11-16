@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
   top_io_score           FLOAT        NULL,
   top_confidence         FLOAT        NULL,
   top_years_after_wcm    INT          NULL,
+  top_venue_fit          FLOAT        NULL,
   top_cohort_size        INT          NULL,
   top_given_match        VARCHAR(16)  NULL,
   top_affil_match        TINYINT(1)   NULL,

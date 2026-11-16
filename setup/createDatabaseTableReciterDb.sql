@@ -674,6 +674,16 @@ CREATE TABLE IF NOT EXISTS `journal_science_metrix` (
   KEY `sdhfkjsdjfh` (`subfield`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- Inferred venue categories for containers with no ISSN (v3.14): see alter_venue_fit_v3.14.sql.
+CREATE TABLE IF NOT EXISTS `venue_subfield_inferred` (
+  `venue_key`   VARCHAR(512) NOT NULL,
+  `title`       VARCHAR(512) NOT NULL,
+  `subfield`    VARCHAR(128) NOT NULL,
+  `model`       VARCHAR(64)  NOT NULL,
+  `inferred_at` DATETIME     NOT NULL,
+  PRIMARY KEY (`venue_key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 -- ============================================================================
 -- Person Tables
 -- ============================================================================

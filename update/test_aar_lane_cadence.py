@@ -91,4 +91,35 @@ if _saved_key is None:
 else:
     os.environ["PUBMED_API_KEY"] = _saved_key
 
+# --- Venue inference: unset means OFF, and a failure never leaves the step ------------
+# It calls a paid model with the CronJob's role, so only an explicit "on" may start it.
+_ran.clear()
+for _val in (None, "", "off", "true", "apply"):
+    if _val is None:
+        os.environ.pop("AAR_VENUE_INFER", None)
+    else:
+        os.environ["AAR_VENUE_INFER"] = _val
+    run_all.run_venue_infer_if_enabled()
+check("venue inference never runs unset, empty, off or on any value but 'on'", _ran, [])
+os.environ["AAR_VENUE_INFER"] = " ON "
+run_all.run_venue_infer_if_enabled()
+check("venue inference runs when set to on", _ran, ["python3 infer_venue_subfield.py --apply"])
+
+
+def _boom(name, cmd, timeout_seconds=None):
+    raise RuntimeError("simulated")
+
+
+_logged = []
+run_all.run_script = _boom
+run_all.logger.exception = lambda msg, *a, **k: _logged.append(msg)
+run_all.run_venue_infer_if_enabled()      # must not raise
+check("a failing venue inference step is caught and logged, not raised",
+      [m.startswith("Venue inference failed") for m in _logged], [True])
+os.environ.pop("AAR_VENUE_INFER", None)
+_main = open(run_all.__file__).read().split("def main():")[1]
+check("venue inference runs ahead of the Scopus and OpenAlex lanes",
+      _main.index("run_venue_infer_if_enabled()") < _main.index("run_scopus_lane_if_due()")
+      < _main.index("run_openalex_lane_if_due()"), True)
+
 print(f"\n{n}/{n} passed\n")
