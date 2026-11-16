@@ -159,6 +159,18 @@ def _key(c):
                       "confidence": c.get("confidence") or 0.0})
 
 
+
+def _is_ithaca(c):
+    """Is this stored candidate a Cornell Ithaca one? The `campus` key says so on rows
+    written since it existed. The 2026-09-26 initial Ithaca load predates the key (7,016
+    of the 7,340 open rows from that day lack it), and reading "no key" as WCM skipped
+    them all. Every Cornell person-type label starts with "Cornell"
+    (identity_index.CORNELL_PERSON_TYPES and the "Cornell Ithaca" fallback); no WCM
+    label does."""
+    return (c.get("campus") == CAMPUS_ITHACA
+            or str(c.get("person_type") or "").startswith("Cornell"))
+
+
 def replay_row(row, lookup, table, run_ts):
     """One open row -> (verdict, entry). `verdict` names what would happen; `entry` is
     the ledger record with the full before/after, or None when the row is left alone.
@@ -181,7 +193,7 @@ def replay_row(row, lookup, table, run_ts):
         return "skipped: no stored candidates", None
     if any("venue_fit" in c for c in cands):
         return "skipped: already has venue fit", None
-    if any(c.get("campus") != CAMPUS_ITHACA for c in cands):
+    if not all(_is_ithaca(c) for c in cands):
         return "skipped: WCM candidate on the row", None
     subfield = venue_fit.subfield_for(lookup, row["issn"], row["journal"])
     if not subfield:
@@ -468,6 +480,14 @@ def _selftest():
           replay_row(row([law, wcm]), lookup, table, ts)
           == replay_row(row([phys, law, wcm]), lookup, table, ts)
           == ("skipped: WCM candidate on the row", None))
+
+    # --- rows stored before candidates carried `campus` (the 2026-09-26 Ithaca load)
+    old = [dict((k, v) for k, v in c.items() if k != "campus") for c in (phys, law)]
+    check("Cornell candidates stored without a `campus` key are still Cornell: the row is "
+          "scored as the same row with the key is, not skipped as a WCM one",
+          replay_row(row(old), lookup, table, ts)[0]
+          == replay_row(row([phys, law]), lookup, table, ts)[0]
+          != "skipped: WCM candidate on the row")
 
     # --- the candidate's own accepted rows are left out of their fit
     own = venue_fit.DeptVenueFit([("Physics", "Optics", 15, "rw2"), ("Physics", "Optics", 5, "zz"),
