@@ -307,6 +307,8 @@ CREATE TABLE IF NOT EXISTS `analysis_nih` (
   `apt` float(4,2) DEFAULT NULL,
   `x_coord` float(5,4) DEFAULT NULL,
   `y_coord` float(5,4) DEFAULT NULL,
+  `has_percentile` tinyint DEFAULT NULL,  -- v3.11 (R1): 1 = iCite returned nih_percentile, 0 = null
+  `has_rcr` tinyint DEFAULT NULL,         -- v3.11 (R1): 1 = iCite returned relative_citation_ratio, 0 = null
   PRIMARY KEY (`id`),
   UNIQUE KEY `idx_pmid` (`pmid`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
