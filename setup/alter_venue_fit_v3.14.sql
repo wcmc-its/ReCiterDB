@@ -1,5 +1,5 @@
 -- =============================================================================
--- Migration: venue_subfield_inferred table + authorship_review.top_venue_fit (v3.13)
+-- Migration: venue_subfield_inferred table + authorship_review.top_venue_fit (v3.14)
 -- =============================================================================
 -- Venue fit for the external-lane matcher (Scopus and OpenAlex rows on authorship_review).
 -- Adds:
@@ -48,7 +48,7 @@
 --   ALTER, still best applied outside the nightly window (14:30 UTC).
 --
 -- Apply with:
---   mysql -h "$DB_HOST" -u "$DB_USERNAME" -p "$DB_NAME" < setup/alter_venue_fit_v3.13.sql
+--   mysql -h "$DB_HOST" -u "$DB_USERNAME" -p "$DB_NAME" < setup/alter_venue_fit_v3.14.sql
 --
 -- Rollback (set AAR_VENUE_FIT and AAR_VENUE_INFER off first):
 --   ALTER TABLE authorship_review DROP COLUMN top_venue_fit;

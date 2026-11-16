@@ -55,7 +55,7 @@ COPY update/scopus_afids.csv ./
 # env-gated Ithaca lane in run_all.py (AAR_SCOPUS_ITHACA_LANE).
 COPY update/scopus_afids_cornell_ithaca.csv ./
 
-# Venue fit for the external AAR lanes (v3.13). venue_fit.py is the venue -> subfield
+# Venue fit for the external AAR lanes (v3.14). venue_fit.py is the venue -> subfield
 # lookup and the department x subfield table; infer_venue_subfield.py classifies new
 # venues on Bedrock ahead of the lanes (OFF unless AAR_VENUE_INFER=on in run_all.py).
 COPY update/venue_fit.py ./
