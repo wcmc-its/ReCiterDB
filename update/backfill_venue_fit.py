@@ -153,8 +153,11 @@ def rescored(c, term):
 
 
 def _key(c):
-    """identity_index._rank_key over a STORED candidate, tolerant of a missing field."""
-    return _rank_key({"given_match": c.get("given_match"),
+    """identity_index._rank_key over a STORED candidate, tolerant of a missing field.
+    `orcid_match` (v3.15) is carried so a row the byline ORCID ranked keeps that person
+    first when the venue term re-sorts the rest."""
+    return _rank_key({"orcid_match": c.get("orcid_match"),
+                      "given_match": c.get("given_match"),
                       "affil_dept_match": bool(c.get("affil_dept_match")),
                       "confidence": c.get("confidence") or 0.0})
 
@@ -472,6 +475,16 @@ def _selftest():
     verdict, e = replay_row(row([aff_bad, init_good], issn="0010-8847"), lookup, table2, ts)
     check("...and so does an affiliation match", e["after"]["top_cwid"] == "rw2"
           and e["after"]["top_affil_match"] == 1)
+
+    orcid_led = [dict(cand("rh1", "Law School", confidence=0.45), orcid_match=True),
+                 dict(cand("rw2", "Physics", confidence=0.45), orcid_match=False)]
+    verdict, e = replay_row(row(orcid_led), lookup, table, ts)
+    check("...and the person a byline ORCID put first stays first (v3.15): the venue "
+          "re-sorts the others behind them",
+          e["after"]["top_cwid"] == "rh1" and verdict == "CONFIDENCE_CHANGE"
+          and [(c["cwid"], c["confidence"], c["orcid_match"])
+               for c in json.loads(e["after"]["candidate_cwids_json"])]
+          == [("rh1", 0.25, True), ("rw2", 0.6, False)])
 
     # --- two campuses: a mixed list carries no term, so the row is left as it is
     wcm = cand("wcm1", "Physics", campus=None, person_type="Full-Time Faculty", confidence=0.45)

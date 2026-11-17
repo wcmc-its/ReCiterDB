@@ -89,6 +89,7 @@ import aar_db                                          # noqa: E402
 from aar_universe_scopus import (                      # noqa: E402
     doi_in_pubmed, resolve_no_doi, wcm_lane_candidates, _roster, rolling_window,
     recheck_open_scopus, _compact, _normalize_issn, _position_label, _trunc, _PM_SLEEP,
+    top_orcid_match,
     PUBMED_STATS, reset_pubmed_stats, pubmed_unreliable, load_venue_lookup,
     stored_venue_subfield)
 
@@ -316,6 +317,7 @@ def _build_row(w, i, n, author, top, cands, run_ts, dup_map=None):
         "top_confidence": top["confidence"] if top else None,
         "top_years_after_wcm": top.get("years_after_wcm") if top else None,
         "top_venue_fit": top.get("venue_fit") if top else None,   # v3.14, as on the Scopus lane
+        "top_orcid_match": top_orcid_match(top),                  # v3.15, likewise
         "top_cohort_size": cohort,
         "top_given_match": top["given_match"] if top else None,
         "top_affil_match": int(bool(top["affil_dept_match"])) if top else None,
@@ -667,7 +669,7 @@ def run(since, until, apply_writes=False, recheck=True, idx=None, venue_lookup=N
                 au["byline_orcid"] = au["orcid"]
             # frozenset(): no Scopus afids on this lane, so no Ithaca afid list to load.
             cands, _ = wcm_lane_candidates(idx, au, w.get("publication_year"), frozenset(),
-                                           subfield)
+                                           subfield, au.get("byline_orcid"))
             top = cands[0] if cands else None
             if top is None:
                 unmatched += 1
@@ -983,6 +985,47 @@ def _selftest():
                       if k not in ("byline_orcid", "matched_pmid_at", "first_seen",
                                    "last_checked", "last_refreshed"))
               and out.getvalue().count("byline ORCID: 1 of 1 rows carry one") == 1)
+        # ...and the matcher (v3.15): on a byline that names Ithaca and has no WCM namesake,
+        # the person the ORCID is on file for leads; with capture off the same work is
+        # ranked by name alone.
+        from identity_index import orcid_map
+        cu2 = dict(rec("Avery", "Cooper", "av_cu"), campus=CAMPUS_ITHACA,
+                   person_type="Cornell Faculty")
+        ith_o = IdentityIndex([cu, cu2], campus=CAMPUS_ITHACA,
+                              orcid_cwid=orcid_map([("av_cu", "0000-0002-1825-0097")]))
+        solo_o = CampusRoster(IdentityIndex([rec("Bea", "Other", "bo1")]), ithaca=ith_o)
+        orcid_work["authorships"][1]["raw_affiliation_strings"] = [
+            "Weill Cornell Medicine, New York, NY", "Cornell University, Ithaca, NY"]
+        env = os.environ.pop("AAR_BYLINE_ORCID", None)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                run("2026-01-01", "2026-12-31", apply_writes=True, idx=solo_o)
+                os.environ["AAR_BYLINE_ORCID"] = "on"
+                run("2026-01-01", "2026-12-31", apply_writes=True, idx=solo_o)
+                run("2026-01-01", "2026-12-31", apply_writes=True,
+                    idx=CampusRoster(IdentityIndex([rec("Alissa", "Cooper", "ac1")]),
+                                     ithaca=ith_o))
+        finally:
+            os.environ.pop("AAR_BYLINE_ORCID", None)
+            if env is not None:
+                os.environ["AAR_BYLINE_ORCID"] = env
+        by_name, by_orcid, with_wcm = kept[5:]
+        check("ORCID match off: the full-name Cornell candidate leads, top_orcid_match is "
+              "NULL and no candidate carries orcid_match",
+              by_name["top_cwid"] == "ac_cu" and by_name["top_orcid_match"] is None
+              and "orcid_match" not in by_name["candidate_cwids_json"])
+        check("ORCID match on: the person the byline ORCID is on file for leads, the row "
+              "stores top_orcid_match=1 and orcid_match on each candidate, and stays open",
+              by_orcid["top_cwid"] == "av_cu" and by_orcid["top_orcid_match"] == 1
+              and by_orcid["status"] == "open"
+              and [(c["cwid"], c["orcid_match"])
+                   for c in json.loads(by_orcid["candidate_cwids_json"])]
+              == [("av_cu", True), ("ac_cu", False)])
+        check("ORCID match on, WCM namesake on the list: the WCM pick stands and nobody "
+              "carries orcid_match, though the ORCID itself is still stored",
+              with_wcm["top_cwid"] == "ac1" and with_wcm["top_orcid_match"] is None
+              and "orcid_match" not in with_wcm["candidate_cwids_json"]
+              and with_wcm["byline_orcid"] == "0000-0002-1825-0097")
         g["_openalex_get"] = lambda p: (calls.append(p) or
                                         {"meta": {"count": 201}, "results": pages[p["page"]]})
         aar_db.upsert = saved_upsert

@@ -161,8 +161,10 @@ assert not _missing, f"NULL_COLUMNS names columns the producer doesn't refresh: 
 # _null_sql), but it is not IN the nine: NULL_COLUMNS is tied by assertion to
 # aar_report_changed_picks._DRIFT_COLS and is the shape of the #177 ledger. Nothing is
 # lost by leaving it out of the ledger's before-snapshot: the value is the `venue_fit`
-# of the first entry in the snapshot's own candidate_cwids_json.
-ALSO_NULL = ["top_venue_fit"]
+# of the first entry in the snapshot's own candidate_cwids_json. top_orcid_match (v3.15)
+# by the same rule and for the same reason: it says the top pick is the byline ORCID's
+# person, and its value is the first stored entry's `orcid_match`.
+ALSO_NULL = ["top_venue_fit", "top_orcid_match"]
 assert set(ALSO_NULL) <= set(aar_db._OPTIONAL_COLS), (
     "ALSO_NULL names a column aar_db does not treat as optional -- _null_sql only knows "
     "how to check for those")
@@ -237,7 +239,12 @@ def _classify_scopus(rows, idx, limit=None):
     for r in rows:
         fore, last = _split_byline(r["wcm_author"])
         affils = [a for a in (r["author_affiliation"] or "").split(" | ") if a]
-        cands, _cohort = idx.candidates(last, fore, None, affils, top_k=5)
+        # The row's stored byline ORCID (v3.15) goes with the name: on some rows the
+        # ORCID is the only reason there is a candidate, and without it this sweep would
+        # read them as naming nobody and null the pick.
+        cands, _cohort = idx.candidates(last, fore, None, affils, top_k=5,
+                                        **({"byline_orcid": r["byline_orcid"]}
+                                           if r.get("byline_orcid") else {}))
         if cands:
             # ponytail: trusted on the split alone -- this row is NEVER live re-
             # verified below. `_split_byline` reads the LAST token as the surname, so
@@ -277,8 +284,10 @@ def _classify_scopus(rows, idx, limit=None):
                 unresolvable.append(r)
             else:
                 # No venue subfield (v3.14): the venue term re-orders a candidate list
-                # and never empties one, and empty-or-not is all this sweep asks.
-                cands, _cohort = scop.wcm_lane_candidates(idx, hit, scop._pub_year(entry))
+                # and never empties one, and empty-or-not is all this sweep asks. The
+                # byline ORCID (v3.15) can fill an empty one, so it is passed.
+                cands, _cohort = scop.wcm_lane_candidates(
+                    idx, hit, scop._pub_year(entry), byline_orcid=r.get("byline_orcid"))
                 if cands:
                     matched.append(r)
                 else:
@@ -296,13 +305,13 @@ def _classify_scopus(rows, idx, limit=None):
 # ---- DB I/O ------------------------------------------------------------------
 _SELECT_COLS = ["id", "source", "pmid", "external_id", "doi", "author_key",
                 "author_position", "wcm_author", "author_affiliation", "status",
-                "first_seen"] + NULL_COLUMNS
+                "first_seen"] + NULL_COLUMNS + ["byline_orcid"]   # v3.15, optional
 
 
 def _open_rows(engine, source):
     from sqlalchemy import text
-    cols = ", ".join(_SELECT_COLS)
     with engine.connect() as c:
+        cols = ", ".join(aar_db.present_cols(c, _SELECT_COLS))
         rows = c.execute(text(
             f"SELECT {cols} FROM authorship_review "
             "WHERE source=:s AND status='open'"), {"s": source}).mappings().all()
@@ -310,7 +319,8 @@ def _open_rows(engine, source):
 
 
 def _apply_updates(engine, stale_entries):
-    """NULL the 9 columns (and top_venue_fit, where the table has it: see ALSO_NULL) for
+    """NULL the 9 columns (and top_venue_fit and top_orcid_match, where the table has
+    them: see ALSO_NULL) for
     the given confirmed-stale rows, by primary key, re-checking status='open' at UPDATE
     time so a curator action between the SELECT and here wins. Chunked 500/statement,
     same convention as aar_db.upsert."""
@@ -447,13 +457,17 @@ def _selftest():
                            "candidate_cwids_json", "n_candidates"])
     check("every NULL_COLUMNS entry is producer-refreshed (aar_db._REFRESH_COLS)",
           all(c in aar_db._REFRESH_COLS for c in NULL_COLUMNS))
-    check("a swept row loses its top_venue_fit with its top pick (v3.14): no fit is left "
-          "on a row that names nobody",
+    check("a swept row loses its top_venue_fit (v3.14) and top_orcid_match (v3.15) with "
+          "its top pick: neither is left on a row that names nobody",
           _null_sql() == "UPDATE authorship_review SET "
           + ", ".join(f"{c}=NULL" for c in NULL_COLUMNS)
-          + ", top_venue_fit=NULL WHERE id=:id AND status='open'")
-    check("...and before the migration the UPDATE is the one it always was",
-          _null_sql(["top_venue_fit"]) == "UPDATE authorship_review SET "
+          + ", top_venue_fit=NULL, top_orcid_match=NULL WHERE id=:id AND status='open'")
+    check("...before v3.15 only the fit goes, and before both migrations the UPDATE is "
+          "the one it always was",
+          _null_sql(["top_orcid_match", "byline_orcid"]) == "UPDATE authorship_review SET "
+          + ", ".join(f"{c}=NULL" for c in NULL_COLUMNS)
+          + ", top_venue_fit=NULL WHERE id=:id AND status='open'"
+          and _null_sql(aar_db._OPTIONAL_COLS) == "UPDATE authorship_review SET "
           + ", ".join(f"{c}=NULL" for c in NULL_COLUMNS) + " WHERE id=:id AND status='open'")
 
     check("_split_byline: 'Riley D Mayne' -> fore='Riley D', last='Mayne'",
@@ -484,6 +498,35 @@ def _selftest():
     stale_cands, _ = idx2.candidates("Mayne", "Riley D", "RD", [])
     check("stale case: 'Riley D Mayne' resolves to nobody (middleName-initial is gone)",
           stale_cands == [])
+
+    # v3.15: a row whose only candidate came through its byline ORCID is not stale. The
+    # byline is "Chidi Okafor"; the ORCID on it is on file for Rhea Lindqvist.
+    o_idx = IdentityIndex([dict(rec("Rhea", "", "Lindqvist", "rl_c"),
+                                campus=idxmod.CAMPUS_ITHACA)], campus=idxmod.CAMPUS_ITHACA,
+                          orcid_cwid={"0000-0001-0000-0002": "rl_c"})
+    o_row = {"id": 9, "wcm_author": "Chidi Okafor", "author_affiliation": "Cornell University",
+             "doi": None, "external_id": None, "author_position": 1,
+             "byline_orcid": "0000-0001-0000-0002", **{c: None for c in NULL_COLUMNS}}
+    real_family = scop.load_family_afids
+    scop.load_family_afids = lambda *a: frozenset()
+    import contextlib, io
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            kept = _classify_scopus([o_row], o_idx)
+            dropped = _classify_scopus([dict(o_row, byline_orcid=None)], o_idx)
+            no_col = _classify_scopus([{k: v for k, v in o_row.items() if k != "byline_orcid"}],
+                                      o_idx)
+    finally:
+        scop.load_family_afids = real_family
+    check("a row reached only through its stored byline ORCID still matches: the sweep "
+          "passes the ORCID, and does not null the pick",
+          [r["id"] for r in kept[1]] == [9] and kept[0] == [] and kept[2] == [])
+    check("...and the same byline with no ORCID (or on a table without the column) goes "
+          "to live re-verification as before, never straight to stale",
+          dropped[0] == no_col[0] == [] and dropped[1] == no_col[1] == []
+          and [r["id"] for r in dropped[2]] == [r["id"] for r in no_col[2]] == [9])
+    check("byline_orcid is read with the open rows",
+          _SELECT_COLS[-1] == "byline_orcid" and "byline_orcid" not in NULL_COLUMNS)
 
     print("\nSELFTEST", "PASS" if ok else "FAIL")
     return ok

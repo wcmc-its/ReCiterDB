@@ -338,13 +338,24 @@ def _compact(cands):
     # `campus` only when a candidate carries one (Cornell): a WCM entry keeps its exact
     # pre-campus bytes, and PM spreads each entry as an opaque object, so the extra key
     # rides through to the card untouched. `venue_fit` (v3.14) by the same rule: present
-    # only on a candidate the fit table scored, and 0.0 is a score.
+    # only on a candidate the fit table scored, and 0.0 is a score. `orcid_match` (v3.15)
+    # likewise: present, true or false, only on a row whose byline ORCID found somebody.
     def extra(c):
         out = {"campus": c["campus"]} if c.get("campus") else {}
         if c.get("venue_fit") is not None:
             out["venue_fit"] = c["venue_fit"]
+        if "orcid_match" in c:
+            out["orcid_match"] = bool(c["orcid_match"])
         return out
     return [dict({k: c.get(k) for k in keep}, **extra(c)) for c in cands]
+
+
+def top_orcid_match(top):
+    """authorship_review.top_orcid_match for a top candidate (v3.15): 1 when they are the
+    person the byline ORCID is on file for, NULL when the row has no ORCID or it found
+    nobody (no candidate carries the key). 0 cannot come out of the matcher, which ranks
+    the ORCID's person first; it is what a list re-ordered some other way would store."""
+    return int(bool(top["orcid_match"])) if top and "orcid_match" in top else None
 
 
 def _pub_year(entry):
@@ -543,6 +554,7 @@ def _build_row(entry, i, n, author, top, cands, run_ts, dup_map=None):
         # v3.14: the top candidate's department/venue fit, NULL when the matcher had
         # none to give (feature off, WCM candidate, venue or department unknown).
         "top_venue_fit": top.get("venue_fit") if top else None,
+        "top_orcid_match": top_orcid_match(top),
         "top_cohort_size": cohort,
         "top_given_match": top["given_match"] if top else None,
         "top_affil_match": int(bool(top["affil_dept_match"])) if top else None,
@@ -778,7 +790,8 @@ def openalex_authorships(dois, get=None):
     return out
 
 
-def wcm_lane_candidates(idx, au, pub_year, ithaca_family=None, venue_subfield=None):
+def wcm_lane_candidates(idx, au, pub_year, ithaca_family=None, venue_subfield=None,
+                        byline_orcid=None):
     """`idx.candidates` for one WCM-lane author -- the producer's call, and the one the
     replay tools (aar_sweep_stale / aar_report_changed_picks) make on a live re-fetch, so
     a replay reaches the same roster(s) the producer did. A `CampusRoster` gets the
@@ -788,7 +801,8 @@ def wcm_lane_candidates(idx, au, pub_year, ithaca_family=None, venue_subfield=No
     `venue_subfield` (`stored_venue_subfield()` for the document) is forwarded
     only when there is one, so with the venue term off the call is the one it always
     was. A `CampusRoster` uses it only for an author the WCM roster offers nobody for
-    (see `CampusRoster.candidates`): a list with a WCM candidate on it carries no term."""
+    (see `CampusRoster.candidates`): a list with a WCM candidate on it carries no term.
+    `byline_orcid` (the row's byline_orcid) travels the same way, by the same rule."""
     kw = {}
     if isinstance(idx, CampusRoster):
         if ithaca_family is None:
@@ -796,6 +810,8 @@ def wcm_lane_candidates(idx, au, pub_year, ithaca_family=None, venue_subfield=No
         kw["campuses"] = _campuses(au, ithaca_family)
     if venue_subfield:
         kw["venue_subfield"] = venue_subfield
+    if byline_orcid:
+        kw["byline_orcid"] = byline_orcid
     return idx.candidates(au["last"], au["fore"], au["initials"], au["affiliations"],
                           top_k=5, pub_year=pub_year, **kw)
 
@@ -887,7 +903,8 @@ def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True,
                 au["byline_scopus_authid"] = au["authid"]
                 au["byline_orcid"] = au["orcid"] or pick_byline_orcid(
                     by_doi.get((d.get("prism:doi") or "").lower()), i, _byline_name(au))
-            cands, _ = wcm_lane_candidates(idx, au, _pub_year(d), ithaca_family, subfield)
+            cands, _ = wcm_lane_candidates(idx, au, _pub_year(d), ithaca_family, subfield,
+                                           au.get("byline_orcid"))
             top = cands[0] if cands else None
             if top is None:
                 unmatched += 1                         # nothing to assign (v1 skips unmatched)
@@ -901,7 +918,9 @@ def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True,
     if capture:
         n_orcid = sum(1 for r in rows if r["byline_orcid"])
         print(f"      byline ORCID: {n_orcid} of {len(rows)} rows carry one "
-              f"({n_orcid - n_openalex} from Scopus, {n_openalex} from OpenAlex)", flush=True)
+              f"({n_orcid - n_openalex} from Scopus, {n_openalex} from OpenAlex); "
+              f"{sum(1 for r in rows if r['top_orcid_match'])} name the person it is on "
+              f"file for", flush=True)
 
     unreliable = pubmed_unreliable()
     print(f"      PubMed: {PUBMED_STATS['failures']} of {PUBMED_STATS['calls']} esearch calls "
@@ -1235,6 +1254,45 @@ def _selftest():
     check("...OpenAlex answering nothing leaves that ORCID NULL and the row written",
           [(r["byline_orcid"], r["byline_scopus_authid"]) for r in _rows_down]
           == [("0000-0002-1825-0097", "57200000001"), (None, "57200000002")])
+    # The ORCID match (v3.15): run() hands the captured ORCID to the matcher, and the row
+    # stores who it found. Two Cornell Does; the byline spells out John, the ORCID is on
+    # file for Jordan.
+    from identity_index import orcid_map as _omap
+    _cu = [dict(_p("John", "Doe", "jd_c"), campus=CAMPUS_ITHACA, person_type="Cornell Faculty"),
+           dict(_p("Jordan", "Doe", "jo_c"), campus=CAMPUS_ITHACA, person_type="Cornell Faculty")]
+    _ith_o = IdentityIndex(_cu, campus=CAMPUS_ITHACA,
+                           orcid_cwid=_omap([("jo_c", "0000-0001-0000-0002")]))
+    _au_o = {"last": "Doe", "fore": "John", "initials": "J.",
+             "affiliations": ["Cornell University, Ithaca, NY"], "afids": []}
+    _named, _ = wcm_lane_candidates(_ith_o, _au_o, None)
+    _by_orcid, _ = wcm_lane_candidates(_ith_o, _au_o, None, None, None, "0000-0001-0000-0002")
+    check("wcm_lane_candidates forwards the byline ORCID only when there is one: without "
+          "it the call and the answer are the ones they always were",
+          [c["cwid"] for c in _named] == ["jd_c", "jo_c"]
+          and not any("orcid_match" in c for c in _named)
+          and wcm_lane_candidates(_ith_o, _au_o, None, None, None, None)[0] == _named)
+    check("...with it, the person the ORCID is on file for leads the full-name match",
+          [(c["cwid"], c["orcid_match"]) for c in _by_orcid]
+          == [("jo_c", True), ("jd_c", False)])
+    _row_o = _build_row(entry, 0, 2, dict(_au_o, byline_orcid="0000-0001-0000-0002"),
+                        _by_orcid[0], _by_orcid, "2026-11-17 00:00:00")
+    _row_n = _build_row(entry, 0, 2, _au_o, _named[0], _named, "2026-11-17 00:00:00")
+    check("the row stores top_orcid_match=1 and orcid_match on every candidate, last key, "
+          "as _compact writes it",
+          _row_o["top_orcid_match"] == 1 and _row_o["top_cwid"] == "jo_c"
+          and [(c["cwid"], c["orcid_match"], list(c)[-1])
+               for c in json.loads(_row_o["candidate_cwids_json"])]
+          == [("jo_c", True, "orcid_match"), ("jd_c", False, "orcid_match")])
+    check("...and a row no ORCID touched stores NULL and no orcid_match key at all",
+          _row_n["top_orcid_match"] is None and "orcid_match" not in _row_n["candidate_cwids_json"]
+          and top_orcid_match(None) is None and top_orcid_match({"orcid_match": False}) == 0)
+    _roster_o = CampusRoster(IdentityIndex([_p("John", "Doe", "jd2")]), ithaca=_ith_o)
+    _ith_fam = load_family_afids(ITHACA_AFID_LIST)
+    _mixed_o = wcm_lane_candidates(_roster_o, _au_o, None, _ith_fam, None, "0000-0001-0000-0002")
+    check("a WCM-lane author with a WCM namesake is ranked as with no ORCID: nobody "
+          "carries orcid_match",
+          _mixed_o == wcm_lane_candidates(_roster_o, _au_o, None, _ith_fam)
+          and not any("orcid_match" in c for c in _mixed_o[0]))
     check("the row's byline name for the lookup is the stored wcm_author",
           _byline_name(_au2) == _on_row["wcm_author"] == "Jane Smith"
           and _byline_name({"initials": "J.", "last": "Smith"}) == "Smith")
@@ -1555,12 +1613,12 @@ def _selftest():
 
     # aar_db: top_venue_fit is refreshed like top_years_after_wcm, and left out of the
     # statement while the live table lacks the column (code deployed before v3.14).
-    check("aar_db refreshes top_venue_fit and the v3.15 byline identifiers, and those are "
+    check("aar_db refreshes top_venue_fit and the v3.15 byline columns, and those are "
           "the optional columns",
           all(c in aar_db._REFRESH_COLS and c in aar_db._INSERT_COLS
               for c in aar_db._OPTIONAL_COLS)
           and aar_db._OPTIONAL_COLS == ("top_venue_fit", "byline_orcid",
-                                        "byline_scopus_authid"))
+                                        "byline_scopus_authid", "top_orcid_match"))
     _cols, _sql = aar_db._upsert_sql()
     _cols0, _sql0 = aar_db._upsert_sql(aar_db._OPTIONAL_COLS)
     check("upsert names top_venue_fit in the insert and in the refresh when the column exists",
@@ -1569,7 +1627,7 @@ def _selftest():
     check("upsert names the byline identifiers in the insert and in the refresh when the "
           "columns exist (v3.15)",
           all(c in _cols and f"{c}=VALUES({c})" in _sql
-              for c in ("byline_orcid", "byline_scopus_authid")))
+              for c in ("byline_orcid", "byline_scopus_authid", "top_orcid_match")))
     check("before v3.14 and v3.15 the statement is byte-for-byte the one this module built "
           "before the columns were added (sha256 of that statement)",
           not any(c in _sql0 or c in _cols0 for c in aar_db._OPTIONAL_COLS)
@@ -1597,7 +1655,7 @@ def _selftest():
             self.stmts.append((str(stmt), params))
 
     try:
-        _before, _after = _Sink(["byline_orcid", "byline_scopus_authid"]), _Sink(
+        _before, _after = _Sink([c for c in aar_db._OPTIONAL_COLS if c != "top_venue_fit"]), _Sink(
             list(aar_db._OPTIONAL_COLS))
         _bare = _Sink([])
         _buf = io.StringIO()
@@ -1621,12 +1679,13 @@ def _selftest():
           and _buf.getvalue().count("no top_venue_fit column yet") == 1)
     check("upsert before v3.15: the row is written without the byline columns, and says so; "
           "after, with them",
-          not any("byline_" in k for k in _bare.stmts[0][1][0])
-          and "byline_orcid" not in _bare.stmts[0][0]
-          and "no top_venue_fit, byline_orcid, byline_scopus_authid column yet"
-          in _buf.getvalue()
+          not any("orcid" in k or "authid" in k for k in _bare.stmts[0][1][0])
+          and "orcid" not in _bare.stmts[0][0]
+          and "no top_venue_fit, byline_orcid, byline_scopus_authid, top_orcid_match "
+              "column yet" in _buf.getvalue()
           and "byline_orcid=VALUES(byline_orcid)" in _after.stmts[0][0]
-          and "byline_scopus_authid" in _after.stmts[0][1][0])
+          and "top_orcid_match=VALUES(top_orcid_match)" in _after.stmts[0][0]
+          and {"byline_scopus_authid", "top_orcid_match"} <= set(_after.stmts[0][1][0]))
 
     for _c, _l in ((CAMPUS_WCM, ITHACA_AFID_LIST), (CAMPUS_ITHACA, DEFAULT_AFID_LIST)):
         try:

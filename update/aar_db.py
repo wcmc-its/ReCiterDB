@@ -40,7 +40,7 @@ _REFRESH_COLS = [
     "entrez_date", "title", "journal", "issn", "isbn", "doi", "authors_json", "classification",
     "top_cwid", "top_name", "top_person_type", "top_dept",
     "top_fg_score", "top_io_score", "top_confidence", "top_years_after_wcm",
-    "top_venue_fit", "top_cohort_size",
+    "top_venue_fit", "top_orcid_match", "top_cohort_size",
     "top_given_match", "top_affil_match", "n_candidates", "single_candidate",
     "candidate_cwids_json", "dup_flag", "dup_reason", "last_refreshed",
 ]
@@ -57,7 +57,7 @@ _REFRESH_COLS = [
 _INSERT_COLS = ["pmid", "author_key"] + _REFRESH_COLS + [
     "matched_pmid", "matched_pmid_source", "matched_pmid_at",
     "status", "first_seen", "last_checked"]
-# top_venue_fit (v3.14) and the byline identifiers (v3.15) are the columns here the live
+# top_venue_fit (v3.14) and the byline columns (v3.15) are the columns here the live
 # table may not have yet. The v2.7 note at the top of this file is what that costs: an
 # INSERT naming a column the table lacks fails outright, and a ReCiterDB merge deploys
 # the image whether or not anyone has applied setup/alter_venue_fit_v3.14.sql or
@@ -65,7 +65,7 @@ _INSERT_COLS = ["pmid", "author_key"] + _REFRESH_COLS + [
 # information_schema once per call and leaves an absent optional column out of its
 # statement. Every lane then writes exactly what it wrote before the column existed, and
 # starts filling it the night after the migration, with no deploy in between.
-_OPTIONAL_COLS = ("top_venue_fit", "byline_orcid", "byline_scopus_authid")
+_OPTIONAL_COLS = ("top_venue_fit", "byline_orcid", "byline_scopus_authid", "top_orcid_match")
 
 _ENGINE = None
 
@@ -168,6 +168,13 @@ def missing_optional_cols(conn):
     have = {str(r[0]).lower() for r in conn.execute(
         stmt, {"t": TABLE, "cols": list(_OPTIONAL_COLS)})}
     return [c for c in _OPTIONAL_COLS if c not in have]
+
+
+def present_cols(conn, cols):
+    """`cols` without the optional ones the live table lacks, for a SELECT that names a
+    column whose migration may not be applied yet."""
+    absent = missing_optional_cols(conn)
+    return [c for c in cols if c not in absent]
 
 
 def _upsert_sql(skip=()):
