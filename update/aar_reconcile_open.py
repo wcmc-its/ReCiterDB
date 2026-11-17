@@ -412,9 +412,14 @@ def _load_class_b_modules():
     # aar_report_changed_picks), so the value written is the new top candidate's own; on
     # the pubmed lane, which has no venue term, it is NULL. It is also the one column
     # here the live table may not have yet: see _drop_absent_optional_cols.
+    #
+    # top_orcid_match (v3.15) is another, and optional in the same way: 1 when the top
+    # candidate is the person the row's byline ORCID is on file for. The scopus replay
+    # ranks with the row's stored byline_orcid, so the value is the new top candidate's
+    # own; on the pubmed lane it is NULL.
     _TOP_CANDIDATE_COLS = [
         "top_fg_score", "top_io_score", "top_years_after_wcm", "top_venue_fit",
-        "classification"]
+        "top_orcid_match", "classification"]
     REFRESH_COLS = list(sweep.NULL_COLUMNS) + _TOP_CANDIDATE_COLS + [
         "top_cohort_size", "single_candidate", "last_refreshed"]
     _EXTRA = [c for c in REFRESH_COLS if c not in sweep.NULL_COLUMNS]
@@ -568,7 +573,8 @@ def _install_capture():
 
 def _drop_absent_optional_cols(engine):
     """Take out of REFRESH_COLS any column the live table does not have yet
-    (aar_db._OPTIONAL_COLS: top_venue_fit before setup/alter_venue_fit_v3.14.sql). An
+    (aar_db._OPTIONAL_COLS: top_venue_fit before setup/alter_venue_fit_v3.14.sql,
+    top_orcid_match before setup/alter_authorship_review_add_byline_orcid_v3.15.sql). An
     optional column CLASS B does not refresh (the v3.15 byline identifiers, which describe
     the byline and not the top candidate) is none of this function's business.
 
@@ -638,6 +644,7 @@ def _write_payload(rec, run_ts):
         "top_years_after_wcm": top.get("years_after_wcm"),
         # as aar_universe_scopus._build_row: the top candidate's own, NULL when it has none
         "top_venue_fit": top.get("venue_fit"),
+        "top_orcid_match": scop.top_orcid_match(top),
         # verbatim from aar_orchestrator._db_rows
         "classification": "absent" if fg is None else "buried",
         "top_cohort_size": cohort,
@@ -773,9 +780,12 @@ def _class_b_update_sql():
     row a curator touched between the SELECT and here is skipped, not overwritten --
     the guarantee that matters most now that DRIFT_ONLY makes this a thousands-of-rows
     nightly pass rather than a hand-reviewed one-off. Factored out of _apply_class_b so
-    _selftest can assert that shape without a DB."""
+    _selftest can assert that shape without a DB. accept_conflict IS NULL keeps a parked
+    Accept on the person it was made for (the rule backfill_venue_fit and
+    backfill_byline_orcid write by)."""
     sets = ", ".join(f"{c}=:{c}" for c in REFRESH_COLS)
-    return f"UPDATE authorship_review SET {sets} WHERE id=:id AND status='open'"
+    return (f"UPDATE authorship_review SET {sets} WHERE id=:id AND status='open' "
+            f"AND accept_conflict IS NULL")
 
 
 def _apply_class_b(engine, entries, run_ts):
@@ -1222,7 +1232,7 @@ def _selftest():
                            "top_given_match", "top_affil_match", "top_confidence",
                            "candidate_cwids_json", "n_candidates",
                            "top_fg_score", "top_io_score", "top_years_after_wcm",
-                           "top_venue_fit", "classification",
+                           "top_venue_fit", "top_orcid_match", "classification",
                            "top_cohort_size", "single_candidate", "last_refreshed"])
     check("...and #180's own nine are still exactly its nine, untouched by that",
           sweep.NULL_COLUMNS == ["top_cwid", "top_name", "top_person_type", "top_dept",
@@ -1303,7 +1313,7 @@ def _selftest():
     check("every top-candidate column is in the SET clause CLASS B actually emits",
           all(f"{c}=:{c}" in _class_b_update_sql()
               for c in ("top_fg_score", "top_io_score", "top_years_after_wcm",
-                        "top_venue_fit", "classification")))
+                        "top_venue_fit", "top_orcid_match", "classification")))
 
     # v3.14: top_venue_fit describes the top candidate, so it moves with top_cwid. A
     # refresh that left it behind would put one person's fit on another person's row.
@@ -1318,6 +1328,19 @@ def _selftest():
           fitted["top_venue_fit"] == 1.586
           and [c.get("venue_fit") for c in json.loads(fitted["candidate_cwids_json"])]
           == [1.586, -3.045])
+
+    # v3.15: top_orcid_match moves with top_cwid in the same way.
+    check("write_payload writes NULL top_orcid_match for a top candidate no ORCID touched",
+          "top_orcid_match" in payload and payload["top_orcid_match"] is None
+          and fitted["top_orcid_match"] is None)
+    FULL_CANDS_BY_ID[1004] = [dict(FULL_CANDS_BY_ID[1000][0], orcid_match=True),
+                              dict(FULL_CANDS_BY_ID[1000][1], orcid_match=False)]
+    by_orcid = _write_payload({"id": 1004, "source": "scopus", "new_cwid": "abc123"}, RUN_TS)
+    check("...and 1 when the top candidate is the byline ORCID's person, with orcid_match "
+          "on every stored candidate",
+          by_orcid["top_orcid_match"] == 1
+          and [c.get("orcid_match") for c in json.loads(by_orcid["candidate_cwids_json"])]
+          == [True, False])
 
     # ...and the column may not exist yet: code deploys with the merge, the migration is
     # applied by hand. CLASS B then reads and writes exactly what it did before v3.14.
@@ -1341,11 +1364,12 @@ def _selftest():
     full_cols = list(REFRESH_COLS)
     try:
         with contextlib.redirect_stdout(io.StringIO()) as _out:
-            present = _drop_absent_optional_cols(_Eng(["top_venue_fit"]))
-        check("with the v3.14 column present nothing is dropped and nothing is printed",
+            present = _drop_absent_optional_cols(_Eng(["top_venue_fit", "top_orcid_match"]))
+        check("with the v3.14 and v3.15 columns present nothing is dropped and nothing is "
+              "printed, whether or not the byline identifiers are there",
               present == [] and REFRESH_COLS == full_cols and _out.getvalue() == "")
         with contextlib.redirect_stdout(io.StringIO()) as _out:
-            absent = _drop_absent_optional_cols(_Eng([]))
+            absent = _drop_absent_optional_cols(_Eng(["top_orcid_match", "byline_orcid"]))
         pre = _write_payload({"id": 1003, "source": "scopus", "new_cwid": "abc123"}, RUN_TS)
         check("before the migration top_venue_fit leaves the SELECT list, the UPDATE and "
               "the payload together, and the run says so",
@@ -1353,10 +1377,21 @@ def _selftest():
               and "top_venue_fit" not in _class_b_update_sql()
               and set(pre) == set(REFRESH_COLS) == set(full_cols) - {"top_venue_fit"}
               and "no top_venue_fit column yet" in _out.getvalue())
-        check("...and what is left is the pre-v3.14 statement, column for column",
+        check("...and what is left is that statement without it, column for column",
               _class_b_update_sql() == "UPDATE authorship_review SET "
               + ", ".join(f"{c}=:{c}" for c in full_cols if c != "top_venue_fit")
-              + " WHERE id=:id AND status='open'")
+              + " WHERE id=:id AND status='open' AND accept_conflict IS NULL")
+        REFRESH_COLS[:] = full_cols
+        with contextlib.redirect_stdout(io.StringIO()) as _out:
+            absent = _drop_absent_optional_cols(_Eng([]))
+        check("before v3.15 as well top_orcid_match leaves with it, and what is left is "
+              "the pre-v3.14 statement",
+              absent == ["top_venue_fit", "top_orcid_match"]
+              and "no top_venue_fit, top_orcid_match column yet" in _out.getvalue()
+              and _class_b_update_sql() == "UPDATE authorship_review SET "
+              + ", ".join(f"{c}=:{c}" for c in full_cols
+                          if c not in ("top_venue_fit", "top_orcid_match"))
+              + " WHERE id=:id AND status='open' AND accept_conflict IS NULL")
     finally:
         REFRESH_COLS[:] = full_cols
     check("write_payload's top_affil_match is coerced to 0/1",
@@ -1401,7 +1436,8 @@ def _selftest():
           set(rcp._DRIFT_COLS) < set(REFRESH_COLS)
           and set(REFRESH_COLS) - set(rcp._DRIFT_COLS) - {"top_cwid"}
           == {"top_fg_score", "top_io_score", "top_years_after_wcm", "top_venue_fit",
-              "classification", "top_cohort_size", "single_candidate", "last_refreshed"})
+              "top_orcid_match", "classification", "top_cohort_size", "single_candidate",
+              "last_refreshed"})
     # top_fg_score/top_io_score must stay payload-only for the same reason #182 gave:
     # they wobble run to run, so as triggers they would make every row drift forever.
     # They are written when something ELSE drifts, never the reason a row is rewritten.
@@ -1443,8 +1479,9 @@ def _selftest():
     # rows in the first place. Worth asserting now that the drift class turns this from
     # a hand-reviewed one-off into an unattended nightly pass over thousands of rows.
     sql_b = _class_b_update_sql()
-    check("CLASS B UPDATE re-checks status='open' (curator-touched rows never written)",
-          sql_b.endswith("WHERE id=:id AND status='open'"))
+    check("CLASS B UPDATE re-checks status='open' and accept_conflict IS NULL (curator-"
+          "touched and parked rows never written)",
+          sql_b.endswith("WHERE id=:id AND status='open' AND accept_conflict IS NULL"))
     set_clause_b = sql_b.split("WHERE")[0]
     check("CLASS B UPDATE never touches curator columns",
           all(col not in set_clause_b for col in

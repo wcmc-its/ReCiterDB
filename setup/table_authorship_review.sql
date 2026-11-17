@@ -83,7 +83,8 @@ CREATE TABLE IF NOT EXISTS `authorship_review` (
                                                              -- venue's subfield / campus share); NULL = unknown.
                                                              -- See setup/alter_venue_fit_v3.14.sql
   `top_orcid_match`        TINYINT(1)   NULL,                -- (v3.15) 1 = the top pick is the person the byline ORCID
-                                                             -- maps to; NULL = no byline ORCID, or it maps to nobody
+                                                             -- maps to; NULL = no byline ORCID, or it maps to nobody.
+                                                             -- Candidates on such a row carry "orcid_match"
   `top_cohort_size`        INT          NULL,                -- homonyms (surname+initial)
   `top_given_match`        VARCHAR(16)  NULL,                -- full|initial
   `top_affil_match`        TINYINT(1)   NULL,

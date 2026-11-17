@@ -15,18 +15,22 @@
 --   top_orcid_match        TINYINT(1) NULL. 1 when the top pick is the person the byline
 --                          ORCID maps to (cornell_pub_orcid_mapping); NULL when the row
 --                          has no byline ORCID or the ORCID maps to nobody on the roster.
---                          Written by the matcher change that follows this one; until
---                          then it stays NULL.
+--                          Each entry of candidate_cwids_json on such a row carries
+--                          "orcid_match": true|false (identity_index.candidates).
 -- All three are producer-owned (aar_db._REFRESH_COLS), like top_venue_fit. Publication
 -- Manager reads them; it never writes them.
 --
 -- BEHAVIOUR CHANGE: none by itself. Nothing fills the columns until the CronJob env
---   sets AAR_BYLINE_ORCID=on.
+--   sets AAR_BYLINE_ORCID=on. That one switch turns on both halves: the lanes store the
+--   identifiers, and on a Cornell Ithaca byline with no WCM candidate the matcher ranks
+--   the person the ORCID is on file for first. It never changes a row's status.
 --
 -- ORDERING: apply this file BEFORE setting AAR_BYLINE_ORCID. Merging the code first is
 --   harmless: the env var ships off, and aar_db.upsert leaves a column the table does
 --   not have out of its statement (aar_db._OPTIONAL_COLS).
---   One-off after applying and turning capture on (dry run first, then --apply):
+--   One-off after applying and turning it on (dry run first, then --apply). With
+--   AAR_BYLINE_ORCID=on in its own shell it also re-ranks the open rows and reports
+--   PICK_CHANGE / ORCID_CONFIRMS / ORCID_NEW_PERSON:
 --     python3 update/backfill_byline_orcid.py
 --
 -- Does not need v3.14: top_orcid_match goes after top_venue_fit where that column

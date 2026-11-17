@@ -75,6 +75,12 @@ VENUE TERM (v3.14): the scopus replay ranks as the producer ranks. It reads the 
   about exactly that, and refuses outright when the switch is on but the lookup or the
   fit table could not be loaded.
 
+BYLINE ORCID (v3.15): likewise. Each row is replayed with the byline_orcid IT STORES, the
+  value the producer ranked it with, never a fresh lookup. A row whose pick came from the
+  ORCID (some candidate carries `orcid_match`) only replays to itself on a roster that
+  holds the ORCID map, so `_replay_orcid_guard` refuses to replay such rows without it:
+  when the map did not load, and equally when AAR_BYLINE_ORCID is not on in this shell.
+
 SYS.PATH FORK TRAP: same guard as aar_sweep_stale.py -- this file's own directory must
   win over the stale ~/Dropbox/Projects/ReCiter Research/scripts/ copy. Asserted below,
   resolved paths printed.
@@ -131,7 +137,8 @@ _SELECT_COLS = ["id", "source", "pmid", "external_id", "doi", "author_key",
                 "top_confidence", "classification", "entrez_date",
                 "top_person_type", "top_dept", "top_affil_match",
                 "n_candidates", "candidate_cwids_json",
-                "issn", "journal"]        # the venue, for the scopus replay's venue term
+                "issn", "journal",        # the venue, for the scopus replay's venue term
+                "byline_orcid"]           # v3.15, optional: see aar_db.present_cols
 
 
 def _cwid_eq(a, b):
@@ -147,8 +154,8 @@ def _cwid_eq(a, b):
 
 def _open_rows(engine, source):
     from sqlalchemy import text
-    cols = ", ".join(_SELECT_COLS)
     with engine.connect() as c:
+        cols = ", ".join(aar_db.present_cols(c, _SELECT_COLS))
         rows = c.execute(text(
             f"SELECT {cols} FROM authorship_review "
             "WHERE source=:s AND status='open'"), {"s": source}).mappings().all()
@@ -556,10 +563,40 @@ def _venue_kw(lookup, r):
     return {"venue_subfield": subfield} if subfield else {}
 
 
+def _orcid_kw(r):
+    """{'byline_orcid': ...} for a stored row that has one, or {} so the matcher call is
+    the one it always was (and is, on a table without the v3.15 column)."""
+    return {"byline_orcid": r["byline_orcid"]} if r.get("byline_orcid") else {}
+
+
+def _replay_orcid_guard(rows, idx):
+    """`_replay_venue_lookup`'s rule for the ORCID match, without the warn-only half.
+    Rows whose stored candidates carry `orcid_match` were ranked by the byline ORCID;
+    replayed on a roster with no ORCID map they all read as drift, and
+    aar_reconcile_open --apply would write the ORCID's person back off them (a move to a
+    full given-name match is the 'stronger' move CLASS B accepts). So this raises
+    whenever such rows exist and the roster holds no map, whether the map failed to load
+    or AAR_BYLINE_ORCID is simply not on in this shell."""
+    ranked = sum(1 for r in rows if '"orcid_match"' in (r.get("candidate_cwids_json") or ""))
+    if not ranked or getattr(getattr(idx, "ithaca", idx), "orcid_rec", None):
+        return
+    if idxmod.byline_orcid_enabled():
+        raise RuntimeError(
+            "AAR_BYLINE_ORCID is on but the Ithaca ORCID map could not be loaded (see the "
+            "warning above). Refusing to replay the scopus lane without it: every row "
+            "ranked by its byline ORCID would read as drift.")
+    raise RuntimeError(
+        f"{ranked} open scopus rows were ranked by a byline ORCID and AAR_BYLINE_ORCID is "
+        f"not on here. Refusing to replay the scopus lane WITHOUT the ORCID match: they "
+        f"would read as drift and --apply would move their picks. Set AAR_BYLINE_ORCID=on "
+        f"to replay as the CronJob does.")
+
+
 def _replay_scopus(rows, idx, limit=None):
     rows = rows[:limit] if limit else rows
     family = scop.load_family_afids()
     venue_lookup = _replay_venue_lookup(rows, idx)
+    _replay_orcid_guard(rows, idx)
 
     # pass 1: free reconstruction, every row, no network.
     prelim = []
@@ -568,7 +605,7 @@ def _replay_scopus(rows, idx, limit=None):
         affils = [a for a in (r["author_affiliation"] or "").split(" | ") if a]
         cands, _cohort = idx.candidates(last, fore, None, affils, top_k=5,
                                         pub_year=_scopus_pub_year(r),
-                                        **_venue_kw(venue_lookup, r))
+                                        **_venue_kw(venue_lookup, r), **_orcid_kw(r))
         top = cands[0] if cands else None
         rec = _row_result(r, top, "scopus", cands)
         prelim.append((r, rec))
@@ -616,7 +653,8 @@ def _replay_scopus(rows, idx, limit=None):
             else:
                 cands, _cohort = scop.wcm_lane_candidates(
                     idx, hit, scop._pub_year(entry), None,
-                    _venue_kw(venue_lookup, r).get("venue_subfield"))
+                    _venue_kw(venue_lookup, r).get("venue_subfield"),
+                    r.get("byline_orcid"))
                 top = cands[0] if cands else None
                 results.append(_row_result(r, top, "scopus", cands))
         except Exception as e:                          # noqa: BLE001
@@ -632,8 +670,8 @@ def _replay_scopus(rows, idx, limit=None):
 # ---- named-row check ----------------------------------------------------------
 def _check_ids(engine, idx, io_scorer, ids):
     from sqlalchemy import text
-    cols = ", ".join(_SELECT_COLS)
     with engine.connect() as c:
+        cols = ", ".join(aar_db.present_cols(c, _SELECT_COLS))
         rows = [dict(r) for r in c.execute(text(
             f"SELECT {cols} FROM authorship_review WHERE id IN :ids"),
             {"ids": tuple(ids)}).mappings().all()]
@@ -861,6 +899,69 @@ def _selftest():
     finally:
         (scop.load_venue_lookup, scop.load_family_afids, scop.venue_fit_enabled,
          scop._scopus_get) = saved
+
+    # ---- byline ORCID (v3.15): the scopus replay ranks with the row's stored ORCID ----
+    # Same two Weisses plus a Rhea who publishes as Lindqvist. The byline says "R Weiss";
+    # the ORCID on it is on file for Lindqvist, whom the name cannot reach.
+    ORCID = "0000-0001-0000-0002"
+    o_people = people + [dict(person("Rhea", "Law School", "rl_c"), surname="Lindqvist",
+                              surname_norm="lindqvist")]
+    o_idx = idxmod.IdentityIndex(o_people, campus=idxmod.CAMPUS_ITHACA,
+                                 orcid_cwid=idxmod.orcid_map([("rl_c", ORCID)]))
+    o_produced, _ = scop.wcm_lane_candidates(o_idx, au, 2024, None, None, ORCID)
+    otop = o_produced[0]
+    orcid_row = dict(venue_row, id=8, byline_orcid=ORCID, top_cwid=otop["cwid"],
+                     top_name=otop["name"], top_person_type=otop["person_type"],
+                     top_dept=otop["dept"], top_given_match=otop["given_match"],
+                     top_affil_match=int(bool(otop["affil_dept_match"])),
+                     top_confidence=otop["confidence"], n_candidates=len(o_produced),
+                     candidate_cwids_json=json.dumps(scop._compact(o_produced)))
+    check("the fixture is an ORCID-decided row: Lindqvist, absent by name, leads",
+          [(c["cwid"], c["orcid_match"]) for c in o_produced]
+          == [("rl_c", True), ("rh_c", False), ("rw_c", False)])
+    check("the replay reads the ORCID off the row itself, and passes nothing for a row "
+          "(or a table) without one",
+          "byline_orcid" in _SELECT_COLS and _orcid_kw(orcid_row) == {"byline_orcid": ORCID}
+          and _orcid_kw(venue_row) == {} and _orcid_kw(dict(venue_row, byline_orcid=None)) == {})
+    saved = (scop.load_venue_lookup, scop.load_family_afids, scop.venue_fit_enabled,
+             scop._scopus_get, idxmod.byline_orcid_enabled)
+    scop.load_family_afids, scop._scopus_get = (lambda *a: frozenset()), _no_network
+    scop.venue_fit_enabled, scop.load_venue_lookup = (lambda: False), (lambda: None)
+    no_map = idxmod.IdentityIndex(o_people, campus=idxmod.CAMPUS_ITHACA)
+    buf = io.StringIO()
+    try:
+        idxmod.byline_orcid_enabled = lambda: True
+        with contextlib.redirect_stdout(buf):
+            on, on_unres = _replay_scopus([orcid_row], o_idx)
+        check("ORCID match on: a row the producer ranked by its ORCID replays to itself -- "
+              "UNCHANGED, no drift, no live re-fetch",
+              on_unres == [] and [(x["classification"], x["drift"], x["new_cwid"])
+                                  for x in on] == [("UNCHANGED", [], "rl_c")])
+        try:
+            with contextlib.redirect_stdout(buf):
+                _replay_scopus([orcid_row], no_map)
+            refused = False
+        except RuntimeError:
+            refused = True
+        check("ORCID match on but the map did not load: the replay refuses instead of "
+              "reading every ORCID-ranked row as drift", refused)
+        check("...and rows no ORCID ranked do not need the map: nothing is refused",
+              _replay_orcid_guard([venue_row], no_map) is None)
+
+        idxmod.byline_orcid_enabled = lambda: False
+        try:
+            with contextlib.redirect_stdout(buf):
+                _replay_scopus([orcid_row], no_map)
+            off = ""
+        except RuntimeError as e:
+            off = str(e)
+        check("ORCID match off here: the replay refuses too, and says 1 stored row was "
+              "ranked by a byline ORCID -- a warning would let --apply move its pick",
+              "1 open scopus rows were ranked by a byline ORCID" in off
+              and "AAR_BYLINE_ORCID=on" in off)
+    finally:
+        (scop.load_venue_lookup, scop.load_family_afids, scop.venue_fit_enabled,
+         scop._scopus_get, idxmod.byline_orcid_enabled) = saved
 
     print("\nSELFTEST", "PASS" if ok else "FAIL")
     return ok
