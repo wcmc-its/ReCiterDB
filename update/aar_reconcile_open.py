@@ -780,9 +780,12 @@ def _class_b_update_sql():
     row a curator touched between the SELECT and here is skipped, not overwritten --
     the guarantee that matters most now that DRIFT_ONLY makes this a thousands-of-rows
     nightly pass rather than a hand-reviewed one-off. Factored out of _apply_class_b so
-    _selftest can assert that shape without a DB."""
+    _selftest can assert that shape without a DB. accept_conflict IS NULL keeps a parked
+    Accept on the person it was made for (the rule backfill_venue_fit and
+    backfill_byline_orcid write by)."""
     sets = ", ".join(f"{c}=:{c}" for c in REFRESH_COLS)
-    return f"UPDATE authorship_review SET {sets} WHERE id=:id AND status='open'"
+    return (f"UPDATE authorship_review SET {sets} WHERE id=:id AND status='open' "
+            f"AND accept_conflict IS NULL")
 
 
 def _apply_class_b(engine, entries, run_ts):
@@ -1377,7 +1380,7 @@ def _selftest():
         check("...and what is left is that statement without it, column for column",
               _class_b_update_sql() == "UPDATE authorship_review SET "
               + ", ".join(f"{c}=:{c}" for c in full_cols if c != "top_venue_fit")
-              + " WHERE id=:id AND status='open'")
+              + " WHERE id=:id AND status='open' AND accept_conflict IS NULL")
         REFRESH_COLS[:] = full_cols
         with contextlib.redirect_stdout(io.StringIO()) as _out:
             absent = _drop_absent_optional_cols(_Eng([]))
@@ -1388,7 +1391,7 @@ def _selftest():
               and _class_b_update_sql() == "UPDATE authorship_review SET "
               + ", ".join(f"{c}=:{c}" for c in full_cols
                           if c not in ("top_venue_fit", "top_orcid_match"))
-              + " WHERE id=:id AND status='open'")
+              + " WHERE id=:id AND status='open' AND accept_conflict IS NULL")
     finally:
         REFRESH_COLS[:] = full_cols
     check("write_payload's top_affil_match is coerced to 0/1",
@@ -1476,8 +1479,9 @@ def _selftest():
     # rows in the first place. Worth asserting now that the drift class turns this from
     # a hand-reviewed one-off into an unattended nightly pass over thousands of rows.
     sql_b = _class_b_update_sql()
-    check("CLASS B UPDATE re-checks status='open' (curator-touched rows never written)",
-          sql_b.endswith("WHERE id=:id AND status='open'"))
+    check("CLASS B UPDATE re-checks status='open' and accept_conflict IS NULL (curator-"
+          "touched and parked rows never written)",
+          sql_b.endswith("WHERE id=:id AND status='open' AND accept_conflict IS NULL"))
     set_clause_b = sql_b.split("WHERE")[0]
     check("CLASS B UPDATE never touches curator columns",
           all(col not in set_clause_b for col in

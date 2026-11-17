@@ -182,7 +182,12 @@ def _upsert_sql(skip=()):
     insert_cols = [c for c in _INSERT_COLS if c not in skip]
     cols = ", ".join(insert_cols)
     placeholders = ", ".join(f":{c}" for c in insert_cols)
-    updates = ", ".join(f"{c}=VALUES({c})" for c in _REFRESH_COLS if c not in skip)
+    # A row held in Publication Manager's duplicates queue (accept_conflict set) keeps
+    # what it stores: a curator's Accept is parked on the person the row names, and a
+    # refresh that moved top_cwid (the byline ORCID match can, v3.15) would leave that
+    # Accept on a row naming somebody else. Refreshed again once PM clears the column.
+    updates = ", ".join(f"{c}=IF(accept_conflict IS NULL, VALUES({c}), {c})"
+                        for c in _REFRESH_COLS if c not in skip)
     # also advance last_checked on refresh; never touch status/resolution_*/reviewer/note/snooze
     return insert_cols, (f"INSERT INTO {TABLE} ({cols}) VALUES ({placeholders}) "
                          f"ON DUPLICATE KEY UPDATE {updates}, last_checked=VALUES(last_checked)")

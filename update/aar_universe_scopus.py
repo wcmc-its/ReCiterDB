@@ -1662,16 +1662,21 @@ def _selftest():
     _cols0, _sql0 = aar_db._upsert_sql(aar_db._OPTIONAL_COLS)
     check("upsert names top_venue_fit in the insert and in the refresh when the column exists",
           "top_venue_fit" in _cols and ":top_venue_fit" in _sql
-          and "top_venue_fit=VALUES(top_venue_fit)" in _sql)
+          and "top_venue_fit=IF(accept_conflict IS NULL, VALUES(top_venue_fit), top_venue_fit)" in _sql)
     check("upsert names the byline identifiers in the insert and in the refresh when the "
           "columns exist (v3.15)",
-          all(c in _cols and f"{c}=VALUES({c})" in _sql
+          all(c in _cols and f"{c}=IF(accept_conflict IS NULL, VALUES({c}), {c})" in _sql
               for c in ("byline_orcid", "byline_scopus_authid", "top_orcid_match")))
-    check("before v3.14 and v3.15 the statement is byte-for-byte the one this module built "
-          "before the columns were added (sha256 of that statement)",
+    check("before v3.14 and v3.15 the statement names none of the optional columns and is "
+          "otherwise the same one (sha256 of that statement, parked-row guard included)",
           not any(c in _sql0 or c in _cols0 for c in aar_db._OPTIONAL_COLS)
           and hashlib.sha256(_sql0.encode()).hexdigest()
-          == "ae978c88e4e000656361d02cd33d1641d33fcfbff41eac32564f6f4e12eec92f")
+          == "df866f4265dcf5dd552bf10a6aa99770a9eb08db6b5c22ced73af0fab8f3a12c")
+    check("a row parked in PM's duplicates queue (accept_conflict set) is not refreshed: "
+          "every refreshed column keeps its stored value, and last_checked still advances",
+          all(f"{c}=IF(accept_conflict IS NULL, VALUES({c}), {c})" in _sql
+              for c in aar_db._REFRESH_COLS)
+          and _sql.endswith("last_checked=VALUES(last_checked)"))
 
     class _Sink:
         """Stands in for the engine and its connection: answers the information_schema
@@ -1713,7 +1718,7 @@ def _selftest():
           and _before.stmts[0][1][0]["top_cwid"] == "ad_cu"
           and "no top_venue_fit column yet" in _buf.getvalue())
     check("upsert after v3.14: the same row is written with it",
-          _n1 == 1 and "top_venue_fit=VALUES(top_venue_fit)" in _after.stmts[0][0]
+          _n1 == 1 and "top_venue_fit=IF(accept_conflict IS NULL, VALUES(top_venue_fit), top_venue_fit)" in _after.stmts[0][0]
           and _after.stmts[0][1][0]["top_venue_fit"] == 1.586
           and _buf.getvalue().count("no top_venue_fit column yet") == 1)
     check("upsert before v3.15: the row is written without the byline columns, and says so; "
@@ -1722,8 +1727,8 @@ def _selftest():
           and "orcid" not in _bare.stmts[0][0]
           and "no top_venue_fit, byline_orcid, byline_scopus_authid, top_orcid_match "
               "column yet" in _buf.getvalue()
-          and "byline_orcid=VALUES(byline_orcid)" in _after.stmts[0][0]
-          and "top_orcid_match=VALUES(top_orcid_match)" in _after.stmts[0][0]
+          and "byline_orcid=IF(accept_conflict IS NULL, VALUES(byline_orcid), byline_orcid)" in _after.stmts[0][0]
+          and "top_orcid_match=IF(accept_conflict IS NULL, VALUES(top_orcid_match), top_orcid_match)" in _after.stmts[0][0]
           and {"byline_scopus_authid", "top_orcid_match"} <= set(_after.stmts[0][1][0]))
 
     for _c, _l in ((CAMPUS_WCM, ITHACA_AFID_LIST), (CAMPUS_ITHACA, DEFAULT_AFID_LIST)):
