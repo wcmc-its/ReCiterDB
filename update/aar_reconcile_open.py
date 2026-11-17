@@ -568,7 +568,9 @@ def _install_capture():
 
 def _drop_absent_optional_cols(engine):
     """Take out of REFRESH_COLS any column the live table does not have yet
-    (aar_db._OPTIONAL_COLS: top_venue_fit before setup/alter_venue_fit_v3.14.sql).
+    (aar_db._OPTIONAL_COLS: top_venue_fit before setup/alter_venue_fit_v3.14.sql). An
+    optional column CLASS B does not refresh (the v3.15 byline identifiers, which describe
+    the byline and not the top candidate) is none of this function's business.
 
     A ReCiterDB merge deploys this file whether or not the migration has been applied,
     and CLASS B both SELECTs and UPDATEs every REFRESH_COLS column by name -- the
@@ -578,7 +580,7 @@ def _drop_absent_optional_cols(engine):
     what it did before the column existed, and picks it up on the first run after the
     migration with no deploy in between. Returns the columns dropped."""
     with engine.connect() as c:
-        absent = aar_db.missing_optional_cols(c)
+        absent = [col for col in aar_db.missing_optional_cols(c) if col in REFRESH_COLS]
     if absent:
         REFRESH_COLS[:] = [c for c in REFRESH_COLS if c not in absent]
         print(f"NOTE: authorship_review has no {', '.join(absent)} column yet (its "

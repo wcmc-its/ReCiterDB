@@ -23,7 +23,12 @@ publishes in the venue's subfield gains a little `confidence`, and one whose dep
 never does loses a little. Cornell Ithaca only, off unless AAR_VENUE_FIT=on. See
 `venue_fit_enabled`.
 
-Env: DB_USERNAME/DB_PASSWORD/DB_HOST/DB_NAME (reciterdb, read-only); AAR_VENUE_FIT.
+And to the BYLINE ORCID switch and its normaliser (v3.15): the external lanes store the
+ORCID the source attaches to a byline author. Off unless AAR_BYLINE_ORCID=on. See
+`byline_orcid_enabled`.
+
+Env: DB_USERNAME/DB_PASSWORD/DB_HOST/DB_NAME (reciterdb, read-only); AAR_VENUE_FIT;
+AAR_BYLINE_ORCID.
 """
 import logging, os, re, unicodedata
 
@@ -543,6 +548,28 @@ def temporal_penalty(years_after_wcm):
 def venue_fit_enabled():
     """AAR_VENUE_FIT=on. Anything else, a typo included, is off."""
     return (os.environ.get("AAR_VENUE_FIT") or "").strip().lower() == "on"
+
+
+# ---- byline ORCID ------------------------------------------------------------
+# Scopus and OpenAlex both attach an ORCID to some byline authors, and until v3.15 the
+# lanes threw it away. With AAR_BYLINE_ORCID=on they store it per row as
+# authorship_review.byline_orcid (and the Scopus author id as byline_scopus_authid).
+# CAPTURE ONLY: nothing here reads the stored value, so no pick, confidence or candidate
+# list changes. Off, the lanes make no lookup and write NULL in both columns.
+def byline_orcid_enabled():
+    """AAR_BYLINE_ORCID=on. Anything else, a typo included, is off."""
+    return (os.environ.get("AAR_BYLINE_ORCID") or "").strip().lower() == "on"
+
+
+_ORCID = re.compile(r"(?:HTTPS?://ORCID\.ORG/)?(\d{4}-\d{4}-\d{4}-\d{3}[\dX])")
+
+
+def bare_orcid(value):
+    """An ORCID as byline_orcid CHAR(19) stores it: 0000-0000-0000-000X, no
+    https://orcid.org/ prefix, check letter upper-cased. None for anything else, so a
+    malformed value is never stored and never matched."""
+    m = _ORCID.fullmatch(str(value or "").strip().upper())
+    return m.group(1) if m else None
 
 
 # ---- candidate label -------------------------------------------------------

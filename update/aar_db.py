@@ -36,6 +36,7 @@ TABLE = "authorship_review"
 _REFRESH_COLS = [
     "source", "external_id", "pub_type", "container_id",
     "author_position", "author_position_label", "wcm_author", "author_affiliation",
+    "byline_orcid", "byline_scopus_authid",
     "entrez_date", "title", "journal", "issn", "isbn", "doi", "authors_json", "classification",
     "top_cwid", "top_name", "top_person_type", "top_dept",
     "top_fg_score", "top_io_score", "top_confidence", "top_years_after_wcm",
@@ -56,14 +57,15 @@ _REFRESH_COLS = [
 _INSERT_COLS = ["pmid", "author_key"] + _REFRESH_COLS + [
     "matched_pmid", "matched_pmid_source", "matched_pmid_at",
     "status", "first_seen", "last_checked"]
-# top_venue_fit (v3.14) is the one column here the live table may not have yet. The
-# v2.7 note at the top of this file is what that costs: an INSERT naming a column the
-# table lacks fails outright, and a ReCiterDB merge deploys the image whether or not
-# anyone has applied setup/alter_venue_fit_v3.14.sql. So upsert() asks information_schema
-# once per call and leaves an absent optional column out of its statement. Every lane
-# then writes exactly what it wrote before the column existed, and starts filling it the
-# night after the migration, with no deploy in between.
-_OPTIONAL_COLS = ("top_venue_fit",)
+# top_venue_fit (v3.14) and the byline identifiers (v3.15) are the columns here the live
+# table may not have yet. The v2.7 note at the top of this file is what that costs: an
+# INSERT naming a column the table lacks fails outright, and a ReCiterDB merge deploys
+# the image whether or not anyone has applied setup/alter_venue_fit_v3.14.sql or
+# setup/alter_authorship_review_add_byline_orcid_v3.15.sql. So upsert() asks
+# information_schema once per call and leaves an absent optional column out of its
+# statement. Every lane then writes exactly what it wrote before the column existed, and
+# starts filling it the night after the migration, with no deploy in between.
+_OPTIONAL_COLS = ("top_venue_fit", "byline_orcid", "byline_scopus_authid")
 
 _ENGINE = None
 
@@ -91,6 +93,8 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
   author_position_label  VARCHAR(8)   NULL,
   wcm_author             VARCHAR(255) NULL,
   author_affiliation     TEXT         NULL,
+  byline_orcid           CHAR(19)     NULL,
+  byline_scopus_authid   VARCHAR(20)  NULL,
   entrez_date            DATE         NULL,
   title                  TEXT         NULL,
   journal                VARCHAR(512) NULL,
@@ -108,6 +112,7 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
   top_confidence         FLOAT        NULL,
   top_years_after_wcm    INT          NULL,
   top_venue_fit          FLOAT        NULL,
+  top_orcid_match        TINYINT(1)   NULL,
   top_cohort_size        INT          NULL,
   top_given_match        VARCHAR(16)  NULL,
   top_affil_match        TINYINT(1)   NULL,

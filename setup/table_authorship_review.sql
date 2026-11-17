@@ -56,6 +56,11 @@ CREATE TABLE IF NOT EXISTS `authorship_review` (
   `author_position_label`  VARCHAR(8)   NULL,                -- first/middle/last
   `wcm_author`             VARCHAR(255) NULL,                -- PubMed author name
   `author_affiliation`     TEXT         NULL,
+  `byline_orcid`           CHAR(19)     NULL,                -- (v3.15) ORCID of this row's byline author, bare
+                                                             -- 0000-0000-0000-0000; NULL = none found or capture off.
+                                                             -- See setup/alter_authorship_review_add_byline_orcid_v3.15.sql
+  `byline_scopus_authid`   VARCHAR(20)  NULL,                -- (v3.15) Scopus author id of the byline author, scopus
+                                                             -- only; captured, nothing reads it yet
   `entrez_date`            DATE         NULL,                -- ReCiter entrez add date
   `title`                  TEXT         NULL,
   `journal`                VARCHAR(512) NULL,
@@ -77,6 +82,8 @@ CREATE TABLE IF NOT EXISTS `authorship_review` (
   `top_venue_fit`          FLOAT        NULL,                -- (v3.14) ln(top candidate's department share of the
                                                              -- venue's subfield / campus share); NULL = unknown.
                                                              -- See setup/alter_venue_fit_v3.14.sql
+  `top_orcid_match`        TINYINT(1)   NULL,                -- (v3.15) 1 = the top pick is the person the byline ORCID
+                                                             -- maps to; NULL = no byline ORCID, or it maps to nobody
   `top_cohort_size`        INT          NULL,                -- homonyms (surname+initial)
   `top_given_match`        VARCHAR(16)  NULL,                -- full|initial
   `top_affil_match`        TINYINT(1)   NULL,
