@@ -355,7 +355,10 @@ def top_orcid_match(top):
     person the byline ORCID is on file for, NULL when the row has no ORCID or it found
     nobody (no candidate carries the key). 0 cannot come out of the matcher, which ranks
     the ORCID's person first; it is what a list re-ordered some other way would store."""
-    return int(bool(top["orcid_match"])) if top and "orcid_match" in top else None
+    if not top or "orcid_match" not in top:
+        return None
+    # 2 = the ORCID's person, and only the ORCID put them on the list (no name match).
+    return 2 if top["orcid_match"] and top.get("orcid_added") else int(bool(top["orcid_match"]))
 
 
 def _pub_year(entry):
@@ -1324,7 +1327,8 @@ def _selftest():
           == [("jo_c", True, "orcid_match"), ("jd_c", False, "orcid_match")])
     check("...and a row no ORCID touched stores NULL and no orcid_match key at all",
           _row_n["top_orcid_match"] is None and "orcid_match" not in _row_n["candidate_cwids_json"]
-          and top_orcid_match(None) is None and top_orcid_match({"orcid_match": False}) == 0)
+          and top_orcid_match(None) is None and top_orcid_match({"orcid_match": False}) == 0
+          and top_orcid_match({"orcid_match": True, "orcid_added": True}) == 2)
     _roster_o = CampusRoster(IdentityIndex([_p("John", "Doe", "jd2")]), ithaca=_ith_o)
     _ith_fam = load_family_afids(ITHACA_AFID_LIST)
     _mixed_o = wcm_lane_candidates(_roster_o, _au_o, None, _ith_fam, None, "0000-0001-0000-0002")

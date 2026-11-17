@@ -1319,6 +1319,10 @@ class IdentityIndex:
             if orcid_rec is not None:
                 # And again: the key exists only on a row whose ORCID found somebody.
                 out[-1]["orcid_match"] = rec["cwid"] == orcid_rec["cwid"]
+                if k >= name_cohort:
+                    # The name did not reach this person; the ORCID alone put them here.
+                    # PM keeps such rows out of its bulk-accept lane (top_orcid_match=2).
+                    out[-1]["orcid_added"] = True
         out.sort(key=_rank_key, reverse=True)
         return out[:top_k], cohort_size
 
@@ -2967,7 +2971,8 @@ def _selftest():
          and added[0]["name"] == "Rhea Lindqvist" and added[0]["campus"] == CAMPUS_ITHACA),
         ("orcid (3): ...built as a name-matched candidate is, with the given name judged "
          "honestly: 'Rhea' is a full given-name match whatever the surname",
-         set(added[0]) == set(added[1]) and added[0]["given_match"] == "full"
+         set(added[0]) - {"orcid_added"} == set(added[1]) and added[0]["orcid_added"] is True
+         and "orcid_added" not in promoted[0] and added[0]["given_match"] == "full"
          and added[0]["name_source"] == "directory" and added[0]["affil_dept_match"] is False
          and added[0]["confidence"] == IdentityIndex._confidence("full", 4, False, False)
          == 0.6),
