@@ -38,6 +38,11 @@ spec:
             # AAR_VENUE_FIT (the matcher's venue term, Cornell Ithaca only) is deliberately NOT
             # listed: it ships off and is turned on live with `kubectl set env`, after v3.14
             # and a read of backfill_venue_fit.py's dry run.
+            # AAR_BYLINE_ORCID (the external lanes store the byline author's ORCID and Scopus
+            # author id) is likewise NOT listed: it ships off and is turned on live with
+            # `kubectl set env`, after setup/alter_authorship_review_add_byline_orcid_v3.15.sql.
+            # On, the Scopus lanes ask OpenAlex for the ORCIDs Scopus does not carry, one call
+            # per 50 DOIs, using OPENALEX_MAILTO below.
             # AAR Scopus + PubMed lanes (weekly, gated in run_all.py)
             - name: SCOPUS_API_KEY
               valueFrom:

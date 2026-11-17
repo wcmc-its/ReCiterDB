@@ -341,7 +341,7 @@ def main():
         sys.exit(2)
     eng = aar_db.engine()
     with eng.connect() as c:
-        column_ready = not aar_db.missing_optional_cols(c)
+        column_ready = "top_venue_fit" not in aar_db.missing_optional_cols(c)
         if args.apply and not column_ready:
             print("authorship_review has no top_venue_fit column: apply "
                   "setup/alter_venue_fit_v3.14.sql first. Nothing written.")

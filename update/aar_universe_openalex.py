@@ -83,7 +83,8 @@ from datetime import date, datetime
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from identity_index import IdentityIndex, CAMPUS_WCM   # noqa: E402
+from identity_index import (IdentityIndex, CAMPUS_WCM,  # noqa: E402
+                            byline_orcid_enabled, bare_orcid)
 import aar_db                                          # noqa: E402
 from aar_universe_scopus import (                      # noqa: E402
     doi_in_pubmed, resolve_no_doi, wcm_lane_candidates, _roster, rolling_window,
@@ -242,7 +243,8 @@ def _byline(au):
 def wcm_authorships(w):
     """Yield (i, n, author-for-matcher) for authorships carrying a WCM institution id.
     `afids` is empty: those are Scopus afids, and the campus set comes from the byline's
-    own affiliation text instead (aar_universe_scopus._campuses)."""
+    own affiliation text instead (aar_universe_scopus._campuses). `orcid` is the
+    authorship's own author.orcid (v3.15), stored only when the run captures it."""
     authorships = w.get("authorships") or []
     n = len(authorships)
     for i, au in enumerate(authorships):
@@ -257,6 +259,7 @@ def wcm_authorships(w):
             "initials": "".join(f"{t[0]}." for t in (fore or "").split() if t) or None,
             "affiliations": list(au.get("raw_affiliation_strings") or []),
             "afids": [],
+            "orcid": bare_orcid((au.get("author") or {}).get("orcid")),
         }
 
 
@@ -294,6 +297,9 @@ def _build_row(w, i, n, author, top, cands, run_ts, dup_map=None):
         "wcm_author": _trunc(" ".join(x for x in (author.get("fore"), author.get("last")) if x),
                              255),
         "author_affiliation": " | ".join(author.get("affiliations") or []),
+        # v3.15: set on the author by run() only when AAR_BYLINE_ORCID is on, else NULL.
+        # No Scopus author id on this lane.
+        "byline_orcid": author.get("byline_orcid"), "byline_scopus_authid": None,
         "entrez_date": w.get("publication_date"),     # no entrez date; publication date
         "title": w.get("title") or w.get("display_name"),
         "journal": _trunc(_source(w).get("display_name"), 512),
@@ -651,11 +657,14 @@ def run(since, until, apply_writes=False, recheck=True, idx=None, venue_lookup=N
     # lane's rows on bylines that name Ithaca and match nobody on the WCM roster.
     if venue_lookup is None:
         venue_lookup = load_venue_lookup()
+    capture = byline_orcid_enabled()      # v3.15: the authorship's own ORCID, or nothing
     rows, unmatched = [], 0
     for w in openalex_only:
         subfield = stored_venue_subfield(venue_lookup, _source(w).get("issn_l"),
                                   _source(w).get("display_name"))
         for i, n, au in wcm_authorships(w):
+            if capture:
+                au["byline_orcid"] = au["orcid"]
             # frozenset(): no Scopus afids on this lane, so no Ithaca afid list to load.
             cands, _ = wcm_lane_candidates(idx, au, w.get("publication_year"), frozenset(),
                                            subfield)
@@ -665,6 +674,9 @@ def run(since, until, apply_writes=False, recheck=True, idx=None, venue_lookup=N
                 continue
             rows.append(_build_row(w, i, n, au, top, cands, run_ts, dup_map=dup_map))
     print(f"      {len(rows)} matched authorships; {unmatched} unmatched (skipped)", flush=True)
+    if capture:
+        print(f"      byline ORCID: {sum(1 for r in rows if r['byline_orcid'])} of {len(rows)} "
+              f"rows carry one", flush=True)
 
     unreliable = pubmed_unreliable()
     print(f"      PubMed: {PUBMED_STATS['failures']} of {PUBMED_STATS['calls']} esearch calls "
@@ -775,7 +787,8 @@ def _selftest():
           [(i, n) for i, n, _ in wcm] == [(1, 3), (2, 3)])
     check("matcher author from the printed byline, affiliations kept, no afids",
           wcm[0][2] == {"last": "Cooper", "fore": "Alissa J.", "initials": "A.J.",
-                        "affiliations": ["Weill Cornell Medicine, New York, NY"], "afids": []})
+                        "affiliations": ["Weill Cornell Medicine, New York, NY"], "afids": [],
+                        "orcid": None})
 
     top = {"cwid": "ac1", "name": "Alissa Cooper", "person_type": "Faculty", "dept": "Med",
            "confidence": 0.9, "cohort_size": 1, "given_match": "full", "affil_dept_match": False}
@@ -944,6 +957,32 @@ def _selftest():
         check("venue term off (no lookup): the WCM pick stands, nothing carries a venue fit",
               plain["top_cwid"] == "ac1" and plain["top_venue_fit"] is None
               and "venue_fit" not in plain["candidate_cwids_json"])
+        # byline ORCID (v3.15): the authorship's own author.orcid, stored bare, and only
+        # when AAR_BYLINE_ORCID is on.
+        orcid_work = _fixture()
+        orcid_work["authorships"][1]["author"]["orcid"] = "https://orcid.org/0000-0002-1825-0097"
+        g["_openalex_get"] = lambda p: {"meta": {"count": 1}, "results": [orcid_work]}
+        env = os.environ.pop("AAR_BYLINE_ORCID", None)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                run("2026-01-01", "2026-12-31", apply_writes=True, idx=both)
+                os.environ["AAR_BYLINE_ORCID"] = "on"
+                run("2026-01-01", "2026-12-31", apply_writes=True, idx=both)
+        finally:
+            os.environ.pop("AAR_BYLINE_ORCID", None)
+            if env is not None:
+                os.environ["AAR_BYLINE_ORCID"] = env
+        off, on = kept[3:]
+        check("byline ORCID off: the row stores none, and the run does not mention it",
+              off["byline_orcid"] is None and off["byline_scopus_authid"] is None
+              and "byline ORCID" not in out.getvalue().split("[1/5]")[1])
+        check("byline ORCID on: the authorship's ORCID is stored bare, there is no Scopus "
+              "author id on this lane, and nothing else on the row moves",
+              on["byline_orcid"] == "0000-0002-1825-0097" and on["byline_scopus_authid"] is None
+              and all(on[k] == off[k] for k in on
+                      if k not in ("byline_orcid", "matched_pmid_at", "first_seen",
+                                   "last_checked", "last_refreshed"))
+              and out.getvalue().count("byline ORCID: 1 of 1 rows carry one") == 1)
         g["_openalex_get"] = lambda p: (calls.append(p) or
                                         {"meta": {"count": 201}, "results": pages[p["page"]]})
         aar_db.upsert = saved_upsert

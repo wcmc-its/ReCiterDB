@@ -43,14 +43,15 @@ Usage:
   python aar_universe_scopus.py --mode rolling --apply     # weekly cron: [today-90d,today-14d]
   python aar_universe_scopus.py --month 2026-05            # dry-run one month (vs probe ranges)
 """
-import argparse, calendar, csv, json, os, re, sys, time
+import argparse, calendar, csv, json, os, re, sys, time, unicodedata
 from datetime import date, datetime, timedelta
 
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from identity_index import (IdentityIndex, CampusRoster, byline_campuses,  # identity roster(s)
-                            CAMPUS_WCM, CAMPUS_ITHACA, venue_fit_enabled)
+                            CAMPUS_WCM, CAMPUS_ITHACA, venue_fit_enabled,
+                            byline_orcid_enabled, bare_orcid)
 import aar_db                              # shared authorship_review upsert sink
 
 SCOPUS_SEARCH = "https://api.elsevier.com/content/search/scopus"
@@ -458,7 +459,11 @@ def wcm_authorships(entry, family, yield_to=frozenset()):
 
     An author who also carries an afid in `yield_to` is skipped: the lane owning that
     family writes the row. author_key has no campus in it, so without this a dual-afid
-    author would be upserted by both lanes and the later one would overwrite the pick."""
+    author would be upserted by both lanes and the later one would overwrite the pick.
+
+    `authid` and `orcid` are the author entry's own identifiers (v3.15): the COMPLETE
+    view always carries the Scopus author id and sometimes an ORCID. Read here, stored
+    only when the run captures them (`run`, AAR_BYLINE_ORCID)."""
     authors = _as_list(entry.get("author"))
     affil = _affil_names(entry)
     n = len(authors)
@@ -472,6 +477,7 @@ def wcm_authorships(entry, family, yield_to=frozenset()):
             "initials": au.get("initials"),
             "affiliations": [affil[a] for a in afids if a in affil],
             "afids": afids,
+            "authid": au.get("authid"), "orcid": bare_orcid(au.get("orcid")),
         }, hits
 
 
@@ -511,9 +517,11 @@ def _build_row(entry, i, n, author, top, cands, run_ts, dup_map=None):
         "pub_type": _trunc(pub_type, 40),
         "container_id": _container_doi(doi, pub_type),
         "author_position": i + 1, "author_position_label": _position_label(i, n),
-        "wcm_author": _trunc(" ".join(x for x in (author.get("fore"), author.get("last")) if x)
-                             or author.get("initials") or author.get("last"), 255),
+        "wcm_author": _trunc(_byline_name(author), 255),
         "author_affiliation": " | ".join(author.get("affiliations") or []),
+        # v3.15: set on the author by run() only when AAR_BYLINE_ORCID is on, else NULL.
+        "byline_orcid": author.get("byline_orcid"),
+        "byline_scopus_authid": _trunc(author.get("byline_scopus_authid"), 20),
         "entrez_date": entry.get("prism:coverDate"),   # Scopus has no entrez date; coverDate ~ recency
         "title": entry.get("dc:title"),
         "journal": _trunc(entry.get("prism:publicationName"), 512),
@@ -691,6 +699,108 @@ def stored_venue_subfield(lookup, issn, journal):
     return venue_fit.subfield_for(lookup, _normalize_issn(issn), _trunc(journal, 512))
 
 
+# ---- byline ORCID (v3.15) -----------------------------------------------------
+OPENALEX_DOI_BATCH = 50      # DOIs per filter=doi:a|b|... call
+_DOI_UNSAFE = re.compile(r"[,|&\s]")   # would break, or widen, the OpenAlex filter
+
+
+def _fold(s):
+    """Lowercase, accents stripped, everything else kept: byline names compared as text."""
+    s = unicodedata.normalize("NFKD", str(s or ""))
+    return "".join(ch for ch in s if not unicodedata.combining(ch)).lower()
+
+
+def _byline_name(author):
+    """The byline name as `_build_row` stores it in wcm_author."""
+    return (" ".join(x for x in (author.get("fore"), author.get("last")) if x)
+            or author.get("initials") or author.get("last"))
+
+
+_NAME_SPLIT = re.compile(r"[\s.]+")
+_HYPHENS = re.compile(r"[-\u2010\u2011\u2013]")
+
+
+def _name_parts(name):
+    """(surname words, first initial) of a byline name, folded. 'Given Last' gives the
+    last word, 'Last, Given' the part before the comma; a hyphenated surname gives each
+    half, so 'Smith' and 'Smith-Jones' share a word. The initial is '' when the name is
+    a surname alone."""
+    last, comma, given = _fold(name).partition(",")
+    if comma:
+        words, given = _NAME_SPLIT.split(last), _NAME_SPLIT.split(given)
+    else:
+        toks = [t for t in _NAME_SPLIT.split(last) if t]
+        words, given = toks[-1:], toks[:-1]
+    words = {w for t in words for w in _HYPHENS.split(t) if w}
+    return words, "".join(given)[:1]
+
+
+def pick_byline_orcid(authorships, index, name):
+    """The ORCID OpenAlex attaches to one byline author, or None.
+
+    `authorships` is the work's list of (byline name, bare ORCID or None) in byline
+    order, `index` the row's 0-based byline position and `name` its stored byline name
+    (wcm_author). An author is the row's when the surname agrees as a WHOLE word and the
+    first initial agrees too: 'Li' is not inside 'Alice Chen' or 'Yang Liu', and 'Li
+    Wang' is not 'Hao Wang'. The author at `index` when that holds; otherwise the ONE
+    author it holds for; otherwise nothing. OpenAlex and Scopus do not always agree on
+    the author count, so the position alone is never trusted, and a row name with no
+    given name or initial is never matched. The 2026-11-17 measurement (ReCiter Research
+    scripts/byline_orcid_measure.py) used a looser surname-substring form of this rule."""
+    surname, initial = _name_parts(name)
+    if not surname or not initial or not authorships:
+        return None
+    hits = []
+    for k, (their_name, _o) in enumerate(authorships):
+        theirs, their_initial = _name_parts(their_name)
+        if surname & theirs and their_initial == initial:
+            hits.append(k)
+    if index in hits:
+        k = index
+    elif len(hits) == 1:
+        k = hits[0]
+    else:
+        return None
+    return authorships[k][1] or None
+
+
+def openalex_authorships(dois, get=None):
+    """lower-cased DOI -> [(byline name, bare ORCID or None), ...] for the DOIs OpenAlex
+    knows, in batches of OPENALEX_DOI_BATCH (filter=doi:a|b|..., select=doi,authorships).
+    A DOI carrying a comma, pipe, ampersand or whitespace is never sent.
+
+    FAIL-NEUTRAL. Any failure -- no network, a 4xx, a response that is not what it
+    should be -- is printed and ends the lookup: the DOIs already answered are returned,
+    the rest are simply absent, and the caller stores NULL for them. It never raises, so
+    it can never fail a lane. It stops at the first failed batch rather than retrying
+    the remainder into the same outage (`_openalex_get` has already retried five times).
+
+    `get` is the request function, for the selftest; by default the OpenAlex lane's own
+    `_openalex_get`, so the mailto convention and the retry policy are that lane's."""
+    dois = sorted({d.lower() for d in dois if d and not _DOI_UNSAFE.search(d)})
+    out = {}
+    try:
+        if get is None:
+            from aar_universe_openalex import _openalex_get as get, SLEEP as pause
+        else:
+            pause = 0
+        for i in range(0, len(dois), OPENALEX_DOI_BATCH):
+            batch = dois[i:i + OPENALEX_DOI_BATCH]
+            j = get({"filter": "doi:" + "|".join(batch), "select": "doi,authorships",
+                     "per-page": OPENALEX_DOI_BATCH})
+            for w in j.get("results") or []:
+                doi = (w.get("doi") or "").lower().replace("https://doi.org/", "")
+                out[doi] = [(a.get("raw_author_name")
+                             or (a.get("author") or {}).get("display_name") or "",
+                             bare_orcid((a.get("author") or {}).get("orcid")))
+                            for a in w.get("authorships") or []]
+            time.sleep(pause)
+    except Exception as e:                                       # noqa: BLE001
+        print(f"      WARNING: OpenAlex byline lookup stopped ({type(e).__name__}: {e}); "
+              f"{len(out)} of {len(dois)} DOIs answered, the rest keep no ORCID", flush=True)
+    return out
+
+
 def wcm_lane_candidates(idx, au, pub_year, ithaca_family=None, venue_subfield=None):
     """`idx.candidates` for one WCM-lane author -- the producer's call, and the one the
     replay tools (aar_sweep_stale / aar_report_changed_picks) make on a live re-fetch, so
@@ -782,21 +892,39 @@ def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True,
     # Venue term (v3.14): None unless AAR_VENUE_FIT is on. Loaded once, like the roster.
     if venue_lookup is None:
         venue_lookup = load_venue_lookup()
-    rows, unmatched = [], 0
+    # Byline identifiers (v3.15): nothing is looked up or stored unless AAR_BYLINE_ORCID
+    # is on. Scopus's own ORCID where the author entry has one; otherwise OpenAlex's for
+    # the same DOI, asked for once per run for every such author.
+    capture = byline_orcid_enabled()
+    by_doi = openalex_authorships(
+        d.get("prism:doi") for d in scopus_only
+        if d.get("prism:doi") and any(not au["orcid"]
+                                      for _i, _n, au, _ in wcm_authorships(d, family, yield_to))
+    ) if capture else {}
+    rows, unmatched, n_openalex = [], 0, 0
     for d in scopus_only:
         subfield = stored_venue_subfield(venue_lookup, d.get("prism:issn") or d.get("prism:eIssn"),
                                   d.get("prism:publicationName"))
         for i, n, au, _ in wcm_authorships(d, family, yield_to):
+            if capture:
+                au["byline_scopus_authid"] = au["authid"]
+                au["byline_orcid"] = au["orcid"] or pick_byline_orcid(
+                    by_doi.get((d.get("prism:doi") or "").lower()), i, _byline_name(au))
             cands, _ = wcm_lane_candidates(idx, au, _pub_year(d), ithaca_family, subfield)
             top = cands[0] if cands else None
             if top is None:
                 unmatched += 1                         # nothing to assign (v1 skips unmatched)
                 continue
             rows.append(_build_row(d, i, n, au, top, cands, run_ts, dup_map=dup_map))
+            n_openalex += bool(au.get("byline_orcid") and not au["orcid"])
     print(f"      {len(rows)} matched authorships; {unmatched} unmatched (skipped)", flush=True)
     if venue_lookup is not None:
         print(f"      venue fit: {sum(1 for r in rows if r['top_venue_fit'] is not None)} "
               f"of {len(rows)} rows carry a top_venue_fit", flush=True)
+    if capture:
+        n_orcid = sum(1 for r in rows if r["byline_orcid"])
+        print(f"      byline ORCID: {n_orcid} of {len(rows)} rows carry one "
+              f"({n_orcid - n_openalex} from Scopus, {n_openalex} from OpenAlex)", flush=True)
 
     unreliable = pubmed_unreliable()
     print(f"      PubMed: {PUBMED_STATS['failures']} of {PUBMED_STATS['calls']} esearch calls "
@@ -977,6 +1105,178 @@ def _selftest():
     check("WCM author is position 0 (Smith)", i == 0 and au["last"] == "Smith")
     check("WCM affiliation resolved to family affilname",
           any("Weill Cornell" in a for a in au["affiliations"]))
+
+    # ---- byline identifiers (v3.15) ----
+    check("an author entry with neither identifier yields None for both",
+          au["authid"] is None and au["orcid"] is None)
+    _ided = dict(entry, author=[dict(entry["author"][0], authid="57200000001",
+                                     orcid="0000-0002-1825-009x"), entry["author"][1]])
+    _i2, _n2, _au2, _ = next(wcm_authorships(_ided, family))
+    check("wcm_authorships reads the entry's Scopus author id and its ORCID, bare and "
+          "upper-cased",
+          _au2["authid"] == "57200000001" and _au2["orcid"] == "0000-0002-1825-0097"[:-1] + "X")
+    check("bare_orcid strips the URL form and refuses anything that is not an ORCID",
+          bare_orcid("https://orcid.org/0000-0002-1825-0097") == "0000-0002-1825-0097"
+          and bare_orcid(" 0000-0002-1825-009x ") == "0000-0002-1825-009X"
+          and bare_orcid("0000-0002-1825") is None and bare_orcid(None) is None
+          and bare_orcid("10000-0002-1825-0097") is None)
+    _top0 = {"cwid": "js1", "name": "Jane Smith", "person_type": "Faculty", "dept": "Peds",
+             "confidence": 0.9, "cohort_size": 1, "given_match": "full",
+             "affil_dept_match": False}
+    _off_row = _build_row(_ided, _i2, _n2, _au2, _top0, [_top0], "2026-11-17 00:00:00")
+    check("capture off: the row stores neither identifier, whatever the entry carries",
+          _off_row["byline_orcid"] is None and _off_row["byline_scopus_authid"] is None)
+    _on_row = _build_row(_ided, _i2, _n2, dict(_au2, byline_orcid=_au2["orcid"],
+                                               byline_scopus_authid=_au2["authid"]),
+                         _top0, [_top0], "2026-11-17 00:00:00")
+    check("capture on: the row stores both, and is otherwise the same row",
+          _on_row["byline_orcid"] == "0000-0002-1825-009X"
+          and _on_row["byline_scopus_authid"] == "57200000001"
+          and {k: v for k, v in _on_row.items() if not k.startswith("byline_")}
+          == {k: v for k, v in _off_row.items() if not k.startswith("byline_")})
+
+    _oa = [("Jane Q. Smith", "0000-0001-0000-0001"), ("John Doe", None),
+           ("Zoë Smith-Jones", "0000-0001-0000-0003"), ("J. Smith", "0000-0001-0000-0004")]
+    check("pick_byline_orcid: the author at the row's position, when the surname agrees",
+          pick_byline_orcid(_oa, 0, "Jane Smith") == "0000-0001-0000-0001"
+          and pick_byline_orcid(_oa, 3, "J. Smith") == "0000-0001-0000-0004")
+    check("...an author at that position with no ORCID gives none, not a neighbour's",
+          pick_byline_orcid(_oa, 1, "John Doe") is None)
+    check("...position off by one (the two sources count authors differently): the one "
+          "author with the surname and the first initial",
+          pick_byline_orcid(_oa, 1, "Zoe Smith") == "0000-0001-0000-0003"
+          and pick_byline_orcid(_oa, 9, "John Doe") is None)
+    check("...two authors share surname and initial and the position does not settle it: "
+          "nothing",
+          pick_byline_orcid(_oa, 1, "Jane Smith") is None)
+    check("...the surname is a whole word and the initial must agree, at the position too: "
+          "a shifted list never hands over a namesake's or a neighbour's ORCID",
+          pick_byline_orcid([("Wei Zhang", None), ("Hao Wang", "0000-0001-0000-0005"),
+                             ("Li Wang", "0000-0001-0000-0006")], 1, "Li Wang")
+          == "0000-0001-0000-0006"
+          and pick_byline_orcid([("Wei Zhang", None), ("Alice Chen", "0000-0001-0000-0005")],
+                                1, "Jun Li") is None
+          and pick_byline_orcid([("Wei Zhang", None), ("Yang Liu", "0000-0001-0000-0005"),
+                                 ("Yi Li", None)], 1, "Yi Li") is None
+          and pick_byline_orcid([("Matthew Jones", "0000-0001-0000-0005")], 0, "Jie He") is None
+          and pick_byline_orcid([("Julie Chen", "0000-0001-0000-0005")], 7, "J. Li") is None)
+    check("...'Last, Given' is read as such, and a surname alone matches nobody",
+          pick_byline_orcid([("Yan Liu", "0000-0001-0000-0005"),
+                             ("Li, Yi", "0000-0001-0000-0006")], 5, "Yi Li")
+          == "0000-0001-0000-0006"
+          and pick_byline_orcid(_oa, 0, "Smith") is None)
+    check("...no such surname, no name, or no OpenAlex work: nothing",
+          pick_byline_orcid(_oa, 0, "Ann Lee") is None and pick_byline_orcid(_oa, 0, "") is None
+          and pick_byline_orcid(None, 0, "Jane Smith") is None)
+
+    _sent = []
+
+    def _fake_get(params):
+        _sent.append(params)
+        return {"results": [{"doi": "https://doi.org/10.1/X", "authorships": [
+            {"raw_author_name": "Jane Smith",
+             "author": {"display_name": "J Smith",
+                        "orcid": "https://orcid.org/0000-0001-0000-0001"}},
+            {"author": {"display_name": "John Doe", "orcid": None}}]}]}
+    _got = openalex_authorships(["10.1/X", "10.1/x", None, "10.1/a,b", "10.1/a|b", "10.1/a&b",
+                                 "10.1/a b"] + [f"10.2/{k}" for k in range(60)], get=_fake_get)
+    check("openalex_authorships: unsafe DOIs are never sent, the rest go lower-cased and "
+          "deduplicated in batches of 50 with select=doi,authorships",
+          [len(p["filter"].split("|")) for p in _sent] == [50, 11]
+          and _sent[0]["filter"].startswith("doi:10.1/x|10.2/0|")
+          and all(p["select"] == "doi,authorships" and p["per-page"] == 50 for p in _sent)
+          and not any(ch in p["filter"][4:] for p in _sent for ch in ", &"))
+    check("...and each work comes back as (byline name, bare ORCID) under its lower-cased DOI",
+          _got == {"10.1/x": [("Jane Smith", "0000-0001-0000-0001"), ("John Doe", None)]})
+
+    def _down(params):
+        if "10.2/9" in params["filter"]:          # sorts last: the second batch
+            raise requests.ConnectionError("simulated outage")
+        return _fake_get(params)
+    import contextlib as _ctx, io as _io
+    _buf0 = _io.StringIO()
+    with _ctx.redirect_stdout(_buf0):
+        _part = openalex_authorships(["10.1/x"] + [f"10.2/{k}" for k in range(60)], get=_down)
+        _none = openalex_authorships(["10.1/x"], get=lambda p: {"results": "garbage"})
+    check("...a failed batch stops the lookup, keeps what was answered, says so and never "
+          "raises; a malformed response likewise",
+          set(_part) == {"10.1/x"} and _none == {}
+          and _buf0.getvalue().count("WARNING: OpenAlex byline lookup stopped") == 2)
+    # run(): nothing is looked up or stored unless AAR_BYLINE_ORCID is on. Scopus's own
+    # ORCID wins; an author without one takes OpenAlex's; a failed lookup stores NULL.
+    _g = globals()
+    _keep = {k: _g[k] for k in ("sweep", "doi_in_pubmed", "openalex_authorships",
+                                "load_venue_lookup", "time")}
+    _keep_dup, _env_o = aar_db.dup_flags_by_doi, os.environ.pop("AAR_BYLINE_ORCID", None)
+    _doc = dict(entry, author=[
+        dict(entry["author"][0], authid="57200000001", orcid="0000-0002-1825-0097"),
+        {"@seq": "2", "surname": "Doe", "given-name": "John", "authid": "57200000002",
+         "afid": [{"$": "60007997"}]}])
+    from identity_index import _norm as _nrm
+
+    def _p(given, surname, cwid):
+        return {"cwid": cwid, "given": given, "middle": "", "surname": surname,
+                "given_norm": _nrm(given), "surname_norm": _nrm(surname), "pref_norm": "",
+                "dept": "", "division": "", "program": "", "title": "",
+                "person_type": "Faculty", "historical": False, "end_year": None}
+    _idx0 = IdentityIndex([_p("Jane", "Smith", "js1"), _p("John", "Doe", "jd2")])
+    _asked = []
+
+    class _Quiet:
+        sleep = staticmethod(lambda _s: None)
+
+    def _run_rows(lookup):
+        _seen = []
+        _real_build = _g["_build_row"]
+        _g["_build_row"] = lambda *a, **k: _seen.append(_real_build(*a, **k)) or _seen[-1]
+        _g["openalex_authorships"] = lookup
+        try:
+            with _ctx.redirect_stdout(_io.StringIO()) as _o:
+                run("x", "y", idx=_idx0)
+        finally:
+            _g["_build_row"] = _real_build
+        return _seen, _o.getvalue()
+    try:
+        _g["sweep"] = lambda *a, **k: [json.loads(json.dumps(_doc))]
+        _g["doi_in_pubmed"] = lambda d: None
+        _g["load_venue_lookup"] = lambda: None
+        _g["time"] = _Quiet
+        aar_db.dup_flags_by_doi = lambda ds: {}
+        _from_oa = lambda ds: _asked.append(sorted(ds)) or {
+            "10.1/x": [("Jane Smith", "0000-0009-9999-9999"), ("John Doe", "0000-0001-0000-0002")]}
+        _rows_off, _out_off = _run_rows(_from_oa)
+        _asked_off = list(_asked)
+        os.environ["AAR_BYLINE_ORCID"] = "on"
+        _rows_on, _out_on = _run_rows(_from_oa)
+        _rows_down, _ = _run_rows(lambda ds: {})
+    finally:
+        _g.update(_keep)
+        aar_db.dup_flags_by_doi = _keep_dup
+        os.environ.pop("AAR_BYLINE_ORCID", None)
+        if _env_o is not None:
+            os.environ["AAR_BYLINE_ORCID"] = _env_o
+    _volatile = ("byline_orcid", "byline_scopus_authid", "first_seen", "last_checked",
+                 "last_refreshed")           # the identifiers, and the run's own clock
+    check("run() with AAR_BYLINE_ORCID unset: OpenAlex is never asked and both columns are "
+          "NULL on every row",
+          _asked_off == [] and len(_rows_off) == 2 and "byline ORCID" not in _out_off
+          and all(r["byline_orcid"] is None and r["byline_scopus_authid"] is None
+                  for r in _rows_off))
+    check("run() with it on: Scopus's own ORCID is kept over OpenAlex's, the author without "
+          "one takes OpenAlex's at the same byline position, and both carry their authid",
+          [(r["byline_orcid"], r["byline_scopus_authid"]) for r in _rows_on]
+          == [("0000-0002-1825-0097", "57200000001"), ("0000-0001-0000-0002", "57200000002")]
+          and _asked == [["10.1/x"]]
+          and "byline ORCID: 2 of 2 rows carry one (1 from Scopus, 1 from OpenAlex)" in _out_on)
+    check("...and the rows are otherwise the ones written with capture off",
+          [{k: v for k, v in r.items() if k not in _volatile} for r in _rows_on]
+          == [{k: v for k, v in r.items() if k not in _volatile} for r in _rows_off])
+    check("...OpenAlex answering nothing leaves that ORCID NULL and the row written",
+          [(r["byline_orcid"], r["byline_scopus_authid"]) for r in _rows_down]
+          == [("0000-0002-1825-0097", "57200000001"), (None, "57200000002")])
+    check("the row's byline name for the lookup is the stored wcm_author",
+          _byline_name(_au2) == _on_row["wcm_author"] == "Jane Smith"
+          and _byline_name({"initials": "J.", "last": "Smith"}) == "Smith")
 
     top = {"cwid": "js1", "name": "Jane Smith", "person_type": "Faculty", "dept": "Peds",
            "confidence": 0.9, "cohort_size": 1, "given_match": "full", "affil_dept_match": False}
@@ -1294,17 +1594,24 @@ def _selftest():
 
     # aar_db: top_venue_fit is refreshed like top_years_after_wcm, and left out of the
     # statement while the live table lacks the column (code deployed before v3.14).
-    check("aar_db refreshes top_venue_fit, and it is the only optional column",
-          "top_venue_fit" in aar_db._REFRESH_COLS and "top_venue_fit" in aar_db._INSERT_COLS
-          and aar_db._OPTIONAL_COLS == ("top_venue_fit",))
+    check("aar_db refreshes top_venue_fit and the v3.15 byline identifiers, and those are "
+          "the optional columns",
+          all(c in aar_db._REFRESH_COLS and c in aar_db._INSERT_COLS
+              for c in aar_db._OPTIONAL_COLS)
+          and aar_db._OPTIONAL_COLS == ("top_venue_fit", "byline_orcid",
+                                        "byline_scopus_authid"))
     _cols, _sql = aar_db._upsert_sql()
-    _cols0, _sql0 = aar_db._upsert_sql(["top_venue_fit"])
+    _cols0, _sql0 = aar_db._upsert_sql(aar_db._OPTIONAL_COLS)
     check("upsert names top_venue_fit in the insert and in the refresh when the column exists",
           "top_venue_fit" in _cols and ":top_venue_fit" in _sql
           and "top_venue_fit=VALUES(top_venue_fit)" in _sql)
-    check("before v3.14 the statement is byte-for-byte the one this module built before "
-          "the column was added (sha256 of that statement)",
-          "top_venue_fit" not in _sql0 and "top_venue_fit" not in _cols0
+    check("upsert names the byline identifiers in the insert and in the refresh when the "
+          "columns exist (v3.15)",
+          all(c in _cols and f"{c}=VALUES({c})" in _sql
+              for c in ("byline_orcid", "byline_scopus_authid")))
+    check("before v3.14 and v3.15 the statement is byte-for-byte the one this module built "
+          "before the columns were added (sha256 of that statement)",
+          not any(c in _sql0 or c in _cols0 for c in aar_db._OPTIONAL_COLS)
           and hashlib.sha256(_sql0.encode()).hexdigest()
           == "ae978c88e4e000656361d02cd33d1641d33fcfbff41eac32564f6f4e12eec92f")
 
@@ -1329,13 +1636,17 @@ def _selftest():
             self.stmts.append((str(stmt), params))
 
     try:
-        _before, _after = _Sink([]), _Sink(["top_venue_fit"])
+        _before, _after = _Sink(["byline_orcid", "byline_scopus_authid"]), _Sink(
+            list(aar_db._OPTIONAL_COLS))
+        _bare = _Sink([])
         _buf = io.StringIO()
         with contextlib.redirect_stdout(_buf):
             aar_db.engine = lambda: _before
             _n0 = aar_db.upsert([_row_v])
             aar_db.engine = lambda: _after
             _n1 = aar_db.upsert([_row_v])
+            aar_db.engine = lambda: _bare
+            aar_db.upsert([_row_v])
     finally:
         aar_db.engine = _real_engine
     check("upsert before v3.14: the row is written without the column, and says so",
@@ -1347,6 +1658,14 @@ def _selftest():
           _n1 == 1 and "top_venue_fit=VALUES(top_venue_fit)" in _after.stmts[0][0]
           and _after.stmts[0][1][0]["top_venue_fit"] == 1.586
           and _buf.getvalue().count("no top_venue_fit column yet") == 1)
+    check("upsert before v3.15: the row is written without the byline columns, and says so; "
+          "after, with them",
+          not any("byline_" in k for k in _bare.stmts[0][1][0])
+          and "byline_orcid" not in _bare.stmts[0][0]
+          and "no top_venue_fit, byline_orcid, byline_scopus_authid column yet"
+          in _buf.getvalue()
+          and "byline_orcid=VALUES(byline_orcid)" in _after.stmts[0][0]
+          and "byline_scopus_authid" in _after.stmts[0][1][0])
 
     for _c, _l in ((CAMPUS_WCM, ITHACA_AFID_LIST), (CAMPUS_ITHACA, DEFAULT_AFID_LIST)):
         try:
