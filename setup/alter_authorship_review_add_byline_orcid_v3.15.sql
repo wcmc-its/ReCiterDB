@@ -29,6 +29,8 @@
 --   One-off after applying and turning capture on (dry run first, then --apply):
 --     python3 update/backfill_byline_orcid.py
 --
+-- Does not need v3.14: top_orcid_match goes after top_venue_fit where that column
+--   exists, and at the end of the table where it does not.
 -- Idempotent: each ALTER runs only when its column is missing (per information_schema).
 --   Nothing is dropped or truncated. Apply directly to BOTH reciterdb instances (the
 --   producer and the dev instance behind reciter-pm-dev). Merging the PR does NOT run
@@ -71,7 +73,10 @@ SET @sql = (SELECT IF(
     AND (SELECT COUNT(*) FROM information_schema.columns
           WHERE table_schema = @db AND table_name = 'authorship_review'
             AND column_name = 'top_orcid_match') = 0,
-    'ALTER TABLE authorship_review ADD COLUMN `top_orcid_match` TINYINT(1) NULL DEFAULT NULL AFTER `top_venue_fit`',
+    CONCAT('ALTER TABLE authorship_review ADD COLUMN `top_orcid_match` TINYINT(1) NULL DEFAULT NULL',
+           IF((SELECT COUNT(*) FROM information_schema.columns
+                WHERE table_schema = @db AND table_name = 'authorship_review'
+                  AND column_name = 'top_venue_fit') = 1, ' AFTER `top_venue_fit`', '')),
     'SELECT ''authorship_review already has top_orcid_match (or the table is absent)'''));
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
