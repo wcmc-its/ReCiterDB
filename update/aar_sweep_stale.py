@@ -235,6 +235,19 @@ def _classify_scopus(rows, idx, limit=None):
     rows = rows[:limit] if limit else rows
     family = scop.load_family_afids()
 
+    # v3.15, the rule aar_report_changed_picks._replay_orcid_guard applies: a row whose
+    # stored candidates carry `orcid_match` may name somebody only the byline ORCID
+    # reaches. On a roster with no ORCID map (AAR_BYLINE_ORCID not on in this shell, or
+    # the map failed to load) it would replay to nobody in both passes and be nulled.
+    ranked = sum(1 for r in rows if '"orcid_match"' in str(r.get("candidate_cwids_json") or ""))
+    if ranked and not getattr(getattr(idx, "ithaca", idx), "orcid_rec", None):
+        raise RuntimeError(
+            f"{ranked} open scopus rows were ranked by a byline ORCID and this roster "
+            f"holds no ORCID map (AAR_BYLINE_ORCID is not on here, or the map could not "
+            f"be loaded -- see any warning above). Refusing to sweep the scopus lane "
+            f"without it: rows only the ORCID reaches would be classed stale and nulled. "
+            f"Set AAR_BYLINE_ORCID=on to sweep as the CronJob matches.")
+
     candidate_stale, matched = [], []
     for r in rows:
         fore, last = _split_byline(r["wcm_author"])
@@ -516,8 +529,22 @@ def _selftest():
             dropped = _classify_scopus([dict(o_row, byline_orcid=None)], o_idx)
             no_col = _classify_scopus([{k: v for k, v in o_row.items() if k != "byline_orcid"}],
                                       o_idx)
+        ranked_row = dict(o_row, candidate_cwids_json='[{"cwid": "rl_c", "orcid_match": true}]')
+        try:
+            _classify_scopus([ranked_row], IdentityIndex(
+                [dict(rec("Rhea", "", "Lindqvist", "rl_c"), campus=idxmod.CAMPUS_ITHACA)],
+                campus=idxmod.CAMPUS_ITHACA))
+            refused = ""
+        except RuntimeError as e:
+            refused = str(e)
+        with contextlib.redirect_stdout(io.StringIO()):
+            ranked_kept = _classify_scopus([ranked_row], o_idx)
     finally:
         scop.load_family_afids = real_family
+    check("rows ranked by a byline ORCID are not swept on a roster with no ORCID map: the "
+          "sweep refuses rather than null them; with the map it runs",
+          "1 open scopus rows were ranked by a byline ORCID" in refused
+          and [r["id"] for r in ranked_kept[1]] == [9] and ranked_kept[0] == [])
     check("a row reached only through its stored byline ORCID still matches: the sweep "
           "passes the ORCID, and does not null the pick",
           [r["id"] for r in kept[1]] == [9] and kept[0] == [] and kept[2] == [])

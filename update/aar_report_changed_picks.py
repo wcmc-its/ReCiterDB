@@ -78,8 +78,8 @@ VENUE TERM (v3.14): the scopus replay ranks as the producer ranks. It reads the 
 BYLINE ORCID (v3.15): likewise. Each row is replayed with the byline_orcid IT STORES, the
   value the producer ranked it with, never a fresh lookup. A row whose pick came from the
   ORCID (some candidate carries `orcid_match`) only replays to itself on a roster that
-  holds the ORCID map, so `_replay_orcid_guard` refuses when AAR_BYLINE_ORCID is on and
-  the map did not load, and warns when the switch is off in this shell.
+  holds the ORCID map, so `_replay_orcid_guard` refuses to replay such rows without it:
+  when the map did not load, and equally when AAR_BYLINE_ORCID is not on in this shell.
 
 SYS.PATH FORK TRAP: same guard as aar_sweep_stale.py -- this file's own directory must
   win over the stale ~/Dropbox/Projects/ReCiter Research/scripts/ copy. Asserted below,
@@ -570,25 +570,26 @@ def _orcid_kw(r):
 
 
 def _replay_orcid_guard(rows, idx):
-    """`_replay_venue_lookup`'s rule for the ORCID match. Rows whose stored candidates
-    carry `orcid_match` were ranked by the byline ORCID; replayed on a roster with no
-    ORCID map they all read as drift, and aar_reconcile_open would write the ORCID's
-    person back off them. With AAR_BYLINE_ORCID on and no map loaded this raises; with
-    the switch off here it says how many rows are in that position."""
+    """`_replay_venue_lookup`'s rule for the ORCID match, without the warn-only half.
+    Rows whose stored candidates carry `orcid_match` were ranked by the byline ORCID;
+    replayed on a roster with no ORCID map they all read as drift, and
+    aar_reconcile_open --apply would write the ORCID's person back off them (a move to a
+    full given-name match is the 'stronger' move CLASS B accepts). So this raises
+    whenever such rows exist and the roster holds no map, whether the map failed to load
+    or AAR_BYLINE_ORCID is simply not on in this shell."""
     ranked = sum(1 for r in rows if '"orcid_match"' in (r.get("candidate_cwids_json") or ""))
-    if not ranked:
-        return
-    if getattr(getattr(idx, "ithaca", idx), "orcid_rec", None):
+    if not ranked or getattr(getattr(idx, "ithaca", idx), "orcid_rec", None):
         return
     if idxmod.byline_orcid_enabled():
         raise RuntimeError(
             "AAR_BYLINE_ORCID is on but the Ithaca ORCID map could not be loaded (see the "
             "warning above). Refusing to replay the scopus lane without it: every row "
             "ranked by its byline ORCID would read as drift.")
-    print(f"      WARNING: {ranked} open scopus rows were ranked by a byline ORCID and "
-          f"AAR_BYLINE_ORCID is not on here. They are replayed WITHOUT the ORCID match "
-          f"and will read as drift; set AAR_BYLINE_ORCID=on to replay as the CronJob "
-          f"does.", flush=True)
+    raise RuntimeError(
+        f"{ranked} open scopus rows were ranked by a byline ORCID and AAR_BYLINE_ORCID is "
+        f"not on here. Refusing to replay the scopus lane WITHOUT the ORCID match: they "
+        f"would read as drift and --apply would move their picks. Set AAR_BYLINE_ORCID=on "
+        f"to replay as the CronJob does.")
 
 
 def _replay_scopus(rows, idx, limit=None):
@@ -948,18 +949,16 @@ def _selftest():
               _replay_orcid_guard([venue_row], no_map) is None)
 
         idxmod.byline_orcid_enabled = lambda: False
-        scop._scopus_get = lambda *a, **k: {"search-results": {"entry": []}}
-        real_sleep, time.sleep = time.sleep, lambda _s: None
-        buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(buf):
-                off, off_unres = _replay_scopus([orcid_row], no_map)
-        finally:
-            time.sleep = real_sleep
-        check("ORCID match off here: the same row no longer replays to itself, and the run "
-              "warns that 1 stored row was ranked by a byline ORCID",
-              off == [] and [r["id"] for r in off_unres] == [8]
-              and "WARNING: 1 open scopus rows were ranked by a byline ORCID" in buf.getvalue())
+                _replay_scopus([orcid_row], no_map)
+            off = ""
+        except RuntimeError as e:
+            off = str(e)
+        check("ORCID match off here: the replay refuses too, and says 1 stored row was "
+              "ranked by a byline ORCID -- a warning would let --apply move its pick",
+              "1 open scopus rows were ranked by a byline ORCID" in off
+              and "AAR_BYLINE_ORCID=on" in off)
     finally:
         (scop.load_venue_lookup, scop.load_family_afids, scop.venue_fit_enabled,
          scop._scopus_get, idxmod.byline_orcid_enabled) = saved
