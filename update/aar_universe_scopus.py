@@ -346,6 +346,8 @@ def _compact(cands):
             out["venue_fit"] = c["venue_fit"]
         if "orcid_match" in c:
             out["orcid_match"] = bool(c["orcid_match"])
+        if c.get("orcid_added"):
+            out["orcid_added"] = True       # only the ORCID put them here: top_orcid_match 2
         return out
     return [dict({k: c.get(k) for k in keep}, **extra(c)) for c in cands]
 
@@ -1328,7 +1330,8 @@ def _selftest():
     check("...and a row no ORCID touched stores NULL and no orcid_match key at all",
           _row_n["top_orcid_match"] is None and "orcid_match" not in _row_n["candidate_cwids_json"]
           and top_orcid_match(None) is None and top_orcid_match({"orcid_match": False}) == 0
-          and top_orcid_match({"orcid_match": True, "orcid_added": True}) == 2)
+          and top_orcid_match({"orcid_match": True, "orcid_added": True}) == 2
+          and top_orcid_match(_compact([{"orcid_match": True, "orcid_added": True}])[0]) == 2)
     _roster_o = CampusRoster(IdentityIndex([_p("John", "Doe", "jd2")]), ithaca=_ith_o)
     _ith_fam = load_family_afids(ITHACA_AFID_LIST)
     _mixed_o = wcm_lane_candidates(_roster_o, _au_o, None, _ith_fam, None, "0000-0001-0000-0002")

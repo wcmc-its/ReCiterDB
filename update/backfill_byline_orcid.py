@@ -630,7 +630,7 @@ def _selftest():
           "matcher builds them, they lead, and the cohort and candidate count grow by one",
           verdict == "ORCID_NEW_PERSON" and after["top_cwid"] == "rl_c"
           and after["top_name"] == "Rhea Lindqvist" and after["top_given_match"] == "full"
-          and after["top_orcid_match"] == 1
+          and after["top_orcid_match"] == 2
           and (after["top_cohort_size"], after["single_candidate"], after["n_candidates"])
           == (4, 0, 4))
     check("...again byte for byte the matcher's own list for that byline and ORCID",
