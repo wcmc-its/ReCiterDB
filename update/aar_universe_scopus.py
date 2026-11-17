@@ -728,28 +728,51 @@ def _byline_name(author):
             or author.get("initials") or author.get("last"))
 
 
+_NAME_SPLIT = re.compile(r"[\s.]+")
+_HYPHENS = re.compile(r"[-\u2010\u2011\u2013]")
+
+
+def _name_parts(name):
+    """(surname words, first initial) of a byline name, folded. 'Given Last' gives the
+    last word, 'Last, Given' the part before the comma; a hyphenated surname gives each
+    half, so 'Smith' and 'Smith-Jones' share a word. The initial is '' when the name is
+    a surname alone."""
+    last, comma, given = _fold(name).partition(",")
+    if comma:
+        words, given = _NAME_SPLIT.split(last), _NAME_SPLIT.split(given)
+    else:
+        toks = [t for t in _NAME_SPLIT.split(last) if t]
+        words, given = toks[-1:], toks[:-1]
+    words = {w for t in words for w in _HYPHENS.split(t) if w}
+    return words, "".join(given)[:1]
+
+
 def pick_byline_orcid(authorships, index, name):
     """The ORCID OpenAlex attaches to one byline author, or None.
 
     `authorships` is the work's list of (byline name, bare ORCID or None) in byline
     order, `index` the row's 0-based byline position and `name` its stored byline name
-    (wcm_author). The author at `index` when its name carries the row's surname;
-    otherwise the ONE author who carries the surname and the row's first initial;
-    otherwise nothing. OpenAlex and Scopus do not always agree on the author count, so
-    the position alone is never trusted. This is the rule the 2026-11-17 measurement
-    used (ReCiter Research scripts/byline_orcid_measure.py)."""
-    toks = _fold(name).replace(".", " ").split()
-    if not toks or not authorships:
+    (wcm_author). An author is the row's when the surname agrees as a WHOLE word and the
+    first initial agrees too: 'Li' is not inside 'Alice Chen' or 'Yang Liu', and 'Li
+    Wang' is not 'Hao Wang'. The author at `index` when that holds; otherwise the ONE
+    author it holds for; otherwise nothing. OpenAlex and Scopus do not always agree on
+    the author count, so the position alone is never trusted, and a row name with no
+    given name or initial is never matched. The 2026-11-17 measurement (ReCiter Research
+    scripts/byline_orcid_measure.py) used a looser surname-substring form of this rule."""
+    surname, initial = _name_parts(name)
+    if not surname or not initial or not authorships:
         return None
-    surname, initial = toks[-1], toks[0][0]
-    hits = [k for k, (their_name, _o) in enumerate(authorships) if surname in _fold(their_name)]
+    hits = []
+    for k, (their_name, _o) in enumerate(authorships):
+        theirs, their_initial = _name_parts(their_name)
+        if surname & theirs and their_initial == initial:
+            hits.append(k)
     if index in hits:
         k = index
-    else:
-        hits = [k for k in hits if _fold(authorships[k][0]).lstrip()[:1] == initial]
-        if len(hits) != 1:
-            return None
+    elif len(hits) == 1:
         k = hits[0]
+    else:
+        return None
     return authorships[k][1] or None
 
 
@@ -1145,6 +1168,22 @@ def _selftest():
     check("...two authors share surname and initial and the position does not settle it: "
           "nothing",
           pick_byline_orcid(_oa, 1, "Jane Smith") is None)
+    check("...the surname is a whole word and the initial must agree, at the position too: "
+          "a shifted list never hands over a namesake's or a neighbour's ORCID",
+          pick_byline_orcid([("Wei Zhang", None), ("Hao Wang", "0000-0001-0000-0005"),
+                             ("Li Wang", "0000-0001-0000-0006")], 1, "Li Wang")
+          == "0000-0001-0000-0006"
+          and pick_byline_orcid([("Wei Zhang", None), ("Alice Chen", "0000-0001-0000-0005")],
+                                1, "Jun Li") is None
+          and pick_byline_orcid([("Wei Zhang", None), ("Yang Liu", "0000-0001-0000-0005"),
+                                 ("Yi Li", None)], 1, "Yi Li") is None
+          and pick_byline_orcid([("Matthew Jones", "0000-0001-0000-0005")], 0, "Jie He") is None
+          and pick_byline_orcid([("Julie Chen", "0000-0001-0000-0005")], 7, "J. Li") is None)
+    check("...'Last, Given' is read as such, and a surname alone matches nobody",
+          pick_byline_orcid([("Yan Liu", "0000-0001-0000-0005"),
+                             ("Li, Yi", "0000-0001-0000-0006")], 5, "Yi Li")
+          == "0000-0001-0000-0006"
+          and pick_byline_orcid(_oa, 0, "Smith") is None)
     check("...no such surname, no name, or no OpenAlex work: nothing",
           pick_byline_orcid(_oa, 0, "Ann Lee") is None and pick_byline_orcid(_oa, 0, "") is None
           and pick_byline_orcid(None, 0, "Jane Smith") is None)
