@@ -63,6 +63,9 @@ COPY update/infer_venue_subfield.py ./
 # Manual one-off, not run by run_all.py: brings OPEN Cornell rows already in the queue
 # to what the matcher writes once AAR_VENUE_FIT is on (dry run by default).
 COPY update/backfill_venue_fit.py ./
+# Manual one-off, not run by run_all.py: fills authorship_review.byline_orcid (v3.15) on
+# rows already in the queue, from OpenAlex by DOI (dry run by default).
+COPY update/backfill_byline_orcid.py ./
 
 # AAR OpenAlex lane (WCM conference abstracts + preprints; OFF unless
 # AAR_OPENALEX_LANE_CADENCE is set in run_all.py). Imports aar_universe_scopus above.
