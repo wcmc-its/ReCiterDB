@@ -23,9 +23,10 @@ publishes in the venue's subfield gains a little `confidence`, and one whose dep
 never does loses a little. Cornell Ithaca only, off unless AAR_VENUE_FIT=on. See
 `venue_fit_enabled`.
 
-And to the BYLINE ORCID switch and its normaliser (v3.15): the external lanes store the
-ORCID the source attaches to a byline author. Off unless AAR_BYLINE_ORCID=on. See
-`byline_orcid_enabled`.
+And to the BYLINE ORCID (v3.15): the external lanes store the ORCID the source attaches
+to a byline author, and on a Cornell Ithaca byline the person that ORCID is on file for
+leads the candidate list, whether or not the name reached them. Off unless
+AAR_BYLINE_ORCID=on. See `byline_orcid_enabled`.
 
 Env: DB_USERNAME/DB_PASSWORD/DB_HOST/DB_NAME (reciterdb, read-only); AAR_VENUE_FIT;
 AAR_BYLINE_ORCID.
@@ -553,9 +554,43 @@ def venue_fit_enabled():
 # ---- byline ORCID ------------------------------------------------------------
 # Scopus and OpenAlex both attach an ORCID to some byline authors, and until v3.15 the
 # lanes threw it away. With AAR_BYLINE_ORCID=on they store it per row as
-# authorship_review.byline_orcid (and the Scopus author id as byline_scopus_authid).
-# CAPTURE ONLY: nothing here reads the stored value, so no pick, confidence or candidate
-# list changes. Off, the lanes make no lookup and write NULL in both columns.
+# authorship_review.byline_orcid (and the Scopus author id as byline_scopus_authid), and
+# hand it to `candidates()`. Off, the lanes make no lookup, write NULL in both columns
+# and pass nothing, and `load()` reads no ORCID map.
+#
+# WHAT THE ORCID DOES. `cornell_pub_orcid_mapping` says which netid an ORCID is on file
+# for. When the byline's ORCID is on file for somebody on the roster, that person is a
+# candidate -- added to the list when the name did not reach them -- and every candidate
+# on the row carries `orcid_match`, true for that person and false for the rest.
+#
+# IT LEADS `_rank_key`, AHEAD OF THE GIVEN-NAME TIER. This is the one signal measured
+# strong enough to: on 7,428 adjudicated Cornell Scopus rows where the ORCID mapped to a
+# netid and the answer was known, it named the curator's person on 7,373 (99.3%,
+# 2026-11-17), and on 295 of the rows a curator had reassigned, that person was not among
+# the name-matched candidates at all. A name can only rank the people it reaches. The
+# temporal and venue comments above argue that a graded term must never lead the key;
+# this is a boolean, like `full`, and there is no magnitude to mis-weigh.
+#
+# RANK, DO NOT DECIDE. An ORCID match never accepts, rejects or dismisses a row and
+# removes nobody from the list. OpenAlex assigns some ORCIDs through its own author
+# disambiguation, and one wrong mapping row misattributes every paper under that ORCID,
+# so a curator still reads the card; the name-matched candidates stay on it, in the
+# order they had.
+#
+# AN ORCID ON FILE FOR TWO NETIDS IS IGNORED (`orcid_map`): it cannot say which.
+#
+# CORNELL ITHACA ONLY, AND ONLY WHERE EVERY CANDIDATE IS A CORNELL ONE: the venue term's
+# rule, for the venue term's reason. The map is of Cornell netids, so only the Cornell
+# side of a mixed list could ever earn the match, and WCM has its own ORCID authority
+# that this does not read. A WCM index never holds a map, and `CampusRoster.candidates`
+# passes the ORCID on only when the WCM roster offers nobody. A row with a WCM candidate
+# on it therefore cannot change when the feature is switched on.
+#
+# NOTHING CHANGES UNTIL ALL THREE ARE PRESENT: the index holds a map, the caller passed
+# an ORCID, and the ORCID is on file for somebody on this roster. In every other case --
+# the feature off, a WCM index, a mixed list, the PubMed lane, a byline with no ORCID,
+# an ORCID nobody here holds -- no candidate carries `orcid_match` and the list is
+# byte-for-byte what it was.
 def byline_orcid_enabled():
     """AAR_BYLINE_ORCID=on. Anything else, a typo included, is off."""
     return (os.environ.get("AAR_BYLINE_ORCID") or "").strip().lower() == "on"
@@ -570,6 +605,18 @@ def bare_orcid(value):
     malformed value is never stored and never matched."""
     m = _ORCID.fullmatch(str(value or "").strip().upper())
     return m.group(1) if m else None
+
+
+def orcid_map(pairs):
+    """(netid, orcid) rows of cornell_pub_orcid_mapping -> {bare ORCID: netid}, netids
+    lower-cased. An ORCID on file for more than one netid is left out: it identifies
+    nobody. One person holding two ORCIDs keeps both."""
+    by_orcid = {}
+    for netid, orcid in pairs:
+        orcid, netid = bare_orcid(orcid), str(netid or "").strip().lower()
+        if orcid and netid:
+            by_orcid.setdefault(orcid, set()).add(netid)
+    return {o: next(iter(n)) for o, n in by_orcid.items() if len(n) == 1}
 
 
 # ---- candidate label -------------------------------------------------------
@@ -712,8 +759,13 @@ _TIER = {"full": 2, "initial": 1, "unknown": 0}   # given_match strength, for th
 
 def _rank_key(d):
     """`candidates()`' ordering, shared with `CampusRoster` so a two-campus merge ranks
-    both lists by exactly the key each was already ranked by."""
-    return d["given_match"] == "full", d["affil_dept_match"], d["confidence"]
+    both lists by exactly the key each was already ranked by.
+
+    `orcid_match` leads (see the byline-ORCID block above). A candidate without the key
+    reads as False, so on every list no ORCID touched the first element is the same for
+    everybody and the order is the one the other three give, as before."""
+    return (bool(d.get("orcid_match")), d["given_match"] == "full", d["affil_dept_match"],
+            d["confidence"])
 
 
 class IdentityIndex:
@@ -730,12 +782,20 @@ class IdentityIndex:
     the sibling modules' self-tests is therefore WCM, exactly as before, and so is
     every row `_record` builds today (see `_campus_person_types`)."""
 
-    def __init__(self, records, campus=CAMPUS_WCM, alternate_names=None, dept_venue_fit=None):
+    def __init__(self, records, campus=CAMPUS_WCM, alternate_names=None, dept_venue_fit=None,
+                 orcid_cwid=None):
         self.campus = campus
         # The department x subfield table behind the venue term (see the venue-fit block
         # above), or None: no term, no `venue_fit` key, today's output. Kept only on an
         # Ithaca index -- the scope decision is enforced here, not left to each caller.
         self.dept_venue_fit = dept_venue_fit if campus == CAMPUS_ITHACA else None
+        # bare ORCID -> the roster record of the person it is on file for (`orcid_map`),
+        # or empty: no ORCID match, no `orcid_match` key, today's output. Ithaca only,
+        # by the same rule, and only for people actually on this roster.
+        self.orcid_rec = {}
+        orcids_of = {}
+        for orcid, cwid in (orcid_cwid or {}).items() if campus == CAMPUS_ITHACA else ():
+            orcids_of.setdefault(str(cwid).lower(), []).append(orcid)
         self.by_surname = {}
         self.n_other_campus = 0          # observability: how many the scope excluded
         self.n_alt_names = 0             # ...and how many alternate-name copies were indexed
@@ -749,6 +809,8 @@ class IdentityIndex:
                 continue
             if r.get("cornell_linked"):
                 self.cornell_linked.add(r["cwid"])
+            for orcid in orcids_of.get(str(r["cwid"]).lower(), ()):
+                self.orcid_rec[orcid] = r
             self.by_surname.setdefault(r["surname_norm"], []).append(r)
             for alt in self._alt_records(r, alternate_names.get(r["cwid"])):
                 self.n_alt_names += 1
@@ -895,10 +957,40 @@ class IdentityIndex:
             # Last on this connection, so a failed venue query cannot disturb a read the
             # roster depends on.
             dept_venue_fit = cls._load_dept_venue_fit(c, campus)
+            orcid_cwid = cls._load_orcid_map(c, campus)
         return cls([cls._record(r, campus_types.get(r["cwid"], ()), r["cwid"] in linked)
                     for r in rows],
                    campus=campus, alternate_names=alternate_names,
-                   dept_venue_fit=dept_venue_fit)
+                   dept_venue_fit=dept_venue_fit, orcid_cwid=orcid_cwid)
+
+    @staticmethod
+    def _load_orcid_map(conn, campus):
+        """{bare ORCID: netid} from `cornell_pub_orcid_mapping` (`orcid_map`), or {} when
+        the ORCID match does not apply: AAR_BYLINE_ORCID is not "on", this is not the
+        Ithaca roster, or the table is not there (the dev instance has none).
+
+        `_load_dept_venue_fit`'s failure rule, for its reason: a roster with no map is
+        the roster of the day before the feature existed, so ANY failure is logged and
+        returns {}, and the lane runs without the match. The table is looked for in
+        information_schema first, so its absence is not a failed query at all."""
+        if campus != CAMPUS_ITHACA or not byline_orcid_enabled():
+            return {}
+        try:
+            if not conn.execute(text(
+                    "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = "
+                    "DATABASE() AND table_name = 'cornell_pub_orcid_mapping'")).scalar():
+                logging.getLogger(__name__).warning(
+                    "no cornell_pub_orcid_mapping table; matching without the byline ORCID")
+                return {}
+            mapped = orcid_map(conn.execute(text(
+                "SELECT netid, orcid FROM cornell_pub_orcid_mapping")).all())
+            logging.getLogger(__name__).info(
+                "byline ORCID: %d ORCIDs on file for one netid each", len(mapped))
+            return mapped
+        except Exception as e:                                       # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "ORCID map unavailable (%r); matching without the byline ORCID", e)
+            return {}
 
     @staticmethod
     def _load_dept_venue_fit(conn, campus):
@@ -980,8 +1072,16 @@ class IdentityIndex:
         }
 
     def candidates(self, last, fore=None, initials=None, affiliations=None, top_k=5,
-                   pub_year=None, venue_subfield=None, _swapped=False):
+                   pub_year=None, venue_subfield=None, byline_orcid=None, _swapped=False):
         """Ranked candidate CWIDs for one authorship (no identity-only score yet).
+
+        `byline_orcid` is the bare ORCID the source attaches to this byline author
+        (authorship_review.byline_orcid); pass it to enable the ORCID match. It does
+        anything only on an index that holds a map (`orcid_rec`) and only when the ORCID
+        is on file for somebody on this roster: that person is added to the list if the
+        name did not reach them, every candidate gains an `orcid_match` key (true for
+        that person, false for the rest), and the key leads the sort. Omitted, or
+        matching nobody, the output is exactly what it was. It never changes a status.
 
         `venue_subfield` is the Science-Metrix subfield of the paper's venue
         (`venue_fit.subfield_for`); pass it to enable the venue term. It does anything
@@ -1007,7 +1107,10 @@ class IdentityIndex:
         if not surname_norm:
             return [], 0
         pool = self.by_surname.get(surname_norm, [])
-        if not pool:
+        # The roster record the byline's ORCID is on file for, or None (always None on
+        # an index with no map, and for a caller that passed no ORCID).
+        orcid_rec = self.orcid_rec.get(byline_orcid) if byline_orcid else None
+        if not pool and orcid_rec is None:
             # PubMed sometimes files a byline with LastName and ForeName inverted --
             # pmid 42523178 has LastName='Anna J' ForeName='Podolanczuk' Initials='P' on
             # authors 2-12 -- so the surname pool is empty and the roster's own faculty
@@ -1166,10 +1269,20 @@ class IdentityIndex:
                 best[rec["cwid"]] = (rec, given_match, via)
         cohort = list(best.values())
 
+        # The surname+initial cohort, counted BEFORE the ORCID adds anybody: it is the
+        # rarity term of everyone the name reached, and a person the ORCID brought in
+        # is not a homonym of theirs. So the name-matched candidates keep the confidence
+        # they had (as each campus keeps its own in a `CampusRoster` merge), and only
+        # `cohort_size`, the "choose among N" number the card shows and
+        # `single_candidate` is derived from, counts the extra person.
+        name_cohort = len(cohort)
+        if orcid_rec is not None and orcid_rec["cwid"] not in best:
+            cohort.append((orcid_rec,) + self._orcid_given_match(
+                orcid_rec, author_given, author_first, author_init))
         cohort_size = len(cohort)
         fit_table = self.dept_venue_fit if venue_subfield else None
         out = []
-        for rec, given_match, via in cohort:
+        for k, (rec, given_match, via) in enumerate(cohort):
             affil_match, where = self._affil_match(rec, affil_toks)
             gap = (pub_year - rec["end_year"]) if (pub_year and rec["end_year"]) else None
             penalty = temporal_penalty(gap)
@@ -1188,8 +1301,9 @@ class IdentityIndex:
                 "affil_dept_match": affil_match, "affil_match_on": where,
                 "cohort_size": cohort_size,
                 "years_after_wcm": gap,
-                "confidence": self._confidence(given_match, cohort_size, affil_match,
-                                               rec["historical"], penalty,
+                "confidence": self._confidence(given_match,
+                                               name_cohort if k < name_cohort else cohort_size,
+                                               affil_match, rec["historical"], penalty,
                                                fit_table.term(fit) if fit_table else 0.0),
             })
             if self.campus != CAMPUS_WCM:
@@ -1202,8 +1316,38 @@ class IdentityIndex:
                 # Same rule, same reason: the key exists only where there is a number.
                 # A candidate the table cannot score carries no key and no term.
                 out[-1]["venue_fit"] = fit
+            if orcid_rec is not None:
+                # And again: the key exists only on a row whose ORCID found somebody.
+                out[-1]["orcid_match"] = rec["cwid"] == orcid_rec["cwid"]
         out.sort(key=_rank_key, reverse=True)
         return out[:top_k], cohort_size
+
+    @staticmethod
+    def _orcid_given_match(rec, author_given, author_first, author_init):
+        """(given_match, name source) for a person the ORCID added, i.e. one the surname
+        pool and the initial test did not reach: what the byline's given name honestly
+        says about them, with no credit for the ORCID.
+
+        The tiers are the loop's own, tested in the loop's order against the same
+        fields -- the publishing first name, then givenName, the whole middleName and
+        the two concatenated -- so a person who would have read `full` or `initial` had
+        the surname agreed reads the same here (a married or hyphenated surname is the
+        common case). The one difference is the last line. Where the loop drops a
+        candidate whose given name shares not even an initial with the byline, this
+        returns "unknown": the ORCID is the reason they are on the list, and "unknown"
+        is the lowest tier there is, worth 0.15 in `_confidence`. The selftest holds
+        this to the loop for people the name does reach."""
+        middle = _norm(rec["middle"])
+        if author_given and (rec.get("pref_norm") == author_given
+                             or (author_first and author_first == rec.get("pref_norm"))):
+            return "full", "primary"
+        if author_given and (author_given == rec["given_norm"]
+                             or (middle and author_given in (middle, rec["given_norm"] + middle))
+                             or (author_first and author_first == rec["given_norm"])):
+            return "full", "directory"
+        if author_init and rec["given_norm"][:1] == author_init:
+            return "initial", "directory"
+        return "unknown", "directory"
 
     @staticmethod
     def _affil_match(rec, affil_toks):
@@ -1317,6 +1461,8 @@ class CampusRoster:
     combined count is the cohort, as for `both`. No linked match -> the Ithaca answer
     exactly.
 
+    `byline_orcid` travels with `venue_subfield` and by the same rule, below.
+
     `venue_subfield` reaches the Ithaca index only when its answer is returned as it
     stands: the WCM roster offers nobody for the byline (no namesake on `both`, no linked
     dual appointee on a Cornell-only one). Whenever a WCM candidate is merged in, the
@@ -1361,7 +1507,7 @@ class CampusRoster:
                                                           alternate_names=alternate_names))
 
     def candidates(self, last, fore=None, initials=None, affiliations=None, top_k=5,
-                   pub_year=None, campuses=None, venue_subfield=None):
+                   pub_year=None, campuses=None, venue_subfield=None, byline_orcid=None):
         campuses = campuses or byline_campuses(affiliations)
         args = (last, fore, initials, affiliations, top_k, pub_year)
         if CAMPUS_ITHACA not in campuses:
@@ -1380,8 +1526,9 @@ class CampusRoster:
             w_n = len(w)
         if not w:
             # No WCM candidate to merge: the Ithaca answer as it stands, and the one
-            # answer the venue term may reach (see the venue-fit block above).
-            return self.ithaca.candidates(*args, venue_subfield)
+            # answer the venue term and the ORCID match may reach (see the venue-fit and
+            # byline-ORCID blocks above).
+            return self.ithaca.candidates(*args, venue_subfield, byline_orcid)
         c, c_n = self.ithaca.candidates(*args)
         # both: WCM first, so an exact tie keeps the pre-campus pick. Cornell-only byline:
         # Cornell first, so its tie is Cornell's.
@@ -2627,11 +2774,11 @@ def _selftest():
         ("venue (3): ...and an Optics journal keeps Physics first by penalising the rival",
          [(c["cwid"], c["confidence"]) for c in tied_optics]
          == [("rw_c", 0.45), ("rh_c", 0.25)]),
-        ("venue (3): nobody is ever dropped, and _rank_key still reads only the three "
-         "fields it always read",
+        ("venue (3): nobody is ever dropped, and _rank_key does not read the fit: it is "
+         "the three fields it always read, behind the ORCID match (False here)",
          all(len(x) == 2 for x in (tier, aff_tier, tied_law, tied_optics))
          and _rank_key(dict(tier[0], venue_fit=99.0)) == _rank_key(tier[0])
-         == (True, False, 0.50)),
+         == (False, True, False, 0.50)),
     ]
 
     # (4) WCM. The scope decision is structural: a WCM index holds no table whatever it
@@ -2749,6 +2896,201 @@ def _selftest():
          gated[4] == (table, None) and seen == [CAMPUS_ITHACA]),
         ("venue load: a failure is a roster without the term, not a failed load",
          failed is None),
+    ]
+
+    # ---- byline ORCID (v3.15) ---------------------------------------------------
+    # Three Cornell Weisses. The byline spells out "Rhea Weiss", so by name Rhea leads at
+    # `full` and the two R-initial rivals follow. Lindqvist is somebody the surname pool
+    # cannot reach at all: the Rhea who publishes under a married name.
+    import json as _json
+    O_ROBERT, O_LIND, O_TWO, O_NOBODY, O_WCM = (f"0000-0001-0000-000{k}" for k in range(1, 6))
+    orcid_people = [ithaca("Rhea", "Weiss", "rh_c"), ithaca("Robert", "Weiss", "rw_c"),
+                    ithaca("Rex", "Weiss", "rx_c"), ithaca("Rhea", "Lindqvist", "rl_c"),
+                    ithaca("Olga", "Petrova", "op_c")]
+    pairs = [("RW_C", "https://orcid.org/" + O_ROBERT), ("rl_c", O_LIND),
+             ("rh_c", O_TWO), ("rx_c", O_TWO),              # one ORCID, two netids
+             ("gone1", O_NOBODY),                           # on file for nobody on the roster
+             ("op_c", "not-an-orcid")]
+    omap = orcid_map(pairs)
+    o_idx = IdentityIndex(orcid_people, campus=CAMPUS_ITHACA, orcid_cwid=omap)
+    plain_idx = IdentityIndex(orcid_people, campus=CAMPUS_ITHACA)
+    byline = ("Weiss", "Rhea", "R", ["Cornell University, Ithaca, NY"])
+    today = plain_idx.candidates(*byline)
+    promoted, promoted_n = o_idx.candidates(*byline, byline_orcid=O_ROBERT)
+    added, added_n = o_idx.candidates(*byline, byline_orcid=O_LIND)
+    by_today = {c["cwid"]: c for c in today[0]}
+    stranger, stranger_n = o_idx.candidates("Okafor", "Chidi", "C", byline_orcid=O_LIND)
+    nameless, _ = o_idx.candidates("Weiss", None, None, byline_orcid=O_LIND)
+    crowd = IdentityIndex([ithaca(f"R{k}x", "Weiss", f"r{k}_c") for k in range(7)]
+                          + [ithaca("Rhea", "Lindqvist", "rl_c")],
+                          campus=CAMPUS_ITHACA, orcid_cwid=omap)
+    crowd_out, crowd_n = crowd.candidates("Weiss", None, "R", byline_orcid=O_LIND)
+
+    def _strip(cands):
+        return [{k: v for k, v in c.items() if k != "orcid_match"} for c in cands]
+
+    checks += [
+        ("orcid: the map is bare ORCID -> lower-cased netid, URL form accepted, a malformed "
+         "value dropped, and an ORCID on file for two netids left out",
+         omap == {O_ROBERT: "rw_c", O_LIND: "rl_c", O_NOBODY: "gone1"}),
+        ("orcid: the index keeps only ORCIDs held by somebody on its roster",
+         set(o_idx.orcid_rec) == {O_ROBERT, O_LIND}
+         and o_idx.orcid_rec[O_LIND]["cwid"] == "rl_c"),
+        ("orcid (1): no ORCID passed is today's output byte for byte, on an index that "
+         "holds a map and on one that does not",
+         _json.dumps(o_idx.candidates(*byline)) == _json.dumps(today)
+         and _json.dumps(o_idx.candidates(*byline, byline_orcid=None)) == _json.dumps(today)
+         and [c["cwid"] for c in today[0]] == ["rh_c", "rw_c", "rx_c"]
+         and not any("orcid_match" in c for c in today[0])),
+        ("orcid (1): ...and so is an ORCID that is on file for nobody on the roster, or "
+         "passed to an index with no map",
+         _json.dumps(o_idx.candidates(*byline, byline_orcid=O_NOBODY)) == _json.dumps(today)
+         and _json.dumps(o_idx.candidates(*byline, byline_orcid="0000-0009-0000-0009"))
+         == _json.dumps(today)
+         and _json.dumps(plain_idx.candidates(*byline, byline_orcid=O_ROBERT))
+         == _json.dumps(today)),
+        ("orcid (2): an ORCID on file for a lower-ranked candidate promotes them over a "
+         "full given-name match: orcid_match leads _rank_key",
+         [(c["cwid"], c["orcid_match"], c["given_match"]) for c in promoted]
+         == [("rw_c", True, "initial"), ("rh_c", False, "full"), ("rx_c", False, "initial")]
+         and _rank_key(promoted[0])[0] is True and _rank_key(promoted[1])[0] is False),
+        ("orcid (2): ...and it is ranking evidence only: same three people, same cohort, "
+         "every confidence and every other field as it was",
+         promoted_n == today[1] == 3
+         and sorted(_strip(promoted), key=lambda c: c["cwid"])
+         == sorted(today[0], key=lambda c: c["cwid"])
+         and not any(k in c for c in promoted for k in ("status", "classification"))),
+        ("orcid (3): an ORCID on file for somebody the name did not reach adds them to the "
+         "list and ranks them first",
+         [(c["cwid"], c["orcid_match"]) for c in added]
+         == [("rl_c", True), ("rh_c", False), ("rw_c", False), ("rx_c", False)]
+         and added[0]["name"] == "Rhea Lindqvist" and added[0]["campus"] == CAMPUS_ITHACA),
+        ("orcid (3): ...built as a name-matched candidate is, with the given name judged "
+         "honestly: 'Rhea' is a full given-name match whatever the surname",
+         set(added[0]) == set(added[1]) and added[0]["given_match"] == "full"
+         and added[0]["name_source"] == "directory" and added[0]["affil_dept_match"] is False
+         and added[0]["confidence"] == IdentityIndex._confidence("full", 4, False, False)
+         == 0.6),
+        ("orcid (3): ...the cohort counts them (4, so the card is not a single-candidate "
+         "one), and the name-matched candidates keep the confidence their own cohort of "
+         "three gave them",
+         added_n == 4 and all(c["cohort_size"] == 4 for c in added)
+         and all(c["confidence"] == by_today[c["cwid"]]["confidence"] for c in added[1:])
+         and [dict(c, cohort_size=3) for c in _strip(added[1:])] == today[0]),
+        ("orcid (3): a byline whose surname nobody holds still reaches the ORCID's person, "
+         "alone, and a given name that shares nothing with theirs reads 'unknown', the "
+         "lowest tier: no credit for the ORCID",
+         [(c["cwid"], c["orcid_match"], c["given_match"], c["cohort_size"], c["confidence"])
+          for c in stranger] == [("rl_c", True, "unknown", 1, 0.55)] and stranger_n == 1
+         and nameless[0]["cwid"] == "rl_c" and nameless[0]["given_match"] == "unknown"),
+        ("orcid (3): the ORCID's person survives the top-5 cut of a cohort of eight",
+         crowd_n == 8 and len(crowd_out) == 5 and crowd_out[0]["cwid"] == "rl_c"
+         and [c["orcid_match"] for c in crowd_out] == [True] + [False] * 4),
+        ("orcid (3): the added person's tier is the loop's own for anyone the name does "
+         "reach (full, initial, publishing name, given+middle)",
+         all(IdentityIndex._orcid_given_match(r, _norm(fore), _byline_first_name(fore),
+                                              _first_initial(fore, None))[0]
+             == IdentityIndex([r]).candidates(r["surname"], fore)[0][0]["given_match"]
+             for r, fore in ((rec("Rhea", "", "Weiss"), "Rhea"),
+                             (rec("Rhea", "", "Weiss"), "Rhea M"),
+                             (rec("Rhea", "", "Weiss"), "R"),
+                             (rec("Rhea", "", "Weiss"), "Ruth"),
+                             (rec("Hua", "Judy", "Zhong"), "Judy"),
+                             (rec("Eileen Ruth", "Samson", "Torres"), "Eileen Ruth Samson"),
+                             (rec("Shuo", "", "Sun", pref_first="Mila"), "Mila")))),
+        ("orcid (4): an ORCID on file for two netids is ignored: the row is today's",
+         O_TWO not in o_idx.orcid_rec
+         and _json.dumps(o_idx.candidates(*byline, byline_orcid=O_TWO)) == _json.dumps(today)),
+    ]
+
+    # (5) WCM. A WCM index never holds a map, and a roster passes the ORCID to the Ithaca
+    # index only when the WCM roster offers nobody.
+    wcm_weiss = rec("Rhea", "", "Weiss", cwid="rh_w")
+    wcm_map_idx = IdentityIndex([wcm_weiss], orcid_cwid={O_WCM: "rh_w"})
+    mixed_roster = CampusRoster(IdentityIndex([wcm_weiss]), ithaca=o_idx)
+    lone_roster = CampusRoster(IdentityIndex([rec("Bea", "", "Other", cwid="bo_w")]),
+                               ithaca=o_idx)
+    two_campus = ["Weill Cornell Medicine, New York, NY", "Cornell University, Ithaca, NY"]
+    linked_wcm = IdentityIndex([dict(rec("Rhea", "", "Weiss", cwid="rh_w"), cornell_linked=True)])
+    linked_roster = CampusRoster(linked_wcm, ithaca=o_idx)
+    checks += [
+        ("orcid (5): a WCM index never holds a map, even when handed one, and ignores the "
+         "ORCID entirely",
+         wcm_map_idx.orcid_rec == {}
+         and wcm_map_idx.candidates("Weiss", "Rhea", "R", byline_orcid=O_WCM)
+         == wcm_map_idx.candidates("Weiss", "Rhea", "R")),
+        ("orcid (5): a WCM candidate on the list -> no effect: the two-campus row is "
+         "ranked exactly as with no ORCID, and nobody carries orcid_match",
+         _json.dumps(mixed_roster.candidates("Weiss", "Rhea", "R", two_campus,
+                                             byline_orcid=O_ROBERT))
+         == _json.dumps(mixed_roster.candidates("Weiss", "Rhea", "R", two_campus))
+         and mixed_roster.candidates("Weiss", "Rhea", "R", two_campus,
+                                     byline_orcid=O_LIND)[0][0]["cwid"] == "rh_w"
+         and "rl_c" not in {c["cwid"] for c in mixed_roster.candidates(
+             "Weiss", "Rhea", "R", two_campus, byline_orcid=O_LIND)[0]}),
+        ("orcid (5): ...and so is a Cornell byline that keeps a linked WCM dual appointee",
+         _json.dumps(linked_roster.candidates("Weiss", "Rhea", "R", byline[3],
+                                              byline_orcid=O_ROBERT))
+         == _json.dumps(linked_roster.candidates("Weiss", "Rhea", "R", byline[3]))),
+        ("orcid (5): a WCM-only byline never reaches the Ithaca roster, ORCID or not",
+         lone_roster.candidates("Other", "Bea", "B", ["Weill Cornell Medicine, New York"],
+                                byline_orcid=O_LIND)
+         == lone_roster.candidates("Other", "Bea", "B", ["Weill Cornell Medicine, New York"])),
+        ("orcid: a Cornell byline the WCM roster offers nobody for is the Ithaca index's "
+         "own answer, ORCID included, through a CampusRoster and with a venue subfield",
+         lone_roster.candidates(*byline, byline_orcid=O_LIND) == (added, added_n)
+         and lone_roster.candidates("Weiss", "Rhea", "R", two_campus,
+                                    venue_subfield="Optics", byline_orcid=O_ROBERT)
+         == (promoted, promoted_n)),
+    ]
+
+    # load(): the map is read only for the Ithaca roster, only when AAR_BYLINE_ORCID is
+    # "on", and a missing table or a failed read is a roster without the match.
+    class _MapConn:
+        def __init__(self, has_table=True, fail=False):
+            self.has_table, self.fail, self.sql = has_table, fail, []
+
+        def execute(self, stmt):
+            self.sql.append(str(stmt))
+            if self.fail:
+                raise RuntimeError("connection lost")
+            return self
+
+        def scalar(self):
+            return int(self.has_table)
+
+        def all(self):
+            return pairs
+    _env = os.environ.get("AAR_BYLINE_ORCID")
+    try:
+        o_gated = []
+        for val in (None, "", "off", "true", "ON "):
+            os.environ.pop("AAR_BYLINE_ORCID", None)
+            if val is not None:
+                os.environ["AAR_BYLINE_ORCID"] = val
+            conn = _MapConn()
+            o_gated.append((byline_orcid_enabled(),
+                            IdentityIndex._load_orcid_map(conn, CAMPUS_ITHACA),
+                            IdentityIndex._load_orcid_map(conn, CAMPUS_WCM), len(conn.sql)))
+        logging.disable(logging.CRITICAL)
+        no_table = _MapConn(has_table=False)
+        o_missing = IdentityIndex._load_orcid_map(no_table, CAMPUS_ITHACA)
+        o_failed = IdentityIndex._load_orcid_map(_MapConn(fail=True), CAMPUS_ITHACA)
+    finally:
+        logging.disable(logging.NOTSET)
+        os.environ.pop("AAR_BYLINE_ORCID", None)
+        if _env is not None:
+            os.environ["AAR_BYLINE_ORCID"] = _env
+    checks += [
+        ("orcid load: unset, empty, off and a typo read nothing and query nothing",
+         o_gated[:4] == [(False, {}, {}, 0)] * 4),
+        ("orcid load: 'on' reads the Ithaca map and still none for WCM",
+         o_gated[4] == (True, omap, {}, 2)),
+        ("orcid load: no cornell_pub_orcid_mapping table (the dev instance) loads nothing, "
+         "and the table is never queried",
+         o_missing == {} and len(no_table.sql) == 1 and "information_schema" in no_table.sql[0]),
+        ("orcid load: a failed read is a roster without the match, not a failed load",
+         o_failed == {}),
     ]
 
     ok = True
