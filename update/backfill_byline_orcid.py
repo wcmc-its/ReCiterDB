@@ -61,19 +61,34 @@ from the above, all of them only in that mode:
   * A row is WCM, Ithaca or mixed by the campuses of its STORED candidates, and its ORCID
     is looked up on the roster of each campus they come from: the WCM map for a WCM row,
     the Ithaca map for an Ithaca row, both for a mixed one. A WCM candidate on the row no
-    longer skips it. An ORCID on file for a person on each roster is skipped (it cannot
-    say which), as the matcher skips it.
+    longer skips it.
+  * An ORCID on file for a person on each roster is skipped on EVERY row, whatever its
+    stored candidates (it cannot say which). The matcher ignores such an ORCID on any
+    byline that names Ithaca, where it asks both rosters; on a WCM-only byline it asks
+    the WCM roster alone and would rank by it. The row does not say for certain which
+    byline it had, so this pass leaves those few to the producer too.
   * A person on a roster none of the row's stored candidates come from is NOT added here
     (a WCM person on an all-Cornell row, or the reverse). The producer can add them, since
     it knows the byline's campuses from the Scopus afids; this pass has only the row.
   * The matched candidate carries orcid_source ('scholars', 'affiliation_manager' or
     'inferred'), which Publication Manager reads off the first stored candidate.
   * A row ranked by its ORCID before the switch (orcid_match, no orcid_source) is ranked
-    again, so it gains the label, and moves if Scholars names somebody else. A row that
-    already carries orcid_source is skipped: a second run is still a no-op.
-  * The report counts PICK_CHANGE / ORCID_CONFIRMS / ORCID_NEW_PERSON separately for WCM,
-    Ithaca and mixed rows, and the matches by orcid_source. Each ledger entry of a
-    re-ranked row carries `group` and `orcid_source`.
+    again from the labelled maps. The old ranking is taken back off first: a person only
+    the old ORCID list added leaves the list and the cohort, and nobody keeps
+    orcid_match. Then the row is ranked as any other, so it gains the label, and moves
+    if Scholars names somebody else. A row that already carries orcid_source is
+    skipped: a second run is still a no-op.
+      ORCID_WITHDRAWN  the labelled maps give that ORCID to nobody this pass may rank
+                       the row by (nobody on the rosters of its candidates, or a person
+                       on each roster). The row is written back as the name alone ranks
+                       it, top_orcid_match NULL. Only when each roster the row draws on
+                       holds its lists; a row with nobody left but the person the old
+                       ORCID added is left for the sweep.
+    What the row cannot give back: a candidate the old ORCID pushed out of the stored
+    top five, and the order the producer had among exact ties.
+  * The report counts PICK_CHANGE / ORCID_CONFIRMS / ORCID_NEW_PERSON / ORCID_WITHDRAWN
+    separately for WCM, Ithaca and mixed rows, and the matches by orcid_source. Each
+    ledger entry of a re-ranked row carries `group` and `orcid_source`.
 With the switch off this script selects, ranks, reports and writes exactly as before.
 
 SAFETY, the same rules as backfill_venue_fit.py:
@@ -240,7 +255,8 @@ def rerank_row(row, orcid, idx, venue_lookup, run_ts):
 
     `idx` is the Ithaca index, as above, or with AAR_BYLINE_ORCID_WCM on a `CampusRoster`
     whose indexes hold labelled maps. Then a WCM candidate does not skip the row, a row
-    ranked before the switch is ranked again for its label, and there is one more skip:
+    ranked before the switch is ranked again from the labelled maps (verdict
+    ORCID_WITHDRAWN when they give its ORCID to nobody), and there is one more skip:
 
       pick skipped: ORCID is on file for a person on each roster"""
     if row.get("status") != "open":
@@ -257,22 +273,67 @@ def rerank_row(row, orcid, idx, venue_lookup, run_ts):
         cands = None
     if not isinstance(cands, list) or not cands or not all(isinstance(c, dict) for c in cands):
         return "pick skipped: no stored candidates", None
-    if any("orcid_match" in c for c in cands) and not (
-            wide and not any("orcid_source" in c for c in cands)):
+    ranked_before = any("orcid_match" in c for c in cands)
+    if ranked_before and not (wide and not any("orcid_source" in c for c in cands)):
         return "pick skipped: already ranked by ORCID", None
     group = row_group(cands)
     if not wide and group != "Ithaca":
         return "pick skipped: WCM candidate on the row", None
+    first, cohort = cands[0], row.get("top_cohort_size")
+
+    def payload(out):
+        out.sort(key=_key, reverse=True)           # stable: ties keep the stored order
+        out, top = out[:5], out[0]                 # five, as the producer stores
+        return {
+            "top_cwid": top.get("cwid"),
+            "top_name": _trunc(top.get("name"), 255),
+            "top_person_type": _trunc(top.get("person_type"), 64),
+            "top_dept": _trunc(top.get("dept"), 255),
+            "top_given_match": top.get("given_match"),
+            "top_affil_match": int(bool(top.get("affil_dept_match"))),
+            "top_confidence": top.get("confidence"),
+            "top_years_after_wcm": top.get("years_after_wcm"),
+            "top_venue_fit": top.get("venue_fit"),
+            "top_orcid_match": scop.top_orcid_match(top),
+            "top_cohort_size": cohort,
+            "single_candidate": int(cohort == 1) if cohort else None,
+            "n_candidates": len(out),
+            "candidate_cwids_json": json.dumps(out),
+            "last_refreshed": run_ts,
+        }
     if wide:
-        # The roster of each campus the stored candidates come from.
-        found = [(i, i.orcid_rec[orcid])
-                 for i in ([idx.wcm] if group != "Ithaca" else [])
-                 + ([idx.ithaca] if group != "WCM" else []) if orcid in i.orcid_rec]
-        if len(found) > 1:
-            return "pick skipped: ORCID is on file for a person on each roster", None
-        if not found:
-            return "pick skipped: ORCID is on file for nobody", None
-        home, rec = found[0]
+        # Every roster is asked, whatever the stored list holds: on any byline that names
+        # Ithaca the matcher hands the ORCID to both and ranks without it when each has
+        # somebody (CampusRoster._with_ithaca). The row does not say for certain which
+        # campuses its byline named, so an ORCID on both is skipped on every row.
+        on_file = [i for i in (idx.wcm, idx.ithaca) if orcid in i.orcid_rec]
+        # The roster of each campus the stored candidates come from: nobody is added
+        # from another.
+        mine = ([idx.wcm] if group != "Ithaca" else []) + ([idx.ithaca] if group != "WCM"
+                                                           else [])
+        found = [i for i in on_file if any(i is m for m in mine)]
+        if ranked_before:
+            # Ranked by the v3.15 map. Take that ORCID's effect back off first, so what is
+            # ranked below is the list the name alone gives: the person only the ORCID
+            # added goes (the labelled lists may not name them any more), the cohort stops
+            # counting them, and nobody carries orcid_match. If the labelled lists still
+            # name that person the matcher builds them again below.
+            kept = [{k: v for k, v in c.items() if k != "orcid_match"}
+                    for c in cands if not c.get("orcid_added")]
+            if len(kept) < len(cands):
+                cohort = (cohort or len(cands)) - (len(cands) - len(kept))
+                kept = [dict(c, cohort_size=cohort) for c in kept]
+            cands = sorted(kept, key=_key, reverse=True)
+        if len(on_file) > 1 or not found:
+            if ranked_before and cands and all(m.orcid_source for m in mine):
+                # The labelled lists give this ORCID to nobody this pass may rank the row
+                # by, and the row is still ranked by it. Only when each roster the row
+                # draws on holds its lists: one that failed to load withdraws nothing.
+                return "ORCID_WITHDRAWN", payload(cands)
+            return ("pick skipped: ORCID is on file for a person on each roster"
+                    if len(on_file) > 1 else "pick skipped: ORCID is on file for nobody"), None
+        home = found[0]
+        rec = home.orcid_rec[orcid]
     source = home.orcid_source.get(orcid)
 
     def marked(c):
@@ -281,17 +342,17 @@ def rerank_row(row, orcid, idx, venue_lookup, run_ts):
             c["orcid_source"] = source
         return c
     out = [marked(c) for c in cands]
-    cohort = row.get("top_cohort_size")
-    if _cwid_eq(row.get("top_cwid"), rec["cwid"]) and out[0]["orcid_match"]:
-        verdict = "ORCID_CONFIRMS"
-    elif any(c["orcid_match"] for c in out):
-        verdict = "PICK_CHANGE"
+    # Nobody moves when the person already led the row, as stored.
+    confirms = _cwid_eq(row.get("top_cwid"), rec["cwid"]) and _cwid_eq(first.get("cwid"),
+                                                                       rec["cwid"])
+    if any(c["orcid_match"] for c in out):
+        verdict = "ORCID_CONFIRMS" if confirms else "PICK_CHANGE"
     else:
         # Not on the stored list: have the matcher build them from the stored byline.
         # The same call without the ORCID says whether the name reaches them at all (they
         # ranked sixth or lower, so the stored cohort already counts them) or the ORCID
         # is what adds them (and the cohort grows by one).
-        verdict = "ORCID_NEW_PERSON"
+        verdict = "ORCID_CONFIRMS" if confirms else "ORCID_NEW_PERSON"
         toks = str(row.get("wcm_author") or "").split()
         if not toks:
             return "pick skipped: no stored candidates", None
@@ -308,25 +369,7 @@ def rerank_row(row, orcid, idx, venue_lookup, run_ts):
         named = any(_cwid_eq(c["cwid"], rec["cwid"]) for c in home.candidates(*byline)[0])
         cohort = (cohort or len(cands)) + (0 if named else 1)
         out = [dict(c, cohort_size=cohort) for c in scop._compact([person]) + out]
-    out.sort(key=_key, reverse=True)               # stable: ties keep the stored order
-    out, top = out[:5], out[0]                     # five, as the producer stores
-    return verdict, {
-        "top_cwid": top.get("cwid"),
-        "top_name": _trunc(top.get("name"), 255),
-        "top_person_type": _trunc(top.get("person_type"), 64),
-        "top_dept": _trunc(top.get("dept"), 255),
-        "top_given_match": top.get("given_match"),
-        "top_affil_match": int(bool(top.get("affil_dept_match"))),
-        "top_confidence": top.get("confidence"),
-        "top_years_after_wcm": top.get("years_after_wcm"),
-        "top_venue_fit": top.get("venue_fit"),
-        "top_orcid_match": scop.top_orcid_match(top),
-        "top_cohort_size": cohort,
-        "single_candidate": int(cohort == 1) if cohort else None,
-        "n_candidates": len(out),
-        "candidate_cwids_json": json.dumps(out),
-        "last_refreshed": run_ts,
-    }
+    return verdict, payload(out)
 
 
 def group_and_source(row, after):
@@ -339,7 +382,7 @@ def group_and_source(row, after):
 def group_report(group_counts, source_counts):
     """The re-rank's verdicts per group and its matches per source, as printed lines.
     `group_counts` is keyed (group, verdict), `source_counts` by orcid_source."""
-    verdicts = ("PICK_CHANGE", "ORCID_CONFIRMS", "ORCID_NEW_PERSON")
+    verdicts = ("PICK_CHANGE", "ORCID_CONFIRMS", "ORCID_NEW_PERSON", "ORCID_WITHDRAWN")
     lines = ["\n  by the campuses of the row's stored candidates:",
              "  " + " " * 8 + "".join(f"{v:>18}" for v in verdicts)]
     lines += [f"  {g:<8}" + "".join(f"{group_counts[g, v]:18d}" for v in verdicts)
@@ -527,7 +570,8 @@ def main():
                 if wide:
                     entry["group"], entry["orcid_source"] = group_and_source(r, after)
                     group_counts[entry["group"], verdict] += 1
-                    source_counts[entry["orcid_source"]] += 1
+                    if entry["orcid_source"]:          # none on an ORCID_WITHDRAWN row
+                        source_counts[entry["orcid_source"]] += 1
         if entry:
             entries.append(entry)
     for verdict, n in sorted(counts.items(), key=lambda kv: (kv[0].startswith("skipped"), -kv[1])):
@@ -537,7 +581,8 @@ def main():
               f"-> {e['after']['byline_orcid']}")
     if idx is not None:
         print("\n  re-rank of open rows with an ORCID:")
-        for verdict in ("PICK_CHANGE", "ORCID_CONFIRMS", "ORCID_NEW_PERSON"):
+        for verdict in ("PICK_CHANGE", "ORCID_CONFIRMS", "ORCID_NEW_PERSON") + (
+                ("ORCID_WITHDRAWN",) if wide else ()):
             print(f"  {pick_counts[verdict]:6d}  {verdict}")
         for verdict, n in sorted(pick_counts.items(), key=lambda kv: -kv[1]):
             if verdict.startswith("pick skipped"):
@@ -545,7 +590,7 @@ def main():
         if wide:
             for line in group_report(group_counts, source_counts):
                 print(line)
-        for rule in ("PICK_CHANGE", "ORCID_NEW_PERSON"):
+        for rule in ("PICK_CHANGE", "ORCID_NEW_PERSON", "ORCID_WITHDRAWN"):
             for e in [e for e in entries if e["rule"] == rule][:args.sample]:
                 b, a = e["before"], e["after"]
                 print(f"    {rule} id={e['id']} {e['wcm_author']!r} {a['byline_orcid']}\n"
@@ -932,6 +977,67 @@ def _selftest():
           and rerank_row(dict(old_ranked, candidate_cwids_json=after["candidate_cwids_json"]),
                          S_ROBERT, roster, None, ts)
           == ("pick skipped: already ranked by ORCID", None))
+    check("WCM switch: an ORCID on file for a person on each roster is skipped on an "
+          "all-Cornell row and on a WCM row too, not only on a mixed one: the rosters are "
+          "both asked, as the matcher asks them on a Cornell byline, where it ranks without",
+          rerank_row(i_row, F_CLASH, roster, None, ts)
+          == rerank_row(w_row, F_CLASH, roster, None, ts)
+          == ("pick skipped: ORCID is on file for a person on each roster", None)
+          and made(F_CLASH, affil) == made(None, affil) == i_row["candidate_cwids_json"])
+
+    # Rows the v3.15 map ranked, where the labelled maps now say something else. The old
+    # map gave O_LIND to Rhea Lindqvist, whom the name does not reach: she was added.
+    v315 = rerank_row(stored(), O_LIND, idx, None, ts)[1]
+    old_added = stored(candidate_cwids_json=v315["candidate_cwids_json"], top_cwid="rl_c",
+                       top_cohort_size=v315["top_cohort_size"], top_orcid_match=2)
+
+    def relabelled(scholars):
+        m, _ = orcid_sources(scholars, [("rl_c", O_LIND)], [])
+        return CampusRoster(IdentityIndex(w_people, orcid_cwid=m[CAMPUS_WCM]),
+                            ithaca=IdentityIndex(people, campus=CAMPUS_ITHACA,
+                                                 orcid_cwid=m[CAMPUS_ITHACA]))
+    moved = relabelled([("rw_c", O_LIND, "ithaca")])
+    verdict, after = rerank_row(old_added, O_LIND, moved, None, ts)
+    check("WCM switch: a row the old map ranked, whose ORCID Scholars confirms for somebody "
+          "else: the person only the old ORCID added leaves the list and the cohort, and "
+          "the row is the producer's, byte for byte",
+          v315["top_cwid"] == "rl_c" and v315["top_cohort_size"] == 4
+          and verdict == "PICK_CHANGE" and after["top_cwid"] == "rw_c"
+          and after["top_orcid_match"] == 1
+          and (after["top_cohort_size"], after["n_candidates"]) == (3, 3)
+          and "orcid_added" not in after["candidate_cwids_json"]
+          and after["candidate_cwids_json"] == json.dumps(scop._compact(moved.candidates(
+              "Weiss", "Rhea", None, affil, pub_year=2024, byline_orcid=O_LIND)[0])))
+    verdict, after = rerank_row(old_added, F_LIND, roster, None, ts)
+    check("...one the labelled map still gives to the same added person: ORCID_CONFIRMS, "
+          "she is built again by the matcher and the row is the producer's",
+          verdict == "ORCID_CONFIRMS" and after["top_cwid"] == "rl_c"
+          and after["top_orcid_match"] == 2 and after["top_cohort_size"] == 4
+          and after["candidate_cwids_json"] == made(F_LIND, affil))
+    gone = relabelled([("bo_w", O_LIND, "wcm"), ("rx_c", S_RUTH, "ithaca")])
+    verdict, after = rerank_row(old_added, O_LIND, gone, None, ts)
+    check("ORCID_WITHDRAWN: Scholars confirms the ORCID for a person on the other roster, "
+          "so the Ithaca lists give it to nobody: the row goes back to the list the name "
+          "alone gives, byte for byte, with no ORCID pick and top_orcid_match NULL",
+          O_LIND not in gone.ithaca.orcid_rec and gone.ithaca.orcid_source
+          and verdict == "ORCID_WITHDRAWN" and after["top_cwid"] == "rh_c"
+          and after["top_orcid_match"] is None and after["top_cohort_size"] == 3
+          and after["candidate_cwids_json"] == stored()["candidate_cwids_json"]
+          and set(after) == set(PICK_COLS)
+          and group_and_source(old_added, after) == ("Ithaca", None))
+    check("...and so does an ORCID now on file for a person on each roster",
+          rerank_row(old_added, F_CLASH, roster, None, ts)[0] == "ORCID_WITHDRAWN"
+          and rerank_row(old_added, F_CLASH, roster, None, ts)[1]["candidate_cwids_json"]
+          == stored()["candidate_cwids_json"])
+    unloaded = CampusRoster(roster.wcm, ithaca=IdentityIndex(people, campus=CAMPUS_ITHACA))
+    lone = stored(candidate_cwids_json=json.dumps(
+        [c for c in json.loads(old_added["candidate_cwids_json"]) if c.get("orcid_added")]))
+    check("...but nothing is withdrawn on a roster whose lists did not load, from a row "
+          "that was never ranked, or from a row with nobody but the person the ORCID added",
+          rerank_row(old_added, O_LIND, unloaded, None, ts)
+          == rerank_row(stored(), O_LIND, gone, None, ts)
+          == rerank_row(lone, O_LIND, gone, None, ts)
+          == ("pick skipped: ORCID is on file for nobody", None))
     check("WCM switch: the decided, the parked and the empty are skipped as before",
           rerank_row(dict(w_row, status="accepted"), S_RUTH, roster, None, ts)[1] is None
           and rerank_row(dict(w_row, accept_conflict="x"), S_RUTH, roster, None, ts)[1] is None
@@ -957,14 +1063,16 @@ def _selftest():
           and "source IN ('scopus', 'openalex') AND doi IS NOT NULL" in _select_sql(False, True))
     report = "\n".join(group_report(
         Counter({("WCM", "PICK_CHANGE"): 3, ("WCM", "ORCID_NEW_PERSON"): 1,
-                 ("mixed", "ORCID_CONFIRMS"): 2, ("Ithaca", "PICK_CHANGE"): 4}),
+                 ("mixed", "ORCID_CONFIRMS"): 2, ("Ithaca", "PICK_CHANGE"): 4,
+                 ("Ithaca", "ORCID_WITHDRAWN"): 5}),
         Counter({"scholars": 7, "inferred": 2, "affiliation_manager": 1})))
     check("the report separates WCM, Ithaca and mixed rows by verdict and counts the "
           "matches by orcid_source",
           [line.split() for line in report.splitlines() if line.split()[:1] in (
               ["WCM"], ["Ithaca"], ["mixed"])]
-          == [["WCM", "3", "0", "1"], ["Ithaca", "4", "0", "0"], ["mixed", "0", "2", "0"]]
-          and "PICK_CHANGE    ORCID_CONFIRMS  ORCID_NEW_PERSON" in report
+          == [["WCM", "3", "0", "1", "0"], ["Ithaca", "4", "0", "0", "5"],
+              ["mixed", "0", "2", "0", "0"]]
+          and "PICK_CHANGE    ORCID_CONFIRMS  ORCID_NEW_PERSON   ORCID_WITHDRAWN" in report
           and [line.split() for line in report.splitlines()[-3:]]
           == [["7", "scholars"], ["2", "inferred"], ["1", "affiliation_manager"]])
 
