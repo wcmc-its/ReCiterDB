@@ -145,7 +145,7 @@ Window: **after the inst-client run has finished and before the 14:30 UTC ReCite
 - **MySQL.**
   - Before COMMIT, nothing is changed.
   - After COMMIT, restore the step-2 dump of the affected tables. Only the tables in the dump are touched.
-- **DynamoDB and S3.** Run `python3 dynamo_remediation.py --restore snapshots/snapshot_<UTC>.json --apply`, or add `--only <bad uid>` to restore one person. It writes with the low-level client from the typed snapshot, so sets come back as `SS`/`NS`, not lists. It refuses a snapshot taken before 11-18 evening (no `"format": "dynamodb-typed-v2"`), since those stored sets as lists. This:
+- **DynamoDB and S3.** Run `python3 dynamo_remediation.py --restore snapshots/snapshot_<UTC>.json --apply`, or add `--only <bad uid>` to restore one person. It writes with a plain low-level `boto3.client("dynamodb")` from the typed snapshot (covered by `test_restore_moto.py`), so sets come back as `SS`/`NS`, not lists. It refuses a snapshot taken before 11-18 evening (no `"format": "dynamodb-typed-v2"`), since those stored sets as lists. This:
   - puts back every bad-form item and row;
   - returns the canonical GoldStandard and Identity to their snapshot state (deleting them if they didn't exist), which loses any curation done on them since;
   - removes the FeedbackLog and ExternalArticle rows the remediation copied;

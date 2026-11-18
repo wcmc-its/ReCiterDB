@@ -438,6 +438,8 @@ class Ddb:
         import boto3
         self.res = boto3.resource("dynamodb", region_name=region)
         self.client = self.res.meta.client
+        # the resource's client re-serializes typed values; restore needs a plain one
+        self.lowclient = boto3.client("dynamodb", region_name=region)
         self.s3 = boto3.client("s3", region_name=region)
         self.keys = {}
         for t in SINGLE_ITEM_TABLES + MULTI_ITEM_TABLES:
@@ -667,7 +669,7 @@ def restore(ddb, snapshot_path, only, apply):
         sys.exit(f"{snapshot_path}: not a {SNAPSHOT_FORMAT} snapshot. Older snapshots stored sets "
                  f"as lists and would restore SS/NS attributes as L; refusing.")
     data = doc["uids"]
-    cl = ddb.client
+    cl = ddb.lowclient
     entries = [e for e in load_mapping() if (not only or e["bad"] in only)]
     for e in entries:
         bad, canon = e["bad"], e["canon"]
