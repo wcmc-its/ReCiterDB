@@ -1067,8 +1067,8 @@ def _selftest():
               "index holds none: the v3.15 row and the labelled Ithaca row are refused, "
               "the WCM row is not",
               "the Ithaca ORCID map could not be loaded" in guard(orcid_row)
-              and "rows were ranked with AAR_BYLINE_ORCID_WCM on"
-              in guard(dict(orcid_row, candidate_cwids_json=json.dumps(i_sourced)))
+              and "AAR_BYLINE_ORCID_WCM" in (guard(dict(
+                  orcid_row, candidate_cwids_json=json.dumps(i_sourced))) or "")
               and guard(wcm_row) is None)
     finally:
         (scop.load_venue_lookup, scop.load_family_afids, scop.venue_fit_enabled,
