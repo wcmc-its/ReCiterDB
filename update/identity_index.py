@@ -1275,6 +1275,27 @@ class IdentityIndex:
         # The roster record the byline's ORCID is on file for, or None (always None on
         # an index with no map, and for a caller that passed no ORCID).
         orcid_rec = self.orcid_rec.get(byline_orcid) if byline_orcid else None
+        if not pool and orcid_rec is not None and self.orcid_source and fore and not _swapped:
+            # AAR_BYLINE_ORCID_WCM only (a labelled map): the ORCID found somebody, and
+            # that must not cost the row the people the inverted-name retry below
+            # reaches -- the ORCID ranks, it removes nobody. So when the retry has
+            # somebody, the answer is the retry's with the ORCID applied to it: its `full`
+            # matches, plus the ORCID's person. If that person is one of them the ORCID
+            # confirms a full name match; otherwise only the ORCID keeps them on the
+            # list, and they are marked as added. No retry candidate -> the ORCID's
+            # person alone, built below from the byline as it came. The v3.15 map keeps
+            # the rule it had (the branch after this one): with the second switch off
+            # this block is never entered.
+            if any(c["given_match"] == "full" for c in self.candidates(
+                    fore, last, None, affiliations, None, pub_year, _swapped=True)[0]):
+                out, _ = self.candidates(fore, last, None, affiliations, None, pub_year,
+                                         venue_subfield, byline_orcid, _swapped=True)
+                out = [c for c in out if c["given_match"] == "full" or c["orcid_match"]]
+                for c in out:
+                    c["cohort_size"] = len(out)
+                    if c["orcid_match"] and c["given_match"] != "full":
+                        c["orcid_added"] = True
+                return out[:top_k], len(out)
         if not pool and orcid_rec is None:
             # PubMed sometimes files a byline with LastName and ForeName inverted --
             # pmid 42523178 has LastName='Anna J' ForeName='Podolanczuk' Initials='P' on
@@ -1749,16 +1770,40 @@ class CampusRoster:
         return merged, w_n + c_n
 
 
-def roster_orcid_maps(idx):
-    """(holds an ORCID map, holds a labelled one) for a roster, an `IdentityIndex` or a
-    `CampusRoster`. What the replay tools ask before replaying rows the ORCID ranked: a
-    row whose candidates carry `orcid_match` replays to itself only on a roster with a
-    map, and one whose candidates carry `orcid_source` (ranked with
-    AAR_BYLINE_ORCID_WCM on) only on a roster with a labelled one. Asking a
-    `CampusRoster` loads its Ithaca index."""
-    rosters = {id(r): r for r in (getattr(idx, "wcm", idx), getattr(idx, "ithaca", idx))}
-    return (any(getattr(r, "orcid_rec", None) for r in rosters.values()),
-            any(getattr(r, "orcid_source", None) for r in rosters.values()))
+def orcid_rows_without_map(idx, stored):
+    """(no map, no labelled map): how many of the `stored` candidate lists (the JSON of
+    candidate_cwids_json) the ORCID ranked through a roster that holds no such map here.
+    `idx` is an `IdentityIndex` or a `CampusRoster`. What the replay tools ask before
+    replaying rows the ORCID ranked.
+
+    A row is asked of the roster ITS matched candidate is on, never of the two together.
+    A WCM index holding a map says nothing about the Ithaca one, which loads separately
+    and can fail separately; an Ithaca row replayed on a roster whose Ithaca index holds
+    no map reads as naming nobody, whatever the WCM index holds.
+
+    A matched candidate (`orcid_match` true) that carries `orcid_source` was ranked with
+    AAR_BYLINE_ORCID_WCM on: it needs a labelled map on its own roster, Ithaca when it
+    carries that campus, else WCM, and is counted second. Any other list was ranked by
+    the v3.15 match, which only an Ithaca index ever held: it needs a map of either kind
+    on the Ithaca index and is counted first. Asking for an Ithaca row loads a
+    `CampusRoster`'s Ithaca index."""
+    import json
+    no_map = no_labelled = 0
+    for s in stored:
+        if '"orcid_match"' not in (s or ""):
+            continue
+        try:
+            hit = next((c for c in json.loads(s)
+                        if isinstance(c, dict) and c.get("orcid_match")), {})
+        except (ValueError, TypeError):
+            hit = {}
+        if hit.get("orcid_source"):
+            on_wcm = hit.get("campus", CAMPUS_WCM) == CAMPUS_WCM
+            no_labelled += not getattr(getattr(idx, "wcm" if on_wcm else "ithaca", idx),
+                                       "orcid_source", None)
+        else:
+            no_map += not getattr(getattr(idx, "ithaca", idx), "orcid_rec", None)
+    return no_map, no_labelled
 
 
 # ---- offline self-test ------------------------------------------------------
@@ -3388,6 +3433,22 @@ def _selftest():
                  if k not in ("orcid_match", "orcid_added", "orcid_source")} for c in cands]
     clash = CampusRoster(IdentityIndex(wcm_people, orcid_cwid={F_I: ("rh_w", ORCID_INFERRED)}),
                          ithaca=li_idx)
+    # Stored candidate lists, as the replay guards read them: a v3.15 Ithaca row, and an
+    # Ithaca and a WCM row ranked with the second switch on.
+    _G_V315 = _json.dumps([{"cwid": "rl_c", "campus": CAMPUS_ITHACA, "orcid_match": True},
+                           {"cwid": "rh_c", "campus": CAMPUS_ITHACA, "orcid_match": False}])
+    _G_ITH = _json.dumps([{"cwid": "rl_c", "campus": CAMPUS_ITHACA, "orcid_match": True,
+                           "orcid_source": ORCID_AFFILIATION_MANAGER}])
+    _G_WCM = _json.dumps([{"cwid": "rh_w", "orcid_match": True, "orcid_source": ORCID_SCHOLARS},
+                          {"cwid": "rl_c", "campus": CAMPUS_ITHACA, "orcid_match": False}])
+    # An INVERTED byline (LastName 'Ruth J', ForeName 'Weiss'): no surname pool, so the
+    # name reaches Ruth Weiss only through the swapped retry.
+    inv = ("Ruth J", "Weiss", "W", wcm_affil)
+    inv_today = IdentityIndex(wcm_people).candidates(*inv)
+    inv_other, inv_other_n = lw_idx.candidates(*inv, byline_orcid=F_W)
+    inv_homonym, _ = lw_idx.candidates(*inv, byline_orcid=S_W)
+    inv_self, inv_self_n = IdentityIndex(
+        wcm_people, orcid_cwid={S_W: ("ru_w", ORCID_SCHOLARS)}).candidates(*inv, byline_orcid=S_W)
     checks += [
         ("orcid wcm: a WCM index holds a labelled map, for the people on its roster",
          set(lw_idx.orcid_rec) == {S_W, F_W} and lw_idx.orcid_source
@@ -3437,15 +3498,53 @@ def _selftest():
         ("orcid mixed: an ORCID that finds a person on each roster is ignored for the row",
          _json.dumps(clash.candidates("Weiss", "Rhea", "R", two_campus, byline_orcid=F_I))
          == _json.dumps(clash.candidates("Weiss", "Rhea", "R", two_campus))),
-        ("orcid: roster_orcid_maps tells the replay tools no map, the v3.15 map and a "
-         "labelled one apart, for a bare index and for a roster",
-         [roster_orcid_maps(r) for r in (plain_idx, o_idx, li_idx, lw_idx, on_roster,
-                                         CampusRoster(IdentityIndex(wcm_people), ithaca=o_idx),
-                                         CampusRoster(IdentityIndex(wcm_people)))]
-         == [(False, False), (True, False), (True, True), (True, True), (True, True),
-             (True, False), (False, False)]),
+        ("orcid: orcid_rows_without_map asks the roster the row's matched candidate is on: "
+         "no map, the v3.15 map and a labelled one, for a bare index and for a roster",
+         [orcid_rows_without_map(r, [_G_V315, _G_ITH, _G_WCM, "[]", None])
+          for r in (plain_idx, o_idx, li_idx, lw_idx, on_roster,
+                    CampusRoster(IdentityIndex(wcm_people), ithaca=o_idx),
+                    CampusRoster(IdentityIndex(wcm_people)))]
+         == [(1, 2), (0, 2), (0, 0), (0, 0), (0, 0), (0, 2), (1, 2)]),
+        ("orcid: ...a WCM index that holds a map does not answer for an Ithaca index that "
+         "holds none (its lists failed to load): Ithaca rows are counted, WCM ones not",
+         orcid_rows_without_map(CampusRoster(lw_idx, ithaca=plain_idx),
+                                [_G_V315, _G_ITH, _G_WCM]) == (1, 1)
+         and orcid_rows_without_map(CampusRoster(IdentityIndex(wcm_people), ithaca=li_idx),
+                                    [_G_V315, _G_ITH, _G_WCM]) == (0, 1)
+         and orcid_rows_without_map(CampusRoster(lw_idx, ithaca=plain_idx),
+                                    ['[{"orcid_match": false}]', '[{"orcid_match"']) == (2, 0)),
         ("orcid: _rank_key is unchanged by the source: orcid_source is a label, not a term",
          _rank_key(w_promoted[0]) == _rank_key(dict(w_promoted[0], orcid_source="inferred"))),
+        ("orcid wcm, inverted byline: an ORCID on file for somebody else does not cost the "
+         "row the person the swapped retry reaches: she stays, second, as she was but for "
+         "the cohort, which counts both",
+         [c["cwid"] for c in inv_today[0]] == ["ru_w"] and inv_today[1] == 1
+         and [(c["cwid"], c["orcid_match"], c.get("orcid_added"), c.get("orcid_source"))
+              for c in inv_other] == [("bo_w", True, True, "inferred"), ("ru_w", False, None, None)]
+         and inv_other_n == 2 and all(c["cohort_size"] == 2 for c in inv_other)
+         and _plain(inv_other[1:]) == [dict(inv_today[0][0], cohort_size=2)]),
+        ("orcid wcm, inverted byline: an ORCID on file for the person the retry reaches "
+         "confirms her full name match (not orcid_added, so top_orcid_match 1), at the "
+         "confidence she had",
+         [(c["cwid"], c["orcid_match"], c.get("orcid_source"), c["given_match"],
+           c["confidence"]) for c in inv_self]
+         == [("ru_w", True, "scholars", "full", inv_today[0][0]["confidence"])]
+         and "orcid_added" not in inv_self[0] and inv_self_n == 1),
+        ("orcid wcm, inverted byline: a namesake the retry drops (initial tier) stays on "
+         "the list only through her ORCID, and is marked as added by it",
+         [(c["cwid"], c["orcid_match"], c.get("orcid_added"), c["given_match"])
+          for c in inv_homonym] == [("rh_w", True, True, "initial"), ("ru_w", False, None, "full")]),
+        ("orcid wcm, inverted byline: no ORCID is the retry's answer byte for byte, and "
+         "with nobody for the retry to reach the ORCID's person stands alone, as before",
+         _json.dumps(lw_idx.candidates(*inv)) == _json.dumps(inv_today)
+         and [(c["cwid"], c["cohort_size"]) for c in lw_idx.candidates(
+             "Zed Q", "Nomatch", "N", wcm_affil, byline_orcid=F_W)[0]] == [("bo_w", 1)]),
+        ("orcid, inverted byline on the v3.15 map (second switch off): unchanged, the "
+         "ORCID's person alone",
+         [c["cwid"] for c in o_idx.candidates("Rhea J", "Weiss", "W", byline[3],
+                                              byline_orcid=O_LIND)[0]] == ["rl_c"]
+         and "orcid_source" not in o_idx.candidates("Rhea J", "Weiss", "W", byline[3],
+                                                    byline_orcid=O_LIND)[0][0]),
     ]
 
     # OFF-STATE EQUIVALENCE. The rosters `load()` builds with AAR_BYLINE_ORCID_WCM off are

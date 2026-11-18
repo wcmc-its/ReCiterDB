@@ -586,12 +586,14 @@ def _replay_orcid_guard(rows, idx):
     `orcid_source` were ranked with AAR_BYLINE_ORCID_WCM on: from Scholars-first maps, on
     WCM and two-campus lists as well. On a roster holding only the v3.15 Ithaca map the
     WCM and mixed ones lose their pick and the rest lose the label, so they are refused
-    unless the roster holds a labelled map (idxmod.roster_orcid_maps)."""
-    stored = [r.get("candidate_cwids_json") or "" for r in rows]
-    ranked = sum(1 for s in stored if '"orcid_match"' in s)
-    sourced = sum(1 for s in stored if '"orcid_source"' in s)
-    has_map, labelled = idxmod.roster_orcid_maps(idx) if ranked else (True, True)
-    if ranked and not has_map:
+    unless the roster holds a labelled map.
+
+    Each row is asked of the roster its matched candidate is on
+    (idxmod.orcid_rows_without_map), not of the two together: with the second switch on a
+    WCM index that holds a map must not pass Ithaca rows whose own index holds none."""
+    ranked, sourced = idxmod.orcid_rows_without_map(
+        idx, [r.get("candidate_cwids_json") or "" for r in rows])
+    if ranked:
         if idxmod.byline_orcid_enabled():
             raise RuntimeError(
                 "AAR_BYLINE_ORCID is on but the Ithaca ORCID map could not be loaded (see the "
@@ -602,7 +604,7 @@ def _replay_orcid_guard(rows, idx):
             f"not on here. Refusing to replay the scopus lane WITHOUT the ORCID match: they "
             f"would read as drift and --apply would move their picks. Set AAR_BYLINE_ORCID=on "
             f"to replay as the CronJob does.")
-    if sourced and not labelled:
+    if sourced:
         if idxmod.byline_orcid_wcm_enabled():
             raise RuntimeError(
                 "AAR_BYLINE_ORCID_WCM is on but no Scholars or fallback ORCID list could be "
@@ -1043,13 +1045,31 @@ def _selftest():
         check("WCM switch on but the labelled maps did not load: refused as well",
               "AAR_BYLINE_ORCID_WCM is on but no Scholars or fallback ORCID list could be "
               "loaded" in refusals[1])
-        check("...and with no map at all the first refusal still comes first",
-              "AAR_BYLINE_ORCID is on but the Ithaca ORCID map could not be loaded"
-              in refusals[2])
+        check("...and with no map at all it is refused the same way, naming both switches",
+              "1 open scopus rows were ranked with AAR_BYLINE_ORCID_WCM on" in refusals[2]
+              and "AAR_BYLINE_ORCID=on and AAR_BYLINE_ORCID_WCM=on" in refusals[2])
         check("a v3.15 row (orcid_match, no orcid_source) needs no labelled map: it replays "
               "on the v3.15 roster as it did, and on a labelled one is not refused",
               _replay_orcid_guard([orcid_row], v315_roster) is None
               and _replay_orcid_guard([orcid_row], l_roster) is None)
+        # Each row is asked of ITS roster. The WCM index holds its labelled map; the
+        # Ithaca index, loaded separately, holds none (its lists failed to read).
+        half = idxmod.CampusRoster(l_roster.wcm, ithaca=no_map)
+        i_sourced = json.loads(orcid_row["candidate_cwids_json"])
+        next(c for c in i_sourced if c["orcid_match"])["orcid_source"] = "affiliation_manager"
+
+        def guard(r):
+            try:
+                return _replay_orcid_guard([r], half)
+            except RuntimeError as e:
+                return str(e)
+        check("a WCM index that holds a map does not pass Ithaca rows when the Ithaca "
+              "index holds none: the v3.15 row and the labelled Ithaca row are refused, "
+              "the WCM row is not",
+              "the Ithaca ORCID map could not be loaded" in guard(orcid_row)
+              and "rows were ranked with AAR_BYLINE_ORCID_WCM on"
+              in guard(dict(orcid_row, candidate_cwids_json=json.dumps(i_sourced)))
+              and guard(wcm_row) is None)
     finally:
         (scop.load_venue_lookup, scop.load_family_afids, scop.venue_fit_enabled,
          scop._scopus_get, idxmod.byline_orcid_enabled) = saved
