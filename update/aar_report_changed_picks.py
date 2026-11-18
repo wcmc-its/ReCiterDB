@@ -80,6 +80,10 @@ BYLINE ORCID (v3.15): likewise. Each row is replayed with the byline_orcid IT ST
   ORCID (some candidate carries `orcid_match`) only replays to itself on a roster that
   holds the ORCID map, so `_replay_orcid_guard` refuses to replay such rows without it:
   when the map did not load, and equally when AAR_BYLINE_ORCID is not on in this shell.
+  Rows ranked with AAR_BYLINE_ORCID_WCM on (a candidate carries `orcid_source`: WCM and
+  two-campus lists, Scholars-first maps) are refused the same way unless that switch is
+  on here too. The guard cannot see the opposite mistake: with the switch on here and off
+  in the CronJob, WCM rows with an ORCID read as drift. Run with the CronJob's values.
 
 SYS.PATH FORK TRAP: same guard as aar_sweep_stale.py -- this file's own directory must
   win over the stale ~/Dropbox/Projects/ReCiter Research/scripts/ copy. Asserted below,
@@ -576,20 +580,40 @@ def _replay_orcid_guard(rows, idx):
     aar_reconcile_open --apply would write the ORCID's person back off them (a move to a
     full given-name match is the 'stronger' move CLASS B accepts). So this raises
     whenever such rows exist and the roster holds no map, whether the map failed to load
-    or AAR_BYLINE_ORCID is simply not on in this shell."""
-    ranked = sum(1 for r in rows if '"orcid_match"' in (r.get("candidate_cwids_json") or ""))
-    if not ranked or getattr(getattr(idx, "ithaca", idx), "orcid_rec", None):
-        return
-    if idxmod.byline_orcid_enabled():
+    or AAR_BYLINE_ORCID is simply not on in this shell.
+
+    The same again for the second switch. Rows whose stored candidates carry
+    `orcid_source` were ranked with AAR_BYLINE_ORCID_WCM on: from Scholars-first maps, on
+    WCM and two-campus lists as well. On a roster holding only the v3.15 Ithaca map the
+    WCM and mixed ones lose their pick and the rest lose the label, so they are refused
+    unless the roster holds a labelled map (idxmod.roster_orcid_maps)."""
+    stored = [r.get("candidate_cwids_json") or "" for r in rows]
+    ranked = sum(1 for s in stored if '"orcid_match"' in s)
+    sourced = sum(1 for s in stored if '"orcid_source"' in s)
+    has_map, labelled = idxmod.roster_orcid_maps(idx) if ranked else (True, True)
+    if ranked and not has_map:
+        if idxmod.byline_orcid_enabled():
+            raise RuntimeError(
+                "AAR_BYLINE_ORCID is on but the Ithaca ORCID map could not be loaded (see the "
+                "warning above). Refusing to replay the scopus lane without it: every row "
+                "ranked by its byline ORCID would read as drift.")
         raise RuntimeError(
-            "AAR_BYLINE_ORCID is on but the Ithaca ORCID map could not be loaded (see the "
-            "warning above). Refusing to replay the scopus lane without it: every row "
-            "ranked by its byline ORCID would read as drift.")
-    raise RuntimeError(
-        f"{ranked} open scopus rows were ranked by a byline ORCID and AAR_BYLINE_ORCID is "
-        f"not on here. Refusing to replay the scopus lane WITHOUT the ORCID match: they "
-        f"would read as drift and --apply would move their picks. Set AAR_BYLINE_ORCID=on "
-        f"to replay as the CronJob does.")
+            f"{ranked} open scopus rows were ranked by a byline ORCID and AAR_BYLINE_ORCID is "
+            f"not on here. Refusing to replay the scopus lane WITHOUT the ORCID match: they "
+            f"would read as drift and --apply would move their picks. Set AAR_BYLINE_ORCID=on "
+            f"to replay as the CronJob does.")
+    if sourced and not labelled:
+        if idxmod.byline_orcid_wcm_enabled():
+            raise RuntimeError(
+                "AAR_BYLINE_ORCID_WCM is on but no Scholars or fallback ORCID list could be "
+                "loaded (see the warning above). Refusing to replay the scopus lane without "
+                f"them: {sourced} rows ranked through them would read as drift.")
+        raise RuntimeError(
+            f"{sourced} open scopus rows were ranked with AAR_BYLINE_ORCID_WCM on (their "
+            f"candidates carry orcid_source) and it is not on here. Refusing to replay the "
+            f"scopus lane with the Ithaca-only match: WCM and two-campus rows would read as "
+            f"drift and --apply would move their picks. Set AAR_BYLINE_ORCID=on and "
+            f"AAR_BYLINE_ORCID_WCM=on to replay as the CronJob does.")
 
 
 def _replay_scopus(rows, idx, limit=None):
@@ -959,6 +983,73 @@ def _selftest():
               "ranked by a byline ORCID -- a warning would let --apply move its pick",
               "1 open scopus rows were ranked by a byline ORCID" in off
               and "AAR_BYLINE_ORCID=on" in off)
+        # AAR_BYLINE_ORCID_WCM: a WCM row ranked through a Scholars-confirmed iD. Two WCM
+        # Weisses; the byline spells out Rhea and the ORCID is on file for Ruth.
+        def wperson(given, cwid):
+            return {k: v for k, v in dict(person(given, "Medicine", cwid),
+                                          person_type="Full-Time Faculty").items()
+                    if k != "campus"}
+        w_people = [wperson("Rhea", "rh_w"), wperson("Ruth", "ru_w")]
+        maps, _ = idxmod.orcid_sources([("ru_w", ORCID, "wcm")], [("rl_c", ORCID[:-1] + "9")])
+        l_roster = idxmod.CampusRoster(
+            idxmod.IdentityIndex(w_people, orcid_cwid=maps[idxmod.CAMPUS_WCM]),
+            ithaca=idxmod.IdentityIndex(o_people, campus=idxmod.CAMPUS_ITHACA,
+                                        orcid_cwid=maps[idxmod.CAMPUS_ITHACA]))
+        v315_roster = idxmod.CampusRoster(idxmod.IdentityIndex(w_people), ithaca=o_idx)
+        w_au = dict(au, fore="Rhea", affiliations=["Weill Cornell Medicine, New York, NY"])
+        w_produced, _ = scop.wcm_lane_candidates(l_roster, w_au, 2024, frozenset(), None, ORCID)
+        wtop = w_produced[0]
+        wcm_row = dict(orcid_row, id=9, wcm_author="Rhea Weiss",
+                       author_affiliation=w_au["affiliations"][0], top_cwid=wtop["cwid"],
+                       top_name=wtop["name"], top_person_type=wtop["person_type"],
+                       top_dept=wtop["dept"], top_given_match=wtop["given_match"],
+                       top_affil_match=int(bool(wtop["affil_dept_match"])),
+                       top_confidence=wtop["confidence"], n_candidates=len(w_produced),
+                       candidate_cwids_json=json.dumps(scop._compact(w_produced)))
+        check("the fixture is a WCM row the second switch ranked: Ruth, by Scholars, leads "
+              "the full-name match and the stored list says so",
+              [(c["cwid"], c["orcid_match"]) for c in w_produced]
+              == [("ru_w", True), ("rh_w", False)]
+              and '"orcid_source": "scholars"' in wcm_row["candidate_cwids_json"])
+        idxmod.byline_orcid_enabled = lambda: True
+        with contextlib.redirect_stdout(buf):
+            w_on, w_unres = _replay_scopus([wcm_row], l_roster)
+        check("WCM switch on: the row replays to itself on a roster holding labelled maps "
+              "-- UNCHANGED, no drift",
+              w_unres == [] and [(x["classification"], x["drift"], x["new_cwid"])
+                                 for x in w_on] == [("UNCHANGED", [], "ru_w")])
+        keep_wcm = os.environ.pop("AAR_BYLINE_ORCID_WCM", None)
+        try:
+            refusals = []
+            for val, roster in ((None, v315_roster), ("on", v315_roster),
+                                (None, idxmod.CampusRoster(idxmod.IdentityIndex(w_people)))):
+                os.environ.pop("AAR_BYLINE_ORCID_WCM", None)
+                if val:
+                    os.environ["AAR_BYLINE_ORCID_WCM"] = val
+                try:
+                    with contextlib.redirect_stdout(buf):
+                        _replay_scopus([wcm_row], roster)
+                    refusals.append("")
+                except RuntimeError as e:
+                    refusals.append(str(e))
+        finally:
+            os.environ.pop("AAR_BYLINE_ORCID_WCM", None)
+            if keep_wcm is not None:
+                os.environ["AAR_BYLINE_ORCID_WCM"] = keep_wcm
+        check("WCM switch off here, roster with only the v3.15 Ithaca map: a row ranked "
+              "through the WCM path is refused, and the message names the switch",
+              "1 open scopus rows were ranked with AAR_BYLINE_ORCID_WCM on" in refusals[0]
+              and "AAR_BYLINE_ORCID_WCM=on" in refusals[0])
+        check("WCM switch on but the labelled maps did not load: refused as well",
+              "AAR_BYLINE_ORCID_WCM is on but no Scholars or fallback ORCID list could be "
+              "loaded" in refusals[1])
+        check("...and with no map at all the first refusal still comes first",
+              "AAR_BYLINE_ORCID is on but the Ithaca ORCID map could not be loaded"
+              in refusals[2])
+        check("a v3.15 row (orcid_match, no orcid_source) needs no labelled map: it replays "
+              "on the v3.15 roster as it did, and on a labelled one is not refused",
+              _replay_orcid_guard([orcid_row], v315_roster) is None
+              and _replay_orcid_guard([orcid_row], l_roster) is None)
     finally:
         (scop.load_venue_lookup, scop.load_family_afids, scop.venue_fit_enabled,
          scop._scopus_get, idxmod.byline_orcid_enabled) = saved
