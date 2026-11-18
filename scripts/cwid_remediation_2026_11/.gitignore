@@ -1,0 +1,4 @@
+snapshots/
+rerun_*.tsv
+*.log
+__pycache__/
