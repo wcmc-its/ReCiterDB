@@ -9,7 +9,9 @@
 -- Run (never with --force: the first error must stop the script, and the open
 -- transaction is then rolled back when the client disconnects). The script stops
 -- itself with "CONSTRAINT `stop_here` failed" when two merged accounts carry different
--- scope_* / proxy_person_ids values; the row just above the error says which:
+-- scope_* / proxy_person_ids values, when a GUARD count is not 0, or when an after-check
+-- is not 0 (just before ROLLBACK/COMMIT, so a COMMIT run never commits a bad state); the
+-- "checks" / "STOP if listed" result just above the error says which:
 --   mysql --defaults-file=<prod-creds.cnf> reciterdb < mysql_remediation.sql | tee mysql_run_$(date -u +%Y%m%dT%H%M%SZ).log
 --
 -- Mapping: the rm_map rows below are the MAP/DELETE rows of mapping.json
@@ -19,6 +21,12 @@
 --
 -- Comparisons that must be case- or space-exact use BINARY: every table here is
 -- utf8mb4_unicode_ci, where 'Abl9002' = 'abl9002' and 'ggi9001 ' = 'ggi9001'.
+--
+-- External-cohort ids keep their case (trim only). They are exactly the ids matching
+-- BINARY TRIM(id) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]*_)' (the underscore is
+-- required: a bare 'uc...' id such as 'Uca2001' or 'ucb9001' is a CWID and is lowercased).
+-- Underscore test identities (_pab4001 and the rest) are lowercase already and are
+-- never merged.
 -- =============================================================================
 
 SELECT @@hostname AS host, DATABASE() AS db, NOW() AS run_at,
@@ -75,6 +83,11 @@ INSERT INTO rm_map (bad, canon, action) VALUES
 DROP TEMPORARY TABLE IF EXISTS rm_abort;
 CREATE TEMPORARY TABLE rm_abort (reason VARCHAR(255), CONSTRAINT stop_here CHECK (reason IS NULL));
 
+-- Every GUARD and after-check count lands here; any n > 0 aborts the run at the end.
+DROP TEMPORARY TABLE IF EXISTS rm_check;
+CREATE TEMPORARY TABLE rm_check (phase VARCHAR(8), name VARCHAR(128), n BIGINT NOT NULL)
+  DEFAULT CHARSET=utf8mb4;
+
 -- PM accounts that are not CWIDs at all (decision 5, 11-18)
 DROP TEMPORARY TABLE IF EXISTS rm_junk_pid;
 CREATE TEMPORARY TABLE rm_junk_pid (pid VARCHAR(128) NOT NULL)
@@ -88,7 +101,8 @@ INSERT INTO rm_junk_pid SELECT bad FROM rm_map WHERE action = 'DELETE';
 -- =============================================================================
 SELECT 'before' AS phase, 'admin_users junk accounts' AS what, u.userID, u.personIdentifier, u.status,
        (SELECT COUNT(*) FROM admin_users_roles r WHERE r.userID = u.userID) AS n_roles,
-       (SELECT COUNT(*) FROM admin_feedback_log f WHERE f.userID = u.userID) AS n_feedback_authored
+       (SELECT COUNT(*) FROM admin_feedback_log f WHERE f.userID = u.userID) AS n_feedback_authored,
+       (SELECT COUNT(*) FROM admin_feedback_log f WHERE f.impersonatedByUserID = u.userID) AS n_feedback_impersonated
 FROM admin_users u
 WHERE BINARY u.personIdentifier IN (SELECT BINARY pid FROM rm_junk_pid)
 ORDER BY u.userID;
@@ -135,11 +149,13 @@ ORDER BY u.userID;
 -- lowercases cwid itself (update/buildIdentity.py, same PR), so it is not written here
 SELECT 'before' AS phase, 'identity_grad_school_faculty (non-canonical, fixed by the next nightly)' AS tbl, COUNT(*) AS n FROM identity_grad_school_faculty WHERE BINARY cwid <> BINARY LOWER(TRIM(cwid));
 -- guards: expected 0 (Phase 0); a non-zero here means extend the script before COMMIT
-SELECT 'before' AS phase, 'GUARD admin_orcid' AS tbl, COUNT(*) AS n FROM admin_orcid o JOIN rm_map m ON BINARY o.personIdentifier = BINARY m.bad;
-SELECT 'before' AS phase, 'GUARD analysis_override_author_position' AS tbl, COUNT(*) AS n FROM analysis_override_author_position o JOIN rm_map m ON BINARY o.personIdentifier = BINARY m.bad;
-SELECT 'before' AS phase, 'GUARD external_record' AS tbl, COUNT(*) AS n FROM external_record o JOIN rm_map m ON BINARY o.uid = BINARY m.bad;
-SELECT 'before' AS phase, 'GUARD external_rejection' AS tbl, COUNT(*) AS n FROM external_rejection o JOIN rm_map m ON BINARY o.uid = BINARY m.bad;
-SELECT 'before' AS phase, 'GUARD person_author_id' AS tbl, COUNT(*) AS n FROM person_author_id o JOIN rm_map m ON BINARY o.uid = BINARY m.bad;
+-- (enforced: a non-zero GUARD aborts the run before ROLLBACK/COMMIT)
+INSERT INTO rm_check SELECT 'GUARD', 'admin_orcid', COUNT(*) FROM admin_orcid o JOIN rm_map m ON BINARY o.personIdentifier = BINARY m.bad;
+INSERT INTO rm_check SELECT 'GUARD', 'analysis_override_author_position', COUNT(*) FROM analysis_override_author_position o JOIN rm_map m ON BINARY o.personIdentifier = BINARY m.bad;
+INSERT INTO rm_check SELECT 'GUARD', 'external_record', COUNT(*) FROM external_record o JOIN rm_map m ON BINARY o.uid = BINARY m.bad;
+INSERT INTO rm_check SELECT 'GUARD', 'external_rejection', COUNT(*) FROM external_rejection o JOIN rm_map m ON BINARY o.uid = BINARY m.bad;
+INSERT INTO rm_check SELECT 'GUARD', 'person_author_id', COUNT(*) FROM person_author_id o JOIN rm_map m ON BINARY o.uid = BINARY m.bad;
+SELECT 'before' AS phase, CONCAT('GUARD ', name) AS tbl, n, 'expect 0' AS expect FROM rm_check WHERE phase = 'GUARD';
 
 -- =============================================================================
 -- WRITES
@@ -147,14 +163,16 @@ SELECT 'before' AS phase, 'GUARD person_author_id' AS tbl, COUNT(*) AS n FROM pe
 START TRANSACTION;
 
 -- ---------------------------------------------------------------- 1. junk PM accounts
--- Accounts that authored admin_feedback_log rows are deactivated (status=0, roles and
--- departments removed) instead of deleted, so curator history keeps its userID.
+-- Accounts that authored admin_feedback_log rows, or are named in its
+-- impersonatedByUserID, are deactivated (status=0, roles and departments removed) instead
+-- of deleted, so curator history keeps its userID.
 DROP TEMPORARY TABLE IF EXISTS rm_junk_acct;
 CREATE TEMPORARY TABLE rm_junk_acct (userID INT PRIMARY KEY, keep_inactive TINYINT NOT NULL DEFAULT 0);
 INSERT INTO rm_junk_acct (userID)
 SELECT userID FROM admin_users WHERE BINARY personIdentifier IN (SELECT BINARY pid FROM rm_junk_pid);
 UPDATE rm_junk_acct j SET keep_inactive = 1
-WHERE EXISTS (SELECT 1 FROM admin_feedback_log f WHERE f.userID = j.userID);
+WHERE EXISTS (SELECT 1 FROM admin_feedback_log f
+              WHERE f.userID = j.userID OR f.impersonatedByUserID = j.userID);
 
 DELETE r FROM admin_users_roles r JOIN rm_junk_acct j ON r.userID = j.userID;
 DELETE d FROM admin_users_departments d JOIN rm_junk_acct j ON d.userID = j.userID;
@@ -177,11 +195,7 @@ CREATE TEMPORARY TABLE rm_acct (
 INSERT INTO rm_acct (userID, cur, canon)
 SELECT u.userID, u.personIdentifier,
        COALESCE(m.canon,
-         CASE WHEN BINARY LEFT(TRIM(u.personIdentifier), 4) = 'usc_'
-                OR BINARY LEFT(TRIM(u.personIdentifier), 3) = 'fh_'
-                OR BINARY LEFT(TRIM(u.personIdentifier), 10) = 'fredhutch_'
-                OR BINARY LEFT(TRIM(u.personIdentifier), 5) = 'ucsf_'
-                OR BINARY LEFT(TRIM(u.personIdentifier), 2) = 'uc'
+         CASE WHEN BINARY TRIM(u.personIdentifier) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]*_)'
               THEN TRIM(u.personIdentifier)
               ELSE LOWER(TRIM(u.personIdentifier)) END)
 FROM admin_users u
@@ -203,7 +217,10 @@ CREATE TEMPORARY TABLE rm_loser (userID INT PRIMARY KEY, keeper INT NOT NULL, ca
 INSERT INTO rm_loser
 SELECT a.userID, k.keeper, k.canon FROM rm_acct a JOIN rm_keep k ON a.canon = k.canon WHERE a.userID <> k.keeper;
 
-SELECT 'account merges' AS step, l.canon, l.keeper, l.userID AS merged_away FROM rm_loser l ORDER BY l.canon;
+SELECT 'account merges' AS step, l.canon, l.keeper, ku.status AS keeper_status,
+       l.userID AS merged_away, lu.status AS merged_away_status
+FROM rm_loser l JOIN admin_users ku ON ku.userID = l.keeper JOIN admin_users lu ON lu.userID = l.userID
+ORDER BY l.canon, l.userID;
 
 UPDATE admin_users_roles r JOIN rm_loser l ON r.userID = l.userID SET r.userID = l.keeper;
 UPDATE admin_users_departments d JOIN rm_loser l ON d.userID = l.userID SET d.userID = l.keeper;
@@ -286,6 +303,33 @@ SET u.scope_person_types = COALESCE(v.spt, u.scope_person_types),
 SELECT 'scope/proxy carried to keeper' AS step, v.canon, k.keeper, v.spt, v.sou, v.sin, v.ppi
 FROM rm_scope_pivot v JOIN rm_keep k ON k.canon = v.canon ORDER BY v.canon;
 
+-- Account fields: the keeper gets status = MAX(status) over its group (a merged-away
+-- account that is the active one must not leave the curator locked out on an inactive
+-- keeper), and its own email / names unless empty, else the group's first non-empty
+-- value by userID (COALESCE; the keeper is the lowest userID, so its value comes first).
+DROP TEMPORARY TABLE IF EXISTS rm_acct_fields;
+CREATE TEMPORARY TABLE rm_acct_fields (
+  keeper INT PRIMARY KEY, status_max INT,
+  email VARCHAR(128), nameFirst VARCHAR(128), nameMiddle VARCHAR(128), nameLast VARCHAR(128)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+INSERT INTO rm_acct_fields
+SELECT k.keeper, MAX(u.status),
+       SUBSTRING_INDEX(GROUP_CONCAT(NULLIF(TRIM(u.email), '')      ORDER BY u.userID SEPARATOR x'1F'), x'1F', 1),
+       SUBSTRING_INDEX(GROUP_CONCAT(NULLIF(TRIM(u.nameFirst), '')  ORDER BY u.userID SEPARATOR x'1F'), x'1F', 1),
+       SUBSTRING_INDEX(GROUP_CONCAT(NULLIF(TRIM(u.nameMiddle), '') ORDER BY u.userID SEPARATOR x'1F'), x'1F', 1),
+       SUBSTRING_INDEX(GROUP_CONCAT(NULLIF(TRIM(u.nameLast), '')   ORDER BY u.userID SEPARATOR x'1F'), x'1F', 1)
+FROM rm_keep k JOIN rm_acct a ON a.canon = k.canon JOIN admin_users u ON u.userID = a.userID
+GROUP BY k.keeper;
+UPDATE admin_users u JOIN rm_acct_fields f ON u.userID = f.keeper
+SET u.status     = COALESCE(f.status_max, u.status),
+    u.email      = CASE WHEN TRIM(COALESCE(u.email, '')) <> ''      THEN u.email      ELSE f.email END,
+    u.nameFirst  = CASE WHEN TRIM(COALESCE(u.nameFirst, '')) <> ''  THEN u.nameFirst  ELSE f.nameFirst END,
+    u.nameMiddle = CASE WHEN TRIM(COALESCE(u.nameMiddle, '')) <> '' THEN u.nameMiddle ELSE f.nameMiddle END,
+    u.nameLast   = CASE WHEN TRIM(COALESCE(u.nameLast, '')) <> ''   THEN u.nameLast   ELSE f.nameLast END;
+SELECT 'keeper account after merge' AS step, k.canon, u.userID AS keeper, u.status, u.email, u.nameFirst, u.nameLast
+FROM rm_keep k JOIN admin_users u ON u.userID = k.keeper
+WHERE k.keeper IN (SELECT keeper FROM rm_loser) ORDER BY k.canon;
+
 DELETE u FROM admin_users u JOIN rm_loser l ON u.userID = l.userID;
 
 UPDATE admin_users u JOIN rm_keep k ON u.userID = k.keeper
@@ -321,40 +365,39 @@ SET a.top_cwid = m.canon;
 UPDATE authorship_review a JOIN rm_map m ON BINARY a.resolution_cwid = BINARY m.bad AND m.action = 'MAP'
 SET a.resolution_cwid = m.canon;
 -- candidate_cwids_json holds "cwid": "<uid>" entries. REPLACE() is case-sensitive. A
--- multi-table UPDATE changes each row once per statement, so repeat it for rows that
--- carry two mapped ids; the after-count below must be 0.
-UPDATE authorship_review a JOIN rm_map m
-  ON m.action = 'MAP' AND INSTR(CAST(a.candidate_cwids_json AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0
-SET a.candidate_cwids_json = REPLACE(a.candidate_cwids_json, CONCAT('"', m.bad, '"'), CONCAT('"', m.canon, '"'));
-UPDATE authorship_review a JOIN rm_map m
-  ON m.action = 'MAP' AND INSTR(CAST(a.candidate_cwids_json AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0
-SET a.candidate_cwids_json = REPLACE(a.candidate_cwids_json, CONCAT('"', m.bad, '"'), CONCAT('"', m.canon, '"'));
-UPDATE authorship_review a JOIN rm_map m
-  ON m.action = 'MAP' AND INSTR(CAST(a.candidate_cwids_json AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0
-SET a.candidate_cwids_json = REPLACE(a.candidate_cwids_json, CONCAT('"', m.bad, '"'), CONCAT('"', m.canon, '"'));
+-- multi-table UPDATE changes each row once per statement, so it runs in a loop (with
+-- the proxy_person_ids rewrite in 5b) until a pass changes nothing: a row carrying any
+-- number of mapped ids converges in one run. The after-count below must be 0.
 
 UPDATE authorship_review a JOIN rm_map m ON BINARY a.reviewer = BINARY m.bad AND m.action = 'MAP'
 SET a.reviewer = m.canon;
 
 -- ---------------------------------------------------------------- 5b. admin_users.proxy_person_ids
 -- JSON arrays of person ids. A mapped id is rewritten (REPLACE() is case-sensitive);
--- a DELETE-class id is removed. One change per row per statement, so repeat; the
--- after-count must be 0.
-UPDATE admin_users u JOIN rm_map m
-  ON m.action = 'MAP' AND INSTR(CAST(u.proxy_person_ids AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0
-SET u.proxy_person_ids = REPLACE(u.proxy_person_ids, CONCAT('"', m.bad, '"'), CONCAT('"', m.canon, '"'));
-UPDATE admin_users u JOIN rm_map m
-  ON m.action = 'MAP' AND INSTR(CAST(u.proxy_person_ids AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0
-SET u.proxy_person_ids = REPLACE(u.proxy_person_ids, CONCAT('"', m.bad, '"'), CONCAT('"', m.canon, '"'));
-UPDATE admin_users u JOIN rm_map m
-  ON m.action = 'MAP' AND INSTR(CAST(u.proxy_person_ids AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0
-SET u.proxy_person_ids = REPLACE(u.proxy_person_ids, CONCAT('"', m.bad, '"'), CONCAT('"', m.canon, '"'));
-UPDATE admin_users u JOIN rm_map m
-  ON m.action = 'DELETE' AND INSTR(CAST(u.proxy_person_ids AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0
-SET u.proxy_person_ids = COALESCE(JSON_REMOVE(u.proxy_person_ids, JSON_UNQUOTE(JSON_SEARCH(u.proxy_person_ids, 'one', m.bad))), u.proxy_person_ids);
-UPDATE admin_users u JOIN rm_map m
-  ON m.action = 'DELETE' AND INSTR(CAST(u.proxy_person_ids AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0
-SET u.proxy_person_ids = COALESCE(JSON_REMOVE(u.proxy_person_ids, JSON_UNQUOTE(JSON_SEARCH(u.proxy_person_ids, 'one', m.bad))), u.proxy_person_ids);
+-- a DELETE-class id is removed. One change per row per statement, so all three rewrites
+-- (with candidate_cwids_json above) repeat until a pass changes no row, capped at 100
+-- passes; the after-counts must be 0 (enforced below).
+DELIMITER //
+BEGIN NOT ATOMIC
+  DECLARE changed BIGINT DEFAULT 1;
+  DECLARE passes INT DEFAULT 0;
+  WHILE changed > 0 AND passes < 100 DO
+    UPDATE authorship_review a JOIN rm_map m
+      ON m.action = 'MAP' AND INSTR(CAST(a.candidate_cwids_json AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0
+    SET a.candidate_cwids_json = REPLACE(a.candidate_cwids_json, CONCAT('"', m.bad, '"'), CONCAT('"', m.canon, '"'));
+    SET changed = ROW_COUNT();
+    UPDATE admin_users u JOIN rm_map m
+      ON m.action = 'MAP' AND INSTR(CAST(u.proxy_person_ids AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0
+    SET u.proxy_person_ids = REPLACE(u.proxy_person_ids, CONCAT('"', m.bad, '"'), CONCAT('"', m.canon, '"'));
+    SET changed = changed + ROW_COUNT();
+    UPDATE admin_users u JOIN rm_map m
+      ON m.action = 'DELETE' AND INSTR(CAST(u.proxy_person_ids AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0
+    SET u.proxy_person_ids = COALESCE(JSON_REMOVE(u.proxy_person_ids, JSON_UNQUOTE(JSON_SEARCH(u.proxy_person_ids, 'one', m.bad))), u.proxy_person_ids);
+    SET changed = changed + ROW_COUNT();
+    SET passes = passes + 1;
+  END WHILE;
+END//
+DELIMITER ;
 
 -- ---------------------------------------------------------------- 6. reporting_ad_hoc_*
 -- map, then trim + lowercase (external-cohort ids: trim only), then drop DELETE-class
@@ -367,29 +410,17 @@ DELETE x FROM reporting_ad_hoc_feature_generator_execution x JOIN rm_map m
 DELETE x FROM reporting_ad_hoc_identity_creation x JOIN rm_map m
   ON BINARY x.personIdentifier = BINARY m.bad AND m.action = 'DELETE';
 UPDATE reporting_ad_hoc_feature_generator_execution
-SET personIdentifier = CASE WHEN BINARY LEFT(TRIM(personIdentifier), 4) = 'usc_'
-                              OR BINARY LEFT(TRIM(personIdentifier), 3) = 'fh_'
-                              OR BINARY LEFT(TRIM(personIdentifier), 10) = 'fredhutch_'
-                              OR BINARY LEFT(TRIM(personIdentifier), 5) = 'ucsf_'
-                              OR BINARY LEFT(TRIM(personIdentifier), 2) = 'uc'
+SET personIdentifier = CASE WHEN BINARY TRIM(personIdentifier) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]*_)'
                             THEN TRIM(personIdentifier) ELSE LOWER(TRIM(personIdentifier)) END
 WHERE BINARY personIdentifier <> BINARY TRIM(personIdentifier)
    OR (BINARY personIdentifier <> BINARY LOWER(personIdentifier)
-       AND NOT (BINARY LEFT(TRIM(personIdentifier), 4) = 'usc_' OR BINARY LEFT(TRIM(personIdentifier), 3) = 'fh_'
-                OR BINARY LEFT(TRIM(personIdentifier), 10) = 'fredhutch_' OR BINARY LEFT(TRIM(personIdentifier), 5) = 'ucsf_'
-                OR BINARY LEFT(TRIM(personIdentifier), 2) = 'uc'));
+       AND NOT BINARY TRIM(personIdentifier) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]*_)');
 UPDATE reporting_ad_hoc_identity_creation
-SET personIdentifier = CASE WHEN BINARY LEFT(TRIM(personIdentifier), 4) = 'usc_'
-                              OR BINARY LEFT(TRIM(personIdentifier), 3) = 'fh_'
-                              OR BINARY LEFT(TRIM(personIdentifier), 10) = 'fredhutch_'
-                              OR BINARY LEFT(TRIM(personIdentifier), 5) = 'ucsf_'
-                              OR BINARY LEFT(TRIM(personIdentifier), 2) = 'uc'
+SET personIdentifier = CASE WHEN BINARY TRIM(personIdentifier) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]*_)'
                             THEN TRIM(personIdentifier) ELSE LOWER(TRIM(personIdentifier)) END
 WHERE BINARY personIdentifier <> BINARY TRIM(personIdentifier)
    OR (BINARY personIdentifier <> BINARY LOWER(personIdentifier)
-       AND NOT (BINARY LEFT(TRIM(personIdentifier), 4) = 'usc_' OR BINARY LEFT(TRIM(personIdentifier), 3) = 'fh_'
-                OR BINARY LEFT(TRIM(personIdentifier), 10) = 'fredhutch_' OR BINARY LEFT(TRIM(personIdentifier), 5) = 'ucsf_'
-                OR BINARY LEFT(TRIM(personIdentifier), 2) = 'uc'));
+       AND NOT BINARY TRIM(personIdentifier) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]*_)');
 -- the cron reads every row: one (uid, frequency, type) registration is enough
 DELETE x FROM reporting_ad_hoc_feature_generator_execution x
   JOIN reporting_ad_hoc_feature_generator_execution x2
@@ -399,30 +430,39 @@ DELETE x FROM reporting_ad_hoc_feature_generator_execution x
 -- =============================================================================
 -- AFTER COUNTS (inside the transaction: what COMMIT would leave)
 -- =============================================================================
-SELECT 'after' AS phase, 'admin_users junk' AS tbl, COUNT(*) AS n, 'expect 0' AS expect FROM admin_users WHERE BINARY personIdentifier IN (SELECT BINARY pid FROM rm_junk_pid) AND status <> 0;
-SELECT 'after' AS phase, 'admin_users mapped' AS tbl, COUNT(*) AS n, 'expect 0' AS expect FROM admin_users u JOIN rm_map m ON BINARY u.personIdentifier = BINARY m.bad AND m.action = 'MAP';
-SELECT 'after' AS phase, 'admin_users duplicate canon' AS tbl, COUNT(*) AS n, 'expect 0' AS expect FROM (SELECT LOWER(TRIM(personIdentifier)) c FROM admin_users WHERE personIdentifier IS NOT NULL AND TRIM(personIdentifier) <> '' GROUP BY c HAVING COUNT(*) > 1) d;
-SELECT 'after' AS phase, 'admin_users_roles duplicates' AS tbl, COUNT(*) - COUNT(DISTINCT userID, roleID) AS n, 'expect 0' AS expect FROM admin_users_roles;
-SELECT 'after' AS phase, 'grant_provenance mapped/deleted' AS tbl, COUNT(*) AS n, 'expect 0' AS expect FROM grant_provenance g JOIN rm_map m ON BINARY g.personIdentifier = BINARY m.bad;
-SELECT 'after' AS phase, 'admin_feedback_log mapped' AS tbl, COUNT(*) AS n, 'expect 0' AS expect FROM admin_feedback_log f JOIN rm_map m ON BINARY f.personIdentifier = BINARY m.bad AND m.action = 'MAP';
-SELECT 'after' AS phase, 'authorship_review.top_cwid mapped' AS tbl, COUNT(*) AS n, 'expect 0' AS expect FROM authorship_review a JOIN rm_map m ON BINARY a.top_cwid = BINARY m.bad AND m.action = 'MAP';
-SELECT 'after' AS phase, 'authorship_review.resolution_cwid mapped' AS tbl, COUNT(*) AS n, 'expect 0' AS expect FROM authorship_review a JOIN rm_map m ON BINARY a.resolution_cwid = BINARY m.bad AND m.action = 'MAP';
-SELECT 'after' AS phase, 'authorship_review.candidate_cwids_json mapped' AS tbl, COUNT(DISTINCT a.id) AS n, 'expect 0' AS expect FROM authorship_review a JOIN rm_map m ON m.action = 'MAP' AND INSTR(CAST(a.candidate_cwids_json AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0;
-SELECT 'after' AS phase, 'reporting_ad_hoc_feature_generator_execution untrimmed' AS tbl, COUNT(*) AS n, 'expect 0' AS expect FROM reporting_ad_hoc_feature_generator_execution WHERE BINARY personIdentifier <> BINARY TRIM(personIdentifier);
-SELECT 'after' AS phase, 'reporting_ad_hoc_identity_creation untrimmed' AS tbl, COUNT(*) AS n, 'expect 0' AS expect FROM reporting_ad_hoc_identity_creation WHERE BINARY personIdentifier <> BINARY TRIM(personIdentifier);
-SELECT 'after' AS phase, 'admin_users personIdentifier not byte-equal to its canonical id' AS tbl, COUNT(*) AS n, 'expect 0' AS expect FROM admin_users u JOIN rm_acct a ON a.userID = u.userID WHERE BINARY u.personIdentifier <> BINARY a.canon;
-SELECT 'after' AS phase, 'admin_users untrimmed/upper-case (external cohorts excepted)' AS tbl, COUNT(*) AS n, 'expect 0' AS expect FROM admin_users
+INSERT INTO rm_check SELECT 'after', 'admin_users junk', COUNT(*) FROM admin_users WHERE BINARY personIdentifier IN (SELECT BINARY pid FROM rm_junk_pid) AND status <> 0;
+INSERT INTO rm_check SELECT 'after', 'admin_users mapped', COUNT(*) FROM admin_users u JOIN rm_map m ON BINARY u.personIdentifier = BINARY m.bad AND m.action = 'MAP';
+INSERT INTO rm_check SELECT 'after', 'admin_users duplicate canon', COUNT(*) FROM (SELECT CAST(CASE WHEN BINARY TRIM(personIdentifier) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]*_)' THEN TRIM(personIdentifier) ELSE LOWER(TRIM(personIdentifier)) END AS BINARY) c FROM admin_users WHERE personIdentifier IS NOT NULL AND TRIM(personIdentifier) <> '' AND BINARY personIdentifier NOT IN (SELECT BINARY pid FROM rm_junk_pid) GROUP BY c HAVING COUNT(*) > 1) d;
+INSERT INTO rm_check SELECT 'after', 'admin_users_roles duplicates', COUNT(*) - COUNT(DISTINCT userID, roleID) FROM admin_users_roles;
+INSERT INTO rm_check SELECT 'after', 'grant_provenance mapped/deleted', COUNT(*) FROM grant_provenance g JOIN rm_map m ON BINARY g.personIdentifier = BINARY m.bad;
+INSERT INTO rm_check SELECT 'after', 'admin_feedback_log mapped', COUNT(*) FROM admin_feedback_log f JOIN rm_map m ON BINARY f.personIdentifier = BINARY m.bad AND m.action = 'MAP';
+INSERT INTO rm_check SELECT 'after', 'authorship_review.top_cwid mapped', COUNT(*) FROM authorship_review a JOIN rm_map m ON BINARY a.top_cwid = BINARY m.bad AND m.action = 'MAP';
+INSERT INTO rm_check SELECT 'after', 'authorship_review.resolution_cwid mapped', COUNT(*) FROM authorship_review a JOIN rm_map m ON BINARY a.resolution_cwid = BINARY m.bad AND m.action = 'MAP';
+INSERT INTO rm_check SELECT 'after', 'authorship_review.candidate_cwids_json mapped', COUNT(DISTINCT a.id) FROM authorship_review a JOIN rm_map m ON m.action = 'MAP' AND INSTR(CAST(a.candidate_cwids_json AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0;
+INSERT INTO rm_check SELECT 'after', 'reporting_ad_hoc_feature_generator_execution untrimmed', COUNT(*) FROM reporting_ad_hoc_feature_generator_execution WHERE BINARY personIdentifier <> BINARY TRIM(personIdentifier);
+INSERT INTO rm_check SELECT 'after', 'reporting_ad_hoc_identity_creation untrimmed', COUNT(*) FROM reporting_ad_hoc_identity_creation WHERE BINARY personIdentifier <> BINARY TRIM(personIdentifier);
+INSERT INTO rm_check SELECT 'after', 'admin_users personIdentifier not byte-equal to its canonical id', COUNT(*) FROM admin_users u JOIN rm_acct a ON a.userID = u.userID WHERE BINARY u.personIdentifier <> BINARY a.canon;
+INSERT INTO rm_check SELECT 'after', 'admin_users untrimmed/upper-case (external cohorts excepted)', COUNT(*) FROM admin_users
  WHERE personIdentifier IS NOT NULL AND TRIM(personIdentifier) <> ''
    AND BINARY personIdentifier NOT IN (SELECT BINARY pid FROM rm_junk_pid)
    AND (BINARY personIdentifier <> BINARY TRIM(personIdentifier)
         OR (BINARY personIdentifier <> BINARY LOWER(personIdentifier)
-            AND NOT (BINARY LEFT(personIdentifier, 4) = 'usc_' OR BINARY LEFT(personIdentifier, 3) = 'fh_'
-                     OR BINARY LEFT(personIdentifier, 10) = 'fredhutch_' OR BINARY LEFT(personIdentifier, 5) = 'ucsf_'
-                     OR BINARY LEFT(personIdentifier, 2) = 'uc')));
-SELECT 'after' AS phase, 'admin_users.proxy_person_ids mapped/deleted' AS tbl, COUNT(DISTINCT u.userID) AS n, 'expect 0' AS expect FROM admin_users u JOIN rm_map m ON INSTR(CAST(u.proxy_person_ids AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0;
-SELECT 'after' AS phase, 'authorship_review.reviewer mapped' AS tbl, COUNT(*) AS n, 'expect 0' AS expect FROM authorship_review a JOIN rm_map m ON BINARY a.reviewer = BINARY m.bad AND m.action = 'MAP';
+            AND NOT BINARY TRIM(personIdentifier) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]*_)'));
+INSERT INTO rm_check SELECT 'after', 'admin_users.proxy_person_ids mapped/deleted', COUNT(DISTINCT u.userID) FROM admin_users u JOIN rm_map m ON INSTR(CAST(u.proxy_person_ids AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0;
+INSERT INTO rm_check SELECT 'after', 'authorship_review.reviewer mapped', COUNT(*) FROM authorship_review a JOIN rm_map m ON BINARY a.reviewer = BINARY m.bad AND m.action = 'MAP';
+SELECT 'after' AS phase, name AS tbl, n, 'expect 0' AS expect FROM rm_check WHERE phase = 'after';
 SELECT 'after' AS phase, 'admin_users accounts that changed (force these to re-login)' AS what,
        u.userID, u.personIdentifier FROM admin_users u JOIN rm_keep k ON u.userID = k.keeper ORDER BY u.personIdentifier;
+
+-- =============================================================================
+-- ENFORCE: every GUARD and after-check must be 0, or the run stops here
+-- ("CONSTRAINT `stop_here` failed"), the client exits, and the open transaction is
+-- rolled back: neither ROLLBACK nor COMMIT below is reached.
+-- =============================================================================
+SELECT 'STOP if listed' AS phase, 'checks not 0' AS what, phase AS check_phase, name, n
+FROM rm_check WHERE n > 0;
+INSERT INTO rm_abort (reason)
+SELECT CONCAT(phase, ' check failed: ', name, ' = ', n) FROM rm_check WHERE n > 0;
 
 -- =============================================================================
 -- FINISH. Default is ROLLBACK (dry run). To apply: comment out ROLLBACK and

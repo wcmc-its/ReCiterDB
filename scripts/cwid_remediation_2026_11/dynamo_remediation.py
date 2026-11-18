@@ -28,8 +28,15 @@ Driven by mapping.json next to this file. For every entry:
                   reported and left), and s3://reciter-dynamodb/AnalysisOutput/<bad>.
   DELETE     no real CWID: step 4 only. FeedbackLog / ExternalArticle rows are reported,
              never deleted.
-  UNDERSCORE legacy PM external login with no ED CWID: treated as DELETE when its
+  UNDERSCORE legacy PM external login with no ED CWID, on the explicit UNDERSCORE_DELETE
+             list only (_jfr9006, _pan9087, _xyz1234): treated as DELETE when its
              GoldStandard holds no assertions, otherwise NEEDS-DECISION and left alone.
+             An UNDERSCORE entry not on that list is treated as KEEP.
+  KEEP       underscore test/external identities that hold assertions (_pab4001 and 13
+             more, decided 11-18): never read, merged, deleted or re-classified.
+
+Snapshots are stored in DynamoDB's typed form ({"S": ...}, {"SS": [...]}, {"N": "1"};
+binary as base64), so --restore puts back string/number sets as sets, not lists.
 
 Before anything else every affected item, for the bad AND canonical forms, is written
 to snapshot_<UTC>.json (dry-run too: it is a local file). Table key schemas are read
@@ -47,6 +54,8 @@ Usage:
   python3 dynamo_remediation.py --restore snapshots/snapshot_<UTC>.json [--only X] --apply
 """
 import argparse
+import base64
+import copy
 import datetime as dt
 import json
 import os
@@ -65,6 +74,13 @@ COPY_MULTI = ["FeedbackLog", "ExternalArticle"]
 # canonical uid -> bad uid whose whole Identity is the right person (ED-confirmed);
 # the canonical kym9003 item is Annie Rohan's CTSC record (she is really ajr7002)
 IDENTITY_REPLACE = {"kym9003": "Kym9003"}
+# the only underscore ids that may be deleted (and only while they hold no assertions)
+UNDERSCORE_DELETE = {"_jfr9006", "_pan9087", "_xyz1234"}
+# the underscore ids that hold assertions: kept as is, unconditionally (decided 11-18)
+KEEP_EXPECTED = {"_joc9251", "_pab4001", "_pah4001", "_dar7342", "_djulius", "_huangfud",
+                 "_jpp2757", "_lal2055", "_lsw8099", "_olo2760", "_pac2224", "_tap2707",
+                 "_tem2089", "_uk28"}
+SNAPSHOT_FORMAT = "dynamodb-typed-v2"
 AUDIT_ACTOR = {"uid": "cwid-remediation-2026-11", "userVerbose": "CWID remediation 2026-11"}
 
 
@@ -124,8 +140,7 @@ def audit_entries(add_known, add_rejected, now):
 
 
 def renamed_identity(item, canon):
-    new = json.loads(json.dumps(item, default=_dec))  # deep copy
-    new = _redec(new)
+    new = copy.deepcopy(item)  # keeps sets as sets (a JSON round-trip would make them lists)
     new["uid"] = canon
     if isinstance(new.get("identity"), dict):
         new["identity"]["uid"] = canon
@@ -141,7 +156,7 @@ def replaced_identity(bad_item, canon_item, canon):
     empty = (None, "", [], {})
     kept = sorted(k for k, v in old.items() if v not in empty and new.get(k) in empty)
     for k in kept:
-        new[k] = _redec(json.loads(json.dumps(old[k], default=_dec)))
+        new[k] = copy.deepcopy(old[k])
     changed = sorted(k for k in set(old) | set(new)
                      if json.dumps(old.get(k), default=_dec, sort_keys=True)
                      != json.dumps(new.get(k), default=_dec, sort_keys=True))
@@ -166,10 +181,16 @@ def surname_ok(ed_last, *identity_items):
     return True
 
 
-def resolve_action(entry, gold_bad):
-    """UNDERSCORE -> DELETE when its GoldStandard holds no assertions, else NEEDS-DECISION."""
+def resolve_action(entry, gold_bad=None):
+    """KEEP stays KEEP. UNDERSCORE -> DELETE only for an id on UNDERSCORE_DELETE whose
+    GoldStandard holds no assertions; on the list with assertions -> NEEDS-DECISION; not
+    on the list -> KEEP (fail safe: an underscore id is never deleted by classification)."""
+    if entry["action"] == "KEEP":
+        return "KEEP"
     if entry["action"] != "UNDERSCORE":
         return entry["action"]
+    if entry["bad"] not in UNDERSCORE_DELETE:
+        return "KEEP"
     has = pmids(gold_bad, "knownpmids") or pmids(gold_bad, "rejectedpmids")
     return "NEEDS-DECISION" if has else "DELETE"
 
@@ -194,6 +215,71 @@ def _redec(o):
     if isinstance(o, list):
         return [_redec(v) for v in o]
     return o
+
+
+# ------------------------------------------------------------- typed snapshot form
+def _av_to_json(av):
+    """Low-level AttributeValue (TypeSerializer output) -> JSON-safe (B/BS as base64)."""
+    (t, v), = av.items()
+    if t == "B":
+        return {"B": base64.b64encode(bytes(v.value if hasattr(v, "value") else v)).decode()}
+    if t == "BS":
+        return {"BS": [base64.b64encode(bytes(x.value if hasattr(x, "value") else x)).decode() for x in v]}
+    if t == "M":
+        return {"M": {k: _av_to_json(x) for k, x in v.items()}}
+    if t == "L":
+        return {"L": [_av_to_json(x) for x in v]}
+    return {t: v}
+
+
+def _av_from_json(av):
+    """Inverse of _av_to_json: the low-level AttributeValue client.put_item takes."""
+    (t, v), = av.items()
+    if t == "B":
+        return {"B": base64.b64decode(v)}
+    if t == "BS":
+        return {"BS": [base64.b64decode(x) for x in v]}
+    if t == "M":
+        return {"M": {k: _av_from_json(x) for k, x in v.items()}}
+    if t == "L":
+        return {"L": [_av_from_json(x) for x in v]}
+    return {t: v}
+
+
+def item_to_typed(item):
+    """resource-style item (Decimal, set, Binary) -> {attr: JSON-safe AttributeValue}."""
+    if item is None:
+        return None
+    from boto3.dynamodb.types import TypeSerializer
+    ser = TypeSerializer()
+    return {k: _av_to_json(ser.serialize(v)) for k, v in item.items()}
+
+
+def typed_to_client(item):
+    """Snapshot item -> low-level item for client.put_item / delete_item Key."""
+    return {k: _av_from_json(v) for k, v in item.items()}
+
+
+def typed_to_python(item):
+    from boto3.dynamodb.types import TypeDeserializer
+    de = TypeDeserializer()
+    return {k: de.deserialize(v) for k, v in typed_to_client(item).items()}
+
+
+def snapshot_to_typed(snap):
+    """{uid: {table: item | [items] | None, s3_AnalysisOutput: ...}} -> typed copy."""
+    out = {}
+    for uid, tabs in snap.items():
+        o = {}
+        for t, v in tabs.items():
+            if t in SINGLE_ITEM_TABLES:
+                o[t] = item_to_typed(v)
+            elif t in MULTI_ITEM_TABLES:
+                o[t] = [item_to_typed(r) for r in v]
+            else:
+                o[t] = v
+        out[uid] = o
+    return out
 
 
 def selftest():
@@ -259,11 +345,40 @@ def selftest():
     assert kept == ["primaryEmail"] and new["primaryEmail"] == "Kym9003@nyp.org", kept
     assert changed == ["institutions", "knownRelationships", "primaryName"], changed
     assert merandy["identity"]["uid"] == "Kym9003" and rohan["identity"]["primaryName"]["lastName"] == "Rohan"
-    # underscore resolution
-    assert resolve_action({"action": "UNDERSCORE"}, None) == "DELETE"
-    assert resolve_action({"action": "UNDERSCORE"}, {"knownpmids": []}) == "DELETE"
-    assert resolve_action({"action": "UNDERSCORE"}, {"rejectedpmids": [D(1)]}) == "NEEDS-DECISION"
-    assert resolve_action({"action": "MAP"}, {"knownpmids": [D(1)]}) == "MAP"
+    # underscore resolution: only the explicit list is ever deleted
+    u = {"action": "UNDERSCORE", "bad": "_xyz1234"}
+    assert resolve_action(u, None) == "DELETE"
+    assert resolve_action(u, {"knownpmids": []}) == "DELETE"
+    assert resolve_action(u, {"rejectedpmids": [D(1)]}) == "NEEDS-DECISION"
+    assert resolve_action({"action": "UNDERSCORE", "bad": "_pab4001"}, None) == "KEEP"
+    assert resolve_action({"action": "KEEP", "bad": "_pab4001"}, None) == "KEEP"
+    assert resolve_action({"action": "KEEP", "bad": "_tem2089"}, {"knownpmids": []}) == "KEEP"
+    assert resolve_action({"action": "MAP", "bad": "X"}, {"knownpmids": [D(1)]}) == "MAP"
+    # a KEEP entry plans to nothing and needs no snapshot of its uid
+    kp = plan_entry({"bad": "_pab4001", "canon": None, "action": "KEEP"}, {})
+    assert kp["action"] == "KEEP" and kp["steps"] == [] and kp["abort"] is None, kp
+    # typed snapshot round-trip: string/number sets stay sets (ArticleProvenance.ads,
+    # Analysis relationshipType are SS), numbers stay numbers, binary survives
+    item = {"uid": "x", "ads": {"a", "b"}, "ns": {D(1), D(2)}, "n": D("3.5"), "flag": True,
+            "nul": None, "bin": b"\x00\xff", "m": {"relationshipType": {"MENTOR"},
+                                                 "l": [D(1), "s", {"z"}]}}
+    snap_json = json.loads(json.dumps(snapshot_to_typed({"x": {"ArticleProvenance": [item],
+                                                              "Analysis": item,
+                                                              "s3_AnalysisOutput": None}})))
+    row = snap_json["x"]["ArticleProvenance"][0]
+    assert sorted(row["ads"]["SS"]) == ["a", "b"], row["ads"]
+    assert snap_json["x"]["Analysis"]["m"]["M"]["relationshipType"] == {"SS": ["MENTOR"]}
+    low = typed_to_client(row)
+    assert set(low["ads"]["SS"]) == {"a", "b"} and set(low["ns"]["NS"]) == {"1", "2"}
+    assert low["bin"] == {"B": b"\x00\xff"}, low["bin"]
+    back = typed_to_python(row)
+    assert back["ads"] == {"a", "b"} and isinstance(back["ads"], set), back
+    assert back["ns"] == {D(1), D(2)} and back["n"] == D("3.5") and back["flag"] is True
+    assert back["nul"] is None and bytes(back["bin"].value) == b"\x00\xff"
+    assert back["m"]["relationshipType"] == {"MENTOR"} and back["m"]["l"][2] == {"z"}
+    # renaming an Identity keeps its sets as sets
+    r = renamed_identity({"uid": "A", "identity": {"uid": "A", "tags": {"t"}}}, "a")
+    assert r["identity"]["tags"] == {"t"}, r
     # ED surname guard (the 11-18 underscore near-miss: _pah4001 is Paul A. Harris,
     # ED pah4001 is Parviz Hejazi Pastor)
     harris = {"identity": {"primaryName": {"lastName": "Harris"}}}
@@ -278,6 +393,13 @@ def selftest():
     entries = load_mapping()
     bads = [e["bad"] for e in entries]
     assert len(bads) == len(set(bads)), "duplicate bad uid in mapping.json"
+    keep = {e["bad"] for e in entries if e["action"] == "KEEP"}
+    assert keep == KEEP_EXPECTED, sorted(keep ^ KEEP_EXPECTED)
+    under = {e["bad"] for e in entries if e["action"] == "UNDERSCORE"}
+    assert under == UNDERSCORE_DELETE, sorted(under ^ UNDERSCORE_DELETE)
+    for e in entries:
+        if e["bad"].startswith("_"):
+            assert e["action"] in ("KEEP", "UNDERSCORE"), e
     for e in entries:
         if e["action"] == "MAP":
             c = e["canon"]
@@ -288,7 +410,7 @@ def selftest():
             assert e["canon"] is None, e
     # mysql_remediation.sql's rm_map rows must match mapping.json exactly
     sql_rows = sql_map_rows(os.path.join(HERE, "mysql_remediation.sql"))
-    want = {(e["bad"], e["canon"], e["action"]) for e in entries if e["action"] != "UNDERSCORE"}
+    want = {(e["bad"], e["canon"], e["action"]) for e in entries if e["action"] in ("MAP", "DELETE")}
     assert sql_rows == want, (sorted(sql_rows ^ want, key=str))
     print("selftest OK")
 
@@ -386,6 +508,8 @@ def ident_name(item):
 def plan_entry(e, snap):
     """Build the per-uid plan from the snapshot. Pure: no AWS calls."""
     bad, canon = e["bad"], e["canon"]
+    if resolve_action(e) == "KEEP":
+        return {"bad": bad, "canon": canon, "action": "KEEP", "steps": [], "warnings": [], "abort": None}
     b = snap[bad]
     c = snap.get(canon) if canon else None
     action = resolve_action(e, b["GoldStandard"])
@@ -538,36 +662,41 @@ def restore(ddb, snapshot_path, only, apply):
     and the S3 AnalysisOutput object is re-uploaded from the local copy.
     WARNING: canonical GoldStandard returns to its snapshot state, so curation done on it
     after the remediation is lost. Use --only to restore single uids."""
-    data = json.load(open(snapshot_path))["uids"]
+    doc = json.load(open(snapshot_path))
+    if doc.get("format") != SNAPSHOT_FORMAT:
+        sys.exit(f"{snapshot_path}: not a {SNAPSHOT_FORMAT} snapshot. Older snapshots stored sets "
+                 f"as lists and would restore SS/NS attributes as L; refusing.")
+    data = doc["uids"]
+    cl = ddb.client
     entries = [e for e in load_mapping() if (not only or e["bad"] in only)]
     for e in entries:
         bad, canon = e["bad"], e["canon"]
-        if bad not in data:
+        if bad not in data or resolve_action(e) == "KEEP":
             continue
         b = data[bad]
         print(f"restore {bad!r}" + (f" (and {canon})" if canon else ""))
         if not apply:
             continue
+        # low-level client with the typed snapshot: SS/NS/BS come back as sets
         for t in SINGLE_ITEM_TABLES:
             if b[t]:
-                ddb.res.Table(t).put_item(Item=_redec(b[t]))
+                cl.put_item(TableName=t, Item=typed_to_client(b[t]))
         for t in MULTI_ITEM_TABLES:
-            with ddb.res.Table(t).batch_writer() as w:
-                for row in b[t]:
-                    w.put_item(Item=_redec(row))
+            for row in b[t]:
+                cl.put_item(TableName=t, Item=typed_to_client(row))
         if canon and canon in data:
             c = data[canon]
             for t in ("GoldStandard", "Identity"):
                 if c[t]:
-                    ddb.res.Table(t).put_item(Item=_redec(c[t]))
+                    cl.put_item(TableName=t, Item=typed_to_client(c[t]))
                 else:
-                    ddb.res.Table(t).delete_item(Key={ddb.keys[t][0]: canon})
+                    cl.delete_item(TableName=t, Key={ddb.keys[t][0]: {"S": canon}})
             for t in COPY_MULTI:
                 h, r = ddb.keys[t]
-                had = {row[r] for row in c[t]}
+                had = {json.dumps(row[r], sort_keys=True) for row in c[t]}
                 for row in b[t]:
-                    if row[r] not in had:
-                        ddb.res.Table(t).delete_item(Key={h: canon, r: _redec(row[r])})
+                    if json.dumps(row[r], sort_keys=True) not in had:
+                        cl.delete_item(TableName=t, Key={h: {"S": canon}, r: _av_from_json(row[r])})
         o = b.get("s3_AnalysisOutput")
         if o and o.get("local_copy"):
             ddb.s3.upload_file(o["local_copy"], S3_BUCKET, o["key"])
@@ -602,15 +731,17 @@ def main():
     print("key schemas (DescribeTable):",
           ", ".join(f"{t}={h}{'+' + r if r else ''}" for t, (h, r) in ddb.keys.items()))
 
-    uids = list(dict.fromkeys([e["bad"] for e in entries] + [e["canon"] for e in entries if e["canon"]]))
+    active = [e for e in entries if resolve_action(e) != "KEEP"]  # KEEP ids are never read
+    uids = list(dict.fromkeys([e["bad"] for e in active] + [e["canon"] for e in active if e["canon"]]))
     now = dt.datetime.now(dt.timezone.utc)
     os.makedirs(args.snapshot_dir, exist_ok=True)
     s3_dir = os.path.join(args.snapshot_dir, f"s3_{now:%Y%m%dT%H%M%SZ}")
     snap = {u: ddb.snapshot_uid(u, s3_dir) for u in uids}
     path = os.path.join(args.snapshot_dir, f"snapshot_{now:%Y%m%dT%H%M%SZ}.json")
     with open(path, "w") as f:
-        json.dump({"taken_utc": now.isoformat(), "mode": "apply" if args.apply else "dry-run",
-                   "region": args.region, "uids": snap}, f, default=_dec, indent=1)
+        json.dump({"format": SNAPSHOT_FORMAT, "taken_utc": now.isoformat(),
+                   "mode": "apply" if args.apply else "dry-run",
+                   "region": args.region, "uids": snapshot_to_typed(snap)}, f, indent=1)
     print(f"snapshot: {path} ({len(uids)} uids, "
           f"{sum(len(v) for s in snap.values() for k, v in s.items() if isinstance(v, list))} multi-table rows)")
 
@@ -619,6 +750,8 @@ def main():
     for p in plans:
         tag = "ABORT" if p["abort"] else p["action"]
         totals[tag] = totals.get(tag, 0) + 1
+        if p["action"] == "KEEP":
+            continue
         print(f"\n[{tag}] {p['bad']!r} -> {p['canon'] or '-'}")
         if p["abort"]:
             print(f"   ABORT: {p['abort']}")
@@ -629,6 +762,9 @@ def main():
     print("\nsummary:", ", ".join(f"{k}={v}" for k, v in sorted(totals.items())))
     canon = sorted({p["canon"] for p in plans if p["action"] == "MAP" and not p["abort"]})
     print(f"canonical uids to re-run ({len(canon)}): {' '.join(canon)}")
+    kept = [p["bad"] for p in plans if p["action"] == "KEEP"]
+    if kept:
+        print(f"KEEP, not touched ({len(kept)}): {' '.join(kept)}")
     nd = [p["bad"] for p in plans if p["action"] == "NEEDS-DECISION"]
     if nd:
         print(f"NEEDS-DECISION ({len(nd)}): {' '.join(nd)}")
@@ -642,7 +778,7 @@ def main():
     stamp = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
     failed, aborted, rerun = [], [], set()
     for e, p in zip(entries, plans):
-        if p["abort"] or p["action"] == "NEEDS-DECISION" or not p["steps"]:
+        if p["abort"] or p["action"] in ("KEEP", "NEEDS-DECISION") or not p["steps"]:
             continue
         try:
             live = snap
