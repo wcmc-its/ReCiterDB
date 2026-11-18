@@ -340,6 +340,8 @@ def _compact(cands):
     # rides through to the card untouched. `venue_fit` (v3.14) by the same rule: present
     # only on a candidate the fit table scored, and 0.0 is a score. `orcid_match` (v3.15)
     # likewise: present, true or false, only on a row whose byline ORCID found somebody.
+    # `orcid_source` (AAR_BYLINE_ORCID_WCM) only on the matched person, and only when the
+    # matcher gave one: which list the iD came from. PM reads it off the first candidate.
     def extra(c):
         out = {"campus": c["campus"]} if c.get("campus") else {}
         if c.get("venue_fit") is not None:
@@ -348,6 +350,8 @@ def _compact(cands):
             out["orcid_match"] = bool(c["orcid_match"])
         if c.get("orcid_added"):
             out["orcid_added"] = True       # only the ORCID put them here: top_orcid_match 2
+        if c.get("orcid_source"):
+            out["orcid_source"] = c["orcid_source"]
         return out
     return [dict({k: c.get(k) for k in keep}, **extra(c)) for c in cands]
 
@@ -830,7 +834,11 @@ def wcm_lane_candidates(idx, au, pub_year, ithaca_family=None, venue_subfield=No
     only when there is one, so with the venue term off the call is the one it always
     was. A `CampusRoster` uses it only for an author the WCM roster offers nobody for
     (see `CampusRoster.candidates`): a list with a WCM candidate on it carries no term.
-    `byline_orcid` (the row's byline_orcid) travels the same way, by the same rule."""
+    `byline_orcid` (the row's byline_orcid) is forwarded the same way. What the roster
+    does with it is the roster's rule: with AAR_BYLINE_ORCID alone, the venue term's;
+    with AAR_BYLINE_ORCID_WCM as well, WCM and two-campus lists are matched too. Either
+    way this lane takes the first candidate as top_cwid and nothing re-sorts the list
+    after the matcher, so the person the ORCID is on file for is the row's pick."""
     kw = {}
     if isinstance(idx, CampusRoster):
         if ithaca_family is None:
@@ -1339,6 +1347,50 @@ def _selftest():
           "carries orcid_match",
           _mixed_o == wcm_lane_candidates(_roster_o, _au_o, None, _ith_fam)
           and not any("orcid_match" in c for c in _mixed_o[0]))
+    # AAR_BYLINE_ORCID_WCM: the rosters hold labelled maps (identity_index.orcid_sources),
+    # and a WCM-lane author is matched on a WCM-only list and on a two-campus one. The
+    # row's pick is cands[0], as run() takes it.
+    from identity_index import orcid_sources as _osrc
+    _O_W, _O_ADD = "0000-0001-0000-0007", "0000-0001-0000-0008"
+    _maps, _ = _osrc([("jo_w", _O_W, "wcm")], [("jo_c", "0000-0001-0000-0002")],
+                     [("JB_W", _O_ADD)])
+    _wcm_l = IdentityIndex([_p("John", "Doe", "jd_w"), _p("Jordan", "Doe", "jo_w"),
+                            _p("Jordan", "Buck", "jb_w")], orcid_cwid=_maps[CAMPUS_WCM])
+    _roster_l = CampusRoster(_wcm_l, ithaca=IdentityIndex(_cu, campus=CAMPUS_ITHACA,
+                                                          orcid_cwid=_maps[CAMPUS_ITHACA]))
+    _au_w = dict(_au_o, affiliations=["Weill Cornell Medicine, New York, NY"])
+
+    def _row_l(au, orcid):
+        cands, _n = wcm_lane_candidates(_roster_l, au, None, _ith_fam, None, orcid)
+        return _build_row(entry, 0, 2, dict(au, byline_orcid=orcid), cands[0], cands,
+                          "2026-11-18 00:00:00")
+    _w1, _w2, _mx = _row_l(_au_w, _O_W), _row_l(_au_w, _O_ADD), _row_l(_au_o, "0000-0001-0000-0002")
+    _w1c, _w2c, _mxc = (json.loads(r["candidate_cwids_json"]) for r in (_w1, _w2, _mx))
+    check("WCM switch on, WCM-only author: the Scholars person is top_cwid over the "
+          "full-name match, top_orcid_match=1, and the first stored candidate carries "
+          "orcid_source 'scholars' as its last key",
+          _w1["top_cwid"] == "jo_w" and _w1["top_orcid_match"] == 1
+          and [(c["cwid"], c["orcid_match"]) for c in _w1c] == [("jo_w", True), ("jd_w", False)]
+          and list(_w1c[0])[-1] == "orcid_source" and _w1c[0]["orcid_source"] == "scholars"
+          and "orcid_source" not in _w1c[1] and "campus" not in _w1c[0])
+    check("...a WCM person only the ORCID reaches is top_cwid with top_orcid_match=2 and "
+          "orcid_source 'inferred'",
+          _w2["top_cwid"] == "jb_w" and _w2["top_orcid_match"] == 2
+          and _w2c[0]["orcid_source"] == "inferred" and _w2c[0]["orcid_added"] is True
+          and _w2["n_candidates"] == 3 and _w2["single_candidate"] == 0)
+    check("...two-campus author: the Cornell person the ORCID is on file for is top_cwid "
+          "of the merged list, top_orcid_match=1, source 'affiliation_manager', and the "
+          "WCM namesakes stay on the row with orcid_match false",
+          _mx["top_cwid"] == "jo_c" and _mx["top_orcid_match"] == 1
+          and _mxc[0]["orcid_source"] == "affiliation_manager"
+          and {c["cwid"] for c in _mxc} == {"jo_c", "jd_c", "jd_w", "jo_w"}
+          and [c["orcid_match"] for c in _mxc] == [True, False, False, False])
+    check("...and the same authors with no ORCID are the rows they always were",
+          json.dumps(wcm_lane_candidates(_roster_l, _au_w, None, _ith_fam))
+          == json.dumps(wcm_lane_candidates(
+              CampusRoster(IdentityIndex([_p("John", "Doe", "jd_w"), _p("Jordan", "Doe", "jo_w"),
+                                          _p("Jordan", "Buck", "jb_w")])), _au_w, None, _ith_fam))
+          and "orcid" not in json.dumps(wcm_lane_candidates(_roster_l, _au_o, None, _ith_fam)))
     check("the row's byline name for the lookup is the stored wcm_author",
           _byline_name(_au2) == _on_row["wcm_author"] == "Jane Smith"
           and _byline_name({"initials": "J.", "last": "Smith"}) == "Smith")

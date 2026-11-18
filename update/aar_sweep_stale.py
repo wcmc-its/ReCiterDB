@@ -239,14 +239,28 @@ def _classify_scopus(rows, idx, limit=None):
     # stored candidates carry `orcid_match` may name somebody only the byline ORCID
     # reaches. On a roster with no ORCID map (AAR_BYLINE_ORCID not on in this shell, or
     # the map failed to load) it would replay to nobody in both passes and be nulled.
-    ranked = sum(1 for r in rows if '"orcid_match"' in str(r.get("candidate_cwids_json") or ""))
-    if ranked and not getattr(getattr(idx, "ithaca", idx), "orcid_rec", None):
+    # idxmod.orcid_rows_without_map asks, per row, the roster its matched candidate is
+    # on: a WCM index holding a map does not answer for an Ithaca index that holds none.
+    stored = [str(r.get("candidate_cwids_json") or "") for r in rows]
+    ranked, sourced = idxmod.orcid_rows_without_map(idx, stored)
+    if ranked:
         raise RuntimeError(
             f"{ranked} open scopus rows were ranked by a byline ORCID and this roster "
-            f"holds no ORCID map (AAR_BYLINE_ORCID is not on here, or the map could not "
-            f"be loaded -- see any warning above). Refusing to sweep the scopus lane "
-            f"without it: rows only the ORCID reaches would be classed stale and nulled. "
+            f"holds no ORCID map for them (AAR_BYLINE_ORCID is not on here, or the map "
+            f"could not be loaded -- see any warning above). Refusing to sweep the scopus "
+            f"lane without it: rows only the ORCID reaches would be classed stale and nulled. "
             f"Set AAR_BYLINE_ORCID=on to sweep as the CronJob matches.")
+    # The second switch, by the same rule: a row whose candidates carry `orcid_source`
+    # was ranked with AAR_BYLINE_ORCID_WCM on, and may name a WCM person (or a Cornell
+    # one on a two-campus list) whom only a labelled map reaches.
+    if sourced:
+        raise RuntimeError(
+            f"{sourced} open scopus rows were ranked with AAR_BYLINE_ORCID_WCM on (their "
+            f"candidates carry orcid_source) and this roster holds no Scholars or "
+            f"fallback ORCID list (the switch is not on here, or the lists could not be "
+            f"loaded -- see any warning above). Refusing to sweep the scopus lane without "
+            f"them: WCM rows only the ORCID reaches would be classed stale and nulled. Set "
+            f"AAR_BYLINE_ORCID=on and AAR_BYLINE_ORCID_WCM=on to sweep as the CronJob matches.")
 
     candidate_stale, matched = [], []
     for r in rows:
@@ -539,8 +553,59 @@ def _selftest():
             refused = str(e)
         with contextlib.redirect_stdout(io.StringIO()):
             ranked_kept = _classify_scopus([ranked_row], o_idx)
+        # AAR_BYLINE_ORCID_WCM: a WCM row only a Scholars-confirmed iD reaches. Byline
+        # "Chidi Okafor" again, WCM affiliation; the ORCID is on file for Bea Other.
+        maps, _ = idxmod.orcid_sources([("bo_w", "0000-0001-0000-0002", "wcm")])
+        w_people = [rec("Bea", "", "Other", "bo_w")]
+        l_roster = idxmod.CampusRoster(IdentityIndex(w_people,
+                                                     orcid_cwid=maps[idxmod.CAMPUS_WCM]))
+        w_row = dict(o_row, id=10, author_affiliation="Weill Cornell Medicine, New York, NY",
+                     candidate_cwids_json='[{"cwid": "bo_w", "orcid_match": true, '
+                                          '"orcid_added": true, "orcid_source": "scholars"}]')
+        try:
+            _classify_scopus([w_row], idxmod.CampusRoster(IdentityIndex(w_people), ithaca=o_idx))
+            w_refused = ""
+        except RuntimeError as e:
+            w_refused = str(e)
+        with contextlib.redirect_stdout(io.StringIO()):
+            w_kept = _classify_scopus([w_row], l_roster)
+            v315_kept = _classify_scopus(
+                [dict(ranked_row, author_affiliation="Cornell University, Ithaca, NY")],
+                idxmod.CampusRoster(IdentityIndex(w_people), ithaca=o_idx))
+        # Each row is asked of ITS roster: the WCM index holds its labelled map, the
+        # Ithaca index (loaded separately) holds none.
+        half = idxmod.CampusRoster(l_roster.wcm, ithaca=IdentityIndex(
+            [dict(rec("Rhea", "", "Lindqvist", "rl_c"), campus=idxmod.CAMPUS_ITHACA)],
+            campus=idxmod.CAMPUS_ITHACA))
+        i_row = dict(ranked_row, author_affiliation="Cornell University, Ithaca, NY",
+                     candidate_cwids_json='[{"cwid": "rl_c", "campus": "ithaca", '
+                                          '"orcid_match": true, "orcid_added": true}]')
+        half_refused = []
+        for r in (i_row, dict(i_row, candidate_cwids_json=i_row["candidate_cwids_json"].replace(
+                "}]", ', "orcid_source": "affiliation_manager"}]'))):
+            try:
+                _classify_scopus([r], half)
+                half_refused.append("")
+            except RuntimeError as e:
+                half_refused.append(str(e))
+        with contextlib.redirect_stdout(io.StringIO()):
+            half_wcm = _classify_scopus([w_row], half)
     finally:
         scop.load_family_afids = real_family
+    check("a WCM index that holds a map does not pass Ithaca rows when the Ithaca index "
+          "holds none: the v3.15 row and the labelled Ithaca row are refused, not nulled; "
+          "the WCM row is still swept",
+          "1 open scopus rows were ranked by a byline ORCID" in half_refused[0]
+          and "1 open scopus rows were ranked with AAR_BYLINE_ORCID_WCM on" in half_refused[1]
+          and [r["id"] for r in half_wcm[1]] == [10])
+    check("rows ranked through AAR_BYLINE_ORCID_WCM are not swept on a roster holding only "
+          "the v3.15 Ithaca map: the sweep refuses and names the switch",
+          "1 open scopus rows were ranked with AAR_BYLINE_ORCID_WCM on" in w_refused
+          and "AAR_BYLINE_ORCID_WCM=on" in w_refused)
+    check("...on a roster with the labelled maps the WCM row only its ORCID reaches still "
+          "matches and is not nulled; a v3.15 row needs no labelled map",
+          [r["id"] for r in w_kept[1]] == [10] and w_kept[0] == [] and w_kept[2] == []
+          and [r["id"] for r in v315_kept[1]] == [9] and v315_kept[0] == [])
     check("rows ranked by a byline ORCID are not swept on a roster with no ORCID map: the "
           "sweep refuses rather than null them; with the map it runs",
           "1 open scopus rows were ranked by a byline ORCID" in refused
