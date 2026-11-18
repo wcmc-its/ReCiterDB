@@ -1812,6 +1812,8 @@ def _grad_school_row(raw):
         else:
             v = v.strip() if isinstance(v, str) else v
             v = v if v not in ("", None) else None
+            if col == "cwid" and v is not None:
+                v = v.lower()  # Jenzabar holds e.g. 'Mbd4001'; CWIDs are lowercase
         out.append(v)
     return tuple(out)
 

@@ -5,8 +5,11 @@
 #   through `kubectl port-forward svc/reciter-prod`. Prod only: dev and prod share DynamoDB.
 #
 # Usage:
-#   ./rerun_canonical.sh                 # every MAP canonical uid in mapping.json
-#   ./rerun_canonical.sh djl2008 shp2010 # just these
+#   ./rerun_canonical.sh --from snapshots/rerun_uids_<UTC>.txt  # the uids the --apply run merged
+#   ./rerun_canonical.sh djl2008 shp2010                       # just these
+#
+# There is no default list: only canonical uids whose merge actually applied should be
+# rescored, and dynamo_remediation.py --apply writes exactly those to rerun_uids_<UTC>.txt.
 #
 # Writes rerun_<UTC>.tsv (uid, HTTP status, seconds). Re-running is safe.
 set -euo pipefail
@@ -18,17 +21,17 @@ OUT="$HERE/rerun_$(date -u +%Y%m%dT%H%M%SZ).tsv"
 
 unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
 
-if [ "$#" -gt 0 ]; then
+usage() { echo "usage: $0 --from <rerun_uids_UTC.txt> | <uid>..." >&2; exit 2; }
+UIDS=()
+if [ "${1:-}" = "--from" ]; then
+  [ "$#" -eq 2 ] && [ -f "$2" ] || usage
+  while IFS= read -r u; do [ -n "$u" ] && UIDS+=("$u"); done < "$2"
+elif [ "$#" -gt 0 ]; then
   UIDS=("$@")
 else
-  # the canonical side of every MAP entry, deduped (DLAMB and dlamb both map to djl2008)
-  mapfile_out="$(python3 -c '
-import json, sys
-d = json.load(open(sys.argv[1]))
-print("\n".join(sorted({e["canon"] for e in d["entries"] if e["action"] == "MAP"})))' "$HERE/mapping.json")"
-  UIDS=()
-  while IFS= read -r u; do [ -n "$u" ] && UIDS+=("$u"); done <<< "$mapfile_out"
+  usage
 fi
+[ "${#UIDS[@]}" -gt 0 ] || { echo "no uids to re-run" >&2; exit 1; }
 echo "${#UIDS[@]} uid(s): ${UIDS[*]}"
 
 # api key straight into a variable; never printed
@@ -53,7 +56,8 @@ for uid in "${UIDS[@]}"; do
     --data-urlencode "analysisRefreshFlag=true" \
     --data-urlencode "retrievalRefreshFlag=ALL_PUBLICATIONS" \
     --data-urlencode "useGoldStandard=AS_EVIDENCE" \
-    "http://localhost:$PORT/reciter/feature-generator/by/uid" || echo "000")
+    "http://localhost:$PORT/reciter/feature-generator/by/uid" || true)
+  code="${code:-000}"
   secs=$(( $(date +%s) - start ))
   printf '%s\t%s\t%s\n' "$uid" "$code" "$secs" | tee -a "$OUT"
 done

@@ -13,14 +13,19 @@ Driven by mapping.json next to this file. For every entry:
                   (GoldStandard has no version attribute, so the snapshot IS the version:
                   knownpmids, rejectedpmids and size(auditLog) must be unchanged).
                2. Identity: copy the bad item to the canonical key with uid replaced, but
-                  only when the canonical item is missing. NAME_FIX entries correct the
-                  canonical item's primaryName from the bad item (kym9003 <- Kym9003).
+                  only when the canonical item is missing. IDENTITY_REPLACE entries
+                  (kym9003 <- Kym9003) replace the canonical item's whole `identity` map
+                  with the bad item's, because the canonical one is another person's
+                  (Annie Rohan's name, relationships and institutions). Fields only the
+                  canonical map has are kept and listed in the dry run for a hand check;
+                  every field that changes is listed too.
                3. FeedbackLog and ExternalArticle rows: copied to the canonical uid (same
                   sort key, never overwriting). The bad-key FeedbackLog rows are kept as
                   audit history.
                4. Delete the bad Identity, GoldStandard, Analysis and ESearchResult items
-                  (exact-key DeleteItem), every ArticleProvenance / PmidProvenance row
-                  under the bad uid, and s3://reciter-dynamodb/AnalysisOutput/<bad>.
+                  (exact-key DeleteItem), the ArticleProvenance / PmidProvenance rows
+                  under the bad uid that are in the snapshot (rows written after it are
+                  reported and left), and s3://reciter-dynamodb/AnalysisOutput/<bad>.
   DELETE     no real CWID: step 4 only. FeedbackLog / ExternalArticle rows are reported,
              never deleted.
   UNDERSCORE legacy PM external login with no ED CWID: treated as DELETE when its
@@ -28,7 +33,10 @@ Driven by mapping.json next to this file. For every entry:
 
 Before anything else every affected item, for the bad AND canonical forms, is written
 to snapshot_<UTC>.json (dry-run too: it is a local file). Table key schemas are read
-with DescribeTable, never assumed.
+with DescribeTable, never assumed. With --apply, each pair re-reads its canonical items
+and is re-planned just before it is applied, so two bad uids that share a canonical
+(DLAMB, dlamb -> djl2008) do not write against a stale copy. The canonical uids of the
+pairs that applied are written to rerun_uids_<UTC>.txt for rerun_canonical.sh.
 
 Usage:
   unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
@@ -54,8 +62,9 @@ MULTI_ITEM_TABLES = ["FeedbackLog", "ArticleProvenance", "PmidProvenance", "Exte
 DELETE_SINGLE = ["Identity", "GoldStandard", "Analysis", "ESearchResult"]
 DELETE_MULTI = ["ArticleProvenance", "PmidProvenance"]
 COPY_MULTI = ["FeedbackLog", "ExternalArticle"]
-# canonical uid -> bad uid whose Identity.primaryName is the right one (ED-confirmed)
-NAME_FIX = {"kym9003": "Kym9003"}
+# canonical uid -> bad uid whose whole Identity is the right person (ED-confirmed);
+# the canonical kym9003 item is Annie Rohan's CTSC record (she is really ajr7002)
+IDENTITY_REPLACE = {"kym9003": "Kym9003"}
 AUDIT_ACTOR = {"uid": "cwid-remediation-2026-11", "userVerbose": "CWID remediation 2026-11"}
 
 
@@ -121,6 +130,22 @@ def renamed_identity(item, canon):
     if isinstance(new.get("identity"), dict):
         new["identity"]["uid"] = canon
     return new
+
+
+def replaced_identity(bad_item, canon_item, canon):
+    """IDENTITY_REPLACE: the canonical item's `identity` map becomes the bad item's
+    (uid renamed). A field only the canonical map has (non-empty there, missing or empty
+    in the bad map) is kept. Returns (new_identity_map, changed_fields, kept_fields)."""
+    new = renamed_identity(bad_item, canon)["identity"]
+    old = (canon_item or {}).get("identity") or {}
+    empty = (None, "", [], {})
+    kept = sorted(k for k, v in old.items() if v not in empty and new.get(k) in empty)
+    for k in kept:
+        new[k] = _redec(json.loads(json.dumps(old[k], default=_dec)))
+    changed = sorted(k for k in set(old) | set(new)
+                     if json.dumps(old.get(k), default=_dec, sort_keys=True)
+                     != json.dumps(new.get(k), default=_dec, sort_keys=True))
+    return new, changed, kept
 
 
 def norm_name(x):
@@ -218,6 +243,22 @@ def selftest():
     r = renamed_identity(src, "kym9003")
     assert r["uid"] == "kym9003" and r["identity"]["uid"] == "kym9003"
     assert r["identity"]["primaryName"] == {"lastName": "M"} and src["uid"] == "Kym9003"
+    # IDENTITY_REPLACE: the bad map wins field by field; canonical-only fields are kept
+    rohan = {"uid": "kym9003", "identity": {
+        "uid": "kym9003", "primaryName": {"firstName": "Annie", "lastName": "Rohan"},
+        "knownRelationships": [{"type": "CTSC", "name": {"lastName": "Chambers"}}, {"type": "CTSC"}],
+        "institutions": ["Stony Brook University ", "New York Presbyterian Hospital"],
+        "primaryEmail": "Kym9003@nyp.org", "title": None, "emails": ["a@b"]}}
+    merandy = {"uid": "Kym9003", "identity": {
+        "uid": "Kym9003", "primaryName": {"firstName": "Kyle", "lastName": "Merandy"},
+        "knownRelationships": [{"type": "CTSC", "name": {"lastName": "Lee"}}],
+        "institutions": ["New York Presbyterian Hospital"], "emails": ["a@b"]}}
+    new, changed, kept = replaced_identity(merandy, rohan, "kym9003")
+    assert new["uid"] == "kym9003" and new["primaryName"]["lastName"] == "Merandy", new
+    assert len(new["knownRelationships"]) == 1 and new["institutions"] == ["New York Presbyterian Hospital"]
+    assert kept == ["primaryEmail"] and new["primaryEmail"] == "Kym9003@nyp.org", kept
+    assert changed == ["institutions", "knownRelationships", "primaryName"], changed
+    assert merandy["identity"]["uid"] == "Kym9003" and rohan["identity"]["primaryName"]["lastName"] == "Rohan"
     # underscore resolution
     assert resolve_action({"action": "UNDERSCORE"}, None) == "DELETE"
     assert resolve_action({"action": "UNDERSCORE"}, {"knownpmids": []}) == "DELETE"
@@ -315,10 +356,10 @@ class Ddb:
         return {"key": key, "size": hit[0]["Size"], "last_modified": str(hit[0]["LastModified"]),
                 "version_id": head.get("VersionId")}
 
-    def snapshot_uid(self, uid, s3_dir):
+    def snapshot_uid(self, uid, s3_dir, with_s3=True):
         snap = {t: self.get(t, uid) for t in SINGLE_ITEM_TABLES}
         snap.update({t: self.query(t, uid) for t in MULTI_ITEM_TABLES})
-        o = self.s3_analysis_output(uid)
+        o = self.s3_analysis_output(uid) if with_s3 else None
         if o:
             # keep the bytes: an object written before versioning has VersionId "null"
             os.makedirs(s3_dir, exist_ok=True)
@@ -383,14 +424,14 @@ def plan_entry(e, snap):
         elif not b["Identity"] and not c["Identity"]:
             p["warnings"].append(f"no Identity under either form; the rerun of {canon} will fail "
                                  f"until one exists")
-        if canon in NAME_FIX and NAME_FIX[canon] == bad and c["Identity"] and b["Identity"]:
-            p["steps"].append(("name_fix", f"Identity: {canon} primaryName {ident_name(c['Identity'])!r} "
-                               f"-> {ident_name(b['Identity'])!r}"))
-            alts = ((c["Identity"].get("identity") or {}).get("alternateNames")) or []
-            stray = [a for a in alts if (a or {}).get("lastName") !=
-                     ((b["Identity"].get("identity") or {}).get("primaryName") or {}).get("lastName")]
-            if stray:
-                p["warnings"].append(f"{canon} alternateNames carry other surnames {stray}; check by hand")
+        if IDENTITY_REPLACE.get(canon) == bad and c["Identity"] and b["Identity"]:
+            _, changed, kept = replaced_identity(b["Identity"], c["Identity"], canon)
+            p["steps"].append(("ident_replace", f"Identity: {canon} identity map {ident_name(c['Identity'])!r} "
+                               f"-> {bad!r}'s {ident_name(b['Identity'])!r}; fields changed: {changed}"))
+            if kept:
+                old = c["Identity"].get("identity") or {}
+                p["warnings"].append(f"{canon}: kept canonical-only fields (check by hand): "
+                                     + json.dumps({k: old[k] for k in kept}, default=_dec))
         for t in COPY_MULTI:
             if b[t]:
                 p["steps"].append((f"copy_{t}", f"{t}: copy {len(b[t])} row(s) to {canon} "
@@ -447,11 +488,14 @@ def apply_plan(ddb, e, p, snap, now):
     if "ident_copy" in kinds:
         T("Identity").put_item(Item=renamed_identity(b["Identity"], canon),
                                ConditionExpression="attribute_not_exists(uid)")
-    if "name_fix" in kinds:
+    if "ident_replace" in kinds:
+        new, _, _ = replaced_identity(b["Identity"], c["Identity"], canon)
+        # conditional on the canonical map still being the one planned against
         T("Identity").update_item(
-            Key={"uid": canon}, UpdateExpression="SET #i.primaryName = :n",
-            ConditionExpression="attribute_exists(uid)", ExpressionAttributeNames={"#i": "identity"},
-            ExpressionAttributeValues={":n": b["Identity"]["identity"]["primaryName"]})
+            Key={"uid": canon}, UpdateExpression="SET #i = :n",
+            ConditionExpression="attribute_exists(uid) AND #i = :old",
+            ExpressionAttributeNames={"#i": "identity"},
+            ExpressionAttributeValues={":n": new, ":old": c["Identity"]["identity"]})
     for t in COPY_MULTI:
         if f"copy_{t}" in kinds:
             h, r = ddb.keys[t]
@@ -475,10 +519,14 @@ def apply_plan(ddb, e, p, snap, now):
             T(t).delete_item(Key={ddb.keys[t][0]: bad})
     for t in DELETE_MULTI:
         if f"del_{t}" in kinds:
+            # only the rows in the snapshot: anything written since has no backup
             h, r = ddb.keys[t]
             with T(t).batch_writer() as w:
-                for row in ddb.query(t, bad):
+                for row in b[t]:
                     w.delete_item(Key={h: row[h], r: row[r]})
+            left = len(ddb.query(t, bad))
+            if left:
+                print(f"     {t}: {left} row(s) under {bad!r} written after the snapshot, left in place")
     if "del_s3" in kinds:
         ddb.s3.delete_object(Bucket=S3_BUCKET, Key=S3_PREFIX + bad)
 
@@ -592,18 +640,40 @@ def main():
         if input(f"\nApply to DynamoDB/S3 in {args.region}? type 'apply': ").strip() != "apply":
             sys.exit("aborted")
     stamp = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
-    failed = []
+    failed, aborted, rerun = [], [], set()
     for e, p in zip(entries, plans):
         if p["abort"] or p["action"] == "NEEDS-DECISION" or not p["steps"]:
             continue
         try:
-            apply_plan(ddb, e, p, snap, stamp)
+            live = snap
+            if e["canon"]:
+                # re-read the canonical side: an earlier pair may have written it
+                live = dict(snap)
+                live[e["canon"]] = ddb.snapshot_uid(e["canon"], None, with_s3=False)
+                p2 = plan_entry(e, live)
+                if p2["abort"]:
+                    aborted.append(p["bad"])
+                    print(f"ABORT {p['bad']!r} on re-plan: {p2['abort']}")
+                    continue
+                if [s for _, s in p2["steps"]] != [s for _, s in p["steps"]]:
+                    print(f"   re-planned {p['bad']!r} against the live {e['canon']}:")
+                    for _, s in p2["steps"]:
+                        print(f"   - {s}")
+                p = p2
+            apply_plan(ddb, e, p, live, stamp)
             print(f"applied {p['bad']!r} -> {p['canon'] or '-'}")
+            if p["action"] == "MAP":
+                rerun.add(p["canon"])
         except Exception as ex:  # one uid failing must not stop the others
             failed.append(p["bad"])
             print(f"FAILED {p['bad']!r}: {ex}")
-    print(f"\ndone. failed: {failed or 'none'}. Snapshot for rollback: {path}")
-    if failed:
+    rerun_path = os.path.join(args.snapshot_dir, f"rerun_uids_{now:%Y%m%dT%H%M%SZ}.txt")
+    with open(rerun_path, "w") as f:
+        f.write("".join(u + "\n" for u in sorted(rerun)))
+    print(f"\ndone. failed: {failed or 'none'}. aborted on re-plan: {aborted or 'none'}.")
+    print(f"canonical uids applied ({len(rerun)}), for rerun_canonical.sh: {rerun_path}")
+    print(f"Snapshot for rollback: {path}")
+    if failed or aborted:
         sys.exit(1)
 
 

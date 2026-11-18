@@ -7,7 +7,9 @@
 -- rows.
 --
 -- Run (never with --force: the first error must stop the script, and the open
--- transaction is then rolled back when the client disconnects):
+-- transaction is then rolled back when the client disconnects). The script stops
+-- itself with "CONSTRAINT `stop_here` failed" when two merged accounts carry different
+-- scope_* / proxy_person_ids values; the row just above the error says which:
 --   mysql --defaults-file=<prod-creds.cnf> reciterdb < mysql_remediation.sql | tee mysql_run_$(date -u +%Y%m%dT%H%M%SZ).log
 --
 -- Mapping: the rm_map rows below are the MAP/DELETE rows of mapping.json
@@ -67,6 +69,12 @@ INSERT INTO rm_map (bad, canon, action) VALUES
 -- END rm_map
 ;
 
+-- A row inserted here stops the script with "CONSTRAINT `stop_here` failed" (the
+-- reason is in the INSERT that fired). Without --force the client exits and the
+-- open transaction is rolled back.
+DROP TEMPORARY TABLE IF EXISTS rm_abort;
+CREATE TEMPORARY TABLE rm_abort (reason VARCHAR(255), CONSTRAINT stop_here CHECK (reason IS NULL));
+
 -- PM accounts that are not CWIDs at all (decision 5, 11-18)
 DROP TEMPORARY TABLE IF EXISTS rm_junk_pid;
 CREATE TEMPORARY TABLE rm_junk_pid (pid VARCHAR(128) NOT NULL)
@@ -119,8 +127,14 @@ SELECT 'before' AS phase, 'authorship_review.candidate_cwids_json' AS tbl, COUNT
 SELECT 'before' AS phase, 'reporting_ad_hoc_feature_generator_execution (non-canonical)' AS tbl, COUNT(*) AS n FROM reporting_ad_hoc_feature_generator_execution WHERE BINARY personIdentifier <> BINARY LOWER(TRIM(personIdentifier));
 SELECT 'before' AS phase, 'reporting_ad_hoc_identity_creation (non-canonical)' AS tbl, COUNT(*) AS n FROM reporting_ad_hoc_identity_creation WHERE BINARY personIdentifier <> BINARY LOWER(TRIM(personIdentifier));
 SELECT 'before' AS phase, 'reporting_ad_hoc_* (mapped)' AS tbl, COUNT(*) AS n FROM reporting_ad_hoc_feature_generator_execution x JOIN rm_map m ON BINARY x.personIdentifier = BINARY m.bad;
+SELECT 'before' AS phase, 'authorship_review.reviewer' AS tbl, COUNT(*) AS n FROM authorship_review a JOIN rm_map m ON BINARY a.reviewer = BINARY m.bad;
+SELECT 'before' AS phase, 'admin_users.proxy_person_ids (mapped/deleted ids)' AS what, u.userID, u.personIdentifier, m.bad, m.action
+FROM admin_users u JOIN rm_map m ON INSTR(CAST(u.proxy_person_ids AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0
+ORDER BY u.userID;
+-- informational: the nightly identity build reloads this table from Jenzabar and
+-- lowercases cwid itself (update/buildIdentity.py, same PR), so it is not written here
+SELECT 'before' AS phase, 'identity_grad_school_faculty (non-canonical, fixed by the next nightly)' AS tbl, COUNT(*) AS n FROM identity_grad_school_faculty WHERE BINARY cwid <> BINARY LOWER(TRIM(cwid));
 -- guards: expected 0 (Phase 0); a non-zero here means extend the script before COMMIT
-SELECT 'before' AS phase, 'identity_grad_school_faculty (non-canonical)' AS tbl, COUNT(*) AS n FROM identity_grad_school_faculty WHERE BINARY cwid <> BINARY LOWER(TRIM(cwid));
 SELECT 'before' AS phase, 'GUARD admin_orcid' AS tbl, COUNT(*) AS n FROM admin_orcid o JOIN rm_map m ON BINARY o.personIdentifier = BINARY m.bad;
 SELECT 'before' AS phase, 'GUARD analysis_override_author_position' AS tbl, COUNT(*) AS n FROM analysis_override_author_position o JOIN rm_map m ON BINARY o.personIdentifier = BINARY m.bad;
 SELECT 'before' AS phase, 'GUARD external_record' AS tbl, COUNT(*) AS n FROM external_record o JOIN rm_map m ON BINARY o.uid = BINARY m.bad;
@@ -181,7 +195,7 @@ CREATE TEMPORARY TABLE rm_keep (canon VARCHAR(128) COLLATE utf8mb4_bin PRIMARY K
   DEFAULT CHARSET=utf8mb4;
 INSERT INTO rm_keep
 SELECT canon, MIN(userID) FROM rm_acct GROUP BY canon
-HAVING COUNT(*) > 1 OR SUM(cur <> canon) > 0;
+HAVING COUNT(*) > 1 OR SUM(BINARY cur <> BINARY canon) > 0;  -- BINARY: utf8mb4_bin is PAD SPACE, 'x ' = 'x'
 
 DROP TEMPORARY TABLE IF EXISTS rm_loser;
 CREATE TEMPORARY TABLE rm_loser (userID INT PRIMARY KEY, keeper INT NOT NULL, canon VARCHAR(128) COLLATE utf8mb4_bin)
@@ -205,6 +219,72 @@ UPDATE admin_notification_preferences p JOIN rm_loser l ON p.userID = l.userID S
 DELETE p FROM admin_notification_preferences p
   JOIN admin_notification_preferences p2 ON p.userID = p2.userID AND p.id > p2.id
   JOIN rm_keep k ON k.keeper = p.userID;
+
+-- Curator_Scoped scope and proxies: the keeper must end up with what the group had.
+-- Per (canonical id, column), collect the non-empty values across the keeper and its
+-- losers. One distinct value: the keeper gets it. More than one: STOP (settle by hand,
+-- then re-run). Compared byte-for-byte, so differently formatted JSON also stops.
+DROP TEMPORARY TABLE IF EXISTS rm_scope;
+CREATE TEMPORARY TABLE rm_scope (
+  canon  VARCHAR(128) COLLATE utf8mb4_bin, keeper INT, userID INT,
+  col    VARCHAR(32) COLLATE utf8mb4_bin, val LONGTEXT COLLATE utf8mb4_bin
+) DEFAULT CHARSET=utf8mb4;
+INSERT INTO rm_scope
+SELECT k.canon, k.keeper, u.userID, 'scope_person_types', u.scope_person_types
+  FROM rm_keep k JOIN rm_acct a ON a.canon = k.canon JOIN admin_users u ON u.userID = a.userID
+ WHERE u.scope_person_types IS NOT NULL AND JSON_LENGTH(u.scope_person_types) > 0;
+INSERT INTO rm_scope
+SELECT k.canon, k.keeper, u.userID, 'scope_org_units', u.scope_org_units
+  FROM rm_keep k JOIN rm_acct a ON a.canon = k.canon JOIN admin_users u ON u.userID = a.userID
+ WHERE u.scope_org_units IS NOT NULL AND JSON_LENGTH(u.scope_org_units) > 0;
+INSERT INTO rm_scope
+SELECT k.canon, k.keeper, u.userID, 'scope_institutions', u.scope_institutions
+  FROM rm_keep k JOIN rm_acct a ON a.canon = k.canon JOIN admin_users u ON u.userID = a.userID
+ WHERE u.scope_institutions IS NOT NULL AND JSON_LENGTH(u.scope_institutions) > 0;
+INSERT INTO rm_scope
+SELECT k.canon, k.keeper, u.userID, 'proxy_person_ids', u.proxy_person_ids
+  FROM rm_keep k JOIN rm_acct a ON a.canon = k.canon JOIN admin_users u ON u.userID = a.userID
+ WHERE u.proxy_person_ids IS NOT NULL AND JSON_LENGTH(u.proxy_person_ids) > 0;
+
+-- (each temp table is referenced once per statement: MariaDB cannot reopen a temp table)
+DROP TEMPORARY TABLE IF EXISTS rm_scope_merge;
+CREATE TEMPORARY TABLE rm_scope_merge (canon VARCHAR(128) COLLATE utf8mb4_bin PRIMARY KEY) DEFAULT CHARSET=utf8mb4;
+INSERT INTO rm_scope_merge SELECT DISTINCT canon FROM rm_scope WHERE userID <> keeper;
+
+SELECT 'before' AS phase, 'merge groups with scope/proxy values on a merged-away account' AS what,
+       s.canon, s.keeper, s.userID, s.col, s.val
+FROM rm_scope s JOIN rm_scope_merge g ON g.canon = s.canon
+ORDER BY s.canon, s.col, s.userID;
+
+SELECT 'STOP if listed' AS phase, 'scope/proxy conflicts (settle by hand, then re-run)' AS what,
+       canon, col, GROUP_CONCAT(userID ORDER BY userID) AS userIDs
+FROM rm_scope GROUP BY canon, col HAVING COUNT(DISTINCT val) > 1;
+INSERT INTO rm_abort (reason)
+SELECT CONCAT('scope/proxy conflict: ', canon, '.', col, ' differs across userIDs ', GROUP_CONCAT(userID ORDER BY userID))
+FROM rm_scope GROUP BY canon, col HAVING COUNT(DISTINCT val) > 1;
+
+DROP TEMPORARY TABLE IF EXISTS rm_scope_pivot;
+CREATE TEMPORARY TABLE rm_scope_pivot (
+  canon VARCHAR(128) COLLATE utf8mb4_bin PRIMARY KEY,
+  spt LONGTEXT, sou LONGTEXT, sin LONGTEXT, ppi LONGTEXT
+) DEFAULT CHARSET=utf8mb4;
+INSERT INTO rm_scope_pivot
+SELECT s.canon,
+       MAX(CASE WHEN s.col = 'scope_person_types' THEN s.val END),
+       MAX(CASE WHEN s.col = 'scope_org_units'    THEN s.val END),
+       MAX(CASE WHEN s.col = 'scope_institutions' THEN s.val END),
+       MAX(CASE WHEN s.col = 'proxy_person_ids'   THEN s.val END)
+FROM rm_scope s JOIN rm_scope_merge g ON g.canon = s.canon
+GROUP BY s.canon;
+
+-- the keeper's own non-empty value is the group's only value (else the abort above fired)
+UPDATE admin_users u JOIN rm_keep k ON u.userID = k.keeper JOIN rm_scope_pivot v ON v.canon = k.canon
+SET u.scope_person_types = COALESCE(v.spt, u.scope_person_types),
+    u.scope_org_units    = COALESCE(v.sou, u.scope_org_units),
+    u.scope_institutions = COALESCE(v.sin, u.scope_institutions),
+    u.proxy_person_ids   = COALESCE(v.ppi, u.proxy_person_ids);
+SELECT 'scope/proxy carried to keeper' AS step, v.canon, k.keeper, v.spt, v.sou, v.sin, v.ppi
+FROM rm_scope_pivot v JOIN rm_keep k ON k.canon = v.canon ORDER BY v.canon;
 
 DELETE u FROM admin_users u JOIN rm_loser l ON u.userID = l.userID;
 
@@ -253,6 +333,29 @@ UPDATE authorship_review a JOIN rm_map m
   ON m.action = 'MAP' AND INSTR(CAST(a.candidate_cwids_json AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0
 SET a.candidate_cwids_json = REPLACE(a.candidate_cwids_json, CONCAT('"', m.bad, '"'), CONCAT('"', m.canon, '"'));
 
+UPDATE authorship_review a JOIN rm_map m ON BINARY a.reviewer = BINARY m.bad AND m.action = 'MAP'
+SET a.reviewer = m.canon;
+
+-- ---------------------------------------------------------------- 5b. admin_users.proxy_person_ids
+-- JSON arrays of person ids. A mapped id is rewritten (REPLACE() is case-sensitive);
+-- a DELETE-class id is removed. One change per row per statement, so repeat; the
+-- after-count must be 0.
+UPDATE admin_users u JOIN rm_map m
+  ON m.action = 'MAP' AND INSTR(CAST(u.proxy_person_ids AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0
+SET u.proxy_person_ids = REPLACE(u.proxy_person_ids, CONCAT('"', m.bad, '"'), CONCAT('"', m.canon, '"'));
+UPDATE admin_users u JOIN rm_map m
+  ON m.action = 'MAP' AND INSTR(CAST(u.proxy_person_ids AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0
+SET u.proxy_person_ids = REPLACE(u.proxy_person_ids, CONCAT('"', m.bad, '"'), CONCAT('"', m.canon, '"'));
+UPDATE admin_users u JOIN rm_map m
+  ON m.action = 'MAP' AND INSTR(CAST(u.proxy_person_ids AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0
+SET u.proxy_person_ids = REPLACE(u.proxy_person_ids, CONCAT('"', m.bad, '"'), CONCAT('"', m.canon, '"'));
+UPDATE admin_users u JOIN rm_map m
+  ON m.action = 'DELETE' AND INSTR(CAST(u.proxy_person_ids AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0
+SET u.proxy_person_ids = COALESCE(JSON_REMOVE(u.proxy_person_ids, JSON_UNQUOTE(JSON_SEARCH(u.proxy_person_ids, 'one', m.bad))), u.proxy_person_ids);
+UPDATE admin_users u JOIN rm_map m
+  ON m.action = 'DELETE' AND INSTR(CAST(u.proxy_person_ids AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0
+SET u.proxy_person_ids = COALESCE(JSON_REMOVE(u.proxy_person_ids, JSON_UNQUOTE(JSON_SEARCH(u.proxy_person_ids, 'one', m.bad))), u.proxy_person_ids);
+
 -- ---------------------------------------------------------------- 6. reporting_ad_hoc_*
 -- map, then trim + lowercase (external-cohort ids: trim only), then drop DELETE-class
 UPDATE reporting_ad_hoc_feature_generator_execution x JOIN rm_map m
@@ -293,10 +396,6 @@ DELETE x FROM reporting_ad_hoc_feature_generator_execution x
     ON BINARY x.personIdentifier = BINARY x2.personIdentifier
    AND x.frequency <=> x2.frequency AND x.`type` <=> x2.`type` AND x.id > x2.id;
 
--- ---------------------------------------------------------------- 7. identity_grad_school_faculty
-UPDATE IGNORE identity_grad_school_faculty SET cwid = LOWER(TRIM(cwid))
-WHERE BINARY cwid <> BINARY LOWER(TRIM(cwid));
-
 -- =============================================================================
 -- AFTER COUNTS (inside the transaction: what COMMIT would leave)
 -- =============================================================================
@@ -311,7 +410,17 @@ SELECT 'after' AS phase, 'authorship_review.resolution_cwid mapped' AS tbl, COUN
 SELECT 'after' AS phase, 'authorship_review.candidate_cwids_json mapped' AS tbl, COUNT(DISTINCT a.id) AS n, 'expect 0' AS expect FROM authorship_review a JOIN rm_map m ON m.action = 'MAP' AND INSTR(CAST(a.candidate_cwids_json AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0;
 SELECT 'after' AS phase, 'reporting_ad_hoc_feature_generator_execution untrimmed' AS tbl, COUNT(*) AS n, 'expect 0' AS expect FROM reporting_ad_hoc_feature_generator_execution WHERE BINARY personIdentifier <> BINARY TRIM(personIdentifier);
 SELECT 'after' AS phase, 'reporting_ad_hoc_identity_creation untrimmed' AS tbl, COUNT(*) AS n, 'expect 0' AS expect FROM reporting_ad_hoc_identity_creation WHERE BINARY personIdentifier <> BINARY TRIM(personIdentifier);
-SELECT 'after' AS phase, 'identity_grad_school_faculty non-canonical' AS tbl, COUNT(*) AS n, 'expect 0' AS expect FROM identity_grad_school_faculty WHERE BINARY cwid <> BINARY LOWER(TRIM(cwid));
+SELECT 'after' AS phase, 'admin_users personIdentifier not byte-equal to its canonical id' AS tbl, COUNT(*) AS n, 'expect 0' AS expect FROM admin_users u JOIN rm_acct a ON a.userID = u.userID WHERE BINARY u.personIdentifier <> BINARY a.canon;
+SELECT 'after' AS phase, 'admin_users untrimmed/upper-case (external cohorts excepted)' AS tbl, COUNT(*) AS n, 'expect 0' AS expect FROM admin_users
+ WHERE personIdentifier IS NOT NULL AND TRIM(personIdentifier) <> ''
+   AND BINARY personIdentifier NOT IN (SELECT BINARY pid FROM rm_junk_pid)
+   AND (BINARY personIdentifier <> BINARY TRIM(personIdentifier)
+        OR (BINARY personIdentifier <> BINARY LOWER(personIdentifier)
+            AND NOT (BINARY LEFT(personIdentifier, 4) = 'usc_' OR BINARY LEFT(personIdentifier, 3) = 'fh_'
+                     OR BINARY LEFT(personIdentifier, 10) = 'fredhutch_' OR BINARY LEFT(personIdentifier, 5) = 'ucsf_'
+                     OR BINARY LEFT(personIdentifier, 2) = 'uc')));
+SELECT 'after' AS phase, 'admin_users.proxy_person_ids mapped/deleted' AS tbl, COUNT(DISTINCT u.userID) AS n, 'expect 0' AS expect FROM admin_users u JOIN rm_map m ON INSTR(CAST(u.proxy_person_ids AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0;
+SELECT 'after' AS phase, 'authorship_review.reviewer mapped' AS tbl, COUNT(*) AS n, 'expect 0' AS expect FROM authorship_review a JOIN rm_map m ON BINARY a.reviewer = BINARY m.bad AND m.action = 'MAP';
 SELECT 'after' AS phase, 'admin_users accounts that changed (force these to re-login)' AS what,
        u.userID, u.personIdentifier FROM admin_users u JOIN rm_keep k ON u.userID = k.keeper ORDER BY u.personIdentifier;
 
