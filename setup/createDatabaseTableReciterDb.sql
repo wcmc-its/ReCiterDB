@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS `admin_users` (
   `createTimestamp` timestamp NOT NULL DEFAULT '0000-00-00 00:00:00',
   `modifyTimestamp` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
   PRIMARY KEY (`userID`),
+  -- idx_personIdentifier is redundant next to the unique key below but is kept so a
+  -- fresh install matches prod after v3.17, which adds the key and drops nothing.
   KEY `idx_personIdentifier` (`personIdentifier`) USING BTREE,
   UNIQUE KEY `uq_admin_users_personIdentifier` (`personIdentifier`),
   KEY `idx_email` (`email`) USING BTREE

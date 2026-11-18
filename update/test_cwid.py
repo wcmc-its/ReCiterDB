@@ -12,7 +12,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
-from cwid import canonical_uid, is_external_cohort, person_guard_queries, warn_person_identifiers
+from cwid import (EXTERNAL_COHORT_PREFIX, EXTERNAL_COHORT_PREFIX_SQL, canonical_uid,
+                  is_external_cohort, person_guard_queries, warn_person_identifiers)
 
 # --- canonical_uid -------------------------------------------------------------------
 # Converted on the way in: trimmed and lowercased (the bad forms found 11-18).
@@ -57,14 +58,24 @@ assert "FROM `person`" in q["duplicated"] and "FROM `person`" in q["non-canonica
 nc = q["non-canonical"]
 assert "CAST(personIdentifier AS BINARY) <> CAST(TRIM(personIdentifier) AS BINARY)" in nc
 assert "CAST(personIdentifier AS BINARY) <> CAST(LOWER(TRIM(personIdentifier)) AS BINARY)" in nc
-assert "NOT REGEXP '^(usc|fh|fredhutch|uc[a-z]*)_'" in nc
+assert "BINARY TRIM(personIdentifier) NOT REGEXP '^(usc|fh|fredhutch|uc[a-z]*)_'" in nc
 for sql in q.values():
     assert re.match(r"^SELECT ", sql) and not re.search(r"\b(INSERT|UPDATE|DELETE|ALTER|DROP)\b", sql)
 
-# The SQL prefix and the Python prefix agree.
-for raw in ["fredhutch_Rachel.Rau", "fh_x", "usc_1", "ucsf_1", "ucla_1", "Abl9002", "ucb2001", "uc_x"]:
-    sql_match = re.match(r"^(usc|fh|fredhutch|uc[a-z]*)_", raw) is not None
-    assert sql_match == is_external_cohort(raw), raw
+# The SQL prefix and the Python prefix agree. The pattern text is the same, and every
+# SQL use must apply it to a BINARY value: under the column's case-insensitive
+# collation a bare REGEXP would treat `FH_Abc` as a cohort id while Python lowercases it.
+assert EXTERNAL_COHORT_PREFIX_SQL == EXTERNAL_COHORT_PREFIX.pattern.replace("(?:", "(")
+for raw in ["FH_Abc", "UCSF_X1", "Fredhutch_A"]:
+    assert not is_external_cohort(raw) and canonical_uid(raw) == (raw.lower(), None), raw
+for _f in ["setup/createEventsProceduresReciterDb.sql", "setup/proc_updateCurateSelfRole_v3.17.sql"]:
+    _sql = open(os.path.join(ROOT, _f)).read().lower()
+    _uses = [m.start() for m in re.finditer(re.escape("regexp '" + EXTERNAL_COHORT_PREFIX_SQL.lower()), _sql)]
+    assert _uses, _f
+    for _i in _uses:
+        assert _sql[:_i].rstrip().endswith("binary trim(p.personidentifier)"), (_f, _sql[_i - 60:_i])
+_g = [sql for _, sql in person_guard_queries()]
+assert all(sql.count("REGEXP '" + EXTERNAL_COHORT_PREFIX_SQL) == sql.count("BINARY TRIM(personIdentifier) NOT REGEXP '" + EXTERNAL_COHORT_PREFIX_SQL) for sql in _g)
 
 
 class FakeCursor:
@@ -143,8 +154,9 @@ body = routine("setup/createEventsProceduresReciterDb.sql")
 assert body == routine("setup/proc_updateCurateSelfRole_v3.17.sql"), "reload file drifted from master file"
 flat = " ".join(body.split())
 assert "else lower(trim(p.personIdentifier)) end as canon" in flat
-assert "regexp '^(usc|fh|fredhutch|uc[a-z]*)_'" in flat
-assert "and not exists (select 1 from admin_users u where trim(u.personIdentifier) = c.canon) group by c.canon;" in flat
+assert "select case when binary trim(p.personIdentifier) regexp '^(usc|fh|fredhutch|uc[a-z]*)_'" in flat
+assert ("and c.canon not in (select trim(u.personIdentifier) from admin_users u "
+        "where u.personIdentifier is not null) group by c.canon;") in flat
 for role in ("4", "3"):
     assert f"select distinct a.userID, {role} from person p" in flat
     assert (f"not exists (select 1 from admin_users_roles r where r.userID = a.userID "

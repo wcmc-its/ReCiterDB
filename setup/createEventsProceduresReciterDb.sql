@@ -5551,11 +5551,18 @@ where (a.email is null or a.email = '') and p.primaryEmail is not null;
 -- per canonical id. Copying person's raw value made `Abl9002` accounts, and person rows
 -- that differ only in case (`Abl9002` + `abl9002`) became two candidates for one account.
 -- An id that is still not a plain id after trimming (inner space, '@') gets no account.
+-- The cohort-prefix test runs on BINARY so it is case-sensitive like the Python one:
+-- `FH_Abc` is a miscased id and is lowercased, `fh_Abc` keeps its case.
+-- SQL TRIM() strips spaces only, where Python strip() also strips tabs and newlines,
+-- so an id wrapped in a tab is refused here (no account) rather than converted; the
+-- nightly CWID GUARD lists it as invalid.
+-- The existing-account check is a non-correlated NOT IN on trimmed ids, so it is
+-- materialized once and still matches an account stored with a leading space.
 
 insert into admin_users (personIdentifier, nameFirst, nameMiddle, nameLast, email)
 select c.canon, max(c.firstName), max(c.middleName), max(c.lastName), max(c.primaryEmail)
 from (
-  select case when trim(p.personIdentifier) regexp '^(usc|fh|fredhutch|uc[a-z]*)_'
+  select case when binary trim(p.personIdentifier) regexp '^(usc|fh|fredhutch|uc[a-z]*)_'
               then trim(p.personIdentifier)
               else lower(trim(p.personIdentifier)) end as canon,
          p.firstName, p.middleName, p.lastName, p.primaryEmail
@@ -5564,7 +5571,7 @@ from (
   and not (p.dateAdded is null and p.personIdentifier in (select personIdentifier from person_person_type where personType = 'cornell-ithaca'))
 ) c
 where c.canon regexp '^[A-Za-z0-9._-]+$'
-and not exists (select 1 from admin_users u where trim(u.personIdentifier) = c.canon)
+and c.canon not in (select trim(u.personIdentifier) from admin_users u where u.personIdentifier is not null)
 group by c.canon;
 
 -- Create roles for them. DISTINCT + NOT EXISTS: one (userID, roleID) row per account

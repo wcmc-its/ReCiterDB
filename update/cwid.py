@@ -4,7 +4,9 @@ DynamoDB keys are exact strings and MySQL compares case-insensitively, so `Abl90
 and `abl9002` are two people in ReCiter and one duplicated person here. The rule
 (approved 2026-11-18, Roadmap/cwid-normalization-plan.md):
 
-  1. Trim surrounding whitespace.
+  1. Trim surrounding whitespace. (The SQL in updateCurateSelfRole uses TRIM(), which
+     strips spaces only: an id wrapped in a tab or newline is refused there, not
+     converted, and the nightly guard lists it as invalid.)
   2. Lowercase, unless the id is an external-cohort id. Those carry the partner's
      own key (fredhutch_Rachel.Rau) and must stay as they are.
   3. Reject only what is still invalid: empty, any inner whitespace, '@', or a
@@ -18,10 +20,10 @@ import re
 
 # Case-sensitive on purpose: `Ucb2001` is a miscased CWID, not a cohort id.
 EXTERNAL_COHORT_PREFIX = re.compile(r"^(?:usc|fh|fredhutch|uc[a-z]*)_")
-# The same prefixes as a MySQL pattern, for the nightly guard below. It is matched
-# under the column's case-insensitive collation (REGEXP on a BINARY cast is not
-# portable across MySQL versions), so `FH_x` is also exempt there; the `_` it
-# requires keeps a miscased CWID like `Ucb2001` from slipping through.
+# The same prefixes as a SQL pattern. Every SQL use applies it to a BINARY value
+# (`BINARY TRIM(x) REGEXP ...`) so it is case-sensitive like the Python one; under
+# the column's case-insensitive collation `FH_x` would otherwise count as a cohort id.
+# Prod is MariaDB, where REGEXP on BINARY is supported (and used elsewhere here).
 EXTERNAL_COHORT_PREFIX_SQL = "^(usc|fh|fredhutch|uc[a-z]*)_"
 
 _VALID = re.compile(r"^[a-z0-9._-]+$")
@@ -69,7 +71,7 @@ def person_guard_queries(table="person"):
     non_canonical = (
         f"SELECT personIdentifier FROM `{table}` "
         "WHERE CAST(personIdentifier AS BINARY) <> CAST(TRIM(personIdentifier) AS BINARY) "
-        f"OR (TRIM(personIdentifier) NOT REGEXP '{EXTERNAL_COHORT_PREFIX_SQL}' "
+        f"OR (BINARY TRIM(personIdentifier) NOT REGEXP '{EXTERNAL_COHORT_PREFIX_SQL}' "
         "AND CAST(personIdentifier AS BINARY) <> CAST(LOWER(TRIM(personIdentifier)) AS BINARY)) "
         "ORDER BY personIdentifier"
     )
