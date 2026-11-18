@@ -656,7 +656,9 @@ def run(since, until, apply_writes=False, recheck=True, idx=None, venue_lookup=N
     # Venue term (v3.14), as on the Scopus lane: None unless AAR_VENUE_FIT is on, and
     # resolved from the same issn/journal pair _build_row stores. Only a Cornell candidate
     # can be scored, and only where no WCM candidate shares the list, so it reaches this
-    # lane's rows on bylines that name Ithaca and match nobody on the WCM roster.
+    # lane's rows on bylines that name Ithaca and match nobody on the WCM roster. The
+    # byline ORCID reaches those rows too, and every row once AAR_BYLINE_ORCID_WCM is on
+    # (CampusRoster.candidates); the pick below is cands[0] either way.
     if venue_lookup is None:
         venue_lookup = load_venue_lookup()
     capture = byline_orcid_enabled()      # v3.15: the authorship's own ORCID, or nothing
@@ -1026,6 +1028,44 @@ def _selftest():
               with_wcm["top_cwid"] == "ac1" and with_wcm["top_orcid_match"] is None
               and "orcid_match" not in with_wcm["candidate_cwids_json"]
               and with_wcm["byline_orcid"] == "0000-0002-1825-0097")
+        # AAR_BYLINE_ORCID_WCM: rosters with labelled maps (identity_index.orcid_sources).
+        # The same two-campus work, whose WCM namesake kept the pick above, now names
+        # the person the ORCID is on file for; and a WCM person Scholars confirms leads
+        # a WCM list. top_cwid is cands[0] on this lane, so that person is the pick.
+        from identity_index import orcid_sources
+        o_id = "0000-0002-1825-0097"
+        ith_maps, _ = orcid_sources([], [("av_cu", o_id)])
+        wcm_maps, _ = orcid_sources([("al2", o_id, "wcm")])
+        wcm_two = [rec("Alissa", "Cooper", "ac1"), rec("Alba", "Cooper", "al2")]
+        env = os.environ.pop("AAR_BYLINE_ORCID", None)
+        try:
+            os.environ["AAR_BYLINE_ORCID"] = "on"
+            with contextlib.redirect_stdout(io.StringIO()):
+                run("2026-01-01", "2026-12-31", apply_writes=True,
+                    idx=CampusRoster(IdentityIndex([rec("Alissa", "Cooper", "ac1")]),
+                                     ithaca=IdentityIndex([cu, cu2], campus=CAMPUS_ITHACA,
+                                                          orcid_cwid=ith_maps[CAMPUS_ITHACA])))
+                run("2026-01-01", "2026-12-31", apply_writes=True,
+                    idx=CampusRoster(IdentityIndex(wcm_two, orcid_cwid=wcm_maps[CAMPUS_WCM]),
+                                     ithaca=IdentityIndex([], campus=CAMPUS_ITHACA)))
+        finally:
+            os.environ.pop("AAR_BYLINE_ORCID", None)
+            if env is not None:
+                os.environ["AAR_BYLINE_ORCID"] = env
+        mixed_l, wcm_l = kept[8:10]
+        mixed_c, wcm_c = (json.loads(r["candidate_cwids_json"]) for r in (mixed_l, wcm_l))
+        check("WCM switch on, WCM namesake on the list: the Cornell person the ORCID is on "
+              "file for is top_cwid, top_orcid_match=1, the first stored candidate says "
+              "'affiliation_manager', the WCM namesake stays on the row, and it stays open",
+              mixed_l["top_cwid"] == "av_cu" and mixed_l["top_orcid_match"] == 1
+              and mixed_c[0]["orcid_source"] == "affiliation_manager"
+              and [c["orcid_match"] for c in mixed_c] == [True] + [False] * (len(mixed_c) - 1)
+              and "ac1" in {c["cwid"] for c in mixed_c} and mixed_l["status"] == "open")
+        check("WCM switch on, WCM candidates only: the Scholars-confirmed person is top_cwid "
+              "over the full-name match, top_orcid_match=1, source 'scholars'",
+              wcm_l["top_cwid"] == "al2" and wcm_l["top_orcid_match"] == 1
+              and [(c["cwid"], c["orcid_match"], c.get("orcid_source")) for c in wcm_c]
+              == [("al2", True, "scholars"), ("ac1", False, None)])
         g["_openalex_get"] = lambda p: (calls.append(p) or
                                         {"meta": {"count": 201}, "results": pages[p["page"]]})
         aar_db.upsert = saved_upsert

@@ -326,7 +326,30 @@ def _rank_selftest():
     both_tie = match_authorship({"last": "Moss", "fore": None, "initials": "K",
                                  "affiliations": wcm + ith}, 99, roster, _RecordingIO())
 
+    # The byline ORCID never reaches this lane. Rosters holding the labelled ORCID maps of
+    # AAR_BYLINE_ORCID_WCM (the ORCID is on file for the Karl and Kim that Kate outranks)
+    # give the list the plain rosters give, because match_authorship passes no ORCID.
+    from identity_index import orcid_sources
+    omaps, _ = orcid_sources([("km_w", "0000-0001-0000-0001", "wcm")],
+                             [("km_c2", "0000-0001-0000-0002")])
+    labelled = CampusRoster(
+        IdentityIndex(ppl, orcid_cwid=omaps[CAMPUS_WCM]),
+        ithaca=IdentityIndex(ppl, campus=CAMPUS_ITHACA, orcid_cwid=omaps[CAMPUS_ITHACA]))
+    pubmed_same = all(
+        json.dumps(match_authorship(a, 99, labelled, _RecordingIO()))
+        == json.dumps(match_authorship(a, 99, roster, _RecordingIO()))
+        for a in ({"last": "Moss", "fore": "Kate", "initials": "K", "affiliations": wcm},
+                  {"last": "Moss", "fore": "Kate", "initials": "K", "affiliations": ith},
+                  {"last": "Moss", "fore": None, "initials": "K", "affiliations": wcm + ith}))
+
     checks = [
+        ("the PubMed lane passes no byline ORCID: rosters holding the WCM and Ithaca ORCID "
+         "maps (AAR_BYLINE_ORCID_WCM) rank a WCM, a Cornell and a two-campus byline exactly "
+         "as rosters without them, and no candidate carries an orcid key",
+         pubmed_same and labelled.wcm.orcid_rec and labelled.ithaca.orcid_rec
+         and "orcid" not in json.dumps(match_authorship(
+             {"last": "Moss", "fore": None, "initials": "K", "affiliations": wcm + ith},
+             99, labelled, _RecordingIO()))),
         ("Cornell-only byline: the Cornell people come back, top is the full match, "
          "io_score None / not_retrieved, and the scorer was NEVER asked for a Cornell cwid",
          [c["cwid"] for c in cu_only] == ["km_c", "km_c2"]
