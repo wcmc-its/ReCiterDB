@@ -17,6 +17,8 @@ COPY update/retrieveReporter.py ./
 COPY update/retrieveAltmetric.py ./
 COPY update/retrieveArticles.py ./
 COPY update/updateReciterDB.py ./
+# cwid.py: the one uid canonicalizer, imported by updateReciterDB.py and executeFeatureGenerator.py
+COPY update/cwid.py ./
 COPY update/abstractImport.py ./
 COPY update/conflictsImport.py ./
 COPY update/dataTransformer.py ./

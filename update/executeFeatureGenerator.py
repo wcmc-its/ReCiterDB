@@ -13,7 +13,10 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Lock, Thread
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from urllib.parse import quote
 import sys
+
+from cwid import canonical_uid
 
 
 ## This script is a lightweight way for using person ID's from ReCiterDB to run Feature Generator (which suggests new 
@@ -170,11 +173,43 @@ def get_person_identifier(mysql_cursor):
     """
     try:
         mysql_cursor.execute(get_metadata_query)
-        person_identifiers = [rec[0] for rec in mysql_cursor]
-        return person_identifiers
+        return canonical_person_identifiers(rec[0] for rec in mysql_cursor)
     except Exception as e:
         logger.exception(f"An error occurred while fetching person identifiers: {e}")
         return []
+
+def canonical_person_identifiers(raw_ids):
+    """Canonicalize each id (cwid.canonical_uid: trim, lowercase unless an external-cohort
+    id), skip and log what is still invalid, and drop the duplicates canonicalizing makes
+    (`Abl9002` and `abl9002` are one person). Sending the raw value created a second
+    ReCiter person under the bad form (`xoprotop `, `cci4002 `)."""
+    out, seen = [], set()
+    for raw in raw_ids:
+        uid, reason = canonical_uid(raw)
+        if uid is None:
+            logger.warning(f"Skipping personIdentifier {raw!r} from "
+                           f"reporting_ad_hoc_feature_generator_execution: {reason}")
+            continue
+        if uid != raw:
+            logger.warning(f"personIdentifier {raw!r} canonicalized to {uid!r}")
+        if uid not in seen:
+            seen.add(uid)
+            out.append(uid)
+    return out
+
+
+def feature_generator_url(base_url, person_identifier, retrieval_flag):
+    """The Feature Generator request URL. The uid is URL-encoded: an id with '.', '&'
+    or a space must reach ReCiter as itself, not as a broken query string."""
+    return (
+        f"{base_url}?uid={quote(person_identifier, safe='')}"
+        f"&useGoldStandard=AS_EVIDENCE"
+        f"&fields=reCiterArticleFeatures.pmid,personIdentifier,"
+        f"reCiterArticleFeatures.publicationDateStandardized"
+        f"&analysisRefreshFlag=true"
+        f"&retrievalRefreshFlag={retrieval_flag}"
+    )
+
 
 def create_session_with_retries(
     total_retries=3, 
@@ -219,14 +254,7 @@ def make_curl_request(person_identifier):
         else "ALL_PUBLICATIONS"
     )
 
-    curl_url = (
-        f"{URL}?uid={person_identifier}"
-        f"&useGoldStandard=AS_EVIDENCE"
-        f"&fields=reCiterArticleFeatures.pmid,personIdentifier,"
-        f"reCiterArticleFeatures.publicationDateStandardized"
-        f"&analysisRefreshFlag=true"
-        f"&retrievalRefreshFlag={retrieval_flag}"
-    )
+    curl_url = feature_generator_url(URL, person_identifier, retrieval_flag)
 
     headers = {
         "accept": "application/json",

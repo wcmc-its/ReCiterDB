@@ -5545,36 +5545,48 @@ where (a.email is null or a.email = '') and p.primaryEmail is not null;
 
 -- Add new users from person table. Cornell Ithaca people (never run: dateAdded null)
 -- are in person only so Find People lists them; they get no account or roles.
+--
+-- The account is keyed by the CANONICAL personIdentifier (trimmed, lowercased unless an
+-- external-cohort id such as fredhutch_Rachel.Rau; same rule as update/cwid.py), one row
+-- per canonical id. Copying person's raw value made `Abl9002` accounts, and person rows
+-- that differ only in case (`Abl9002` + `abl9002`) became two candidates for one account.
+-- An id that is still not a plain id after trimming (inner space, '@') gets no account.
 
 insert into admin_users (personIdentifier, nameFirst, nameMiddle, nameLast, email)
-select personIdentifier, firstName, middleName, lastName, primaryEmail
-from person p 
-where p.primaryEmail not in (select email from admin_users where email is not null and email != '')
-and personIdentifier not in (select personIdentifier from admin_users)
-and not (p.dateAdded is null and p.personIdentifier in (select personIdentifier from person_person_type where personType = 'cornell-ithaca'));
+select c.canon, max(c.firstName), max(c.middleName), max(c.lastName), max(c.primaryEmail)
+from (
+  select case when trim(p.personIdentifier) regexp '^(usc|fh|fredhutch|uc[a-z]*)_'
+              then trim(p.personIdentifier)
+              else lower(trim(p.personIdentifier)) end as canon,
+         p.firstName, p.middleName, p.lastName, p.primaryEmail
+  from person p
+  where p.primaryEmail not in (select email from admin_users where email is not null and email != '')
+  and not (p.dateAdded is null and p.personIdentifier in (select personIdentifier from person_person_type where personType = 'cornell-ithaca'))
+) c
+where c.canon regexp '^[A-Za-z0-9._-]+$'
+and not exists (select 1 from admin_users u where trim(u.personIdentifier) = c.canon)
+group by c.canon;
 
--- Create roles for them
+-- Create roles for them. DISTINCT + NOT EXISTS: one (userID, roleID) row per account
+-- however many person rows match it (case-only duplicates in person used to give the
+-- same account the role twice), and never a role for an account with a blank id.
 
 insert into admin_users_roles (userID, roleID)
-select a.userID, 4 
-from person p 
-join admin_users a on a.personIdentifier = p.personIdentifier
-where a.userID  not in 
-(select userID
-from admin_users_roles
-where roleID = 4)
+select distinct a.userID, 4
+from person p
+join admin_users a on a.personIdentifier = trim(p.personIdentifier)
+where trim(a.personIdentifier) <> ''
+and not exists (select 1 from admin_users_roles r where r.userID = a.userID and r.roleID = 4)
 and not (p.dateAdded is null and p.personIdentifier in (select personIdentifier from person_person_type where personType = 'cornell-ithaca'));
 
 -- Let's give self-curators the ability to generate reports for everyone
 
 insert into admin_users_roles (userID, roleID)
-select a.userID, 3 
-from person p 
-join admin_users a on a.personIdentifier = p.personIdentifier
-left join (select userID
-from admin_users_roles
-where roleID = 3) x on x.userID = a.userID
-where x.userID is null
+select distinct a.userID, 3
+from person p
+join admin_users a on a.personIdentifier = trim(p.personIdentifier)
+where trim(a.personIdentifier) <> ''
+and not exists (select 1 from admin_users_roles r where r.userID = a.userID and r.roleID = 3)
 and not (p.dateAdded is null and p.personIdentifier in (select personIdentifier from person_person_type where personType = 'cornell-ithaca'));
 
 
