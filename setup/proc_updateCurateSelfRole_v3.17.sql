@@ -59,7 +59,8 @@ where (a.email is null or a.email = '') and p.primaryEmail is not null;
 -- external-cohort id such as fredhutch_Rachel.Rau; same rule as update/cwid.py), one row
 -- per canonical id. Copying person's raw value made `Abl9002` accounts, and person rows
 -- that differ only in case (`Abl9002` + `abl9002`) became two candidates for one account.
--- An id that is still not a plain id after trimming (inner space, '@') gets no account.
+-- An id that is still not a plain id after trimming (inner space, '@'), or is a bare
+-- external prefix with nothing after it (`usc_`, `ucsf_`), gets no account.
 -- The cohort-prefix test runs on BINARY so it is case-sensitive like the Python one:
 -- `FH_Abc` is a miscased id and is lowercased, `fh_Abc` keeps its case.
 -- SQL TRIM() strips spaces only, where Python strip() also strips tabs and newlines,
@@ -71,7 +72,7 @@ where (a.email is null or a.email = '') and p.primaryEmail is not null;
 insert into admin_users (personIdentifier, nameFirst, nameMiddle, nameLast, email)
 select c.canon, max(c.firstName), max(c.middleName), max(c.lastName), max(c.primaryEmail)
 from (
-  select case when binary trim(p.personIdentifier) regexp '^(usc|fh|fredhutch|uc[a-z]*)_'
+  select case when binary trim(p.personIdentifier) regexp '^(usc_|fh_|fredhutch_|uc[a-z]+_)'
               then trim(p.personIdentifier)
               else lower(trim(p.personIdentifier)) end as canon,
          p.firstName, p.middleName, p.lastName, p.primaryEmail
@@ -80,6 +81,7 @@ from (
   and not (p.dateAdded is null and p.personIdentifier in (select personIdentifier from person_person_type where personType = 'cornell-ithaca'))
 ) c
 where c.canon regexp '^[A-Za-z0-9._-]+$'
+and binary c.canon not regexp '^(usc_|fh_|fredhutch_|uc[a-z]+_)$'
 and c.canon not in (select trim(u.personIdentifier) from admin_users u where u.personIdentifier is not null)
 group by c.canon;
 

@@ -9,8 +9,12 @@ and `abl9002` are two people in ReCiter and one duplicated person here. The rule
      converted, and the nightly guard lists it as invalid.)
   2. Lowercase, unless the id is an external-cohort id. Those carry the partner's
      own key (fredhutch_Rachel.Rau) and must stay as they are.
-  3. Reject only what is still invalid: empty, any inner whitespace, '@', or a
-     character outside [a-z0-9._-] ([A-Za-z0-9._-] for an external-cohort id).
+  3. Reject only what is still invalid: empty, any inner whitespace, '@', a
+     character outside [a-z0-9._-] ([A-Za-z0-9._-] for an external-cohort id), or a
+     bare external prefix with nothing after it (`usc_`, `fh_`, `fredhutch_`, `ucsf_`).
+
+The external-cohort prefix is ^(?:usc_|fh_|fredhutch_|uc[a-z]+_), the same in every
+repo. `uc_` is not a cohort prefix (uc[a-z]+ needs at least one letter after `uc`).
 
 There is no WCM CWID shape check on purpose: Cornell netids and the external cohorts
 (usc_123, fh_x, fredhutch_A.B, ucsf_..., ucdavis_..., ucla_..., ucsd_..., uci_...)
@@ -19,12 +23,14 @@ have to keep working.
 import re
 
 # Case-sensitive on purpose: `Ucb2001` is a miscased CWID, not a cohort id.
-EXTERNAL_COHORT_PREFIX = re.compile(r"^(?:usc|fh|fredhutch|uc[a-z]*)_")
+EXTERNAL_COHORT_PREFIX = re.compile(r"^(?:usc_|fh_|fredhutch_|uc[a-z]+_)")
 # The same prefixes as a SQL pattern. Every SQL use applies it to a BINARY value
 # (`BINARY TRIM(x) REGEXP ...`) so it is case-sensitive like the Python one; under
 # the column's case-insensitive collation `FH_x` would otherwise count as a cohort id.
 # Prod is MariaDB, where REGEXP on BINARY is supported (and used elsewhere here).
-EXTERNAL_COHORT_PREFIX_SQL = "^(usc|fh|fredhutch|uc[a-z]*)_"
+EXTERNAL_COHORT_PREFIX_SQL = "^(usc_|fh_|fredhutch_|uc[a-z]+_)"
+# A bare prefix with nothing after it (`usc_`, `ucsf_`): rejected, in SQL and Python.
+EXTERNAL_COHORT_BARE_SQL = EXTERNAL_COHORT_PREFIX_SQL + "$"
 
 _VALID = re.compile(r"^[a-z0-9._-]+$")
 _VALID_EXTERNAL = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -50,7 +56,15 @@ def canonical_uid(raw):
         return None, "contains '@'"
     if not (_VALID_EXTERNAL if external else _VALID).match(uid):
         return None, "invalid characters"
+    if is_bare_external_prefix(uid):
+        return None, "bare external prefix"
     return uid, None
+
+
+def is_bare_external_prefix(uid):
+    """True for an external-cohort prefix with nothing after it: `usc_`, `ucsf_`."""
+    m = EXTERNAL_COHORT_PREFIX.match(uid or "")
+    return bool(m) and m.end() == len(uid)
 
 
 def person_guard_queries(table="person"):
@@ -61,7 +75,8 @@ def person_guard_queries(table="person"):
                    together here, which is exactly the collision PM sees.
     non-canonical: rows whose stored value differs (byte-wise) from its canonical
                    form. External-cohort ids are checked for whitespace only.
-    invalid:       rows no canonicalizing can save (an email, inner whitespace, '!').
+    invalid:       rows no canonicalizing can save (an email, inner whitespace, '!',
+                   or a bare external prefix such as `usc_` or `FH_`).
     """
     duplicated = (
         f"SELECT personIdentifier, COUNT(*) AS n FROM `{table}` "
@@ -78,6 +93,7 @@ def person_guard_queries(table="person"):
     invalid = (
         f"SELECT personIdentifier FROM `{table}` "
         "WHERE personIdentifier IS NULL OR TRIM(personIdentifier) NOT REGEXP '^[A-Za-z0-9._-]+$' "
+        f"OR BINARY LOWER(TRIM(personIdentifier)) REGEXP '{EXTERNAL_COHORT_BARE_SQL}' "
         "ORDER BY personIdentifier"
     )
     return [("duplicated", duplicated), ("non-canonical", non_canonical), ("invalid", invalid)]

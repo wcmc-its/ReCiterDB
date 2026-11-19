@@ -12,8 +12,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
-from cwid import (EXTERNAL_COHORT_PREFIX, EXTERNAL_COHORT_PREFIX_SQL, canonical_uid,
-                  is_external_cohort, person_guard_queries, warn_person_identifiers)
+from cwid import (EXTERNAL_COHORT_BARE_SQL, EXTERNAL_COHORT_PREFIX, EXTERNAL_COHORT_PREFIX_SQL,
+                  canonical_uid, is_bare_external_prefix, is_external_cohort,
+                  person_guard_queries, warn_person_identifiers)
 
 # --- canonical_uid -------------------------------------------------------------------
 # Converted on the way in: trimmed and lowercased (the bad forms found 11-18).
@@ -46,19 +47,38 @@ for raw, reason in [
     ("abc!1", "invalid characters"), ("abc,1", "invalid characters"), ("abc/1", "invalid characters"),
     ("abc&x=1", "invalid characters"), ("abé1", "invalid characters"),
     ("fredhutch_A B", "contains whitespace"), ("fredhutch_A!", "invalid characters"),
+    # A bare external prefix names nobody: rejected, also after trimming or lowercasing.
+    ("usc_", "bare external prefix"), ("fh_", "bare external prefix"),
+    ("fredhutch_", "bare external prefix"), ("ucsf_", "bare external prefix"),
+    ("ucdavis_", "bare external prefix"), (" uci_\n", "bare external prefix"),
+    ("FH_", "bare external prefix"), ("UCSF_", "bare external prefix"),
 ]:
     assert canonical_uid(raw) == (None, reason), (raw, canonical_uid(raw))
+
+# The prefix is exactly ^(?:usc_|fh_|fredhutch_|uc[a-z]+_): `uc` needs one letter more.
+assert EXTERNAL_COHORT_PREFIX.pattern == r"^(?:usc_|fh_|fredhutch_|uc[a-z]+_)"
+assert not is_external_cohort("uc_X1") and canonical_uid("uc_X1") == ("uc_x1", None)
+assert canonical_uid("uc_") == ("uc_", None), "uc_ is not a cohort prefix, so not a bare one"
+assert is_external_cohort("ucb_X") and canonical_uid("ucb_X") == ("ucb_X", None)
+assert not is_external_cohort("usc") and canonical_uid("USC") == ("usc", None)
+assert not is_external_cohort("uscx_A") and canonical_uid("uscx_A") == ("uscx_a", None)
+assert is_bare_external_prefix("ucsf_") and not is_bare_external_prefix("ucsf_1")
+assert not is_bare_external_prefix("") and not is_bare_external_prefix(None)
+# Underscore ids stay valid and separate from their plain form.
+assert canonical_uid("_pab4001") == ("_pab4001", None) and canonical_uid("pab4001") == ("pab4001", None)
 
 # --- guard queries -------------------------------------------------------------------
 q = dict(person_guard_queries("person"))
 assert set(q) == {"duplicated", "non-canonical", "invalid"}
 assert "NOT REGEXP '^[A-Za-z0-9._-]+$'" in q["invalid"]
+assert f"OR BINARY LOWER(TRIM(personIdentifier)) REGEXP '{EXTERNAL_COHORT_BARE_SQL}'" in q["invalid"]
+assert EXTERNAL_COHORT_BARE_SQL == "^(usc_|fh_|fredhutch_|uc[a-z]+_)$"
 assert "GROUP BY personIdentifier HAVING COUNT(*) > 1" in q["duplicated"]
 assert "FROM `person`" in q["duplicated"] and "FROM `person`" in q["non-canonical"]
 nc = q["non-canonical"]
 assert "CAST(personIdentifier AS BINARY) <> CAST(TRIM(personIdentifier) AS BINARY)" in nc
 assert "CAST(personIdentifier AS BINARY) <> CAST(LOWER(TRIM(personIdentifier)) AS BINARY)" in nc
-assert "BINARY TRIM(personIdentifier) NOT REGEXP '^(usc|fh|fredhutch|uc[a-z]*)_'" in nc
+assert "BINARY TRIM(personIdentifier) NOT REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]+_)'" in nc
 for sql in q.values():
     assert re.match(r"^SELECT ", sql) and not re.search(r"\b(INSERT|UPDATE|DELETE|ALTER|DROP)\b", sql)
 
@@ -72,10 +92,23 @@ for _f in ["setup/createEventsProceduresReciterDb.sql", "setup/proc_updateCurate
     _sql = open(os.path.join(ROOT, _f)).read().lower()
     _uses = [m.start() for m in re.finditer(re.escape("regexp '" + EXTERNAL_COHORT_PREFIX_SQL.lower()), _sql)]
     assert _uses, _f
+    _bare = "regexp '" + EXTERNAL_COHORT_BARE_SQL.lower() + "'"
     for _i in _uses:
+        if _sql.startswith(_bare, _i):
+            # the bare-prefix refusal runs on the canonical value, still as BINARY
+            assert _sql[:_i].rstrip().endswith("binary c.canon not"), (_f, _sql[_i - 60:_i])
+            continue
         assert _sql[:_i].rstrip().endswith("binary trim(p.personidentifier)"), (_f, _sql[_i - 60:_i])
+    assert _sql.count(_bare) == 1, _f
 _g = [sql for _, sql in person_guard_queries()]
-assert all(sql.count("REGEXP '" + EXTERNAL_COHORT_PREFIX_SQL) == sql.count("BINARY TRIM(personIdentifier) NOT REGEXP '" + EXTERNAL_COHORT_PREFIX_SQL) for sql in _g)
+assert all(sql.count("REGEXP '" + EXTERNAL_COHORT_PREFIX_SQL) == sql.count("BINARY TRIM(personIdentifier) NOT REGEXP '" + EXTERNAL_COHORT_PREFIX_SQL)
+           + sql.count("BINARY LOWER(TRIM(personIdentifier)) REGEXP '" + EXTERNAL_COHORT_BARE_SQL) for sql in _g)
+
+# The bare-prefix SQL agrees with the Python check on every case Python decides.
+_bare_re = re.compile(EXTERNAL_COHORT_BARE_SQL)
+for raw in ["usc_", "fh_", "fredhutch_", "ucsf_", "FH_", "uc_", "ucsf_1", "usc", "_pab4001"]:
+    _c = raw.strip().lower()
+    assert bool(_bare_re.search(_c)) == is_bare_external_prefix(_c), raw
 
 
 class FakeCursor:
@@ -154,7 +187,8 @@ body = routine("setup/createEventsProceduresReciterDb.sql")
 assert body == routine("setup/proc_updateCurateSelfRole_v3.17.sql"), "reload file drifted from master file"
 flat = " ".join(body.split())
 assert "else lower(trim(p.personIdentifier)) end as canon" in flat
-assert "select case when binary trim(p.personIdentifier) regexp '^(usc|fh|fredhutch|uc[a-z]*)_'" in flat
+assert "select case when binary trim(p.personIdentifier) regexp '^(usc_|fh_|fredhutch_|uc[a-z]+_)'" in flat
+assert "where c.canon regexp '^[A-Za-z0-9._-]+$' and binary c.canon not regexp '^(usc_|fh_|fredhutch_|uc[a-z]+_)$'" in flat
 assert ("and c.canon not in (select trim(u.personIdentifier) from admin_users u "
         "where u.personIdentifier is not null) group by c.canon;") in flat
 for role in ("4", "3"):
