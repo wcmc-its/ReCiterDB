@@ -23,7 +23,7 @@
 -- utf8mb4_unicode_ci, where 'Abl9002' = 'abl9002' and 'ggi9001 ' = 'ggi9001'.
 --
 -- External-cohort ids keep their case (trim only). They are exactly the ids matching
--- BINARY TRIM(id) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]*_)' (the underscore is
+-- BINARY TRIM(id) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]+_)' (the underscore is
 -- required: a bare 'uc...' id such as 'Uca2001' or 'ucb9001' is a CWID and is lowercased).
 -- Underscore test identities (_pab4001 and the rest) are lowercase already and are
 -- never merged.
@@ -195,7 +195,7 @@ CREATE TEMPORARY TABLE rm_acct (
 INSERT INTO rm_acct (userID, cur, canon)
 SELECT u.userID, u.personIdentifier,
        COALESCE(m.canon,
-         CASE WHEN BINARY TRIM(u.personIdentifier) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]*_)'
+         CASE WHEN BINARY TRIM(u.personIdentifier) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]+_)'
               THEN TRIM(u.personIdentifier)
               ELSE LOWER(TRIM(u.personIdentifier)) END)
 FROM admin_users u
@@ -410,17 +410,17 @@ DELETE x FROM reporting_ad_hoc_feature_generator_execution x JOIN rm_map m
 DELETE x FROM reporting_ad_hoc_identity_creation x JOIN rm_map m
   ON BINARY x.personIdentifier = BINARY m.bad AND m.action = 'DELETE';
 UPDATE reporting_ad_hoc_feature_generator_execution
-SET personIdentifier = CASE WHEN BINARY TRIM(personIdentifier) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]*_)'
+SET personIdentifier = CASE WHEN BINARY TRIM(personIdentifier) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]+_)'
                             THEN TRIM(personIdentifier) ELSE LOWER(TRIM(personIdentifier)) END
 WHERE BINARY personIdentifier <> BINARY TRIM(personIdentifier)
    OR (BINARY personIdentifier <> BINARY LOWER(personIdentifier)
-       AND NOT BINARY TRIM(personIdentifier) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]*_)');
+       AND NOT BINARY TRIM(personIdentifier) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]+_)');
 UPDATE reporting_ad_hoc_identity_creation
-SET personIdentifier = CASE WHEN BINARY TRIM(personIdentifier) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]*_)'
+SET personIdentifier = CASE WHEN BINARY TRIM(personIdentifier) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]+_)'
                             THEN TRIM(personIdentifier) ELSE LOWER(TRIM(personIdentifier)) END
 WHERE BINARY personIdentifier <> BINARY TRIM(personIdentifier)
    OR (BINARY personIdentifier <> BINARY LOWER(personIdentifier)
-       AND NOT BINARY TRIM(personIdentifier) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]*_)');
+       AND NOT BINARY TRIM(personIdentifier) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]+_)');
 -- the cron reads every row: one (uid, frequency, type) registration is enough
 DELETE x FROM reporting_ad_hoc_feature_generator_execution x
   JOIN reporting_ad_hoc_feature_generator_execution x2
@@ -432,7 +432,7 @@ DELETE x FROM reporting_ad_hoc_feature_generator_execution x
 -- =============================================================================
 INSERT INTO rm_check SELECT 'after', 'admin_users junk', COUNT(*) FROM admin_users WHERE BINARY personIdentifier IN (SELECT BINARY pid FROM rm_junk_pid) AND status <> 0;
 INSERT INTO rm_check SELECT 'after', 'admin_users mapped', COUNT(*) FROM admin_users u JOIN rm_map m ON BINARY u.personIdentifier = BINARY m.bad AND m.action = 'MAP';
-INSERT INTO rm_check SELECT 'after', 'admin_users duplicate canon', COUNT(*) FROM (SELECT CAST(CASE WHEN BINARY TRIM(personIdentifier) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]*_)' THEN TRIM(personIdentifier) ELSE LOWER(TRIM(personIdentifier)) END AS BINARY) c FROM admin_users WHERE personIdentifier IS NOT NULL AND TRIM(personIdentifier) <> '' AND BINARY personIdentifier NOT IN (SELECT BINARY pid FROM rm_junk_pid) GROUP BY c HAVING COUNT(*) > 1) d;
+INSERT INTO rm_check SELECT 'after', 'admin_users duplicate canon', COUNT(*) FROM (SELECT CAST(CASE WHEN BINARY TRIM(personIdentifier) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]+_)' THEN TRIM(personIdentifier) ELSE LOWER(TRIM(personIdentifier)) END AS BINARY) c FROM admin_users WHERE personIdentifier IS NOT NULL AND TRIM(personIdentifier) <> '' AND BINARY personIdentifier NOT IN (SELECT BINARY pid FROM rm_junk_pid) GROUP BY c HAVING COUNT(*) > 1) d;
 INSERT INTO rm_check SELECT 'after', 'admin_users_roles duplicates', COUNT(*) - COUNT(DISTINCT userID, roleID) FROM admin_users_roles;
 INSERT INTO rm_check SELECT 'after', 'grant_provenance mapped/deleted', COUNT(*) FROM grant_provenance g JOIN rm_map m ON BINARY g.personIdentifier = BINARY m.bad;
 INSERT INTO rm_check SELECT 'after', 'admin_feedback_log mapped', COUNT(*) FROM admin_feedback_log f JOIN rm_map m ON BINARY f.personIdentifier = BINARY m.bad AND m.action = 'MAP';
@@ -447,7 +447,7 @@ INSERT INTO rm_check SELECT 'after', 'admin_users untrimmed/upper-case (external
    AND BINARY personIdentifier NOT IN (SELECT BINARY pid FROM rm_junk_pid)
    AND (BINARY personIdentifier <> BINARY TRIM(personIdentifier)
         OR (BINARY personIdentifier <> BINARY LOWER(personIdentifier)
-            AND NOT BINARY TRIM(personIdentifier) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]*_)'));
+            AND NOT BINARY TRIM(personIdentifier) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]+_)'));
 INSERT INTO rm_check SELECT 'after', 'admin_users.proxy_person_ids mapped/deleted', COUNT(DISTINCT u.userID) FROM admin_users u JOIN rm_map m ON INSTR(CAST(u.proxy_person_ids AS BINARY), CAST(CONCAT('"', m.bad, '"') AS BINARY)) > 0;
 INSERT INTO rm_check SELECT 'after', 'authorship_review.reviewer mapped', COUNT(*) FROM authorship_review a JOIN rm_map m ON BINARY a.reviewer = BINARY m.bad AND m.action = 'MAP';
 SELECT 'after' AS phase, name AS tbl, n, 'expect 0' AS expect FROM rm_check WHERE phase = 'after';
