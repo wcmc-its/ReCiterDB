@@ -5552,8 +5552,10 @@ where (a.email is null or a.email = '') and p.primaryEmail is not null;
 -- that differ only in case (`Abl9002` + `abl9002`) became two candidates for one account.
 -- An id that is still not a plain id after trimming (inner space, '@'), or is a bare
 -- external prefix with nothing after it (`usc_`, `ucsf_`), gets no account.
--- The cohort-prefix test runs on BINARY so it is case-sensitive like the Python one:
--- `FH_Abc` is a miscased id and is lowercased, `fh_Abc` keeps its case.
+-- The cohort prefix is matched ASCII-case-insensitively (spelled out as character
+-- classes, on BINARY so the collation plays no part) and only the prefix is
+-- lowercased, as ReCiter's UidCanonicalizer does: `UCSF_AbC` -> `ucsf_AbC`,
+-- `fh_Abc` keeps its case.
 -- SQL TRIM() strips spaces only, where Python strip() also strips tabs and newlines,
 -- so an id wrapped in a tab is refused here (no account) rather than converted; the
 -- nightly CWID GUARD lists it as invalid.
@@ -5563,8 +5565,9 @@ where (a.email is null or a.email = '') and p.primaryEmail is not null;
 insert into admin_users (personIdentifier, nameFirst, nameMiddle, nameLast, email)
 select c.canon, max(c.firstName), max(c.middleName), max(c.lastName), max(c.primaryEmail)
 from (
-  select case when binary trim(p.personIdentifier) regexp '^(usc_|fh_|fredhutch_|uc[a-z]+_)'
-              then trim(p.personIdentifier)
+  select case when binary trim(p.personIdentifier) regexp '^([Uu][Ss][Cc]|[Ff][Hh]|[Ff][Rr][Ee][Dd][Hh][Uu][Tt][Cc][Hh]|[Uu][Cc][A-Za-z]+)_'
+              then concat(lower(substring_index(trim(p.personIdentifier), '_', 1)),
+                          substring(trim(p.personIdentifier), locate('_', trim(p.personIdentifier))))
               else lower(trim(p.personIdentifier)) end as canon,
          p.firstName, p.middleName, p.lastName, p.primaryEmail
   from person p
@@ -5572,7 +5575,7 @@ from (
   and not (p.dateAdded is null and p.personIdentifier in (select personIdentifier from person_person_type where personType = 'cornell-ithaca'))
 ) c
 where c.canon regexp '^[A-Za-z0-9._-]+$'
-and binary c.canon not regexp '^(usc_|fh_|fredhutch_|uc[a-z]+_)$'
+and binary c.canon not regexp '^([Uu][Ss][Cc]|[Ff][Hh]|[Ff][Rr][Ee][Dd][Hh][Uu][Tt][Cc][Hh]|[Uu][Cc][A-Za-z]+)_$'
 and c.canon not in (select trim(u.personIdentifier) from admin_users u where u.personIdentifier is not null)
 group by c.canon;
 

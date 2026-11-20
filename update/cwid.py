@@ -2,69 +2,112 @@
 
 DynamoDB keys are exact strings and MySQL compares case-insensitively, so `Abl9002`
 and `abl9002` are two people in ReCiter and one duplicated person here. The rule
-(approved 2026-11-18, Roadmap/cwid-normalization-plan.md):
+(approved 2026-11-18, Roadmap/cwid-normalization-plan.md) is ReCiter's
+`reciter.utils.UidCanonicalizer.canonicalize` (ReCiter #787/#789), and this port must
+give byte-identical output, or the two systems disagree on a person's key:
 
-  1. Trim surrounding whitespace. (The SQL in updateCurateSelfRole uses TRIM(), which
-     strips spaces only: an id wrapped in a tab or newline is refused there, not
-     converted, and the nightly guard lists it as invalid.)
-  2. Lowercase, unless the id is an external-cohort id. Those carry the partner's
-     own key (fredhutch_Rachel.Rau) and must stay as they are.
-  3. Reject only what is still invalid: empty, any inner whitespace, '@', a
-     character outside [a-z0-9._-] ([A-Za-z0-9._-] for an external-cohort id), or a
-     bare external prefix with nothing after it (`usc_`, `fh_`, `fredhutch_`, `ucsf_`).
+  1. Strip surrounding whitespace as Java String.strip() does: Character.isWhitespace,
+     which excludes the no-break spaces U+00A0, U+2007, U+202F and the next-line
+     U+0085 (Python's str.strip() removes all four). Empty -> invalid. (The SQL in
+     updateCurateSelfRole uses TRIM(), which strips spaces only: an id wrapped in a
+     tab or newline is refused there, not converted, and the nightly guard lists it
+     as invalid.)
+  2. If the id starts with an external-cohort prefix, matched ASCII-case-insensitively
+     (`usc_`, `fh_`, `fredhutch_`, `uc<letters>_`): lowercase only the prefix and keep
+     the partner's own key as it is (`UCSF_AbC` -> `ucsf_AbC`, `fredhutch_Rachel.Rau`
+     unchanged). A bare prefix with nothing after it (`usc_`) is invalid. Otherwise
+     lowercase the whole id.
+  3. Valid only if the result matches ^[a-z0-9._-]+$ (^[A-Za-z0-9._-]+$ for a cohort id).
 
-The external-cohort prefix is ^(?:usc_|fh_|fredhutch_|uc[a-z]+_), the same in every
-repo. `uc_` is not a cohort prefix (uc[a-z]+ needs at least one letter after `uc`).
+`uc_` is not a cohort prefix (uc[a-z]+ needs at least one letter after `uc`).
 
 There is no WCM CWID shape check on purpose: Cornell netids and the external cohorts
 (usc_123, fh_x, fredhutch_A.B, ucsf_..., ucdavis_..., ucla_..., ucsd_..., uci_...)
 have to keep working.
 """
 import re
+import unicodedata
 
-# Case-sensitive on purpose: `Ucb2001` is a miscased CWID, not a cohort id.
-EXTERNAL_COHORT_PREFIX = re.compile(r"^(?:usc_|fh_|fredhutch_|uc[a-z]+_)")
-# The same prefixes as a SQL pattern. Every SQL use applies it to a BINARY value
-# (`BINARY TRIM(x) REGEXP ...`) so it is case-sensitive like the Python one; under
-# the column's case-insensitive collation `FH_x` would otherwise count as a cohort id.
-# Prod is MariaDB, where REGEXP on BINARY is supported (and used elsewhere here).
-EXTERNAL_COHORT_PREFIX_SQL = "^(usc_|fh_|fredhutch_|uc[a-z]+_)"
-# A bare prefix with nothing after it (`usc_`, `ucsf_`): rejected, in SQL and Python.
+# Java: Pattern.compile("^(?:usc|fh|fredhutch|uc[a-z]+)_", CASE_INSENSITIVE) + lookingAt().
+# Without UNICODE_CASE, Java folds ASCII only; re.ASCII does the same here (otherwise
+# Python would let the Kelvin sign U+212A match `k`).
+EXTERNAL_COHORT_PREFIX = re.compile(r"(?:usc|fh|fredhutch|uc[a-z]+)_", re.IGNORECASE | re.ASCII)
+# The same prefix as a SQL pattern. ASCII case-insensitivity is spelled out with
+# character classes, and every SQL use applies it to a BINARY value, so the match does
+# not depend on the column collation or on the server's REGEXP case handling.
+EXTERNAL_COHORT_PREFIX_SQL = ("^([Uu][Ss][Cc]|[Ff][Hh]|[Ff][Rr][Ee][Dd][Hh][Uu][Tt][Cc][Hh]"
+                              "|[Uu][Cc][A-Za-z]+)_")
+# A bare prefix with nothing after it (`usc_`, `UCSF_`): rejected, in SQL and Python.
 EXTERNAL_COHORT_BARE_SQL = EXTERNAL_COHORT_PREFIX_SQL + "$"
 
-_VALID = re.compile(r"^[a-z0-9._-]+$")
-_VALID_EXTERNAL = re.compile(r"^[A-Za-z0-9._-]+$")
+_VALID = re.compile(r"[a-z0-9._-]+")
+_VALID_EXTERNAL = re.compile(r"[A-Za-z0-9._-]+")
+
+# Java Character.isWhitespace: SPACE/LINE/PARAGRAPH_SEPARATOR except the no-break
+# spaces, plus these controls.
+_JAVA_WS_CONTROLS = frozenset("\t\n\x0b\x0c\r\x1c\x1d\x1e\x1f")
+_JAVA_NOT_WS = frozenset("\u00a0\u2007\u202f")
+
+
+def _java_is_whitespace(ch):
+    return ch in _JAVA_WS_CONTROLS or (
+        ch not in _JAVA_NOT_WS and unicodedata.category(ch) in ("Zs", "Zl", "Zp"))
+
+
+def java_strip(s):
+    """Java String.strip(): trim Character.isWhitespace code points from both ends."""
+    i, j = 0, len(s)
+    while i < j and _java_is_whitespace(s[i]):
+        i += 1
+    while j > i and _java_is_whitespace(s[j - 1]):
+        j -= 1
+    return s[i:j]
 
 
 def is_external_cohort(uid):
+    """True when the (already stripped) uid starts with a cohort prefix, any ASCII case."""
     return bool(EXTERNAL_COHORT_PREFIX.match(uid or ""))
 
 
 def canonical_uid(raw):
-    """Return (canonical, None) or (None, reason). Never raises on bad input."""
+    """Return (canonical, None) or (None, reason). Never raises on bad input.
+
+    Same output as ReCiter's UidCanonicalizer.canonicalize for every input; where Java
+    throws InvalidUidException this returns (None, reason)."""
     if raw is None:
         return None, "empty"
-    uid = str(raw).strip()
+    uid = java_strip(str(raw))
     if not uid:
         return None, "empty"
-    external = is_external_cohort(uid)
-    if not external:
-        uid = uid.lower()
+    m = EXTERNAL_COHORT_PREFIX.match(uid)
+    if m and m.end() == len(uid):
+        return None, "bare external prefix"
+    # str.lower() and Java toLowerCase(Locale.ROOT) differ only on characters that the
+    # validity check below refuses either way (the Kelvin sign lowercases to `k` in both).
+    uid = (m.group().lower() + uid[m.end():]) if m else uid.lower()
+    if (_VALID_EXTERNAL if m else _VALID).fullmatch(uid):
+        return uid, None
     if re.search(r"\s", uid):
         return None, "contains whitespace"
     if "@" in uid:
         return None, "contains '@'"
-    if not (_VALID_EXTERNAL if external else _VALID).match(uid):
-        return None, "invalid characters"
-    if is_bare_external_prefix(uid):
-        return None, "bare external prefix"
-    return uid, None
+    return None, "invalid characters"
 
 
 def is_bare_external_prefix(uid):
-    """True for an external-cohort prefix with nothing after it: `usc_`, `ucsf_`."""
+    """True for an external-cohort prefix with nothing after it: `usc_`, `UCSF_`."""
     m = EXTERNAL_COHORT_PREFIX.match(uid or "")
     return bool(m) and m.end() == len(uid)
+
+
+def canonical_sql(col):
+    """SQL expression for the canonical form of `col`, as far as SQL can compute it:
+    TRIM() (spaces only), then lowercase the cohort prefix only, or the whole id. The
+    prefix is letters followed by its first `_`, so SUBSTRING_INDEX/LOCATE split it."""
+    t = f"TRIM({col})"
+    return (f"CASE WHEN BINARY {t} REGEXP '{EXTERNAL_COHORT_PREFIX_SQL}' "
+            f"THEN CONCAT(LOWER(SUBSTRING_INDEX({t}, '_', 1)), SUBSTRING({t}, LOCATE('_', {t}))) "
+            f"ELSE LOWER({t}) END")
 
 
 def person_guard_queries(table="person"):
@@ -74,7 +117,8 @@ def person_guard_queries(table="person"):
                    collation is case-insensitive, so `Abl9002` and `abl9002` group
                    together here, which is exactly the collision PM sees.
     non-canonical: rows whose stored value differs (byte-wise) from its canonical
-                   form. External-cohort ids are checked for whitespace only.
+                   form (canonical_sql): stray spaces, upper case outside a cohort id,
+                   or an upper-case cohort prefix (`UCSF_AbC`, canonical `ucsf_AbC`).
     invalid:       rows no canonicalizing can save (an email, inner whitespace, '!',
                    or a bare external prefix such as `usc_` or `FH_`).
     """
@@ -85,15 +129,13 @@ def person_guard_queries(table="person"):
     )
     non_canonical = (
         f"SELECT personIdentifier FROM `{table}` "
-        "WHERE CAST(personIdentifier AS BINARY) <> CAST(TRIM(personIdentifier) AS BINARY) "
-        f"OR (BINARY TRIM(personIdentifier) NOT REGEXP '{EXTERNAL_COHORT_PREFIX_SQL}' "
-        "AND CAST(personIdentifier AS BINARY) <> CAST(LOWER(TRIM(personIdentifier)) AS BINARY)) "
+        f"WHERE CAST(personIdentifier AS BINARY) <> CAST({canonical_sql('personIdentifier')} AS BINARY) "
         "ORDER BY personIdentifier"
     )
     invalid = (
         f"SELECT personIdentifier FROM `{table}` "
         "WHERE personIdentifier IS NULL OR TRIM(personIdentifier) NOT REGEXP '^[A-Za-z0-9._-]+$' "
-        f"OR BINARY LOWER(TRIM(personIdentifier)) REGEXP '{EXTERNAL_COHORT_BARE_SQL}' "
+        f"OR BINARY TRIM(personIdentifier) REGEXP '{EXTERNAL_COHORT_BARE_SQL}' "
         "ORDER BY personIdentifier"
     )
     return [("duplicated", duplicated), ("non-canonical", non_canonical), ("invalid", invalid)]
