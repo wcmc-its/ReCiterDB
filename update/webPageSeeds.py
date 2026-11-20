@@ -46,6 +46,7 @@ import threading
 import time
 import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 import urllib.robotparser
 from concurrent.futures import ThreadPoolExecutor
@@ -65,7 +66,12 @@ REFETCH_DAYS = int(os.environ.get("WEB_SEEDS_REFETCH_DAYS", "30"))
 GONE_AFTER_RUNS = 2
 MISSING_MIN_GAP = datetime.timedelta(days=5)  # count at most one absence per weekly run, even across restarts
 HOST_WORKERS = 12
-REQUEST_GAP = 1.0      # seconds between requests to one host
+REQUEST_GAP = 1.0      # seconds between requests to one host (raised by robots Crawl-delay or throttling)
+MAX_GAP = 60.0         # ceiling for a host's request gap
+THROTTLE_STATUSES = {429, 503, 403, 405, 999}  # observed rate-limit / WAF answers; back off on these
+THROTTLE_STOP = 10     # consecutive throttle answers -> leave the host for this run
+ALIAS_TTL = datetime.timedelta(days=30)  # re-ask the directory about an address after this
+LDAP_BATCH = 40
 READ_TIMEOUT = 25      # per socket operation
 FETCH_BUDGET = 60      # total seconds for one response body
 MAX_BYTES = 3_000_000
@@ -111,6 +117,13 @@ DDL = [
   last_seen DATETIME NOT NULL,
   removed_at DATETIME,
   PRIMARY KEY (url, netid),
+  KEY idx_netid (netid)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""",
+    """CREATE TABLE IF NOT EXISTS pubsource_web_email_alias (
+  email VARCHAR(254) NOT NULL PRIMARY KEY,
+  netid VARCHAR(100),
+  source VARCHAR(20) NOT NULL,
+  resolved_at DATETIME NOT NULL,
   KEY idx_netid (netid)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""",
     """CREATE TABLE IF NOT EXISTS pubsource_web_run (
@@ -198,10 +211,12 @@ def alias_map(roster):
     return m
 
 
-def link_people(emails, aliases):
-    """[(netid, link_method)] for a page's full email addresses. Only exact roster addresses
-    link (a bare local part from another cornell.edu namespace, e.g. WCM, must not). A page
-    counts toward a person downstream only if it names exactly one roster person."""
+def link_people(emails, aliases, directory=None):
+    """[(netid, link_method)] for a page's full email addresses. Only exact addresses link (a bare
+    local part from another cornell.edu namespace, e.g. WCM, must not): first the roster's own
+    addresses, then Cornell directory aliases (mail / publishedemail / mailAlternateAddress) that
+    resolve to a roster NetID. A page counts toward a person downstream only if it names exactly
+    one roster person."""
     hits = {}
     for e in emails:
         if e.split("@", 1)[-1] in SKIP_EMAIL_DOMAINS:
@@ -209,7 +224,38 @@ def link_people(emails, aliases):
         n = aliases.get(e)
         if n:
             hits.setdefault(n, "email" if e == f"{n}@cornell.edu" else "roster_alias")
+        elif directory and directory.get(e):
+            hits.setdefault(directory[e], "ldap_alias")
     return sorted(hits.items())
+
+
+def own_host_urls(entries, host, base):
+    """Sitemap entries resolved against the sitemap URL, kept only if they belong to THIS host.
+    Several host names serve one site (duffield / www.duffield / engineering list the same
+    1,215 pages); without this each name crawled them all, tripling the load on one server."""
+    out = []
+    for u, lm in entries:
+        u = urllib.parse.urljoin(base, u)
+        if urllib.parse.urlsplit(u).netloc.lower() == host:
+            out.append((u, lm))
+    return out
+
+
+def ldap_filter(emails):
+    from ldap3.utils.conv import escape_filter_chars
+    parts = [f"({a}={escape_filter_chars(e)})" for e in emails
+             for a in ("mail", "cornelledupublishedemail", "mailAlternateAddress")]
+    return "(|" + "".join(parts) + ")"
+
+
+def match_directory_entries(emails, entries):
+    """{email: uid} for queried addresses found on exactly one directory entry."""
+    owners = {}
+    for uid, addrs in entries:
+        for a in addrs:
+            if a in emails:
+                owners.setdefault(a, set()).add(uid)
+    return {e: next(iter(u)) for e, u in owners.items() if len(u) == 1}
 
 
 def parse_lastmod(s):
@@ -254,11 +300,17 @@ def expired(deadline):
     return STOP.is_set() or time.monotonic() > deadline
 
 
+class HostThrottled(Exception):
+    pass
+
+
 class Host:
-    """One host's robots.txt + a 1 req/s gate. Every read is bounded in total wall-clock time."""
+    """One host's robots.txt + a request gate (1 req/s, or the site's Crawl-delay, raised further
+    when the site throttles). Every read is bounded in total wall-clock time."""
 
     def __init__(self, name, deadline):
         self.name, self.deadline, self._last, self._lock = name, deadline, 0.0, threading.Lock()
+        self.gap, self.throttled_in_a_row, self.throttle_events = REQUEST_GAP, 0, 0
         self.robots = urllib.robotparser.RobotFileParser(f"https://{name}/robots.txt")
         self.robots_ok = True
         try:
@@ -269,16 +321,19 @@ class Host:
             status, body = None, ""
         if status == 200:
             self.robots.parse(body.splitlines())
-        elif status is not None and 400 <= status < 500:
+            delay = self.robots.crawl_delay(UA)
+            if delay:
+                self.gap = min(max(self.gap, float(delay)), MAX_GAP)
+        elif status is not None and 400 <= status < 500 and status not in THROTTLE_STATUSES:
             self.robots.allow_all = True       # no robots.txt = no restrictions (RFC 9309)
         else:
-            self.robots_ok = False             # 5xx / unreachable: crawl nothing this run
+            self.robots_ok = False             # 5xx / throttled / unreachable: crawl nothing this run
 
     def get(self, url, headers=None):
         if expired(self.deadline):
             raise Deadline()
         with self._lock:
-            wait = self._last + REQUEST_GAP - time.monotonic()
+            wait = self._last + self.gap - time.monotonic()
             if wait > 0:
                 time.sleep(wait)
             self._last = time.monotonic()
@@ -286,7 +341,9 @@ class Host:
         try:
             r = urllib.request.urlopen(req, timeout=READ_TIMEOUT)
         except urllib.error.HTTPError as e:
+            self._throttle_check(e.code, e.headers)
             return e.code, url, dict(e.headers or {}), ""
+        self.throttled_in_a_row = 0
         with r:
             stop, chunks, size = time.monotonic() + FETCH_BUDGET, [], 0
             while size < MAX_BYTES:
@@ -305,6 +362,22 @@ class Host:
             hdr["X-Truncated"] = truncated
             return r.status, r.geturl(), hdr, body.decode("utf-8", "replace")
 
+    def _throttle_check(self, status, headers):
+        """Back off on rate-limit / WAF answers: double the gap (or honour Retry-After), and give up
+        on the host for this run after THROTTLE_STOP in a row. Pages left behind are retried next run."""
+        if status not in THROTTLE_STATUSES:
+            self.throttled_in_a_row = 0
+            return
+        self.throttled_in_a_row += 1
+        self.throttle_events += 1
+        try:
+            retry = float((headers or {}).get("Retry-After") or 0)
+        except ValueError:
+            retry = 0.0
+        self.gap = min(max(self.gap * 2, retry, 2.0), MAX_GAP)
+        if self.throttled_in_a_row >= THROTTLE_STOP:
+            raise HostThrottled(f"{self.name}: {self.throttled_in_a_row} throttled answers in a row (last {status})")
+
     def sitemap(self):
         """([(url, lastmod)], complete). complete is False if any sitemap failed, was truncated,
         or the sitemap cap was hit -- callers must then not treat absence as removal."""
@@ -320,7 +393,7 @@ class Host:
             seen.add(sm)
             try:
                 status, _, hdr, x = self.get(sm)
-            except Deadline:
+            except (Deadline, HostThrottled):
                 raise
             except Exception as e:
                 log.warning("%s sitemap %s: %s", self.name, sm, e)
@@ -334,13 +407,13 @@ class Host:
                 loc = re.search(r"<loc>\s*([^<\s]+)\s*</loc>", block)
                 if not loc:
                     continue
-                u = loc.group(1).replace("&amp;", "&")
+                u = urllib.parse.urljoin(sm, loc.group(1).replace("&amp;", "&"))  # some sitemaps list relative paths
                 if is_index:
                     queue.append(u)
                 else:
                     lm = re.search(r"<lastmod>\s*([^<\s]+)\s*</lastmod>", block)
                     out.append((u, parse_lastmod(lm.group(1) if lm else None)))
-        return out, complete
+        return own_host_urls(out, self.name, f"https://{self.name}/"), complete
 
 
 # ---------------------------------------------------------------------------
@@ -367,12 +440,18 @@ def load_roster(db):
         rows = c.fetchall()
     aliases = alias_map([(r["netid"], r["email"], r["email_netid"], r["email_alt_cu"]) for r in rows])
     idx = surname_index([(r["netid"], r["name_first"], r["name_last"]) for r in rows])
-    return aliases, idx
+    return aliases, idx, {r["netid"].lower() for r in rows}
 
 
-def relink(c, url, emails, content_hash, aliases, now):
+def load_directory(c, roster):
+    """Cached directory answers -> {email: roster netid}; addresses owned by non-roster people drop out."""
+    c.execute("SELECT email, netid FROM pubsource_web_email_alias WHERE netid IS NOT NULL")
+    return {r["email"]: r["netid"] for r in c.fetchall() if r["netid"] in roster}
+
+
+def relink(c, url, emails, content_hash, aliases, now, directory=None):
     """Make a page's person links match its emails; dropped links are soft-removed. Idempotent."""
-    links = link_people(emails, aliases)
+    links = link_people(emails, aliases, directory)
     sole = len(links) == 1
     for netid, method in links:
         c.execute("""INSERT INTO pubsource_web_page_person (url, netid, link_method, is_sole_person, content_hash, first_seen, last_seen, removed_at)
@@ -398,11 +477,12 @@ def load_known(c, host, urls):
     return known
 
 
-def crawl_host(name, aliases, idx, deadline, max_pages, stats, lock):
+def crawl_host(name, aliases, directory, idx, deadline, max_pages, stats, lock):
     s = dict(host=name, listed=0, sitemap_complete=None, robots_ok=None, capped=False, fetched=0, not_modified=0,
              unchanged=0, changed=0, new=0, errors=0, page_errors=0, gone=0, skipped=0, relinked=0,
-             stopped_at_deadline=False)
-    db = None
+             stopped_at_deadline=False, throttled_stop=False, throttle_events=0, gap=REQUEST_GAP)
+    conn = {"db": None}
+    h = None
     try:
         if expired(deadline):
             raise Deadline()
@@ -415,8 +495,8 @@ def crawl_host(name, aliases, idx, deadline, max_pages, stats, lock):
         listed = {u: lm for u, lm in entries
                   if len(u) <= MAX_URL and looks_like_person_url(u, idx) and h.robots.can_fetch(UA, u)}
         s.update(listed=len(listed), sitemap_complete=complete, capped=len(listed) > max_pages)
-        db = db_conn()
-        with db.cursor() as c:
+        conn["db"] = db_conn()
+        with conn["db"].cursor() as c:
             known = load_known(c, name, list(listed))
         now = utcnow()
 
@@ -424,7 +504,15 @@ def crawl_host(name, aliases, idx, deadline, max_pages, stats, lock):
             # One writer at a time across host threads (concurrent page/page_person writes from different
             # hosts deadlocked on gap locks). Each page's writes commit together or not at all.
             with DB_WRITE:
-                db.ping(reconnect=True)
+                try:
+                    conn["db"].ping()
+                except Exception:  # dropped by wait_timeout between slow pages: open a fresh one
+                    try:
+                        conn["db"].close()
+                    except Exception:
+                        pass
+                    conn["db"] = db_conn()
+                db = conn["db"]
                 with db.cursor() as c:
                     try:
                         fn(c)
@@ -457,31 +545,40 @@ def crawl_host(name, aliases, idx, deadline, max_pages, stats, lock):
                 s["stopped_at_deadline"] = True
                 break
             try:
-                crawl_page(h, write, u, listed[u], known.get(u), name, aliases, now, s)
+                crawl_page(h, write, u, listed[u], known.get(u), name, aliases, directory, now, s)
             except Deadline:
                 s["stopped_at_deadline"] = True
+                break
+            except HostThrottled as e:
+                s["throttled_stop"] = True
+                log.warning("%s", e)
                 break
             except Exception as e:  # one bad page must not fail the host every week
                 s["page_errors"] += 1
                 log.warning("%s: %s", u, e)
     except Deadline:
         s["stopped_at_deadline"] = True
+    except HostThrottled as e:
+        s["throttled_stop"] = True
+        log.warning("%s", e)
     except Exception:
         log.exception("host %s failed", name)
         s["failed"] = True
     finally:
-        if db:
-            db.close()
+        if h:
+            s.update(throttle_events=h.throttle_events, gap=h.gap)
+        if conn["db"]:
+            conn["db"].close()
         with lock:
             stats.append(s)
         log.info("%s", s)
 
 
-def crawl_page(h, write, u, lm, row, host, aliases, now, s):
+def crawl_page(h, write, u, lm, row, host, aliases, directory, now, s):
     if not needs_fetch(row, lm, now):
         s["skipped"] += 1
         # links follow the roster even when the page is untouched; no fetch needed
-        write(lambda c: relink(c, u, json.loads(row["emails_json"] or "[]"), row["content_hash"], aliases, now))
+        write(lambda c: relink(c, u, json.loads(row["emails_json"] or "[]"), row["content_hash"], aliases, now, directory))
         s["relinked"] += 1
         return
     cond = {}
@@ -492,7 +589,7 @@ def crawl_page(h, write, u, lm, row, host, aliases, now, s):
             cond["If-Modified-Since"] = row["last_modified"]
     try:
         status, _, hdr, html = h.get(u, cond)
-    except Deadline:
+    except (Deadline, HostThrottled):
         raise
     except Exception as e:
         s["errors"] += 1
@@ -509,7 +606,7 @@ def crawl_page(h, write, u, lm, row, host, aliases, now, s):
         def touch(c):
             c.execute("UPDATE pubsource_web_page SET last_attempt=%s, last_fetched=%s, http_status=304, gone_at=NULL, sitemap_lastmod=%s WHERE url=%s",
                       (now, now, lm, u))
-            relink(c, u, json.loads(row["emails_json"] or "[]"), row["content_hash"], aliases, now)
+            relink(c, u, json.loads(row["emails_json"] or "[]"), row["content_hash"], aliases, now, directory)
         write(touch)
         return
     if status != 200:
@@ -537,7 +634,7 @@ def crawl_page(h, write, u, lm, row, host, aliases, now, s):
         def same(c):
             c.execute("""UPDATE pubsource_web_page SET last_attempt=%s, last_fetched=%s, http_status=200, etag=%s, last_modified=%s,
                          sitemap_lastmod=%s, gone_at=NULL WHERE url=%s""", (now, now, etag, lmod, lm, u))
-            relink(c, u, sig["emails"], sig["hash"], aliases, now)
+            relink(c, u, sig["emails"], sig["hash"], aliases, now, directory)
         write(same)
         return
     s["changed" if row and row["content_hash"] else "new"] += 1
@@ -553,7 +650,7 @@ def crawl_page(h, write, u, lm, row, host, aliases, now, s):
              last_fetched=VALUES(last_fetched), last_changed=VALUES(last_changed), gone_at=NULL""",
                   (u, host, lm, etag, lmod, sig["hash"], json.dumps(sig["emails"]), json.dumps(sig["links"]),
                    sig["dois"], sig["years"], now, now, now, now))
-        relink(c, u, sig["emails"], sig["hash"], aliases, now)  # same transaction as the page row
+        relink(c, u, sig["emails"], sig["hash"], aliases, now, directory)  # same transaction as the page row
     write(upsert)
 
 
@@ -573,6 +670,75 @@ WHERE r.is_faculty = 1
   AND COALESCE(r.primary_job_title, r.primary_business_title) NOT LIKE '%Emerit%'
   AND IFNULL(r.affiliations_all, '') NOT LIKE '%emerit%'
 """
+
+
+def directory_pass(roster, aliases, now):
+    """Resolve page addresses the roster can't, via the Cornell directory, cache every answer
+    (misses too) in pubsource_web_email_alias, and relink the pages that gained a link.
+    Off (logged, not an error) when the directory bind secret is absent."""
+    dn, pw = os.environ.get("CORNELL_ITHACA_ED_DN"), os.environ.get("CORNELL_ITHACA_ED_PASS")
+    if not (dn and pw):
+        log.info("directory pass: CORNELL_ITHACA_ED_DN/PASS unset, skipped")
+        return {"directory": "off"}
+    from ldap3 import Connection, Server, SUBTREE
+    db = db_conn()
+    try:
+        with db.cursor() as c:
+            c.execute("SELECT url, emails_json, content_hash FROM pubsource_web_page WHERE gone_at IS NULL AND emails_json IS NOT NULL")
+            pages = c.fetchall()
+            c.execute("SELECT email FROM pubsource_web_email_alias WHERE resolved_at >= %s", (now - ALIAS_TTL,))
+            fresh = {r["email"] for r in c.fetchall()}
+        wanted = sorted({e for p in pages for e in json.loads(p["emails_json"] or "[]")
+                         if e not in aliases and e not in fresh and e.split("@", 1)[-1] not in SKIP_EMAIL_DOMAINS})
+        conn = Connection(Server("query.directory.cornell.edu", port=636, use_ssl=True, get_info=None),
+                          user=dn, password=pw, auto_bind=True)
+        answered, found = 0, {}
+        try:
+            for i in range(0, len(wanted), LDAP_BATCH):
+                batch = wanted[i:i + LDAP_BATCH]
+                conn.search("ou=People,o=Cornell University,c=us", ldap_filter(batch), SUBTREE,
+                            attributes=["uid", "mail", "cornelledupublishedemail", "mailAlternateAddress"], time_limit=60)
+                if (conn.result or {}).get("description") != "success":
+                    log.warning("directory pass: batch %d failed (%s); not cached", i // LDAP_BATCH, conn.result)
+                    continue
+                entries = []
+                for e in conn.entries:
+                    d = e.entry_attributes_as_dict
+                    uid = str((d.get("uid") or [""])[0]).strip().lower()
+                    addrs = {str(v).strip().lower() for a in ("mail", "cornelledupublishedemail", "mailAlternateAddress")
+                             for v in (d.get(a) or [])}
+                    if uid:
+                        entries.append((uid, addrs))
+                hit = match_directory_entries(set(batch), entries)
+                found.update(hit)
+                answered += len(batch)
+                with db.cursor() as c:
+                    c.executemany("""INSERT INTO pubsource_web_email_alias (email, netid, source, resolved_at) VALUES (%s,%s,'ldap',%s)
+                                     ON DUPLICATE KEY UPDATE netid=VALUES(netid), resolved_at=VALUES(resolved_at)""",
+                                  [(e, hit.get(e), now) for e in batch])
+                db.commit()
+        finally:
+            conn.unbind()
+        with db.cursor() as c:
+            directory = load_directory(c, roster)
+        new_links = {e for e, n in found.items() if n in roster}
+        relinked = 0
+        for p in pages:
+            emails = json.loads(p["emails_json"] or "[]")
+            if new_links.intersection(emails):
+                with db.cursor() as c:
+                    relink(c, p["url"], emails, p["content_hash"], aliases, now, directory)
+                db.commit()
+                relinked += 1
+        out = {"directory_asked": len(wanted), "directory_answered": answered,
+               "directory_resolved": len(found), "directory_to_roster": len(new_links), "directory_relinked_pages": relinked}
+        log.info("directory pass: %s", out)
+        return out
+    except Exception:
+        log.exception("directory pass failed; crawl results stand")
+        return {"directory": "failed"}
+    finally:
+        db.close()
 
 
 def close_run(run_id, status, stats_json=None):
@@ -611,24 +777,34 @@ def main():
             c.execute("INSERT INTO pubsource_web_run (started_at, status) VALUES (%s, 'running')", (utcnow(),))
             run_id = c.lastrowid
         db.commit()
-        hosts = a.hosts or [h.strip() for h in open(HOSTS_FILE) if h.strip() and not h.startswith("#")]
-        aliases, idx = load_roster(db)
+        hosts = list(dict.fromkeys(h.strip().lower() for h in (a.hosts or open(HOSTS_FILE))
+                                   if h.strip() and not h.startswith("#")))
+        aliases, idx, roster = load_roster(db)
+        with db.cursor() as c:
+            directory = load_directory(c, roster)
+            # Rows written by another host name's crawl before own-host filtering: give each its own host.
+            c.execute("""UPDATE pubsource_web_page SET host = LOWER(SUBSTRING_INDEX(SUBSTRING_INDEX(url, '/', 3), '/', -1))
+                         WHERE host <> LOWER(SUBSTRING_INDEX(SUBSTRING_INDEX(url, '/', 3), '/', -1))""")
+        db.commit()
     finally:
         db.close()
-    log.info("run %s: roster %d addresses, %d surnames; %d hosts", run_id, len(aliases), len(idx), len(hosts))
+    log.info("run %s: roster %d addresses, %d directory aliases, %d surnames; %d hosts",
+             run_id, len(aliases), len(directory), len(idx), len(hosts))
 
     # SIGTERM (pod eviction, activeDeadline): stop every thread at its next request, let the pool
     # drain (a request is bounded by FETCH_BUDGET), then the finally below closes the run row.
     signal.signal(signal.SIGTERM, lambda *_: STOP.set())
     deadline = time.monotonic() + MAX_SECONDS
-    stats, lock, status = [], threading.Lock(), "failed"
+    stats, lock, status, dir_stats = [], threading.Lock(), "failed", {}
     try:
         with ThreadPoolExecutor(HOST_WORKERS) as ex:
-            list(ex.map(lambda h: crawl_host(h, aliases, idx, deadline, a.max_pages, stats, lock), hosts))
+            list(ex.map(lambda h: crawl_host(h, aliases, directory, idx, deadline, a.max_pages, stats, lock), hosts))
         if STOP.is_set():
             status = "stopped"
             raise SystemExit(143)
-        incomplete = any(s.get("failed") or s.get("stopped_at_deadline") or s.get("robots_ok") is False for s in stats)
+        dir_stats = directory_pass(roster, aliases, utcnow()) if not expired(deadline) else {"directory": "skipped_deadline"}
+        incomplete = any(s.get("failed") or s.get("stopped_at_deadline") or s.get("throttled_stop")
+                         or s.get("robots_ok") is False for s in stats)
         status = "partial" if incomplete else "ok"
     finally:
         keys = ("listed", "fetched", "new", "changed", "unchanged", "not_modified", "skipped", "relinked",
@@ -638,7 +814,9 @@ def main():
                      hosts_robots_unavailable=sum(1 for s in stats if s.get("robots_ok") is False),
                      hosts_sitemap_incomplete=sum(1 for s in stats if s.get("sitemap_complete") is False),
                      hosts_capped=sum(1 for s in stats if s.get("capped")),
-                     hosts_stopped_at_deadline=sum(1 for s in stats if s.get("stopped_at_deadline")))
+                     hosts_stopped_at_deadline=sum(1 for s in stats if s.get("stopped_at_deadline")),
+                     hosts_throttled_stop=sum(1 for s in stats if s.get("throttled_stop")),
+                     throttle_events=sum(s.get("throttle_events", 0) for s in stats), **dir_stats)
         cov = close_run(run_id, status, json.dumps({"total": total, "hosts": stats}, default=str))
         log.info("run %s %s: %s", run_id, status, total)
         log.info("coverage: %s", cov)

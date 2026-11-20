@@ -42,6 +42,12 @@ spec:
                 name: reciterdb-secrets
             - configMapRef:
                 name: reciterdb-configmap
+            # CORNELL_ITHACA_ED_DN / CORNELL_ITHACA_ED_PASS: the Cornell directory bind, used to
+            # resolve page email aliases the roster doesn't know. Optional: absent, the
+            # directory pass logs "skipped" and linking uses roster addresses only.
+            - secretRef:
+                name: cornell-ithaca-ed
+                optional: true
             resources:
               requests:
                 memory: 512Mi
