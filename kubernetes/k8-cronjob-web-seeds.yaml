@@ -1,0 +1,53 @@
+# Weekly crawl of Cornell Ithaca people pages into pubsource_web_* (webPageSeeds.py).
+#
+# APPLY THIS BY HAND, ONCE. The ReCiterDB CodeBuild pipeline auto-deploys the IMAGE
+# only -- it does not apply manifests (same as k8-cronjob-identity.yaml).
+#
+# Sunday 03:00 UTC. A first full crawl can run into the Sunday reciterdb-identity (12:00 UTC)
+# window; that is harmless -- this job reads identity_cornell_current once at startup and
+# writes only pubsource_web_* tables. The script stops at WEB_SEEDS_MAX_SECONDS (10h) and saves
+# state, so the next run resumes; activeDeadlineSeconds is only the backstop, because
+# concurrencyPolicy: Forbid turns a hung job into a skipped schedule.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: reciterdb-web-seeds
+  namespace: reciter
+  labels:
+    app: reciterdb-web-seeds
+    tier: backend
+spec:
+  schedule: "0 3 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 39600
+      template:
+        spec:
+          # SIGTERM stops every thread at its next request (each bounded by 60s) and closes the run row.
+          terminationGracePeriodSeconds: 120
+          containers:
+          - name: reciterdb-web-seeds
+            image: CONTAINER_IMAGE
+            command: ["python3", "webPageSeeds.py"]
+            env:
+            - name: WEB_SEEDS_MAX_SECONDS
+              value: "36000"
+            envFrom:
+            # DB_USERNAME / DB_PASSWORD, and DB_HOST / DB_NAME from the configmap.
+            - secretRef:
+                name: reciterdb-secrets
+            - configMapRef:
+                name: reciterdb-configmap
+            resources:
+              requests:
+                memory: 512Mi
+                cpu: 250m
+              limits:
+                memory: 1Gi
+                cpu: 500m
+          # NO nodeSelector -- see k8-cronjob-identity.yaml (no node carries lifecycle: Ec2Spot).
+          restartPolicy: OnFailure

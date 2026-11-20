@@ -24,6 +24,12 @@ COPY update/executeFeatureGenerator.py ./
 COPY update/retrieveExternalArticles.py ./
 COPY update/run_all.py ./
 
+# Cornell Ithaca web-page seeds, step 1 (incremental page store + NetID linkage). Own weekly
+# CronJob (k8-cronjob-web-seeds.yaml), deliberately NOT in run_all.py: a first full crawl
+# takes hours at 1 request/second/host.
+COPY update/webPageSeeds.py ./
+COPY update/web_seed_hosts.txt ./
+
 # AAR Scopus lane (not-in-PubMed WCM authorship detector — weekly, gated in run_all.py)
 COPY update/identity_index.py ./
 COPY update/aar_db.py ./
