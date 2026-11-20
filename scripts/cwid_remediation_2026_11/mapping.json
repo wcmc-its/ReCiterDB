@@ -1,0 +1,329 @@
+{
+ "generated": "2026-11-18",
+ "source": "ED lookup + user decisions 11-18 (Roadmap/cwid-normalization-plan.md)",
+ "actions": {
+  "MAP": "merge bad into canon (GoldStandard union, Identity rename if canon missing, FeedbackLog copy), then delete bad. Guard: the bad (else canonical) Identity's surname must match ed_last (ED), or the uid is ABORTED",
+  "DELETE": "no real CWID: delete every record under bad",
+  "UNDERSCORE": "legacy PM external login with no ED CWID, on the explicit delete list in dynamo_remediation.py (UNDERSCORE_DELETE: _jfr9006, _pan9087, _xyz1234): DELETE when its GoldStandard holds no assertions, else NEEDS-DECISION (left alone)",
+  "KEEP": "underscore test/external identity that holds assertions (decided 11-18: kept as is). Never merged, never deleted, never re-classified: skipped unconditionally"
+ },
+ "entries": [
+  {
+   "bad": "Ana2037",
+   "canon": "ana2037",
+   "action": "MAP",
+   "note": "",
+   "ed_last": "Arkun"
+  },
+  {
+   "bad": "Kym9003",
+   "canon": "kym9003",
+   "action": "MAP",
+   "note": "ED: kym9003 = Kyle Merandy; the kym9003 Identity name (Annie Rohan, really ajr7002) is corrected to Kyle Merandy",
+   "ed_last": "Merandy"
+  },
+  {
+   "bad": "ggi9001 ",
+   "canon": "ggi9001",
+   "action": "MAP",
+   "note": "",
+   "ed_last": "Inghirami"
+  },
+  {
+   "bad": "Abl9002",
+   "canon": "abl9002",
+   "action": "MAP",
+   "note": "",
+   "ed_last": "Donde"
+  },
+  {
+   "bad": "Jod2033",
+   "canon": "jod2033",
+   "action": "MAP",
+   "note": "",
+   "ed_last": "Deferio"
+  },
+  {
+   "bad": "ldn9002@nyp.org",
+   "canon": "ldn9002",
+   "action": "MAP",
+   "note": "",
+   "ed_last": "Nguyen"
+  },
+  {
+   "bad": "Arn4002",
+   "canon": "arn4002",
+   "action": "MAP",
+   "note": "",
+   "ed_last": "Nuñez"
+  },
+  {
+   "bad": "EMH2012",
+   "canon": "emh2012",
+   "action": "MAP",
+   "note": "",
+   "ed_last": "Hegel"
+  },
+  {
+   "bad": "SHP2010",
+   "canon": "shp2010",
+   "action": "MAP",
+   "note": "",
+   "ed_last": "Patel"
+  },
+  {
+   "bad": "kims7@mskcc.org",
+   "canon": "ski4009",
+   "action": "MAP",
+   "note": "ED: Sarah Kim = ski4009",
+   "ed_last": "Kim"
+  },
+  {
+   "bad": "Minkowitz",
+   "canon": "bam9012",
+   "action": "MAP",
+   "note": "ED: Barbara Minkowitz = bam9012",
+   "ed_last": "Minkowitz"
+  },
+  {
+   "bad": "xoprotop ",
+   "canon": "xoprotop",
+   "action": "MAP",
+   "note": "",
+   "ed_last": "Protopopescu"
+  },
+  {
+   "bad": "jih9026 ",
+   "canon": "jih9026",
+   "action": "MAP",
+   "note": "",
+   "ed_last": "Hsu"
+  },
+  {
+   "bad": "Anc2032",
+   "canon": "anc2032",
+   "action": "MAP",
+   "note": "",
+   "ed_last": "Costa"
+  },
+  {
+   "bad": "Hlloyd",
+   "canon": "hlloyd",
+   "action": "MAP",
+   "note": "",
+   "ed_last": "Lloyd"
+  },
+  {
+   "bad": "Res2011",
+   "canon": "res2011",
+   "action": "MAP",
+   "note": "",
+   "ed_last": "Stubbs"
+  },
+  {
+   "bad": "SMB9009",
+   "canon": "smb9009",
+   "action": "MAP",
+   "note": "",
+   "ed_last": "Boyle"
+  },
+  {
+   "bad": "DLAMB",
+   "canon": "djl2008",
+   "action": "MAP",
+   "note": "ED: Dolores Lamb = djl2008 (academic-inactive)",
+   "ed_last": "Lamb"
+  },
+  {
+   "bad": "dlamb",
+   "canon": "djl2008",
+   "action": "MAP",
+   "note": "second alias of djl2008",
+   "ed_last": "Lamb"
+  },
+  {
+   "bad": "tfm9003@nyp.org",
+   "canon": "tfm9003",
+   "action": "MAP",
+   "note": "",
+   "ed_last": "Peifer"
+  },
+  {
+   "bad": " Isk9008",
+   "canon": "isk9008",
+   "action": "MAP",
+   "note": "",
+   "ed_last": "Kharode"
+  },
+  {
+   "bad": "ars2027 ",
+   "canon": "ars2027",
+   "action": "MAP",
+   "note": "the CTSC record spells the surname Shakrokni (typo); ED: Armin Shahrokni",
+   "ed_last": [
+    "Shahrokni",
+    "Shakrokni"
+   ]
+  },
+  {
+   "bad": "HAF9018",
+   "canon": "haf9018",
+   "action": "MAP",
+   "note": "",
+   "ed_last": "Fassel"
+  },
+  {
+   "bad": "Nes9050",
+   "canon": "nes9050",
+   "action": "MAP",
+   "note": "",
+   "ed_last": "Shah"
+  },
+  {
+   "bad": "jason.carmel",
+   "canon": "jbc7001",
+   "action": "MAP",
+   "note": "ED: Jason Carmel = jbc7001",
+   "ed_last": "Carmel"
+  },
+  {
+   "bad": "str2025-mi",
+   "canon": "str2025",
+   "action": "MAP",
+   "note": "ED: Shehroz Rana = str2025",
+   "ed_last": "Rana"
+  },
+  {
+   "bad": "NA",
+   "canon": null,
+   "action": "DELETE",
+   "note": "NA/na = Shama Farooq, no ED CWID"
+  },
+  {
+   "bad": "na",
+   "canon": null,
+   "action": "DELETE",
+   "note": "NA/na = Shama Farooq, no ED CWID"
+  },
+  {
+   "bad": "Hello, world!",
+   "canon": null,
+   "action": "DELETE",
+   "note": "junk / no ED match"
+  },
+  {
+   "bad": "margarita.todor",
+   "canon": null,
+   "action": "DELETE",
+   "note": "junk / no ED match"
+  },
+  {
+   "bad": "rodman.john",
+   "canon": null,
+   "action": "DELETE",
+   "note": "junk / no ED match"
+  },
+  {
+   "bad": "_jfr9006",
+   "canon": null,
+   "action": "UNDERSCORE",
+   "note": "NOT merged: ED jfr9006 is Hayley Costas, but the _jfr9006 Identity is Friedman (a different person; the id only looks like a CWID)"
+  },
+  {
+   "bad": "_joc9251",
+   "canon": null,
+   "action": "KEEP",
+   "note": "NOT merged: ED joc9251 is Jordan Chanler-Berat, but the _joc9251 Identity is Jörn Coers, Duke University (a different person; the id only looks like a CWID)"
+  },
+  {
+   "bad": "_pab4001",
+   "canon": null,
+   "action": "KEEP",
+   "note": "NOT merged: ED pab4001 is Paige Brabant, but the _pab4001 Identity is Michael Albert Bales (a different person; the id only looks like a CWID)"
+  },
+  {
+   "bad": "_pah4001",
+   "canon": null,
+   "action": "KEEP",
+   "note": "NOT merged: ED pah4001 is Parviz Daniel Hejazi Pastor, but the _pah4001 Identity is Paul A. Harris, Vanderbilt University (a different person; the id only looks like a CWID)"
+  },
+  {
+   "bad": "_dar7342",
+   "canon": null,
+   "action": "KEEP",
+   "note": ""
+  },
+  {
+   "bad": "_djulius",
+   "canon": null,
+   "action": "KEEP",
+   "note": ""
+  },
+  {
+   "bad": "_huangfud",
+   "canon": null,
+   "action": "KEEP",
+   "note": ""
+  },
+  {
+   "bad": "_jpp2757",
+   "canon": null,
+   "action": "KEEP",
+   "note": ""
+  },
+  {
+   "bad": "_lal2055",
+   "canon": null,
+   "action": "KEEP",
+   "note": ""
+  },
+  {
+   "bad": "_lsw8099",
+   "canon": null,
+   "action": "KEEP",
+   "note": ""
+  },
+  {
+   "bad": "_olo2760",
+   "canon": null,
+   "action": "KEEP",
+   "note": ""
+  },
+  {
+   "bad": "_pac2224",
+   "canon": null,
+   "action": "KEEP",
+   "note": ""
+  },
+  {
+   "bad": "_pan9087",
+   "canon": null,
+   "action": "UNDERSCORE",
+   "note": ""
+  },
+  {
+   "bad": "_tap2707",
+   "canon": null,
+   "action": "KEEP",
+   "note": ""
+  },
+  {
+   "bad": "_tem2089",
+   "canon": null,
+   "action": "KEEP",
+   "note": ""
+  },
+  {
+   "bad": "_uk28",
+   "canon": null,
+   "action": "KEEP",
+   "note": ""
+  },
+  {
+   "bad": "_xyz1234",
+   "canon": null,
+   "action": "UNDERSCORE",
+   "note": ""
+  }
+ ]
+}

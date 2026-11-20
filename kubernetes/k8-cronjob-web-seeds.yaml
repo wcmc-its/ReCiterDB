@@ -1,0 +1,68 @@
+# Weekly crawl of Cornell Ithaca people pages into pubsource_web_* (webPageSeeds.py).
+#
+# APPLY THIS BY HAND, ONCE. The ReCiterDB CodeBuild pipeline auto-deploys the IMAGE
+# only -- it does not apply manifests (same as k8-cronjob-identity.yaml).
+#
+# Sunday 03:00 UTC. A first full crawl can run into the Sunday reciterdb-identity (12:00 UTC)
+# window; that is harmless -- this job reads identity_cornell_current once at startup and
+# writes only pubsource_web_* tables. The script stops at WEB_SEEDS_MAX_SECONDS (10h) and saves
+# state, so the next run resumes; activeDeadlineSeconds is only the backstop, because
+# concurrencyPolicy: Forbid turns a hung job into a skipped schedule.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: reciterdb-web-seeds
+  namespace: reciter
+  labels:
+    app: reciterdb-web-seeds
+    tier: backend
+spec:
+  schedule: "0 3 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 39600
+      template:
+        spec:
+          # SIGTERM stops every thread at its next request (each bounded by 60s) and closes the run row.
+          terminationGracePeriodSeconds: 120
+          # IRSA role with bedrock:InvokeModel on Claude Haiku 5.5 (EKS-recuterdb-CronJob-IRSA-Role,
+          # policy reciterdb-venue-infer-bedrock), used by the citation pass (webPageCitations.py).
+          # The same role the nightly reciterdb job runs as. Without it Bedrock calls are denied
+          # and the pass stops parsing after 3 empty rounds; the crawl itself is unaffected.
+          serviceAccountName: reciterdb-cronjob-sa
+          containers:
+          - name: reciterdb-web-seeds
+            image: CONTAINER_IMAGE
+            command: ["python3", "webPageSeeds.py"]
+            env:
+            - name: WEB_SEEDS_MAX_SECONDS
+              value: "36000"
+            # Step 4: parse citation blocks (Bedrock), resolve DOIs (Crossref), keep author-confirmed
+            # seeds in pubsource_web_seed. Incremental: each block is parsed and resolved once.
+            - name: WEB_SEEDS_CITATIONS
+              value: "on"
+            envFrom:
+            # DB_USERNAME / DB_PASSWORD, and DB_HOST / DB_NAME from the configmap.
+            - secretRef:
+                name: reciterdb-secrets
+            - configMapRef:
+                name: reciterdb-configmap
+            # CORNELL_ITHACA_ED_DN / CORNELL_ITHACA_ED_PASS: the Cornell directory bind, used to
+            # resolve page email aliases the roster doesn't know. Optional: absent, the
+            # directory pass logs "skipped" and linking uses roster addresses only.
+            - secretRef:
+                name: cornell-ithaca-ed
+                optional: true
+            resources:
+              requests:
+                memory: 512Mi
+                cpu: 250m
+              limits:
+                memory: 1Gi
+                cpu: 500m
+          # NO nodeSelector -- see k8-cronjob-identity.yaml (no node carries lifecycle: Ec2Spot).
+          restartPolicy: OnFailure
