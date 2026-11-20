@@ -45,10 +45,7 @@ phases:
           docker logout $REPOSITORY_URI
           aws eks update-kubeconfig --name $EKS_CLUSTER_NAME --region us-east-1 --role-arn $EKS_KUBECTL_ROLE_ARN
           kubectl set image cronjob/$CRON_JOB_NAME $CRON_JOB_NAME=$REPOSITORY_URI:$TAG -n reciter
-          # CRON_JOB_NAME carries a single name; keep the weekly Cornell web-page crawl
-          # (webPageSeeds.py) on the same tag. Skipped if that cronjob is not applied.
-          if kubectl -n reciter get cronjob reciterdb-web-seeds >/dev/null 2>&1; then
-            kubectl set image cronjob/reciterdb-web-seeds \
-              reciterdb-web-seeds=$REPOSITORY_URI:$TAG -n reciter
-          fi
+          # Do NOT set reciterdb-web-seeds here: there is one web-seeds CronJob, it runs
+          # against prod reciterdb (reciterdb-secrets), and master's buildspec owns its
+          # image. A dev build pointing it at the dev image repointed the PROD crawl.
         fi
