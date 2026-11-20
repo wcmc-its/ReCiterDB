@@ -51,6 +51,8 @@ import urllib.request
 import urllib.robotparser
 from concurrent.futures import ThreadPoolExecutor
 
+import webPageCitations
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s",
                     datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger("webPageSeeds")
@@ -498,6 +500,10 @@ def crawl_host(name, aliases, directory, idx, deadline, max_pages, stats, lock):
         conn["db"] = db_conn()
         with conn["db"].cursor() as c:
             known = load_known(c, name, list(listed))
+            # pages whose CURRENT version already has a citation snapshot (step 4)
+            c.execute("""SELECT w.url FROM pubsource_web_page w JOIN pubsource_web_page_snapshot s
+                         ON s.url = w.url AND s.content_hash = w.content_hash WHERE w.host = %s""", (name,))
+            snapped = {r["url"] for r in c.fetchall()}
         now = utcnow()
 
         def write(fn):
@@ -545,7 +551,7 @@ def crawl_host(name, aliases, directory, idx, deadline, max_pages, stats, lock):
                 s["stopped_at_deadline"] = True
                 break
             try:
-                crawl_page(h, write, u, listed[u], known.get(u), name, aliases, directory, now, s)
+                crawl_page(h, write, u, listed[u], known.get(u), name, aliases, directory, now, s, snapped)
             except Deadline:
                 s["stopped_at_deadline"] = True
                 break
@@ -574,15 +580,29 @@ def crawl_host(name, aliases, directory, idx, deadline, max_pages, stats, lock):
         log.info("%s", s)
 
 
-def crawl_page(h, write, u, lm, row, host, aliases, directory, now, s):
-    if not needs_fetch(row, lm, now):
+def wants_snapshot(emails, doi_count, year_count, aliases, directory):
+    """A page worth keeping citation blocks for: it shows pubs and names at least one roster person."""
+    return webPageCitations.has_pub_signal(doi_count, year_count) and bool(link_people(emails, aliases, directory))
+
+
+def save_snapshot(c, url, content_hash, html, text, now):
+    c.execute("""INSERT INTO pubsource_web_page_snapshot (url, content_hash, main_text, blocks_json, captured_at)
+                 VALUES (%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE url=url""",
+              (url, content_hash, text, json.dumps(webPageCitations.citation_blocks(html)), now))
+
+
+def crawl_page(h, write, u, lm, row, host, aliases, directory, now, s, snapped=frozenset()):
+    # A person page with pubs that predates step 4 has no snapshot: fetch it once, unconditionally.
+    backfill = bool(row and row["content_hash"] and u not in snapped and wants_snapshot(
+        json.loads(row["emails_json"] or "[]"), row["doi_count"], row["year_count"], aliases, directory))
+    if not backfill and not needs_fetch(row, lm, now):
         s["skipped"] += 1
         # links follow the roster even when the page is untouched; no fetch needed
         write(lambda c: relink(c, u, json.loads(row["emails_json"] or "[]"), row["content_hash"], aliases, now, directory))
         s["relinked"] += 1
         return
     cond = {}
-    if row and row["http_status"] in (200, 304) and row["content_hash"]:
+    if row and row["http_status"] in (200, 304) and row["content_hash"] and not backfill:
         if row["etag"]:
             cond["If-None-Match"] = row["etag"]
         if row["last_modified"]:
@@ -626,16 +646,24 @@ def crawl_page(h, write, u, lm, row, host, aliases, directory, now, s):
         s["gone"] += gone
         return
     sig = page_signals(html)
+    snap = wants_snapshot(sig["emails"], sig["dois"], sig["years"], aliases, directory) and u not in snapped
     etag = hdr.get("ETag") or hdr.get("Etag")
     lmod = hdr.get("Last-Modified")
     if row and row["content_hash"] == sig["hash"]:
         s["unchanged"] += 1
 
         def same(c):
+            # text unchanged, but markup-only signals (DOI hrefs, mailto) can change: keep them current,
+            # or a stale "wants snapshot" forces an unconditional refetch every run
             c.execute("""UPDATE pubsource_web_page SET last_attempt=%s, last_fetched=%s, http_status=200, etag=%s, last_modified=%s,
-                         sitemap_lastmod=%s, gone_at=NULL WHERE url=%s""", (now, now, etag, lmod, lm, u))
+                         sitemap_lastmod=%s, gone_at=NULL, emails_json=%s, links_json=%s, doi_count=%s, year_count=%s
+                         WHERE url=%s""", (now, now, etag, lmod, lm, json.dumps(sig["emails"]), json.dumps(sig["links"]),
+                                          sig["dois"], sig["years"], u))
             relink(c, u, sig["emails"], sig["hash"], aliases, now, directory)
+            if snap:
+                save_snapshot(c, u, sig["hash"], html, main_text(html), now)
         write(same)
+        s["snapshots"] = s.get("snapshots", 0) + snap
         return
     s["changed" if row and row["content_hash"] else "new"] += 1
 
@@ -651,7 +679,10 @@ def crawl_page(h, write, u, lm, row, host, aliases, directory, now, s):
                   (u, host, lm, etag, lmod, sig["hash"], json.dumps(sig["emails"]), json.dumps(sig["links"]),
                    sig["dois"], sig["years"], now, now, now, now))
         relink(c, u, sig["emails"], sig["hash"], aliases, now, directory)  # same transaction as the page row
+        if snap:
+            save_snapshot(c, u, sig["hash"], html, main_text(html), now)
     write(upsert)
+    s["snapshots"] = s.get("snapshots", 0) + snap
 
 
 REPORT_SQL = """
@@ -766,7 +797,7 @@ def main():
     db = db_conn()
     try:
         with db.cursor() as c:
-            for ddl in DDL:
+            for ddl in DDL + webPageCitations.DDL:
                 c.execute(ddl)
             if a.report:
                 c.execute(REPORT_SQL)
@@ -803,12 +834,16 @@ def main():
             status = "stopped"
             raise SystemExit(143)
         dir_stats = directory_pass(roster, aliases, utcnow()) if not expired(deadline) else {"directory": "skipped_deadline"}
+        if os.environ.get("WEB_SEEDS_CITATIONS", "").lower() == "on" and not expired(deadline):
+            cit = webPageCitations.run_pass(db_conn, lambda: expired(deadline), utcnow())
+            log.info("citation pass: %s", cit)
+            dir_stats.update({"citations_" + k: v for k, v in cit.items()})
         incomplete = any(s.get("failed") or s.get("stopped_at_deadline") or s.get("throttled_stop")
                          or s.get("robots_ok") is False for s in stats)
         status = "partial" if incomplete else "ok"
     finally:
         keys = ("listed", "fetched", "new", "changed", "unchanged", "not_modified", "skipped", "relinked",
-                "errors", "page_errors", "gone")
+                "errors", "page_errors", "gone", "snapshots")
         total = {k: sum(s.get(k, 0) for s in stats) for k in keys}
         total.update(hosts=len(hosts), hosts_done=len(stats), hosts_failed=sum(1 for s in stats if s.get("failed")),
                      hosts_robots_unavailable=sum(1 for s in stats if s.get("robots_ok") is False),

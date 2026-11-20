@@ -29,6 +29,11 @@ spec:
         spec:
           # SIGTERM stops every thread at its next request (each bounded by 60s) and closes the run row.
           terminationGracePeriodSeconds: 120
+          # IRSA role with bedrock:InvokeModel on Claude Haiku 5.5 (EKS-recuterdb-CronJob-IRSA-Role,
+          # policy reciterdb-venue-infer-bedrock), used by the citation pass (webPageCitations.py).
+          # The same role the nightly reciterdb job runs as. Without it Bedrock calls are denied
+          # and the pass stops parsing after 3 empty rounds; the crawl itself is unaffected.
+          serviceAccountName: reciterdb-cronjob-sa
           containers:
           - name: reciterdb-web-seeds
             image: CONTAINER_IMAGE
@@ -36,6 +41,10 @@ spec:
             env:
             - name: WEB_SEEDS_MAX_SECONDS
               value: "36000"
+            # Step 4: parse citation blocks (Bedrock), resolve DOIs (Crossref), keep author-confirmed
+            # seeds in pubsource_web_seed. Incremental: each block is parsed and resolved once.
+            - name: WEB_SEEDS_CITATIONS
+              value: "on"
             envFrom:
             # DB_USERNAME / DB_PASSWORD, and DB_HOST / DB_NAME from the configmap.
             - secretRef:
