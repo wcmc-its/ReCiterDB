@@ -85,6 +85,49 @@ def test_count_missing_once_per_week():
     assert w.count_missing(r, NOW) == (2, True)
 
 
+def test_own_host_urls_and_relative_paths():
+    entries = [("/staff-directory/", None), ("https://www.example.cornell.edu/people/a", None),
+               ("https://example.cornell.edu/people/b", None), ("people/c", None)]
+    got = [u for u, _ in w.own_host_urls(entries, "example.cornell.edu", "https://example.cornell.edu/")]
+    assert got == ["https://example.cornell.edu/staff-directory/", "https://example.cornell.edu/people/b",
+                   "https://example.cornell.edu/people/c"]  # the www. sibling belongs to its own host
+
+
+def test_directory_aliases_link_only_unambiguous_roster_people():
+    m = w.alias_map(ROSTER_EMAILS)
+    found = w.match_directory_entries({"vandal@cornell.edu", "shared@cornell.edu"},
+                                      [("pq55", {"vandal@cornell.edu", "pq55@cornell.edu"}),
+                                       ("aa1", {"shared@cornell.edu"}), ("bb2", {"shared@cornell.edu"})])
+    assert found == {"vandal@cornell.edu": "pq55"}  # an address on two entries proves nothing
+    assert w.link_people(["vandal@cornell.edu"], m, found) == [("pq55", "ldap_alias")]
+    assert w.link_people(["vandal@cornell.edu"], m, {}) == []
+    # a roster address wins over a directory answer for the same address
+    assert w.link_people(["hollis@cornell.edu"], m, {"hollis@cornell.edu": "zz66"}) == [("xy4", "roster_alias")]
+
+
+def test_ldap_filter_escapes():
+    f = w.ldap_filter(["a*b@cornell.edu"])
+    assert "a\\2ab@cornell.edu" in f and f.startswith("(|") and f.count("(") == 4
+
+
+def test_throttle_backoff_and_stop():
+    h = object.__new__(w.Host)
+    h.name, h.gap, h.throttled_in_a_row, h.throttle_events = "x.cornell.edu", 1.0, 0, 0
+    h._throttle_check(429, {"Retry-After": "7"})
+    assert h.gap == 7.0
+    h._throttle_check(200, {})
+    assert h.throttled_in_a_row == 0 and h.gap == 7.0  # stays slow for the rest of the run
+    h._throttle_check(429, {"Retry-After": "soon"})
+    assert h.gap == 14.0
+    try:
+        for _ in range(w.THROTTLE_STOP):
+            h._throttle_check(405, {})
+        raise AssertionError("expected HostThrottled")
+    except w.HostThrottled:
+        pass
+    assert h.gap == w.MAX_GAP
+
+
 def test_parse_lastmod():
     assert w.parse_lastmod("2026-11-01T10:00:00-05:00") == datetime.datetime(2026, 11, 1, 15, 0)
     assert w.parse_lastmod("2026-11-01") == datetime.datetime(2026, 11, 1)
