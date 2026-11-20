@@ -48,6 +48,7 @@ COPY update/netid_cwid_bridge_2026-09-03.csv ./
 # CronJob (k8-cronjob-web-seeds.yaml), deliberately NOT in run_all.py: a first full crawl
 # takes hours at 1 request/second/host.
 COPY update/webPageSeeds.py ./
+COPY update/webPageCitations.py ./
 COPY update/web_seed_hosts.txt ./
 
 # AAR Scopus lane (not-in-PubMed WCM authorship detector — weekly, gated in run_all.py)
