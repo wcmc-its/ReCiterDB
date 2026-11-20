@@ -72,6 +72,11 @@ phases:
             kubectl set image cronjob/reciterdb-identity \
               reciterdb-identity=$REPOSITORY_URI:$TAG -n reciter
           fi
+          # Same reason, for the weekly Cornell web-page crawl (webPageSeeds.py).
+          if kubectl -n reciter get cronjob reciterdb-web-seeds >/dev/null 2>&1; then
+            kubectl set image cronjob/reciterdb-web-seeds \
+              reciterdb-web-seeds=$REPOSITORY_URI:$TAG -n reciter
+          fi
         else
           echo "Not a pipeline-initiated deploy (initiator=${CODEBUILD_INITIATOR}, branch=${BRANCH})."
           echo "Image built and discarded; nothing pushed, cronjob untouched."
