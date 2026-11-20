@@ -81,7 +81,7 @@ The uid validation allows `_` (`[a-z0-9._-]`), so they keep working. They were p
   - It appears once in data: one GoldStandard `auditLog` entry, `uid: "ReCiterBot"`, `userVerbose: "ReCiter Bot"`, ACCEPTED pmid 21927451 on 2025-06-10, found in the `ReCiter Research/analysis/goldstandard_cleanup_2026-08-20/` backups.
   - So something did write as that account once in 2025. Nothing in our code does now.
 - **Duplicate and bad-case accounts.**
-  - Each account's canonical id is its mapped id, or else its trimmed, lowercased id. External-cohort ids, exactly those matching `BINARY TRIM(id) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]+_)'`, are only trimmed. The underscore is required: a bare `uc...` id (`ucA2001`, `Ucb9001`) is a CWID and is lowercased. The same test is used for the `reporting_ad_hoc_*` tables and the after-checks.
+  - Each account's canonical id is its mapped id, or else its trimmed, lowercased id. External-cohort ids, exactly those matching `BINARY TRIM(id) REGEXP '^([Uu][Ss][Cc]|[Ff][Hh]|[Ff][Rr][Ee][Dd][Hh][Uu][Tt][Cc][Hh]|[Uu][Cc][A-Za-z]+)_'` (the prefix in any ASCII case, as ReCiter's `UidCanonicalizer` matches it), are trimmed and only the prefix is lowercased (`UCSF_AbC` → `ucsf_AbC`). The underscore is required: a bare `uc...` id (`ucA2001`, `Ucb9001`) is a CWID and is lowercased. The same test is used for the `reporting_ad_hoc_*` tables and the after-checks.
   - Each group of accounts with the same canonical id keeps its lowest `userID`.
   - The other accounts' roles, departments, notification log, feedback-log `userID`/`impersonatedByUserID` and (when the keeper has none) notification preferences move to the keeper. Then those accounts are deleted.
   - **Status, email and name.** Before the other accounts are deleted, the keeper gets `status = MAX(status)` over its group, so a curator whose live account is the merged-away one is not left on an inactive keeper. Its `email`, `nameFirst`, `nameMiddle` and `nameLast` are kept unless empty, else filled from the group's first non-empty value by `userID`. The "account merges" result shows both accounts' `status`, and "keeper account after merge" shows the result.
@@ -169,9 +169,11 @@ The other writes:
 ```sql
 -- person: no case/space duplicates, no non-canonical ids outside the external cohorts
 SELECT LOWER(TRIM(personIdentifier)) c, COUNT(*) n FROM person GROUP BY c HAVING n > 1;
+-- (the same query the nightly CWID GUARD runs: cwid.person_guard_queries()["non-canonical"])
 SELECT personIdentifier FROM person
-WHERE BINARY personIdentifier <> BINARY LOWER(TRIM(personIdentifier))
-  AND NOT BINARY TRIM(personIdentifier) REGEXP '^(usc_|fh_|fredhutch_|uc[a-z]+_)';
+WHERE BINARY personIdentifier <> BINARY (CASE WHEN BINARY TRIM(personIdentifier) REGEXP '^([Uu][Ss][Cc]|[Ff][Hh]|[Ff][Rr][Ee][Dd][Hh][Uu][Tt][Cc][Hh]|[Uu][Cc][A-Za-z]+)_'
+  THEN CONCAT(LOWER(SUBSTRING_INDEX(TRIM(personIdentifier), '_', 1)), SUBSTRING(TRIM(personIdentifier), LOCATE('_', TRIM(personIdentifier))))
+  ELSE LOWER(TRIM(personIdentifier)) END);
 -- Jenzabar grad-school faculty (needs this PR's buildIdentity.py deployed): expect 0
 SELECT COUNT(*) FROM identity_grad_school_faculty WHERE BINARY cwid <> BINARY LOWER(TRIM(cwid));
 -- PM accounts and roles
@@ -185,7 +187,7 @@ WHERE personIdentifier IN ('djl2008','shp2010','hlloyd','smb9009','jod2033','kym
 ```
 
 - **`kym9003`.** Identity is Kyle D Merandy with one known relationship (Richard Lee) and no Stony Brook institution.
-- **DynamoDB.** A dry run of `dynamo_remediation.py` should now show only KEEP entries and steps with nothing left to delete. A full rescan of Identity, GoldStandard and Analysis for uids that fail `^[a-z0-9._-]+$` (external cohorts `^(usc_|fh_|fredhutch_|uc[a-z]+_)` excepted) should list nothing; the KEEP ids already pass it.
+- **DynamoDB.** A dry run of `dynamo_remediation.py` should now show only KEEP entries and steps with nothing left to delete. A full rescan of Identity, GoldStandard and Analysis for uids that fail `^[a-z0-9._-]+$` (external cohorts, prefix `^(usc|fh|fredhutch|uc[a-z]+)_` in lower case, checked against `^[A-Za-z0-9._-]+$` instead) should list nothing; the KEEP ids already pass it.
 - **PM.** Spot-check `djl2008`, `shp2010` and `hlloyd` on /curate.
 - **After the next IC run.** `'ggi9001 '` and `'jih9026 '` have not come back.
 

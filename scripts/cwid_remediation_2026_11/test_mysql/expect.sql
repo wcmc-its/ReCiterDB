@@ -16,9 +16,9 @@ SELECT 'FAIL d5 ReCiterBot roles removed' AS f FROM admin_users_roles WHERE user
 SELECT 'FAIL d5 NewName123 deleted' AS f FROM admin_users WHERE userID = 51;
 SELECT 'FAIL d6 admin_users ids' AS f, GROUP_CONCAT(CONCAT(userID, '=[', personIdentifier, ']') ORDER BY userID) g
   FROM admin_users WHERE userID BETWEEN 60 AND 70
-  HAVING BINARY g <> BINARY '60=[uca2001],61=[ucsf_AbC],62=[ucsf_q9],63=[ucb9001],64=[ucla_Q1],65=[ucd9001],66=[uca2002],70=[_pab4001]';
+  HAVING BINARY g <> BINARY '60=[uca2001],61=[ucsf_AbC],62=[ucsf_Q9],63=[ucb9001],64=[ucla_Q1],65=[ucd9001],66=[uca2002],70=[_pab4001]';
 SELECT 'FAIL d6 reporting fge' AS f, GROUP_CONCAT(CONCAT('[', personIdentifier, ']') ORDER BY id) g FROM reporting_ad_hoc_feature_generator_execution
-  HAVING BINARY g <> BINARY '[ucb9001],[ucsf_Mixed],[fh_ABC],[usc_X],[ucsf_z],[_pab4001],[ucb9001]';
+  HAVING BINARY g <> BINARY '[ucb9001],[ucsf_Mixed],[fh_ABC],[usc_X],[ucsf_Z],[_pab4001],[ucb9001]';
 SELECT 'FAIL d6 reporting ic' AS f, GROUP_CONCAT(CONCAT('[', personIdentifier, ']') ORDER BY id) g FROM reporting_ad_hoc_identity_creation
   HAVING BINARY g <> BINARY '[ucx1234],[ucdavis_Q],[fredhutch_AA]';
 SELECT 'FAIL grant_provenance' AS f, GROUP_CONCAT(personIdentifier) g FROM grant_provenance HAVING BINARY g <> BINARY 'abl9002,abl9002' OR g IS NULL;
