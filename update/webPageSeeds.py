@@ -70,6 +70,10 @@ MISSING_MIN_GAP = datetime.timedelta(days=5)  # count at most one absence per we
 HOST_WORKERS = 12
 REQUEST_GAP = 1.0      # seconds between requests to one host (raised by robots Crawl-delay or throttling)
 MAX_GAP = 60.0         # ceiling for a host's request gap
+# Hosts that rate-limit the cluster's egress IP well below 1 req/s: start slow instead of
+# tripping the limit and backing off. Politeness only; a host that still throttles is left alone.
+# business.cornell.edu answered 429 after 9 requests at 1/s (run 5, 11-20) and kept refusing at 60s.
+HOST_GAP = {"business.cornell.edu": 15.0}
 THROTTLE_STATUSES = {429, 503, 403, 405, 999}  # observed rate-limit / WAF answers; back off on these
 THROTTLE_STOP = 10     # consecutive throttle answers -> leave the host for this run
 ALIAS_TTL = datetime.timedelta(days=30)  # re-ask the directory about an address after this
@@ -312,7 +316,7 @@ class Host:
 
     def __init__(self, name, deadline):
         self.name, self.deadline, self._last, self._lock = name, deadline, 0.0, threading.Lock()
-        self.gap, self.throttled_in_a_row, self.throttle_events = REQUEST_GAP, 0, 0
+        self.gap, self.throttled_in_a_row, self.throttle_events = HOST_GAP.get(name, REQUEST_GAP), 0, 0
         self.robots = urllib.robotparser.RobotFileParser(f"https://{name}/robots.txt")
         self.robots_ok = True
         try:
