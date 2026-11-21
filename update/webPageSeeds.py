@@ -53,6 +53,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import webPageCitations
 import webPageCornellPub
+import webPageExpand
 import webPageOrcid
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s",
@@ -860,6 +861,14 @@ def main():
                 pdb.close()
             log.info("cornell_pub pass: %s", pub)
             dir_stats.update({"cornell_pub_" + k: v for k, v in pub.items()})
+        if os.environ.get("WEB_SEEDS_EXPAND", "").lower() == "on" and not expired(deadline):
+            xdb = db_conn()
+            try:
+                exp = webPageExpand.run_pass(xdb, utcnow())
+            finally:
+                xdb.close()
+            log.info("expand pass: %s", exp)
+            dir_stats.update({"expand_" + k: v for k, v in exp.items()})
         incomplete = any(s.get("failed") or s.get("stopped_at_deadline") or s.get("throttled_stop")
                          or s.get("robots_ok") is False for s in stats)
         status = "partial" if incomplete else "ok"
