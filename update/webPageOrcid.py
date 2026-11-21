@@ -121,14 +121,14 @@ def am_status(orcid, am):
     return "agrees" if orcid in am else "conflicts"
 
 
-def fetch_openalex(dois):
-    """({doi: authorships} for the DOIs OpenAlex knows, set of DOIs whose batch answered).
+def fetch_openalex(dois, select="doi,authorships"):
+    """({doi: work} for the DOIs OpenAlex knows, set of DOIs whose batch answered).
     A DOI in an unanswered batch is neither found nor a miss: it is asked again next run.
     Keyless, page= only."""
     out, answered = {}, set()
     for i in range(0, len(dois), OPENALEX_BATCH):
         part = dois[i:i + OPENALEX_BATCH]
-        q = urllib.parse.urlencode({"filter": "doi:" + "|".join(part), "select": "doi,authorships",
+        q = urllib.parse.urlencode({"filter": "doi:" + "|".join(part), "select": select,
                                     "per-page": OPENALEX_BATCH, "page": 1})
         for attempt in range(4):
             try:
@@ -137,7 +137,7 @@ def fetch_openalex(dois):
                     for w in json.load(r).get("results", []):
                         d = (w.get("doi") or "").lower().removeprefix("https://doi.org/")
                         if d:
-                            out[d] = w.get("authorships") or []
+                            out[d] = w
                 answered.update(part)
                 break
             except Exception as e:  # transient: back off; a batch that never answers is retried next run
@@ -192,7 +192,8 @@ def run_pass(db, now, dry_run=False, out=None):
             prev = {r["netid"].lower(): r["orcid"] for r in c.fetchall()}
 
     stale = [d for d in dois if d not in cached or now - cached[d]["fetched_at"] > OPENALEX_TTL]
-    fresh, answered = fetch_openalex(stale) if stale else ({}, set())
+    works, answered = fetch_openalex(stale) if stale else ({}, set())
+    fresh = {d: w.get("authorships") or [] for d, w in works.items()}
     s["openalex_asked"], s["openalex_found"] = len(stale), len(fresh)
     s["openalex_unanswered"] = len(stale) - len(answered)
     oa = {d: json.loads(r["authorships_json"] or "[]") for d, r in cached.items()}
