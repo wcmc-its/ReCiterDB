@@ -643,3 +643,24 @@ def swap_new_tables_into_place():
             connection.close()
             connection = None
             logger.info("Database connection closed after swap_new_tables_into_place().")
+
+
+def warn_noncanonical_person_identifiers():
+    """Nightly guard, run after the swap: log a WARN naming any personIdentifier the
+    live `person` table holds twice (case-insensitively) or in a non-canonical form
+    (stray whitespace, or not lowercase outside the external cohorts). See cwid.py.
+
+    Read-only, and it never raises: a recurrence should be visible the next morning,
+    not fail the nightly that has already swapped good tables into place."""
+    from cwid import warn_person_identifiers
+    conn = None
+    try:
+        conn = establish_connection()
+        with conn.cursor() as cursor:
+            return warn_person_identifiers(cursor, logger, table="person")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"CWID GUARD: skipped, could not run: {e}")
+        return None
+    finally:
+        if conn and conn.open:
+            conn.close()

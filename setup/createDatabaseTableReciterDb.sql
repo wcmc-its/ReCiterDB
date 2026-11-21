@@ -42,7 +42,10 @@ CREATE TABLE IF NOT EXISTS `admin_users` (
   `createTimestamp` timestamp NOT NULL DEFAULT '0000-00-00 00:00:00',
   `modifyTimestamp` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
   PRIMARY KEY (`userID`),
+  -- idx_personIdentifier is redundant next to the unique key below but is kept so a
+  -- fresh install matches prod after v3.17, which adds the key and drops nothing.
   KEY `idx_personIdentifier` (`personIdentifier`) USING BTREE,
+  UNIQUE KEY `uq_admin_users_personIdentifier` (`personIdentifier`),
   KEY `idx_email` (`email`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -173,6 +176,7 @@ CREATE TABLE IF NOT EXISTS `admin_users_roles` (
   PRIMARY KEY (`id`),
   KEY `admin_users_roles_ibfk_1` (`userID`),
   KEY `admin_users_roles_ibfk_2` (`roleID`),
+  UNIQUE KEY `uq_admin_users_roles_user_role` (`userID`, `roleID`),
   CONSTRAINT `admin_users_roles_ibfk_1` FOREIGN KEY (`userID`) REFERENCES `admin_users` (`userID`),
   CONSTRAINT `admin_users_roles_ibfk_2` FOREIGN KEY (`roleID`) REFERENCES `admin_roles` (`roleID`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

@@ -549,6 +549,11 @@ def main():
     updateReciterDB.swap_new_tables_into_place()
     logger.info("Table swap step complete.")
 
+    # Step 8: CWID guard (read-only, never fails the run). A duplicated or
+    # non-canonical personIdentifier in the live person table gets a WARN that
+    # names it, so a recurrence shows up the next morning, not months later.
+    updateReciterDB.warn_noncanonical_person_identifiers()
+
     # Log final debugging info about processed/skipped UIDs
     logger.info(f"Processed UIDs count: {len(processed_uids)}")
     logger.info(f"Skipped UIDs count: {len(skipped_uids)}")

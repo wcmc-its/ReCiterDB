@@ -1812,8 +1812,10 @@ def _grad_school_row(raw):
         else:
             v = v.strip() if isinstance(v, str) else v
             v = v if v not in ("", None) else None
+            # Jenzabar ships some CWIDs mixed-case (Mbd4001, MNT4002, Tlfernan);
+            # every CWID join elsewhere expects the canonical lowercase form.
             if col == "cwid" and v is not None:
-                v = v.lower()  # Jenzabar holds e.g. 'Mbd4001'; CWIDs are lowercase
+                v = v.lower()
         out.append(v)
     return tuple(out)
 
@@ -2078,12 +2080,12 @@ def demo():
     assert "*" not in GRAD_SCHOOL_QUERY and "Degree_Code" not in GRAD_SCHOOL_QUERY
     assert GRAD_SCHOOL_QUERY.count(" AS ") == len(GRAD_SCHOOL_COLUMNS) == 31
     gs = dict.fromkeys(c for _, c in GRAD_SCHOOL_COLUMNS)
-    gs.update(jid="42", cwid="abc1001 ", wcgsFacultyStatus="Y",
+    gs.update(jid="42", cwid=" Abc1001 ", wcgsFacultyStatus="Y",
               primaryPhdAppointmentDate="7/1/2019",
               msAppointmentDate1=datetime.datetime(2021, 9, 1, 0, 0),
               terminationDate="", labLink=None)
     row = dict(zip((c for _, c in GRAD_SCHOOL_COLUMNS), _grad_school_row(gs)))
-    assert row["jid"] == 42 and row["cwid"] == "abc1001", "int jid, stripped cwid"
+    assert row["jid"] == 42 and row["cwid"] == "abc1001", "int jid, stripped + lowercased cwid"
     assert row["primaryPhdAppointmentDate"] == datetime.date(2019, 7, 1), "M/D/YYYY parsed"
     assert row["msAppointmentDate1"] == datetime.date(2021, 9, 1), "datetime -> date"
     assert row["terminationDate"] is None and row["labLink"] is None, "blank -> NULL"

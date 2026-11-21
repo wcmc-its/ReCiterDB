@@ -48,3 +48,7 @@ CREATE TABLE IF NOT EXISTS `reporting_ad_hoc_identity_creation` (
   KEY `idx_personIdentifier` (`personIdentifier`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE TABLE IF NOT EXISTS identity_grad_school_faculty (jid INT PRIMARY KEY, cwid VARCHAR(64)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+-- prod before v3.17: createDatabaseTableReciterDb.sql now carries the v3.17 unique keys,
+-- which would refuse this fixture's duplicates; the remediation runs before they exist
+ALTER TABLE admin_users DROP INDEX IF EXISTS `uq_admin_users_personIdentifier`;
+ALTER TABLE admin_users_roles DROP INDEX IF EXISTS `uq_admin_users_roles_user_role`;

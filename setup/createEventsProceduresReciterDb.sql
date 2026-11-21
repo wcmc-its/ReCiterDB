@@ -5545,36 +5545,60 @@ where (a.email is null or a.email = '') and p.primaryEmail is not null;
 
 -- Add new users from person table. Cornell Ithaca people (never run: dateAdded null)
 -- are in person only so Find People lists them; they get no account or roles.
+--
+-- The account is keyed by the CANONICAL personIdentifier (trimmed, lowercased unless an
+-- external-cohort id such as fredhutch_Rachel.Rau; same rule as update/cwid.py), one row
+-- per canonical id. Copying person's raw value made `Abl9002` accounts, and person rows
+-- that differ only in case (`Abl9002` + `abl9002`) became two candidates for one account.
+-- An id that is still not a plain id after trimming (inner space, '@'), or is a bare
+-- external prefix with nothing after it (`usc_`, `ucsf_`), gets no account.
+-- The cohort prefix is matched ASCII-case-insensitively (spelled out as character
+-- classes, on BINARY so the collation plays no part) and only the prefix is
+-- lowercased, as ReCiter's UidCanonicalizer does: `UCSF_AbC` -> `ucsf_AbC`,
+-- `fh_Abc` keeps its case.
+-- SQL TRIM() strips spaces only, where Python strip() also strips tabs and newlines,
+-- so an id wrapped in a tab is refused here (no account) rather than converted; the
+-- nightly CWID GUARD lists it as invalid.
+-- The existing-account check is a non-correlated NOT IN on trimmed ids, so it is
+-- materialized once and still matches an account stored with a leading space.
 
 insert into admin_users (personIdentifier, nameFirst, nameMiddle, nameLast, email)
-select personIdentifier, firstName, middleName, lastName, primaryEmail
-from person p 
-where p.primaryEmail not in (select email from admin_users where email is not null and email != '')
-and personIdentifier not in (select personIdentifier from admin_users)
-and not (p.dateAdded is null and p.personIdentifier in (select personIdentifier from person_person_type where personType = 'cornell-ithaca'));
+select c.canon, max(c.firstName), max(c.middleName), max(c.lastName), max(c.primaryEmail)
+from (
+  select case when binary trim(p.personIdentifier) regexp '^([Uu][Ss][Cc]|[Ff][Hh]|[Ff][Rr][Ee][Dd][Hh][Uu][Tt][Cc][Hh]|[Uu][Cc][A-Za-z]+)_'
+              then concat(lower(substring_index(trim(p.personIdentifier), '_', 1)),
+                          substring(trim(p.personIdentifier), locate('_', trim(p.personIdentifier))))
+              else lower(trim(p.personIdentifier)) end as canon,
+         p.firstName, p.middleName, p.lastName, p.primaryEmail
+  from person p
+  where p.primaryEmail not in (select email from admin_users where email is not null and email != '')
+  and not (p.dateAdded is null and p.personIdentifier in (select personIdentifier from person_person_type where personType = 'cornell-ithaca'))
+) c
+where c.canon regexp '^[A-Za-z0-9._-]+$'
+and binary c.canon not regexp '^([Uu][Ss][Cc]|[Ff][Hh]|[Ff][Rr][Ee][Dd][Hh][Uu][Tt][Cc][Hh]|[Uu][Cc][A-Za-z]+)_$'
+and c.canon not in (select trim(u.personIdentifier) from admin_users u where u.personIdentifier is not null)
+group by c.canon;
 
--- Create roles for them
+-- Create roles for them. DISTINCT + NOT EXISTS: one (userID, roleID) row per account
+-- however many person rows match it (case-only duplicates in person used to give the
+-- same account the role twice), and never a role for an account with a blank id.
 
 insert into admin_users_roles (userID, roleID)
-select a.userID, 4 
-from person p 
-join admin_users a on a.personIdentifier = p.personIdentifier
-where a.userID  not in 
-(select userID
-from admin_users_roles
-where roleID = 4)
+select distinct a.userID, 4
+from person p
+join admin_users a on a.personIdentifier = trim(p.personIdentifier)
+where trim(a.personIdentifier) <> ''
+and not exists (select 1 from admin_users_roles r where r.userID = a.userID and r.roleID = 4)
 and not (p.dateAdded is null and p.personIdentifier in (select personIdentifier from person_person_type where personType = 'cornell-ithaca'));
 
 -- Let's give self-curators the ability to generate reports for everyone
 
 insert into admin_users_roles (userID, roleID)
-select a.userID, 3 
-from person p 
-join admin_users a on a.personIdentifier = p.personIdentifier
-left join (select userID
-from admin_users_roles
-where roleID = 3) x on x.userID = a.userID
-where x.userID is null
+select distinct a.userID, 3
+from person p
+join admin_users a on a.personIdentifier = trim(p.personIdentifier)
+where trim(a.personIdentifier) <> ''
+and not exists (select 1 from admin_users_roles r where r.userID = a.userID and r.roleID = 3)
 and not (p.dateAdded is null and p.personIdentifier in (select personIdentifier from person_person_type where personType = 'cornell-ithaca'));
 
 
