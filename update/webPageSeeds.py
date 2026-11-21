@@ -52,6 +52,7 @@ import urllib.robotparser
 from concurrent.futures import ThreadPoolExecutor
 
 import webPageCitations
+import webPageOrcid
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s",
                     datefmt="%Y-%m-%d %H:%M:%S")
@@ -842,6 +843,14 @@ def main():
             cit = webPageCitations.run_pass(db_conn, lambda: expired(deadline), utcnow())
             log.info("citation pass: %s", cit)
             dir_stats.update({"citations_" + k: v for k, v in cit.items()})
+        if os.environ.get("WEB_SEEDS_ORCID", "").lower() == "on" and not expired(deadline):
+            odb = db_conn()
+            try:
+                orc = webPageOrcid.run_pass(odb, utcnow())
+            finally:
+                odb.close()
+            log.info("orcid pass: %s", orc)
+            dir_stats.update({"orcid_" + k: v for k, v in orc.items()})
         incomplete = any(s.get("failed") or s.get("stopped_at_deadline") or s.get("throttled_stop")
                          or s.get("robots_ok") is False for s in stats)
         status = "partial" if incomplete else "ok"
