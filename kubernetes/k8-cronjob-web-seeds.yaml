@@ -45,6 +45,10 @@ spec:
             # seeds in pubsource_web_seed. Incremental: each block is parsed and resolved once.
             - name: WEB_SEEDS_CITATIONS
               value: "on"
+            # Step 5: seeds -> ORCID inference (webPageOrcid.py) in pubsource_web_orcid_inference.
+            # OpenAlex (keyless) + the cached Crossref authors; no Bedrock.
+            - name: WEB_SEEDS_ORCID
+              value: "on"
             envFrom:
             # DB_USERNAME / DB_PASSWORD, and DB_HOST / DB_NAME from the configmap.
             - secretRef:
