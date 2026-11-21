@@ -128,6 +128,16 @@ def test_throttle_backoff_and_stop():
     assert h.gap == w.MAX_GAP
 
 
+def test_host_gap_override():
+    orig = w.Host.get
+    w.Host.get = lambda self, url, *a, **k: (404, None, None, "")  # no robots.txt, no network
+    try:
+        assert w.Host("business.cornell.edu", time.monotonic() + 60).gap == w.HOST_GAP["business.cornell.edu"]
+        assert w.Host("x.cornell.edu", time.monotonic() + 60).gap == w.REQUEST_GAP
+    finally:
+        w.Host.get = orig
+
+
 def test_parse_lastmod():
     assert w.parse_lastmod("2026-11-01T10:00:00-05:00") == datetime.datetime(2026, 11, 1, 15, 0)
     assert w.parse_lastmod("2026-11-01") == datetime.datetime(2026, 11, 1)
