@@ -53,6 +53,11 @@ spec:
             # auto_accepted) via webPageCornellPub.py; the Feb 2026 retrieval's rows are untouched.
             - name: WEB_SEEDS_CORNELL_PUB
               value: "on"
+            # Step 7a: seed-scored OpenAlex-by-ORCID expansion (webPageExpand.py, rule R6). Promotes
+            # in place (pending -> auto_accepted only), marks every row it touches with reviewed_by
+            # web_seeds_r6 / web_seed_confirm.
+            - name: WEB_SEEDS_EXPAND
+              value: "on"
             envFrom:
             # DB_USERNAME / DB_PASSWORD, and DB_HOST / DB_NAME from the configmap.
             - secretRef:
