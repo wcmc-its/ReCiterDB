@@ -52,6 +52,7 @@ import urllib.robotparser
 from concurrent.futures import ThreadPoolExecutor
 
 import webPageCitations
+import webPageCornellPub
 import webPageOrcid
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s",
@@ -851,6 +852,14 @@ def main():
                 odb.close()
             log.info("orcid pass: %s", orc)
             dir_stats.update({"orcid_" + k: v for k, v in orc.items()})
+        if os.environ.get("WEB_SEEDS_CORNELL_PUB", "").lower() == "on" and not expired(deadline):
+            pdb = db_conn()
+            try:
+                pub = webPageCornellPub.run_pass(pdb, utcnow())
+            finally:
+                pdb.close()
+            log.info("cornell_pub pass: %s", pub)
+            dir_stats.update({"cornell_pub_" + k: v for k, v in pub.items()})
         incomplete = any(s.get("failed") or s.get("stopped_at_deadline") or s.get("throttled_stop")
                          or s.get("robots_ok") is False for s in stats)
         status = "partial" if incomplete else "ok"

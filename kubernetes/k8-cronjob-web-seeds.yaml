@@ -49,6 +49,10 @@ spec:
             # OpenAlex (keyless) + the cached Crossref authors; no Bedrock.
             - name: WEB_SEEDS_ORCID
               value: "on"
+            # Step 6: live seeds -> cornell_pub_researcher_publication (retrieval_source web_seed,
+            # auto_accepted) via webPageCornellPub.py; the Feb 2026 retrieval's rows are untouched.
+            - name: WEB_SEEDS_CORNELL_PUB
+              value: "on"
             envFrom:
             # DB_USERNAME / DB_PASSWORD, and DB_HOST / DB_NAME from the configmap.
             - secretRef:
