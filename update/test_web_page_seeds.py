@@ -138,6 +138,19 @@ def test_host_gap_override():
         w.Host.get = orig
 
 
+def test_dockerfile_copies_every_web_page_module():
+    """The image copies update/ files one by one: a pass module missing from the Dockerfile
+    crashes the CronJob on import (run 6, 2026-11-22)."""
+    import os
+    import re
+    here = os.path.dirname(os.path.abspath(__file__))
+    copied = set(re.findall(r"COPY update/(\S+?)\.py", open(os.path.join(here, "..", "Dockerfile")).read()))
+    local = {m for m in re.findall(r"^import (webPage\w+)", open(os.path.join(here, "webPageSeeds.py")).read(), re.M)}
+    for m in sorted(local):
+        local |= set(re.findall(r"^import (webPage\w+)", open(os.path.join(here, m + ".py")).read(), re.M))
+    assert local <= copied, f"not in Dockerfile: {sorted(local - copied)}"
+
+
 def test_parse_lastmod():
     assert w.parse_lastmod("2026-11-01T10:00:00-05:00") == datetime.datetime(2026, 11, 1, 15, 0)
     assert w.parse_lastmod("2026-11-01") == datetime.datetime(2026, 11, 1)
