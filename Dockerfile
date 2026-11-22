@@ -29,6 +29,9 @@ COPY update/run_all.py ./
 # takes hours at 1 request/second/host.
 COPY update/webPageSeeds.py ./
 COPY update/webPageCitations.py ./
+COPY update/webPageOrcid.py ./
+COPY update/webPageCornellPub.py ./
+COPY update/webPageExpand.py ./
 COPY update/web_seed_hosts.txt ./
 
 # AAR Scopus lane (not-in-PubMed WCM authorship detector — weekly, gated in run_all.py)
