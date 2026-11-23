@@ -1630,14 +1630,16 @@ class IdentityIndex:
         own department name with "&" for "and" or back, an "and" left out, or a plural:
         "Earth & Atmospheric Sciences" 292, "Immunology and Microbial Pathogenesis" 54,
         "Brain & Mind Research Institute" 51, "Population Medicine and Diagnostic
-        Sciences" 30, and 20 smaller ones. Replaying both rules moves 15 top picks. The
-        8 curator-resolved ones are all fixes (seven "A Singh" rows assigned to as3527,
-        one "Wei Wang" assigned to wew4002) and none is a break; 502 resolved people
-        gain the match, none loses it or drops a rank. One open row moves the wrong
-        way: 5959, byline "Junsung Lee", almost certainly jl3939 "John (Junsung) Lee".
-        The byline reaches him only at the initial tier, so once the rival's "Mechanical
-        & Aerospace Engineering" matches as well as his "Biomedical Engineering" does,
-        the tie goes to confidence, where his alumni flag costs him 0.10.
+        Sciences" 30, and 20 smaller ones. Replaying both rules moves 16 top picks (8
+        assigned, 7 open, 1 rejected). The 8 curator-resolved ones are all fixes (seven
+        "A Singh" rows assigned to as3527, one "Wei Wang" assigned to wew4002) and none
+        is a break; 502 resolved people gain the match, none loses it or drops a rank.
+        The rejected row (80505) trades one wrong Zhang for another. One open row moves
+        the wrong way: 5959, byline "Junsung Lee", almost certainly jl3939 "John
+        (Junsung) Lee". The byline reaches him only at the initial tier, so once the
+        rival's "Mechanical & Aerospace Engineering" matches as well as his "Biomedical
+        Engineering" does, the tie goes to confidence, where his alumni flag costs him
+        0.10.
         Every guarantee above still holds. Tokens are still whole words, so the
         "cardiovascular" case stays False; the institution names are stripped before
         either side is folded; and the seam token is neither "and" nor foldable, so no
