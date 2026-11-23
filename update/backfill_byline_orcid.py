@@ -111,6 +111,16 @@ SAFETY, the same rules as backfill_venue_fit.py:
   * OpenAlex failing is not an error: the lookup stops, the rows it did not reach are
     counted as not found, and a later run picks them up.
 
+--pubmed: THE PUBMED LANE, FILL ONLY. Fills byline_orcid on PubMed rows with a DOI by the
+same OpenAlex rule, and moves no pick. A PubMed row's pick carries the identity-only and
+production scores of whoever it names (top_io_score, top_fg_score, classification), which
+a re-rank from the stored list cannot recompute, so picks move through the PubMed replay
+instead: aar_reconcile_open re-fetches the record, re-scores, and ranks with the ORCID the
+row now stores (an ORCID-led move is CLASS B 'stronger'; a confirmed pick reaches the
+nightly drift pass through the orcid_match keys). The PubMed producer only rewrites an
+existing row on a `--mode backfill` re-explode without --only-new; with
+AAR_BYLINE_ORCID_PUBMED off on the CronJob that rewrite stores NULL again.
+
 The --apply run is a prod write; it is handed to the owner to run, out of hours and not
 alongside the nightly (14:30 UTC).
 
@@ -133,6 +143,7 @@ Usage:
   AAR_BYLINE_ORCID=on python3 backfill_byline_orcid.py # ...and the re-rank of open rows
   AAR_BYLINE_ORCID=on AAR_BYLINE_ORCID_WCM=on python3 backfill_byline_orcid.py
                                                        # ...WCM and mixed rows included
+  python3 backfill_byline_orcid.py --pubmed --open-only # PubMed rows: fill only
   python3 backfill_byline_orcid.py --apply
 """
 import argparse, json, os, sys
@@ -186,6 +197,10 @@ _SELECT_PICKS_SQL = ("SELECT {cols} FROM authorship_review WHERE source IN ('sco
                      "((doi IS NOT NULL AND doi <> '' AND byline_orcid IS NULL) "
                      "OR (byline_orcid IS NOT NULL AND status = 'open')) ORDER BY id")
 _CORNELL_TOP = "top_person_type LIKE 'Cornell%' AND "
+# --pubmed: every PubMed row with a DOI, either campus. Fill only (see the docstring).
+_PUBMED_SELECT_SQL = ("SELECT {cols} FROM authorship_review WHERE source = 'pubmed' "
+                      "AND doi IS NOT NULL AND doi <> '' {unfilled} ORDER BY id")
+EXTERNAL, PUBMED = ("scopus", "openalex"), ("pubmed",)
 
 
 def _select_sql(picks, wide):
@@ -407,13 +422,14 @@ def with_pick(row, entry, verdict, after, orcid, run_ts):
     return entry
 
 
-def _update_sql():
+def _update_sql(sources=EXTERNAL):
     """The only write. byline_orcid IS NULL keeps a value the producer wrote since the
-    row was read; the source list keeps it off the PubMed lane. No status test: the
-    column describes the byline and is filled on resolved rows too."""
+    row was read; the source list keeps it on the lane this run selected (the PubMed
+    lane only with --pubmed). No status test: the column describes the byline and is
+    filled on resolved rows too."""
     sets = ", ".join(f"{c}=:{c}" for c in WRITE_COLS)
     return (f"UPDATE authorship_review SET {sets} WHERE id=:id AND byline_orcid IS NULL "
-            "AND source IN ('scopus', 'openalex')")
+            f"AND source IN ({', '.join(repr(x) for x in sources)})")
 
 
 def _pick_update_sql():
@@ -426,11 +442,11 @@ def _pick_update_sql():
             "AND source IN ('scopus', 'openalex') AND last_refreshed <=> :seen_refreshed")
 
 
-def apply_entries(conn, entries):
+def apply_entries(conn, entries, sources=EXTERNAL):
     """Write each entry and set its `applied` from the UPDATE's own row count, so the
     ledger never claims a row the guard skipped. A re-ranked row (its entry carries the
     pick columns) goes through the pick statement and its guards."""
-    fill, pick, n = text(_update_sql()), text(_pick_update_sql()), 0
+    fill, pick, n = text(_update_sql(sources)), text(_pick_update_sql()), 0
     for e in entries:
         if "top_cwid" in e["after"]:
             res = conn.execute(pick, dict(e["after"], id=e["id"],
@@ -442,14 +458,14 @@ def apply_entries(conn, entries):
     return n
 
 
-def ledger_then_apply(eng, entries, path, apply_writes):
+def ledger_then_apply(eng, entries, path, apply_writes, sources=EXTERNAL):
     """The ledger, then the write, then the ledger again, as backfill_venue_fit does it.
     Returns the number of rows updated."""
     _write_ledger(path, entries)
     if not (apply_writes and entries):
         return 0
     with eng.begin() as c:
-        n = apply_entries(c, entries)
+        n = apply_entries(c, entries, sources)
     try:
         _write_ledger(path, entries)
     except OSError:
@@ -479,6 +495,9 @@ def main():
                          "up the resolved rows' ORCIDs")
     ap.add_argument("--limit", type=int, default=None,
                     help="consider only the first N rows (one OpenAlex call per 50 DOIs)")
+    ap.add_argument("--pubmed", action="store_true",
+                    help="fill byline_orcid on PubMed rows instead, both campuses; fill "
+                         "only, no pick moves (see --pubmed in the docstring)")
     ap.add_argument("--sample", type=int, default=15, help="rows to print")
     ap.add_argument("--selftest", action="store_true", help="offline checks, no DB")
     args = ap.parse_args()
@@ -503,9 +522,10 @@ def main():
                   "setup/alter_authorship_review_add_byline_orcid_v3.15.sql first. "
                   "Nothing written.")
             sys.exit(2)
-        picks = byline_orcid_enabled()
-        wide = byline_orcid_wcm_enabled()      # WCM and mixed rows too (needs `picks`)
-        sql = _select_sql(picks and column_ready, wide)
+        picks = byline_orcid_enabled() and not args.pubmed
+        wide = byline_orcid_wcm_enabled() and not args.pubmed   # needs `picks`
+        sql = (_PUBMED_SELECT_SQL if args.pubmed
+               else _select_sql(picks and column_ready, wide))
         rows = [dict(r) for r in c.execute(text(sql.format(
             cols=", ".join(aar_db.present_cols(c, _READ_COLS + (_PICK_READ_COLS if picks
                                                                 else []))),
@@ -517,7 +537,7 @@ def main():
     unfilled = [r for r in rows if not r.get("byline_orcid")]
     dois = {r["doi"] for r in unfilled if r["doi"]}
     print(f"[{'APPLY' if args.apply else 'DRY-RUN'}] {len(unfilled)} "
-          f"{'external' if wide else 'Cornell-top external'} "
+          f"{'PubMed' if args.pubmed else 'external' if wide else 'Cornell-top external'} "
           f"rows with a DOI and no byline_orcid; {len(dois)} DOIs, about "
           f"{-(-len(dois) // scop.OPENALEX_DOI_BATCH)} OpenAlex calls", flush=True)
     if not column_ready:
@@ -548,6 +568,9 @@ def main():
             print("  the ORCID map is empty or could not be read: no row is re-ranked",
                   flush=True)
             idx = None
+    elif args.pubmed:
+        print("  --pubmed: ORCIDs are filled, no pick is re-ranked here (the PubMed replay, "
+              "aar_reconcile_open, moves them)", flush=True)
     else:
         print("  AAR_BYLINE_ORCID is not on in this shell: ORCIDs are filled, no pick is "
               "re-ranked", flush=True)
@@ -599,13 +622,16 @@ def main():
                       f"   -> {a['top_cwid']} {a['top_name']!r} ({a['top_given_match']}, "
                       f"conf {a['top_confidence']})")
 
-    n = ledger_then_apply(eng, entries, ledger, args.apply)
+    n = ledger_then_apply(eng, entries, ledger, args.apply, PUBMED if args.pubmed else EXTERNAL)
     if args.apply and entries:
         print(f"\nAPPLIED: {n} of {len(entries)} rows updated"
               + (f" ({len(entries) - n} skipped: filled or rewritten by the producer, or "
                  f"resolved by a curator, since they were read)" if n != len(entries) else ""))
     print(f"\nledger: {ledger} ({len(entries)} rows)")
-    if args.apply:
+    if args.apply and args.pubmed:
+        print("Next: aar_reconcile_open.py --check <ids>, then its dry run, moves the picks "
+              "these ORCIDs name (see --pubmed in this script's docstring).")
+    elif args.apply:
         print("AAR_BYLINE_ORCID must be on for the CronJob, or its next sweep rewrites the "
               "rows in its window with no ORCID (see ORDER in this script's docstring).")
     else:
@@ -657,6 +683,11 @@ def _selftest():
           "external row",
           sql == "UPDATE authorship_review SET byline_orcid=:byline_orcid WHERE id=:id "
                  "AND byline_orcid IS NULL AND source IN ('scopus', 'openalex')")
+    check("--pubmed's UPDATE is the same write, kept on the PubMed lane, and its SELECT "
+          "takes PubMed rows with a DOI, of any status and either campus",
+          _update_sql(PUBMED) == sql.replace("IN ('scopus', 'openalex')", "IN ('pubmed')")
+          and "source = 'pubmed'" in _PUBMED_SELECT_SQL and "doi IS NOT NULL" in _PUBMED_SELECT_SQL
+          and "status" not in _PUBMED_SELECT_SQL and "Cornell" not in _PUBMED_SELECT_SQL)
     check("the written column is producer-owned; no curator column and no pick is named",
           all(c in aar_db._REFRESH_COLS for c in WRITE_COLS)
           and not any(c in sql for c in ("status", "top_cwid", "candidate_cwids_json",
@@ -712,9 +743,9 @@ def _selftest():
         eng, path, seen = _Engine([1, 0]), os.path.join(d, "apply.jsonl"), []
         real_apply = globals()["apply_entries"]
 
-        def spy(conn, entries):
+        def spy(conn, entries, sources=EXTERNAL):
             seen.extend(read(path))             # what is on disk when the writes begin
-            return real_apply(conn, entries)
+            return real_apply(conn, entries, sources)
         globals()["apply_entries"] = spy
         try:
             n = ledger_then_apply(eng, fresh(), path, True)

@@ -76,7 +76,10 @@ VENUE TERM (v3.14): the scopus replay ranks as the producer ranks. It reads the 
   fit table could not be loaded.
 
 BYLINE ORCID (v3.15): likewise. Each row is replayed with the byline_orcid IT STORES, the
-  value the producer ranked it with, never a fresh lookup. A row whose pick came from the
+  value the producer ranked it with, never a fresh lookup. PubMed rows too: the producer
+  stores one with AAR_BYLINE_ORCID_PUBMED on, backfill_byline_orcid --pubmed fills older
+  rows, and _replay_pubmed puts the stored value on the re-fetched author block (never the
+  re-fetch's own PubMed ORCID). An ORCID-led pick change is CLASS B 'stronger'. A row whose pick came from the
   ORCID (some candidate carries `orcid_match`) only replays to itself on a roster that
   holds the ORCID map, so `_replay_orcid_guard` refuses to replay such rows without it:
   when the map did not load, and equally when AAR_BYLINE_ORCID is not on in this shell.
@@ -219,8 +222,15 @@ def _tier_move(old_tier, new_tier):
 # TEMPORAL_PENALTY block: "the single route by which staleness reaches either sort
 # key"), which IS compared, and through the separate top_years_after_wcm column, which
 # is not one of the 9 columns this reconciliation owns.
+#
+# `orcid_match` / `orcid_source` ARE triggers: identity-derived (the stored byline_orcid
+# against the roster's ORCID lists), and the only way a row whose ORCID confirms the pick
+# it already had, a PubMed row once backfill_byline_orcid --pubmed fills its ORCID, gets
+# the keys and top_orcid_match written. A row without an ORCID carries neither key on
+# either side and never drifts on them.
 _DRIFT_CAND_FIELDS = ("name", "person_type", "dept", "given_match",
-                      "affil_dept_match", "cohort_size", "confidence")
+                      "affil_dept_match", "cohort_size", "confidence",
+                      "orcid_match", "orcid_source")
 
 # The producer-owned COLUMNS _drift_cols can name. top_cwid is deliberately absent: its
 # comparison IS the CHANGED/UNCHANGED split in _row_result, so it is never re-tested as
@@ -296,6 +306,7 @@ _DRIFT_CAND_CMP = {
     "confidence": _conf_ne,
     "affil_dept_match": _flag_ne,
     "cohort_size": _int_ne,
+    "orcid_match": _flag_ne,
 }
 assert set(_DRIFT_CAND_CMP) <= set(_DRIFT_CAND_FIELDS), (
     "_DRIFT_CAND_CMP names a field _cand_map does not project")
@@ -398,7 +409,11 @@ def _row_result(r, new_top, source, cands=None):
         # never matched has no old tier, and _tier_move would call that "unknown", which
         # no apply gate accepts -- so a name the index learns later (#227) could never
         # reach the rows that were opened before it knew the name.
-        rec["tier_move"] = ("stronger" if old_cwid is None
+        # The byline ORCID's person is stronger whatever the name tiers say (owner
+        # decision 2026-11-17: the ORCID outranks the name tier). Live anchor: rows
+        # 84447/84457, byline "A Singh", where the ORCID names as3527 (initial tier) over a
+        # stored WCM full-name homonym, which the name tiers alone call "weaker".
+        rec["tier_move"] = ("stronger" if old_cwid is None or new_top.get("orcid_match")
                             else _tier_move(r["top_given_match"], new_top["given_match"]))
     return rec
 
@@ -429,6 +444,7 @@ def _replay_pubmed(rows, idx, io_scorer, limit=None, io_rescore=True):
     tie-break artifact -- worth looking at rather than assuming, though the callers'
     hard-exclusion of weaker moves stays correct either way."""
     rows = rows[:limit] if limit else rows
+    _replay_orcid_guard(rows, idx, "pubmed")
     pmids = sorted({r["pmid"] for r in rows if r["pmid"]})
     print(f"      distinct pmids to re-fetch: {len(pmids)}", flush=True)
     groups = uni.load_home_institution_groups()
@@ -447,10 +463,12 @@ def _replay_pubmed(rows, idx, io_scorer, limit=None, io_rescore=True):
         if art is None or not pos or pos < 1 or pos > len(art["authors"]):
             unresolvable.append(r)
             continue
-        au = art["authors"][pos - 1]
+        # The byline ORCID the row STORES, never the re-fetch's own (BYLINE ORCID above):
+        # match_authorship reads it off the author block.
+        au = dict(art["authors"][pos - 1], byline_orcid=r.get("byline_orcid"))
         cands, _cohort = idx.candidates(au.get("last"), au.get("fore"), au.get("initials"),
                                         au.get("affiliations"), top_k=5,
-                                        pub_year=art.get("pub_year"))
+                                        pub_year=art.get("pub_year"), **_orcid_kw(r))
         pool.update(c["cwid"] for c in cands)
         prepped.append((r, au, art.get("pub_year")))
 
@@ -460,7 +478,8 @@ def _replay_pubmed(rows, idx, io_scorer, limit=None, io_rescore=True):
         results = []
         for r, au, pub_year in prepped:
             cands, _c = idx.candidates(au.get("last"), au.get("fore"), au.get("initials"),
-                                       au.get("affiliations"), top_k=5, pub_year=pub_year)
+                                       au.get("affiliations"), top_k=5, pub_year=pub_year,
+                                       **_orcid_kw(r))
             top = cands[0] if cands else None
             results.append(_row_result(r, top, "pubmed", cands))
         return results, unresolvable
@@ -573,7 +592,7 @@ def _orcid_kw(r):
     return {"byline_orcid": r["byline_orcid"]} if r.get("byline_orcid") else {}
 
 
-def _replay_orcid_guard(rows, idx):
+def _replay_orcid_guard(rows, idx, lane="scopus"):
     """`_replay_venue_lookup`'s rule for the ORCID match, without the warn-only half.
     Rows whose stored candidates carry `orcid_match` were ranked by the byline ORCID;
     replayed on a roster with no ORCID map they all read as drift, and
@@ -596,24 +615,24 @@ def _replay_orcid_guard(rows, idx):
     if ranked:
         if idxmod.byline_orcid_enabled():
             raise RuntimeError(
-                "AAR_BYLINE_ORCID is on but the Ithaca ORCID map could not be loaded (see the "
-                "warning above). Refusing to replay the scopus lane without it: every row "
+                f"AAR_BYLINE_ORCID is on but the Ithaca ORCID map could not be loaded (see the "
+                f"warning above). Refusing to replay the {lane} lane without it: every row "
                 "ranked by its byline ORCID would read as drift.")
         raise RuntimeError(
-            f"{ranked} open scopus rows were ranked by a byline ORCID and AAR_BYLINE_ORCID is "
-            f"not on here. Refusing to replay the scopus lane WITHOUT the ORCID match: they "
+            f"{ranked} open {lane} rows were ranked by a byline ORCID and AAR_BYLINE_ORCID is "
+            f"not on here. Refusing to replay the {lane} lane WITHOUT the ORCID match: they "
             f"would read as drift and --apply would move their picks. Set AAR_BYLINE_ORCID=on "
             f"to replay as the CronJob does.")
     if sourced:
         if idxmod.byline_orcid_wcm_enabled():
             raise RuntimeError(
                 "AAR_BYLINE_ORCID_WCM is on but no Scholars or fallback ORCID list could be "
-                "loaded (see the warning above). Refusing to replay the scopus lane without "
+                f"loaded (see the warning above). Refusing to replay the {lane} lane without "
                 f"them: {sourced} rows ranked through them would read as drift.")
         raise RuntimeError(
-            f"{sourced} open scopus rows were ranked with AAR_BYLINE_ORCID_WCM on (their "
+            f"{sourced} open {lane} rows were ranked with AAR_BYLINE_ORCID_WCM on (their "
             f"candidates carry orcid_source) and it is not on here. Refusing to replay the "
-            f"scopus lane with the Ithaca-only match: WCM and two-campus rows would read as "
+            f"{lane} lane with the Ithaca-only match: WCM and two-campus rows would read as "
             f"drift and --apply would move their picks. Set AAR_BYLINE_ORCID=on and "
             f"AAR_BYLINE_ORCID_WCM=on to replay as the CronJob does.")
 
@@ -807,7 +826,8 @@ def _selftest():
     # _DRIFT_CAND_FIELDS without a matching hand-written comparison.
     cand_perturb = {"name": "Someone Else", "person_type": "Voluntary Faculty",
                     "dept": "Pediatrics", "given_match": "full",
-                    "affil_dept_match": False, "cohort_size": 4, "confidence": 0.5}
+                    "affil_dept_match": False, "cohort_size": 4, "confidence": 0.5,
+                    "orcid_match": True, "orcid_source": "scholars"}
     check("every field in _DRIFT_CAND_FIELDS has a perturbation below",
           set(cand_perturb) == set(_DRIFT_CAND_FIELDS))
     for f, v in cand_perturb.items():
@@ -1073,6 +1093,43 @@ def _selftest():
     finally:
         (scop.load_venue_lookup, scop.load_family_afids, scop.venue_fit_enabled,
          scop._scopus_get, idxmod.byline_orcid_enabled) = saved
+
+    # ---- byline ORCID on the PubMed lane: the replay ranks with the row's stored ORCID ----
+    # The "R Weiss" byline again, as author 1 of PubMed record 99. The re-fetched record
+    # names no ORCID of its own; the row stores Lindqvist's (AAR_BYLINE_ORCID_PUBMED, or
+    # backfill_byline_orcid --pubmed).
+    class _NoIO:
+        def scores(self, _cwid):
+            return {}
+    pm_art = {"pmid": 99, "pub_year": 2024, "authors": [dict(au, home_inst=True, orcid=None)]}
+    pm_row = dict(venue_row, id=11, source="pubmed", pmid=99, external_id=None)
+    saved_pm = (uni.efetch_by_ids, uni.load_home_institution_groups, idxmod.byline_orcid_enabled)
+    uni.efetch_by_ids, uni.load_home_institution_groups = (lambda p, g: [pm_art]), (lambda: [])
+    idxmod.byline_orcid_enabled = lambda: False
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            pm_on, _u1 = _replay_pubmed([dict(pm_row, byline_orcid=ORCID)], o_idx, _NoIO())
+            pm_off, _u2 = _replay_pubmed([dict(pm_row, byline_orcid=None)], o_idx, _NoIO())
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                _replay_pubmed([dict(pm_row, byline_orcid=ORCID,
+                                     candidate_cwids_json=orcid_row["candidate_cwids_json"])],
+                               no_map, _NoIO())
+            pm_refused = ""
+        except RuntimeError as e:
+            pm_refused = str(e)
+    finally:
+        uni.efetch_by_ids, uni.load_home_institution_groups, idxmod.byline_orcid_enabled = saved_pm
+    check("pubmed replay ranks with the ORCID the row stores: Lindqvist, whom the name "
+          "cannot reach, leads, and the move counts as stronger (the ORCID outranks the "
+          "name tier) where the tiers alone say initial -> initial",
+          [(x["new_cwid"], x["classification"], x.get("tier_move"), x["new_given_match"])
+           for x in pm_on] == [("rl_c", "CHANGED", "stronger", "initial")])
+    check("...and a row storing no ORCID replays by name alone, as before",
+          [x["new_cwid"] for x in pm_off] == ["rh_c"])
+    check("a pubmed row its ORCID ranked is refused on a roster with no ORCID map, and the "
+          "message names the lane", "1 open pubmed rows were ranked by a byline ORCID"
+          in pm_refused)
 
     print("\nSELFTEST", "PASS" if ok else "FAIL")
     return ok

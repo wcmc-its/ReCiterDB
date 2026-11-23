@@ -54,6 +54,8 @@ import aar_universe as uni
 import aar_gate as gate
 import aar_matcher as matcher
 import aar_db
+import aar_universe_scopus as scop     # the byline-ORCID helpers the Scopus lane owns
+from identity_index import byline_orcid_pubmed_enabled
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_STATE = os.path.join(REPO, "analysis", "adversarial_attribution_review", "state")
@@ -147,10 +149,48 @@ def _compact(cands):
     keep = ("cwid", "name", "name_source", "name_n", "person_type", "dept", "given_match",
             "affil_dept_match", "cohort_size", "confidence", "years_after_wcm", "io_score",
             "final_score", "io_source")
+
     # `campus` only on a Cornell candidate -- same rule, and same reason, as
-    # aar_universe_scopus._compact: WCM entries keep their exact pre-campus bytes.
-    return [dict({k: c.get(k) for k in keep}, **({"campus": c["campus"]} if c.get("campus")
-                                                 else {})) for c in cands]
+    # aar_universe_scopus._compact: WCM entries keep their exact pre-campus bytes. The
+    # byline-ORCID keys by that function's rule too: `orcid_match` only on a row whose
+    # ORCID found somebody, `orcid_added` / `orcid_source` only on the matched person.
+    # Every row without an ORCID match stores exactly the bytes it did before.
+    def extra(c):
+        out = {"campus": c["campus"]} if c.get("campus") else {}
+        if "orcid_match" in c:
+            out["orcid_match"] = bool(c["orcid_match"])
+        if c.get("orcid_added"):
+            out["orcid_added"] = True
+        if c.get("orcid_source"):
+            out["orcid_source"] = c["orcid_source"]
+        return out
+    return [dict({k: c.get(k) for k in keep}, **extra(c)) for c in cands]
+
+
+def _fill_byline_orcids(arts):
+    """AAR_BYLINE_ORCID_PUBMED: give every home-institution author block of `arts` a
+    `byline_orcid` -- PubMed's own (aar_universe._pubmed_orcid), else OpenAlex's for the
+    same DOI by the Scopus lane's rule and fail-neutral lookup
+    (aar_universe_scopus.openalex_authorships / pick_byline_orcid), else None. Only DOIs
+    leave the machine, one call per 50. match_authorship reads the key.
+
+    Off, nothing is set and nothing is asked, and the lane is what it was. Returns
+    (author blocks, ORCIDs from PubMed, ORCIDs from OpenAlex), or None when off."""
+    if not byline_orcid_pubmed_enabled():
+        return None
+    blocks = [(a, i, au) for a in arts for i, au in enumerate(a["authors"])
+              if au.get("home_inst")]
+    by_doi = scop.openalex_authorships({a["doi"] for a, _i, au in blocks
+                                        if a.get("doi") and not au.get("orcid")})
+    n_pm = n_oa = 0
+    for a, i, au in blocks:
+        # "Last, Given": PubMed gives the parts, so a two-word surname stays whole.
+        name = f"{au.get('last') or ''}, {au.get('fore') or au.get('initials') or ''}"
+        au["byline_orcid"] = au.get("orcid") or scop.pick_byline_orcid(
+            by_doi.get((a.get("doi") or "").lower()), i, name)
+        n_pm += bool(au.get("orcid"))
+        n_oa += bool(au["byline_orcid"] and not au.get("orcid"))
+    return len(blocks), n_pm, n_oa
 
 
 def _trunc(s, n):
@@ -354,6 +394,10 @@ def _db_rows(resolved_auth, run_date, attr_by_pmid=None, prod_holds=None):
             "top_affil_match": (int(bool(t["affil_dept_match"])) if top else None),
             "n_candidates": len(cands), "single_candidate": int(cohort == 1),
             "candidate_cwids_json": json.dumps(_compact(cands)),
+            # v3.15 columns, as aar_universe_scopus._build_row writes them. NULL unless
+            # AAR_BYLINE_ORCID_PUBMED put an ORCID on the author block.
+            "byline_orcid": au.get("byline_orcid"),
+            "top_orcid_match": scop.top_orcid_match(top),
             "dup_flag": int(bool(dup_uid)),
             "dup_reason": (f"Already added as ExternalArticle for {dup_uid} (DOI match)"
                            if dup_uid else None),
@@ -448,6 +492,10 @@ def run(date_from, date_to, state_dir, export_dir, run_date, workers=16, max_rec
     # --- 3. explode ALL new WCM-authored articles into authorships + match ---
     log("[3/6] Matching WCM authorships on new articles ...")
     log(f"      identity index: {sum(len(v) for v in idx.by_surname.values())} people")
+    filled = _fill_byline_orcids([by_pmid[p] for p in new_pmids])
+    if filled:
+        log(f"      byline ORCID: {filled[1] + filled[2]} of {filled[0]} WCM authorships "
+            f"carry one ({filled[1]} from PubMed, {filled[2]} from OpenAlex)")
     authorships = []  # (article, position, author, candidates)
     cwid_pool = set()
     for p in new_pmids:
@@ -458,7 +506,9 @@ def run(date_from, date_to, state_dir, export_dir, run_date, workers=16, max_rec
                 continue
             cands, _ = idx.candidates(au.get("last"), au.get("fore"),
                                       au.get("initials"), au.get("affiliations"), top_k=5,
-                                      pub_year=a.get("pub_year"))
+                                      pub_year=a.get("pub_year"),
+                                      **({"byline_orcid": au["byline_orcid"]}
+                                         if au.get("byline_orcid") else {}))
             # Cornell cwids have no identity-only input to warm (match_authorship skips them).
             cwid_pool.update(c["cwid"] for c in cands if not c.get("campus"))
             authorships.append((a, i, n, au, cands))
@@ -1044,6 +1094,69 @@ def _selftest():
           store3.ledger["status"].iloc[2] == "resolved_attributed"
           and store3.ledger["resolution_cwid"].iloc[2] == "aer2006")
 
+    # ---- byline ORCID (AAR_BYLINE_ORCID_PUBMED) ---------------------------------
+    _om = dict(auth(None)[5], cwid="cu1", campus="cornell-ithaca", orcid_match=True,
+               orcid_added=True, orcid_source="affiliation_manager")
+    _on = dict(auth(None)[5], orcid_match=False)
+    _oc = _compact([_om, _on])
+    check("_compact keeps the byline-ORCID keys the Scopus lane stores (orcid_match on every "
+          "candidate of a matched row, orcid_added / orcid_source on the matched person), "
+          "and a row with no ORCID match stores exactly the bytes it did",
+          _oc[0]["orcid_match"] is True and _oc[0]["orcid_added"] is True
+          and _oc[0]["orcid_source"] == "affiliation_manager"
+          and _oc[1] == dict(_compact([auth(None)[5]])[0], orcid_match=False)
+          and "orcid_match" not in _compact([auth(None)[5]])[0])
+    _orow = _db_rows([(auth(None)[0], 0, 1, {"last": "N", "fore": "F", "affiliations": [],
+                                              "byline_orcid": "0000-0002-8762-7097"},
+                       [_om, _on], _om)], "2026-01-01")
+    _prow = _db_rows([auth(None)], "2026-01-01")
+    check("_db_rows stores the byline ORCID and top_orcid_match (2: only the ORCID put the "
+          "pick there), and NULL for both on a row with none",
+          _orow[0]["byline_orcid"] == "0000-0002-8762-7097" and _orow[0]["top_orcid_match"] == 2
+          and _prow[0]["byline_orcid"] is None and _prow[0]["top_orcid_match"] is None)
+
+    def _arts():
+        return [{"pmid": 5, "doi": "10.3168/JDS.2026-28823", "authors": [
+            {"last": "Singh", "fore": "A", "initials": "A", "home_inst": True, "orcid": None},
+            {"last": "Mann", "fore": "S", "initials": "S", "home_inst": True,
+             "orcid": "0000-0003-1806-1154"},
+            {"last": "Wieland", "fore": "M", "initials": "M", "home_inst": False, "orcid": None},
+        ]}]
+    asked = []
+
+    def _oa(dois):
+        asked.append(sorted(dois))
+        return {"10.3168/jds.2026-28823": [("Anirudh Pratap Singh", "0000-0002-8762-7097"),
+                                           ("Sabine Mann", "0000-0003-1806-1154")]}
+    keep = (scop.openalex_authorships, os.environ.get("AAR_BYLINE_ORCID"),
+            os.environ.get("AAR_BYLINE_ORCID_PUBMED"))
+    scop.openalex_authorships = _oa
+    try:
+        os.environ.pop("AAR_BYLINE_ORCID_PUBMED", None)
+        os.environ["AAR_BYLINE_ORCID"] = "on"
+        off_arts = _arts()
+        off = _fill_byline_orcids(off_arts)
+        n_asked_off = len(asked)
+        os.environ["AAR_BYLINE_ORCID_PUBMED"] = "on"
+        on_arts = _arts()
+        on = _fill_byline_orcids(on_arts)
+    finally:
+        scop.openalex_authorships = keep[0]
+        for k, v in (("AAR_BYLINE_ORCID", keep[1]), ("AAR_BYLINE_ORCID_PUBMED", keep[2])):
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+    check("AAR_BYLINE_ORCID_PUBMED off: nothing is set and OpenAlex is never asked",
+          off is None and n_asked_off == 0
+          and all("byline_orcid" not in au for au in off_arts[0]["authors"]))
+    _ons = on_arts[0]["authors"]
+    check("on: PubMed's own ORCID is kept, OpenAlex's fills the author PubMed gives none "
+          "(by surname and initial, 'Last, Given'), a non-WCM author is left alone, and "
+          "OpenAlex is asked only for the DOI that needs it",
+          on == (2, 1, 1) and _ons[0]["byline_orcid"] == "0000-0002-8762-7097"
+          and _ons[1]["byline_orcid"] == "0000-0003-1806-1154"
+          and "byline_orcid" not in _ons[2] and asked == [["10.3168/JDS.2026-28823"]])
+
     print("SELFTEST", "PASS" if ok else "FAIL")
     return ok
 
@@ -1122,6 +1235,7 @@ def run_backfill(state_dir, run_date, workers=16, batch_size=500, limit=None, wr
         by_pmid = {a["pmid"]: a for a in arts}
         authorships = []
         cwid_pool = set()
+        _fill_byline_orcids([by_pmid[p] for p in chunk if p in by_pmid])
         for p in chunk:
             a = by_pmid.get(p)
             if not a:
@@ -1132,7 +1246,9 @@ def run_backfill(state_dir, run_date, workers=16, batch_size=500, limit=None, wr
                     continue
                 cands, _ = idx.candidates(au.get("last"), au.get("fore"),
                                           au.get("initials"), au.get("affiliations"),
-                                          top_k=5, pub_year=a.get("pub_year"))
+                                          top_k=5, pub_year=a.get("pub_year"),
+                                          **({"byline_orcid": au["byline_orcid"]}
+                                             if au.get("byline_orcid") else {}))
                 cwid_pool.update(c["cwid"] for c in cands if not c.get("campus"))
                 authorships.append((a, j, n, au, cands))
         pool = sorted(c for c in cwid_pool if c not in io._cache)

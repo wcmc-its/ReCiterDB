@@ -176,16 +176,25 @@ def match_authorship(author, pmid, idx, io_scorer, top_k=5, pub_year=None):
     this key already applies between two WCM people, applied unchanged across campuses.
     ponytail: that includes a near-zero WCM score (the Torres shape, one tier down).
     Revisit if two-campus rows show curators overriding it."""
+    # The byline ORCID rides on the author block: set by the producer only with
+    # AAR_BYLINE_ORCID_PUBMED on, and by the replay tools from the row's stored
+    # byline_orcid. Absent, the call is the one it always was.
+    orcid = author.get("byline_orcid")
     cands, cohort = idx.candidates(
         author.get("last"), author.get("fore"), author.get("initials"),
-        author.get("affiliations"), top_k=top_k, pub_year=pub_year)
+        author.get("affiliations"), top_k=top_k, pub_year=pub_year,
+        **({"byline_orcid": orcid} if orcid else {}))
     for c in cands:
         scored = io_scorer and c.get("campus", CAMPUS_WCM) == CAMPUS_WCM
         v = io_scorer.scores(c["cwid"]).get(int(pmid)) if scored else None
         c["io_score"] = round(v[0], 2) if v else None
         c["final_score"] = round(v[1], 2) if v else None   # production final (>=30 == suggested)
         c["io_source"] = "retrieved" if v else "not_retrieved"
+    # `orcid_match` leads, as in identity_index._rank_key (owner decision 2026-11-17: the
+    # ORCID outranks the name tier). Only a row whose ORCID found somebody carries it, so
+    # every other list sorts exactly as before.
     cands.sort(key=lambda d: (
+        bool(d.get("orcid_match")),
         d["given_match"] == "full",
         d["io_score"] if d["io_score"] is not None else -1.0,
         d["confidence"]), reverse=True)
@@ -342,8 +351,28 @@ def _rank_selftest():
                   {"last": "Moss", "fore": "Kate", "initials": "K", "affiliations": ith},
                   {"last": "Moss", "fore": None, "initials": "K", "affiliations": wcm + ith}))
 
+    # With a byline ORCID on the author block (AAR_BYLINE_ORCID_PUBMED, or a replay of a
+    # row that stores one) the ORCID's person leads: over a full name match on a
+    # Cornell-only byline, and over a WCM rival carrying a retrieved identity-only score on
+    # a two-campus one. Nobody is dropped.
+    o_cu = match_authorship({"last": "Moss", "fore": "Kate", "initials": "K", "affiliations": ith,
+                             "byline_orcid": "0000-0001-0000-0002"}, 99, labelled, _RecordingIO())
+    o_both = match_authorship({"last": "Moss", "fore": None, "initials": "K",
+                               "affiliations": wcm + ith, "byline_orcid": "0000-0001-0000-0002"},
+                              99, labelled, _RecordingIO())
+
     checks = [
-        ("the PubMed lane passes no byline ORCID: rosters holding the WCM and Ithaca ORCID "
+        ("a byline ORCID on the author block puts its person first, over a full given-name "
+         "match, labelled with its source; the others stay, orcid_match false",
+         [c["cwid"] for c in o_cu] == ["km_c2", "km_c"] and o_cu[0]["orcid_match"] is True
+         and o_cu[0].get("orcid_source") == "affiliation_manager"
+         and o_cu[1]["orcid_match"] is False),
+        ("...and over a WCM rival with a retrieved identity-only score (the io tie-break that "
+         "wins a same-tier two-campus row without the ORCID)",
+         o_both[0]["cwid"] == "km_c2"
+         and any(c["cwid"] == "km_w" and c["io_score"] == 0.62 for c in o_both)
+         and both_tie[0]["cwid"] == "km_w"),
+        ("an author block with no byline_orcid: rosters holding the WCM and Ithaca ORCID "
          "maps (AAR_BYLINE_ORCID_WCM) rank a WCM, a Cornell and a two-campus byline exactly "
          "as rosters without them, and no candidate carries an orcid key",
          pubmed_same and labelled.wcm.orcid_rec and labelled.ithaca.orcid_rec

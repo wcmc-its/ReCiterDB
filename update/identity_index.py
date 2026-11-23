@@ -626,10 +626,17 @@ def venue_fit_enabled():
 # list. An ORCID that finds one person on each roster cannot say which, and is ignored
 # for that row.
 #
-# THE EXTERNAL LANES ONLY. Scopus and OpenAlex take `candidates()`' first element as
-# top_cwid with no later re-sort, so the ORCID's person is the pick. The PubMed lane
-# (`aar_matcher.match_authorship`) re-sorts by the identity-only score and does not know
-# `orcid_match`; it passes no ORCID, so no PubMed candidate ever carries the key.
+# THE EXTERNAL LANES, AND THE PUBMED LANE BEHIND ITS OWN SWITCH. Scopus and OpenAlex take
+# `candidates()`' first element as top_cwid with no later re-sort, so the ORCID's person
+# is the pick. The PubMed lane (`aar_matcher.match_authorship`) re-sorts by the
+# identity-only score; its key now leads with `orcid_match` too, so the ORCID's person is
+# its pick as well. The producer captures a PubMed byline ORCID (PubMed's own
+# Author/Identifier, else OpenAlex's by DOI) only with AAR_BYLINE_ORCID_PUBMED=on
+# (`byline_orcid_pubmed_enabled`); off, it passes none and no PubMed candidate carries the
+# key. The replay tools pass a PubMed row the byline_orcid IT STORES whatever the switch
+# says, as they do for Scopus rows. Owner decision 2026-11-23: "A Singh" on two Vet-school
+# papers (pmids 42716290, 42716284) named no ORCID in PubMed, while OpenAlex has the
+# author's (0000-0002-8762-7097, on file for as3527).
 def byline_orcid_enabled():
     """AAR_BYLINE_ORCID=on. Anything else, a typo included, is off."""
     return (os.environ.get("AAR_BYLINE_ORCID") or "").strip().lower() == "on"
@@ -663,6 +670,15 @@ def byline_orcid_wcm_enabled():
     included, is off, and the ORCID match is the Ithaca-only one of v3.15."""
     return (byline_orcid_enabled()
             and (os.environ.get("AAR_BYLINE_ORCID_WCM") or "").strip().lower() == "on")
+
+
+def byline_orcid_pubmed_enabled():
+    """AAR_BYLINE_ORCID_PUBMED=on AND AAR_BYLINE_ORCID=on: the PubMed producer captures
+    the byline ORCID and ranks by it. A third switch for the second's reason: the first
+    two are on in production, so merging must not change PubMed picks the night it
+    deploys."""
+    return (byline_orcid_enabled()
+            and (os.environ.get("AAR_BYLINE_ORCID_PUBMED") or "").strip().lower() == "on")
 
 
 ORCID_SCHOLARS, ORCID_AFFILIATION_MANAGER, ORCID_INFERRED = (
