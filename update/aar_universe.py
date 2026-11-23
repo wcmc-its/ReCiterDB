@@ -48,6 +48,8 @@ from datetime import date, timedelta
 
 import requests
 
+from identity_index import bare_orcid
+
 EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 APP_PROPS = os.path.expanduser(
     "~/Dropbox/GitHub/ReCiter/src/main/resources/application.properties")
@@ -274,6 +276,19 @@ def _text(el):
     return "".join(el.itertext()).strip() if el is not None else None
 
 
+def _pubmed_orcid(au):
+    """PubMed's own ORCID for one Author element, as authorship_review.byline_orcid stores
+    it (identity_index.bare_orcid), or None. PubMed spells it as a bare iD, an orcid.org
+    URL, or, on older records, 16 characters with no hyphens."""
+    for el in au.findall("Identifier"):
+        if (el.get("Source") or "").strip().upper() == "ORCID":
+            raw = re.sub(r"[^0-9X]", "",
+                         (el.text or "").strip().upper().rstrip("/").rsplit("/", 1)[-1])
+            if len(raw) == 16:
+                return bare_orcid("-".join(raw[i:i + 4] for i in range(0, 16, 4)))
+    return None
+
+
 def parse_articles(xml_bytes, groups):
     root = ET.fromstring(xml_bytes)
     out = []
@@ -282,7 +297,7 @@ def parse_articles(xml_bytes, groups):
         if not pmid:
             continue
         authors = []
-        for au in art.findall("./MedlineCitation/Article/AuthorList/Author"):
+        for k, au in enumerate(art.findall("./MedlineCitation/Article/AuthorList/Author")):
             last = au.findtext("LastName")
             fore = au.findtext("ForeName")
             if not (last or fore):
@@ -292,6 +307,12 @@ def parse_articles(xml_bytes, groups):
                 "last": last, "fore": fore, "initials": au.findtext("Initials"),
                 "affiliations": affs,
                 "home_inst": any(match_home_institution(a, groups) for a in affs),
+                # Captured always; the producer ranks by it only with AAR_BYLINE_ORCID_PUBMED.
+                "orcid": _pubmed_orcid(au),
+                # Position in the FULL AuthorList, collective authors counted: what another
+                # source's author list (OpenAlex) lines up with. This list's own index skips
+                # them, and author_position keeps that meaning.
+                "list_index": k,
             })
         out.append({
             "pmid": int(pmid),
@@ -461,6 +482,36 @@ def _selftest():
           own_segment("A Lee is with NYU, New York, NY. At the time of this study, Q Trinh was with "
                       "the Department of Urology, Pittsburgh, PA.", "Trinh")
           == "the Department of Urology, Pittsburgh, PA.")
+
+    def au_el(ids):
+        return ET.fromstring("<Author><LastName>Singh</LastName>" + "".join(
+            f'<Identifier Source="{s}">{v}</Identifier>' for s, v in ids) + "</Author>")
+    check("_pubmed_orcid reads a bare PubMed ORCID",
+          _pubmed_orcid(au_el([("ORCID", "0000-0002-8762-7097")])) == "0000-0002-8762-7097")
+    check("_pubmed_orcid reads the orcid.org URL form and a lower-case check letter",
+          _pubmed_orcid(au_el([("ORCID", "https://orcid.org/0000-0003-0527-576x")]))
+          == "0000-0003-0527-576X")
+    check("_pubmed_orcid reads a URL with a trailing slash",
+          _pubmed_orcid(au_el([("ORCID", "https://orcid.org/0000-0002-8762-7097/")]))
+          == "0000-0002-8762-7097")
+    check("parse_articles keeps each author's index in the FULL AuthorList: a collective "
+          "author is skipped but still counted",
+          [(a["last"], a["list_index"]) for a in parse_articles(VALID.replace(
+              b"<AuthorList>", b"<AuthorList><Author><CollectiveName>XYZ Consortium"
+                               b"</CollectiveName></Author>"), [])[0]["authors"]]
+          == [("Doe", 1)])
+    check("_pubmed_orcid reads the 16-character form older records carry",
+          _pubmed_orcid(au_el([("ORCID", "0000000287627097")])) == "0000-0002-8762-7097")
+    check("_pubmed_orcid ignores other identifier sources and malformed values",
+          _pubmed_orcid(au_el([("ISNI", "0000000287627097")])) is None
+          and _pubmed_orcid(au_el([("ORCID", "0000-0002-8762")])) is None
+          and _pubmed_orcid(au_el([])) is None)
+    check("parse_articles carries the ORCID on the author block",
+          parse_articles(VALID.replace(b"<Initials>J</Initials>",
+                                       b'<Initials>J</Initials><Identifier Source="ORCID">'
+                                       b"0000-0002-8762-7097</Identifier>"), [])[0]
+          ["authors"][0]["orcid"] == "0000-0002-8762-7097"
+          and parse_articles(VALID, [])[0]["authors"][0]["orcid"] is None)
 
     print("SELFTEST", "PASS" if ok else "FAIL")
     return ok

@@ -111,6 +111,19 @@ SAFETY, the same rules as backfill_venue_fit.py:
   * OpenAlex failing is not an error: the lookup stops, the rows it did not reach are
     counted as not found, and a later run picks them up.
 
+--pubmed: THE PUBMED LANE, FILL ONLY. Re-fetches each row's PubMed record and fills
+byline_orcid exactly as the producer would (aar_orchestrator.byline_orcids: PubMed's own
+Author/Identifier ORCID, else OpenAlex's by DOI, positioned by the full AuthorList), so a
+row needs no DOI when PubMed names the ORCID itself. A row whose record no longer has the
+row's byline at its position is skipped. It moves no pick. A PubMed row's pick carries the identity-only and
+production scores of whoever it names (top_io_score, top_fg_score, classification), which
+a re-rank from the stored list cannot recompute, so picks move through the PubMed replay
+instead: aar_reconcile_open re-fetches the record, re-scores, and ranks with the ORCID the
+row now stores (an ORCID-led move is CLASS B 'stronger'; a confirmed pick reaches the
+nightly drift pass through the orcid_match keys). The PubMed producer only rewrites an
+existing row on a `--mode backfill` re-explode without --only-new; with
+AAR_BYLINE_ORCID_PUBMED off on the CronJob that rewrite stores NULL again.
+
 The --apply run is a prod write; it is handed to the owner to run, out of hours and not
 alongside the nightly (14:30 UTC).
 
@@ -133,6 +146,7 @@ Usage:
   AAR_BYLINE_ORCID=on python3 backfill_byline_orcid.py # ...and the re-rank of open rows
   AAR_BYLINE_ORCID=on AAR_BYLINE_ORCID_WCM=on python3 backfill_byline_orcid.py
                                                        # ...WCM and mixed rows included
+  python3 backfill_byline_orcid.py --pubmed --open-only # PubMed rows: fill only
   python3 backfill_byline_orcid.py --apply
 """
 import argparse, json, os, sys
@@ -186,6 +200,10 @@ _SELECT_PICKS_SQL = ("SELECT {cols} FROM authorship_review WHERE source IN ('sco
                      "((doi IS NOT NULL AND doi <> '' AND byline_orcid IS NULL) "
                      "OR (byline_orcid IS NOT NULL AND status = 'open')) ORDER BY id")
 _CORNELL_TOP = "top_person_type LIKE 'Cornell%' AND "
+# --pubmed: every PubMed row, either campus, DOI or not. Fill only (see the docstring).
+_PUBMED_SELECT_SQL = ("SELECT {cols} FROM authorship_review WHERE source = 'pubmed' "
+                      "{unfilled} ORDER BY id")
+EXTERNAL, PUBMED = ("scopus", "openalex"), ("pubmed",)
 
 
 def _select_sql(picks, wide):
@@ -226,6 +244,50 @@ def fill_row(row, by_doi, run_ts):
         "author_key": row["author_key"], "wcm_author": row["wcm_author"], "doi": row["doi"],
         "rule": "ORCID_FOUND", "before": {"byline_orcid": None},
         "after": {"byline_orcid": orcid}, "swept_at": run_ts, "applied": False}
+
+
+def pubmed_fills(rows, run_ts, fetch=None):
+    """--pubmed: (verdict, entry) per row, in order. Re-fetches the rows' PubMed records
+    (`fetch(pmids)` -> parsed articles; aar_universe.efetch_by_ids by default) and fills
+    the author at each row's position with the producer's own rule
+    (aar_orchestrator.byline_orcids). Verdicts besides fill_row's ORCID_FOUND:
+
+      skipped: record not returned by PubMed
+      skipped: byline moved in the record    the record's author at the row's position is
+                                             no longer the row's byline
+      skipped: no ORCID on the byline author neither PubMed nor OpenAlex names one"""
+    import aar_orchestrator as orch                  # pandas/boto3: only this mode needs it
+    import aar_universe as uni
+    if fetch is None:
+        groups = uni.load_home_institution_groups()
+        fetch = lambda pmids: uni.efetch_by_ids(pmids, groups)    # noqa: E731
+    by_pmid = {a["pmid"]: a for a in fetch(sorted({int(r["pmid"]) for r in rows
+                                                   if r.get("pmid")}))}
+    placed = []
+    for r in rows:
+        art, pos = by_pmid.get(int(r["pmid"])) if r.get("pmid") else None, r.get("author_position")
+        au = (art["authors"][int(pos) - 1]
+              if art and pos and 1 <= int(pos) <= len(art["authors"]) else None)
+        # The row's own byline still at that position (wcm_author is _byline, truncated).
+        same = au is not None and orch._trunc(orch._byline(au), 255) == r["wcm_author"]
+        placed.append((r, art, au if same else None))
+    orch.byline_orcids([(art, au) for _r, art, au in placed if au is not None])
+    out = []
+    for r, art, au in placed:
+        if art is None:
+            out.append(("skipped: record not returned by PubMed", None))
+        elif au is None:
+            out.append(("skipped: byline moved in the record", None))
+        elif not au["byline_orcid"]:
+            out.append(("skipped: no ORCID on the byline author", None))
+        else:
+            out.append(("ORCID_FOUND", {
+                "id": r["id"], "source": r["source"], "status": r["status"],
+                "author_key": r["author_key"], "wcm_author": r["wcm_author"], "doi": r.get("doi"),
+                "rule": "ORCID_FOUND", "from": "pubmed" if au.get("orcid") else "openalex",
+                "before": {"byline_orcid": None}, "after": {"byline_orcid": au["byline_orcid"]},
+                "swept_at": run_ts, "applied": False}))
+    return out
 
 
 def _key(c):
@@ -407,13 +469,14 @@ def with_pick(row, entry, verdict, after, orcid, run_ts):
     return entry
 
 
-def _update_sql():
+def _update_sql(sources=EXTERNAL):
     """The only write. byline_orcid IS NULL keeps a value the producer wrote since the
-    row was read; the source list keeps it off the PubMed lane. No status test: the
-    column describes the byline and is filled on resolved rows too."""
+    row was read; the source list keeps it on the lane this run selected (the PubMed
+    lane only with --pubmed). No status test: the column describes the byline and is
+    filled on resolved rows too."""
     sets = ", ".join(f"{c}=:{c}" for c in WRITE_COLS)
     return (f"UPDATE authorship_review SET {sets} WHERE id=:id AND byline_orcid IS NULL "
-            "AND source IN ('scopus', 'openalex')")
+            f"AND source IN ({', '.join(repr(x) for x in sources)})")
 
 
 def _pick_update_sql():
@@ -426,11 +489,11 @@ def _pick_update_sql():
             "AND source IN ('scopus', 'openalex') AND last_refreshed <=> :seen_refreshed")
 
 
-def apply_entries(conn, entries):
+def apply_entries(conn, entries, sources=EXTERNAL):
     """Write each entry and set its `applied` from the UPDATE's own row count, so the
     ledger never claims a row the guard skipped. A re-ranked row (its entry carries the
     pick columns) goes through the pick statement and its guards."""
-    fill, pick, n = text(_update_sql()), text(_pick_update_sql()), 0
+    fill, pick, n = text(_update_sql(sources)), text(_pick_update_sql()), 0
     for e in entries:
         if "top_cwid" in e["after"]:
             res = conn.execute(pick, dict(e["after"], id=e["id"],
@@ -442,14 +505,14 @@ def apply_entries(conn, entries):
     return n
 
 
-def ledger_then_apply(eng, entries, path, apply_writes):
+def ledger_then_apply(eng, entries, path, apply_writes, sources=EXTERNAL):
     """The ledger, then the write, then the ledger again, as backfill_venue_fit does it.
     Returns the number of rows updated."""
     _write_ledger(path, entries)
     if not (apply_writes and entries):
         return 0
     with eng.begin() as c:
-        n = apply_entries(c, entries)
+        n = apply_entries(c, entries, sources)
     try:
         _write_ledger(path, entries)
     except OSError:
@@ -479,6 +542,9 @@ def main():
                          "up the resolved rows' ORCIDs")
     ap.add_argument("--limit", type=int, default=None,
                     help="consider only the first N rows (one OpenAlex call per 50 DOIs)")
+    ap.add_argument("--pubmed", action="store_true",
+                    help="fill byline_orcid on PubMed rows instead, both campuses; fill "
+                         "only, no pick moves (see --pubmed in the docstring)")
     ap.add_argument("--sample", type=int, default=15, help="rows to print")
     ap.add_argument("--selftest", action="store_true", help="offline checks, no DB")
     args = ap.parse_args()
@@ -503,23 +569,30 @@ def main():
                   "setup/alter_authorship_review_add_byline_orcid_v3.15.sql first. "
                   "Nothing written.")
             sys.exit(2)
-        picks = byline_orcid_enabled()
-        wide = byline_orcid_wcm_enabled()      # WCM and mixed rows too (needs `picks`)
-        sql = _select_sql(picks and column_ready, wide)
+        picks = byline_orcid_enabled() and not args.pubmed
+        wide = byline_orcid_wcm_enabled() and not args.pubmed   # needs `picks`
+        sql = (_PUBMED_SELECT_SQL if args.pubmed
+               else _select_sql(picks and column_ready, wide))
         rows = [dict(r) for r in c.execute(text(sql.format(
             cols=", ".join(aar_db.present_cols(c, _READ_COLS + (_PICK_READ_COLS if picks
-                                                                else []))),
+                                                                else [])
+                                                  + (["pmid"] if args.pubmed else []))),
             unfilled="AND byline_orcid IS NULL" if column_ready else ""))).mappings().all()]
     if args.open_only:
         rows = [r for r in rows if r["status"] == "open"]
     if args.limit:
         rows = rows[:args.limit]
     unfilled = [r for r in rows if not r.get("byline_orcid")]
-    dois = {r["doi"] for r in unfilled if r["doi"]}
-    print(f"[{'APPLY' if args.apply else 'DRY-RUN'}] {len(unfilled)} "
-          f"{'external' if wide else 'Cornell-top external'} "
-          f"rows with a DOI and no byline_orcid; {len(dois)} DOIs, about "
-          f"{-(-len(dois) // scop.OPENALEX_DOI_BATCH)} OpenAlex calls", flush=True)
+    dois = set() if args.pubmed else {r["doi"] for r in unfilled if r["doi"]}
+    if args.pubmed:
+        print(f"[{'APPLY' if args.apply else 'DRY-RUN'}] {len(unfilled)} PubMed rows with no "
+              f"byline_orcid; {len({r['pmid'] for r in unfilled})} records to re-fetch",
+              flush=True)
+    else:
+        print(f"[{'APPLY' if args.apply else 'DRY-RUN'}] {len(unfilled)} "
+              f"{'external' if wide else 'Cornell-top external'} "
+              f"rows with a DOI and no byline_orcid; {len(dois)} DOIs, about "
+              f"{-(-len(dois) // scop.OPENALEX_DOI_BATCH)} OpenAlex calls", flush=True)
     if not column_ready:
         print("NOTE: authorship_review has no byline_orcid column yet (v3.15 is not "
               "applied); every row counts as unfilled", flush=True)
@@ -548,18 +621,24 @@ def main():
             print("  the ORCID map is empty or could not be read: no row is re-ranked",
                   flush=True)
             idx = None
+    elif args.pubmed:
+        print("  --pubmed: ORCIDs are filled, no pick is re-ranked here (the PubMed replay, "
+              "aar_reconcile_open, moves them)", flush=True)
     else:
         print("  AAR_BYLINE_ORCID is not on in this shell: ORCIDs are filled, no pick is "
               "re-ranked", flush=True)
-    by_doi = scop.openalex_authorships(dois)
-    print(f"  {len(by_doi)} of {len(dois)} DOIs found in OpenAlex", flush=True)
+    if args.pubmed:
+        fills = dict(zip((r["id"] for r in unfilled), pubmed_fills(unfilled, run_ts)))
+    else:
+        by_doi = scop.openalex_authorships(dois)
+        print(f"  {len(by_doi)} of {len(dois)} DOIs found in OpenAlex", flush=True)
 
     counts, pick_counts, entries = Counter(), Counter(), []
     group_counts, source_counts = Counter(), Counter()     # filled only when `wide`
     for r in rows:
         entry, orcid = None, r.get("byline_orcid")
         if not orcid:
-            verdict, entry = fill_row(r, by_doi, run_ts)
+            verdict, entry = fills[r["id"]] if args.pubmed else fill_row(r, by_doi, run_ts)
             counts[verdict] += 1
             orcid = entry["after"]["byline_orcid"] if entry else None
         if idx is not None and orcid:
@@ -576,6 +655,9 @@ def main():
             entries.append(entry)
     for verdict, n in sorted(counts.items(), key=lambda kv: (kv[0].startswith("skipped"), -kv[1])):
         print(f"  {n:6d}  {verdict}")
+    if args.pubmed:
+        by_from = Counter(e.get("from") for e in entries)
+        print(f"  ORCID_FOUND from PubMed {by_from['pubmed']}, from OpenAlex {by_from['openalex']}")
     for e in [e for e in entries if e["rule"] == "ORCID_FOUND"][:args.sample]:
         print(f"    id={e['id']} [{e['status']}] {e['wcm_author']!r} {e['doi']} "
               f"-> {e['after']['byline_orcid']}")
@@ -599,13 +681,16 @@ def main():
                       f"   -> {a['top_cwid']} {a['top_name']!r} ({a['top_given_match']}, "
                       f"conf {a['top_confidence']})")
 
-    n = ledger_then_apply(eng, entries, ledger, args.apply)
+    n = ledger_then_apply(eng, entries, ledger, args.apply, PUBMED if args.pubmed else EXTERNAL)
     if args.apply and entries:
         print(f"\nAPPLIED: {n} of {len(entries)} rows updated"
               + (f" ({len(entries) - n} skipped: filled or rewritten by the producer, or "
                  f"resolved by a curator, since they were read)" if n != len(entries) else ""))
     print(f"\nledger: {ledger} ({len(entries)} rows)")
-    if args.apply:
+    if args.apply and args.pubmed:
+        print("Next: aar_reconcile_open.py --check <ids>, then its dry run, moves the picks "
+              "these ORCIDs name (see --pubmed in this script's docstring).")
+    elif args.apply:
         print("AAR_BYLINE_ORCID must be on for the CronJob, or its next sweep rewrites the "
               "rows in its window with no ORCID (see ORDER in this script's docstring).")
     else:
@@ -657,6 +742,50 @@ def _selftest():
           "external row",
           sql == "UPDATE authorship_review SET byline_orcid=:byline_orcid WHERE id=:id "
                  "AND byline_orcid IS NULL AND source IN ('scopus', 'openalex')")
+    check("--pubmed's UPDATE is the same write, kept on the PubMed lane, and its SELECT "
+          "takes PubMed rows with a DOI, of any status and either campus",
+          _update_sql(PUBMED) == sql.replace("IN ('scopus', 'openalex')", "IN ('pubmed')")
+          and "source = 'pubmed'" in _PUBMED_SELECT_SQL and "doi" not in _PUBMED_SELECT_SQL
+          and "status" not in _PUBMED_SELECT_SQL and "Cornell" not in _PUBMED_SELECT_SQL)
+    # --pubmed fills as the producer does: PubMed's own ORCID first (no DOI needed), else
+    # OpenAlex's positioned by the full AuthorList; a byline no longer at its position is
+    # skipped. OpenAlex is stubbed, so nothing leaves the machine.
+    _pm_arts = [{"pmid": 42716290, "doi": "10.3168/jds.2026-28823", "authors": [
+        {"last": "Singh", "fore": "A", "initials": "A", "orcid": None, "list_index": 0},
+        {"last": "Mann", "fore": "S", "initials": "S", "orcid": "0000-0003-1806-1154",
+         "list_index": 1}]},
+        {"pmid": 7, "doi": None, "authors": [
+            {"last": "Lee", "fore": "Ann", "initials": "A", "orcid": "0000-0001-0000-0007",
+             "list_index": 0}]}]
+    _pm_rows = [{"id": 1, "source": "pubmed", "status": "open", "author_key": "42716290:0",
+                 "wcm_author": "A Singh", "doi": "10.3168/jds.2026-28823", "pmid": 42716290,
+                 "author_position": 1},
+                {"id": 2, "source": "pubmed", "status": "open", "author_key": "42716290:1",
+                 "wcm_author": "S Mann", "doi": "10.3168/jds.2026-28823", "pmid": 42716290,
+                 "author_position": 2},
+                {"id": 3, "source": "pubmed", "status": "accepted", "author_key": "7:0",
+                 "wcm_author": "Ann Lee", "doi": None, "pmid": 7, "author_position": 1},
+                {"id": 4, "source": "pubmed", "status": "open", "author_key": "7:0",
+                 "wcm_author": "Bo Kim", "doi": None, "pmid": 7, "author_position": 1},
+                {"id": 5, "source": "pubmed", "status": "open", "author_key": "8:0",
+                 "wcm_author": "C D", "doi": None, "pmid": 8, "author_position": 1}]
+    _keep_oa = scop.openalex_authorships
+    scop.openalex_authorships = lambda dois: {"10.3168/jds.2026-28823": [
+        ("Anirudh Pratap Singh", "0000-0002-8762-7097"), ("Sabine Mann", "0000-0003-1806-1154")]}
+    try:
+        _pf = pubmed_fills(_pm_rows, ts, fetch=lambda pmids: [dict(a, authors=[dict(x) for x in
+                                                              a["authors"]]) for a in _pm_arts])
+    finally:
+        scop.openalex_authorships = _keep_oa
+    check("--pubmed fills by the producer's rule: OpenAlex for the author PubMed names no "
+          "ORCID for, PubMed's own otherwise (no DOI needed, any status), and skips a byline "
+          "no longer at its position and a record PubMed did not return",
+          [(v, e and e["after"]["byline_orcid"], e and e["from"]) for v, e in _pf]
+          == [("ORCID_FOUND", "0000-0002-8762-7097", "openalex"),
+              ("ORCID_FOUND", "0000-0003-1806-1154", "pubmed"),
+              ("ORCID_FOUND", "0000-0001-0000-0007", "pubmed"),
+              ("skipped: byline moved in the record", None, None),
+              ("skipped: record not returned by PubMed", None, None)])
     check("the written column is producer-owned; no curator column and no pick is named",
           all(c in aar_db._REFRESH_COLS for c in WRITE_COLS)
           and not any(c in sql for c in ("status", "top_cwid", "candidate_cwids_json",
@@ -712,9 +841,9 @@ def _selftest():
         eng, path, seen = _Engine([1, 0]), os.path.join(d, "apply.jsonl"), []
         real_apply = globals()["apply_entries"]
 
-        def spy(conn, entries):
+        def spy(conn, entries, sources=EXTERNAL):
             seen.extend(read(path))             # what is on disk when the writes begin
-            return real_apply(conn, entries)
+            return real_apply(conn, entries, sources)
         globals()["apply_entries"] = spy
         try:
             n = ledger_then_apply(eng, fresh(), path, True)

@@ -199,9 +199,42 @@ def _snapshot(row):
     return {c: row[c] for c in NULL_COLUMNS}
 
 
+def _orcid_guard(rows, idx, lane):
+    """Raise rather than sweep `rows` on a roster missing the ORCID lists they were ranked
+    with (see the comment below). Both lanes: a PubMed row stores a byline ORCID too once
+    AAR_BYLINE_ORCID_PUBMED is on or backfill_byline_orcid --pubmed has run."""
+    # v3.15, the rule aar_report_changed_picks._replay_orcid_guard applies: a row whose
+    # stored candidates carry `orcid_match` may name somebody only the byline ORCID
+    # reaches. On a roster with no ORCID map (AAR_BYLINE_ORCID not on in this shell, or
+    # the map failed to load) it would replay to nobody in both passes and be nulled.
+    # idxmod.orcid_rows_without_map asks, per row, the roster its matched candidate is
+    # on: a WCM index holding a map does not answer for an Ithaca index that holds none.
+    stored = [str(r.get("candidate_cwids_json") or "") for r in rows]
+    ranked, sourced = idxmod.orcid_rows_without_map(idx, stored)
+    if ranked:
+        raise RuntimeError(
+            f"{ranked} open {lane} rows were ranked by a byline ORCID and this roster "
+            f"holds no ORCID map for them (AAR_BYLINE_ORCID is not on here, or the map "
+            f"could not be loaded -- see any warning above). Refusing to sweep the {lane} "
+            f"lane without it: rows only the ORCID reaches would be classed stale and nulled. "
+            f"Set AAR_BYLINE_ORCID=on to sweep as the CronJob matches.")
+    # The second switch, by the same rule: a row whose candidates carry `orcid_source`
+    # was ranked with AAR_BYLINE_ORCID_WCM on, and may name a WCM person (or a Cornell
+    # one on a two-campus list) whom only a labelled map reaches.
+    if sourced:
+        raise RuntimeError(
+            f"{sourced} open {lane} rows were ranked with AAR_BYLINE_ORCID_WCM on (their "
+            f"candidates carry orcid_source) and this roster holds no Scholars or "
+            f"fallback ORCID list (the switch is not on here, or the lists could not be "
+            f"loaded -- see any warning above). Refusing to sweep the {lane} lane without "
+            f"them: WCM rows only the ORCID reaches would be classed stale and nulled. Set "
+            f"AAR_BYLINE_ORCID=on and AAR_BYLINE_ORCID_WCM=on to sweep as the CronJob matches.")
+
+
 def _classify_pubmed(rows, idx, limit=None):
     """-> (stale, matched, unresolvable). `stale` entries are {row, before}."""
     rows = rows[:limit] if limit else rows
+    _orcid_guard(rows, idx, "pubmed")
     pmids = sorted({r["pmid"] for r in rows if r["pmid"]})
     print(f"      distinct pmids to re-fetch: {len(pmids)}", flush=True)
     groups = uni.load_home_institution_groups()
@@ -217,9 +250,13 @@ def _classify_pubmed(rows, idx, limit=None):
             unresolvable.append(r)
             continue
         au = art["authors"][pos - 1]
+        # The row's stored byline ORCID, as on the scopus lane: on some rows it is the only
+        # reason there is a candidate.
         cands, _cohort = idx.candidates(au.get("last"), au.get("fore"), au.get("initials"),
                                         au.get("affiliations"), top_k=5,
-                                        pub_year=art.get("pub_year"))
+                                        pub_year=art.get("pub_year"),
+                                        **({"byline_orcid": r["byline_orcid"]}
+                                           if r.get("byline_orcid") else {}))
         if cands:
             matched.append(r)
         else:
@@ -235,33 +272,7 @@ def _classify_scopus(rows, idx, limit=None):
     rows = rows[:limit] if limit else rows
     family = scop.load_family_afids()
 
-    # v3.15, the rule aar_report_changed_picks._replay_orcid_guard applies: a row whose
-    # stored candidates carry `orcid_match` may name somebody only the byline ORCID
-    # reaches. On a roster with no ORCID map (AAR_BYLINE_ORCID not on in this shell, or
-    # the map failed to load) it would replay to nobody in both passes and be nulled.
-    # idxmod.orcid_rows_without_map asks, per row, the roster its matched candidate is
-    # on: a WCM index holding a map does not answer for an Ithaca index that holds none.
-    stored = [str(r.get("candidate_cwids_json") or "") for r in rows]
-    ranked, sourced = idxmod.orcid_rows_without_map(idx, stored)
-    if ranked:
-        raise RuntimeError(
-            f"{ranked} open scopus rows were ranked by a byline ORCID and this roster "
-            f"holds no ORCID map for them (AAR_BYLINE_ORCID is not on here, or the map "
-            f"could not be loaded -- see any warning above). Refusing to sweep the scopus "
-            f"lane without it: rows only the ORCID reaches would be classed stale and nulled. "
-            f"Set AAR_BYLINE_ORCID=on to sweep as the CronJob matches.")
-    # The second switch, by the same rule: a row whose candidates carry `orcid_source`
-    # was ranked with AAR_BYLINE_ORCID_WCM on, and may name a WCM person (or a Cornell
-    # one on a two-campus list) whom only a labelled map reaches.
-    if sourced:
-        raise RuntimeError(
-            f"{sourced} open scopus rows were ranked with AAR_BYLINE_ORCID_WCM on (their "
-            f"candidates carry orcid_source) and this roster holds no Scholars or "
-            f"fallback ORCID list (the switch is not on here, or the lists could not be "
-            f"loaded -- see any warning above). Refusing to sweep the scopus lane without "
-            f"them: WCM rows only the ORCID reaches would be classed stale and nulled. Set "
-            f"AAR_BYLINE_ORCID=on and AAR_BYLINE_ORCID_WCM=on to sweep as the CronJob matches.")
-
+    _orcid_guard(rows, idx, "scopus")
     candidate_stale, matched = [], []
     for r in rows:
         fore, last = _split_byline(r["wcm_author"])
