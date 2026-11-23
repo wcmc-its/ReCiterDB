@@ -157,6 +157,59 @@ def test_parse_lastmod():
     assert w.parse_lastmod("garbage") is None and w.parse_lastmod(None) is None
 
 
+def test_hop_kind():
+    assert w.hop_kind("https://zarnowskilab.org/", "qbz11", "Zarnowski") == "lab"
+    assert w.hop_kind("https://quentinzarnowski.com", "qbz11", "Zarnowski") == "personal"
+    assert w.hop_kind("https://www.cs.cornell.edu/~qbz11/", "qbz11", "Zarnowski") == "personal"
+    assert w.hop_kind("https://blogs.cornell.edu/vellacottgroup/", "ov22", "Vellacott") == "lab"
+    assert w.hop_kind("https://x.cornell.edu/files/cv.pdf", "ov22", "Vellacott") == "cv"
+    assert w.hop_kind("https://x.cornell.edu/files/Vellacott-2024.pdf", "ov22", "Vellacott") == "cv"
+    assert w.hop_kind("https://x.cornell.edu/files/syllabus.pdf", "ov22", "Vellacott") is None
+    assert w.hop_kind("https://press.example.org/books/zarnowski-reader/", "qbz11", "Zarnowski") is None
+    assert w.hop_kind("https://paper.example.com/2024/05/zarnowski-wins", "qbz11", "Zarnowski") is None
+    assert w.hop_kind("https://example.com/zarnowski.jpg", "qbz11", "Zarnowski") is None
+    assert w.hop_kind("https://www.journal.example.org/", "qbz11", "Zarnowski") is None
+    assert w.hop_kind("https://www.lee.com/", "kl9", "Lee") is None  # short surnames never match alone
+
+
+def test_hop_candidates():
+    parent = "https://bio.cornell.edu/people/quentin-zarnowski"
+    links = ["https://bio.cornell.edu/zarnowski-lab",            # same host: dept chrome
+             "https://zarnowskilab.org/#team", "https://zarnowskilab.org/",
+             "https://scholar.google.com/citations?user=zarnowski",
+             "https://chemistry.cornell.eduzarnowski.jpg",          # broken href
+             "https://emergency.example.edu/zarnowski",              # site chrome (on many profiles)
+             "https://chem.cornell.edu/people/zarnowski",            # already a crawled profile
+             "https://bio.cornell.edu/files/zarnowski-cv.pdf",       # same-host CV is fine
+             "mailto:qbz11@cornell.edu"]
+    chrome = {"https://emergency.example.edu/zarnowski": 50}
+    got = w.hop_candidates(parent, links, "qbz11", "Zarnowski", chrome, {"https://chem.cornell.edu/people/zarnowski"})
+    assert got == [("https://zarnowskilab.org", "lab"), ("https://bio.cornell.edu/files/zarnowski-cv.pdf", "cv")], got
+    many = [f"https://zarnowski{i}.org/" for i in range(9)]
+    assert len(w.hop_candidates(parent, many, "qbz11", "Zarnowski", {}, set())) == w.MAX_HOPS_PER_PERSON
+
+
+def test_pubs_link():
+    html = ('<a href="/team">People</a><a href="https://other.org/publications">Publications</a>'
+            '<a href="/pubs/#top"><span>Selected Publications</span></a><a href="/publications">Publications</a>')
+    assert w.pubs_link(html, "https://zarnowskilab.org/") == "https://zarnowskilab.org/pubs/"
+    assert w.pubs_link('<a href="/cv.pdf">Papers</a>', "https://zarnowskilab.org/") is None
+    assert w.pubs_link('<a href="/">Publications</a>', "https://zarnowskilab.org/") is None  # itself
+
+
+def test_pdf_html_one_block_per_entry():
+    text = ("PUBLICATIONS\n"
+            "1. Zarnowski Q, Vellacott O. A study of fictional\n"
+            "kinases in imaginary cells. J Made Up. 2021;4:1-9.\n"
+            "2. Vellacott O, Zarnowski Q. Another invented result\n"
+            "about nothing at all. Fake Rev. 2019.\n")
+    import webPageCitations
+    blocks = webPageCitations.citation_blocks(w.pdf_html(text))
+    assert len(blocks) == 2, blocks
+    assert blocks[0].startswith("1. Zarnowski Q") and blocks[0].endswith("2021;4:1-9.")
+    assert w.pdf_html("a < b and c > d") == "<p>a &lt; b and c &gt; d"
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

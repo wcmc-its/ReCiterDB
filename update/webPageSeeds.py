@@ -27,6 +27,11 @@ crawl takes hours. WEB_SEEDS_MAX_SECONDS stops all work cleanly, every network r
 a total wall-clock cap, and the run row is always closed on a fresh connection, so the
 job can never hang into the next schedule (concurrencyPolicy: Forbid).
 
+Step 3 (WEB_SEEDS_HOP=on, hop_pass): for sole-person profiles with no pubs, fetch the person's
+lab / personal site or CV linked from the profile, plus at most one "Publications" page on that
+site. Hop rows (kind lab/personal/cv/pubs, parent_url = profile) inherit the profile's sole person
+and are never re-linked by the emails on them.
+
 Usage:
   python3 webPageSeeds.py                    # crawl + link, all hosts
   python3 webPageSeeds.py --hosts nbb.cornell.edu --max-pages 50
@@ -34,6 +39,7 @@ Usage:
 """
 
 import argparse
+import collections
 import datetime
 import gzip
 import hashlib
@@ -338,7 +344,7 @@ class Host:
         else:
             self.robots_ok = False             # 5xx / throttled / unreachable: crawl nothing this run
 
-    def get(self, url, headers=None):
+    def get(self, url, headers=None, raw=False):
         if expired(self.deadline):
             raise Deadline()
         with self._lock:
@@ -369,7 +375,7 @@ class Host:
                 body = gzip.decompress(body)
             hdr = dict(r.headers)
             hdr["X-Truncated"] = truncated
-            return r.status, r.geturl(), hdr, body.decode("utf-8", "replace")
+            return r.status, r.geturl(), hdr, body if raw else body.decode("utf-8", "replace")
 
     def _throttle_check(self, status, headers):
         """Back off on rate-limit / WAF answers: double the gap (or honour Retry-After), and give up
@@ -486,6 +492,31 @@ def load_known(c, host, urls):
     return known
 
 
+def writer(conn):
+    """write(fn): run fn(cursor) as one transaction on conn["db"], reconnecting if dropped."""
+    def write(fn):
+        # One writer at a time across host threads (concurrent page/page_person writes from different
+        # hosts deadlocked on gap locks). Each page's writes commit together or not at all.
+        with DB_WRITE:
+            try:
+                conn["db"].ping()
+            except Exception:  # dropped by wait_timeout between slow pages: open a fresh one
+                try:
+                    conn["db"].close()
+                except Exception:
+                    pass
+                conn["db"] = db_conn()
+            db = conn["db"]
+            with db.cursor() as c:
+                try:
+                    fn(c)
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    raise
+    return write
+
+
 def crawl_host(name, aliases, directory, idx, deadline, max_pages, stats, lock):
     s = dict(host=name, listed=0, sitemap_complete=None, robots_ok=None, capped=False, fetched=0, not_modified=0,
              unchanged=0, changed=0, new=0, errors=0, page_errors=0, gone=0, skipped=0, relinked=0,
@@ -511,34 +542,17 @@ def crawl_host(name, aliases, directory, idx, deadline, max_pages, stats, lock):
             c.execute("""SELECT w.url FROM pubsource_web_page w JOIN pubsource_web_page_snapshot s
                          ON s.url = w.url AND s.content_hash = w.content_hash WHERE w.host = %s""", (name,))
             snapped = {r["url"] for r in c.fetchall()}
+        # a step-3 hop row (lab/personal/cv/pubs) that a sitemap also lists stays the hop pass's:
+        # relink() would re-link it by emails, and lab pages list students
+        listed = {u: lm for u, lm in listed.items() if (known.get(u) or {}).get("kind", "profile") == "profile"}
         now = utcnow()
-
-        def write(fn):
-            # One writer at a time across host threads (concurrent page/page_person writes from different
-            # hosts deadlocked on gap locks). Each page's writes commit together or not at all.
-            with DB_WRITE:
-                try:
-                    conn["db"].ping()
-                except Exception:  # dropped by wait_timeout between slow pages: open a fresh one
-                    try:
-                        conn["db"].close()
-                    except Exception:
-                        pass
-                    conn["db"] = db_conn()
-                db = conn["db"]
-                with db.cursor() as c:
-                    try:
-                        fn(c)
-                        db.commit()
-                    except Exception:
-                        db.rollback()
-                        raise
+        write = writer(conn)
 
         # Absence counts only against a COMPLETE sitemap (a failed or truncated child sitemap
         # would otherwise retire live pages), at most once per weekly run.
         if complete and listed:
             for u, r in known.items():
-                if r["host"] == name and u not in listed and r["gone_at"] is None:
+                if r["host"] == name and r["kind"] == "profile" and u not in listed and r["gone_at"] is None:
                     m = count_missing(r, now)
                     if m:
                         write(lambda c, u=u, m=m: c.execute(
@@ -692,6 +706,357 @@ def crawl_page(h, write, u, lm, row, host, aliases, directory, now, s, snapped=f
     s["snapshots"] = s.get("snapshots", 0) + snap
 
 
+# ---------------------------------------------------------------------------
+#          step 3: one hop to the person's lab / personal site and CV
+# ---------------------------------------------------------------------------
+# Off-cornell personal and lab sites are in scope (Paul, 2026-11-22). The link must LOOK like the
+# person's own site (NetID or surname in the host or path, a lab/group host, a CV-like PDF), because
+# links_json keeps URLs only, with no anchor text. M1b found 476 people this way; see
+# ithaca-web-page-seed-probe-2026-11-19/m1b in the Projects folder.
+HOP_KINDS = ("lab", "personal", "cv", "pubs")  # pubs = the one "Publications" page followed from a lab/personal hop
+HOP_SKIP_HOST = re.compile(
+    r"(^|\.)(scholar\.google\.[a-z.]+|orcid\.org|linkedin\.com|twitter\.com|x\.com|facebook\.com|instagram\.com"
+    r"|youtube\.com|youtu\.be|vimeo\.com|news\.cornell\.edu|researchgate\.net|ncbi\.nlm\.nih\.gov|doi\.org"
+    r"|wikipedia\.org|bsky\.app|safelinks\.protection\.outlook\.com|github\.com|academia\.edu|ssrn\.com|arxiv\.org"
+    r"|amazon\.[a-z.]+|calendly\.com|zoom\.us)$")
+HOP_NOT_SITE = re.compile(r"/(people|faculty|directory|news|stories|events?|podcasts?|videos?|p/book|books?)/|/20\d\d/", re.I)
+HOP_IMAGE = re.compile(r"\.(jpe?g|png|gif|webp|svg)$", re.I)
+HOP_LAB_HOST = re.compile(r"lab|(^|[.\-])group([.\-]|$)")  # ponytail: "lab" substring also hits e.g. "label"; the name gate catches the rest
+HOP_CHROME = 4          # a link on this many profiles is site chrome, not a person's site
+MAX_HOPS_PER_PERSON = 3
+PUBS_ANCHOR = re.compile(r"\b(publications?|papers)\b", re.I)
+ENTRY_START = re.compile(r"^(\[?\d{1,3}[\].)]|[•▪◦*\-–]\s|(19|20)\d\d\b)")
+PDF_MAX_PAGES = 40
+
+
+def _alnum(s):
+    return re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower())
+
+
+def hop_kind(url, netid, last):
+    """'cv' | 'lab' | 'personal' when a profile link looks like the person's own site or CV, else None."""
+    u = urllib.parse.urlparse(url)
+    host, path = (u.hostname or "").lower(), u.path.lower()
+    sn = _alnum((last or "").split()[-1] if (last or "").split() else "")
+    sn = sn if len(sn) >= 4 else None
+    if path.endswith(".pdf"):
+        return "cv" if re.search(r"cv|vita|resume", path) or (sn and sn in _alnum(url)) else None
+    if HOP_IMAGE.search(path) or HOP_NOT_SITE.search(path):
+        return None
+    hay = _alnum(host) + "/" + "/".join(_alnum(x) for x in path.split("/")[:3])
+    if HOP_LAB_HOST.search(host):
+        return "lab"
+    if netid.lower() in hay or (sn and sn in hay):
+        return "lab" if re.search(r"lab|group", hay) else "personal"
+    return None
+
+
+def hop_candidates(parent_url, links, netid, last, chrome, profiles):
+    """[(url, kind)] hop links of one sole-person profile, at most MAX_HOPS_PER_PERSON.
+    chrome = {normalized link: number of profiles showing it}; profiles = normalized profile URLs."""
+    phost = (urllib.parse.urlparse(parent_url).hostname or "").lower().removeprefix("www.")
+    out = {}
+    for link in links:
+        if len(link) > MAX_URL or not link.startswith(("http://", "https://")):
+            continue
+        key = link.split("#")[0].rstrip("/")
+        host = (urllib.parse.urlparse(key).hostname or "").lower().removeprefix("www.")
+        if (not host or HOP_SKIP_HOST.search(host) or re.search(r"\.edu[a-z0-9]", host)  # ".edufoo.jpg": broken href
+                or chrome.get(key, 0) >= HOP_CHROME or key in profiles or key in out):
+            continue
+        kind = hop_kind(key, netid, last)
+        if kind and (kind == "cv" or host != phost):  # same-host pages are dept chrome; same-host CVs are fine
+            out[key] = kind
+    return sorted(out.items(), key=lambda kv: kv[1] == "cv")[:MAX_HOPS_PER_PERSON]
+
+
+def pubs_link(html, base):
+    """The first same-host link whose anchor text says Publications/Papers, or None."""
+    bhost = urllib.parse.urlparse(base).hostname
+    for href, text in re.findall(r'(?is)<a\b[^>]*?href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', html):
+        t = re.sub(r"<[^>]+>|\s+", " ", text).strip()
+        u = urllib.parse.urljoin(base, href.strip()).split("#")[0]
+        if (len(t) <= 40 and PUBS_ANCHOR.search(t) and urllib.parse.urlparse(u).hostname == bhost
+                and u.rstrip("/") != base.rstrip("/") and len(u) <= MAX_URL and not u.lower().endswith(".pdf")):
+            return u
+    return None
+
+
+def pdf_html(text):
+    """CV text -> one <p> per entry, for citation_blocks. pypdf breaks every wrapped line, so a line
+    joins the one above unless it opens a list item, follows a blank line, or the line above closed
+    a sentence. ponytail: line heuristic; the model drops what isn't a publication."""
+    from html import escape
+    out, prev = [], ""
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if not s:
+            prev = ""
+            continue
+        new = not prev or ENTRY_START.match(s) or prev.endswith(".")
+        out.append(("<p>" if new else " ") + escape(s))
+        prev = s
+    return "".join(out)
+
+
+def pdf_text(body):
+    try:
+        import io
+        import pypdf
+        pages = pypdf.PdfReader(io.BytesIO(body)).pages[:PDF_MAX_PAGES]
+        return "\n".join(p.extract_text() or "" for p in pages)
+    except Exception as e:  # corrupt / encrypted / not a PDF
+        log.info("pdf: %s", e)
+        return None
+
+
+def inherit(c, url, netid, content_hash, now):
+    """The hop page's only person link is its parent profile's sole person (never its own emails)."""
+    if netid:
+        c.execute("""INSERT INTO pubsource_web_page_person (url, netid, link_method, is_sole_person, content_hash, first_seen, last_seen, removed_at)
+                     VALUES (%s,%s,'inherited_from_parent',1,%s,%s,%s,NULL)
+                     ON DUPLICATE KEY UPDATE link_method=VALUES(link_method), is_sole_person=1,
+                      content_hash=VALUES(content_hash), last_seen=VALUES(last_seen), removed_at=NULL""",
+                  (url, netid, content_hash, now, now))
+    c.execute("UPDATE pubsource_web_page_person SET removed_at=%s WHERE url=%s AND removed_at IS NULL AND netid<>%s",
+              (now, url, netid or ""))
+
+
+def hop_page(h, write, url, kind, parent, netid, row, now, s):
+    """Fetch one hop page on the crawler's conditional-GET rules. Returns its HTML when it was
+    fetched fresh (for the Publications link), else None. Returns (status or None, html or None)."""
+    if not needs_fetch(row, None, now):
+        s["skipped"] += 1
+        write(lambda c: inherit(c, url, netid, row["content_hash"], now))
+        return None, None
+    cond = {}
+    if row and row["http_status"] in (200, 304) and row["content_hash"]:
+        if row["etag"]:
+            cond["If-None-Match"] = row["etag"]
+        if row["last_modified"]:
+            cond["If-Modified-Since"] = row["last_modified"]
+    host = urllib.parse.urlparse(url).hostname.lower()
+    try:
+        status, _, hdr, body = h.get(url, cond, raw=kind == "cv")
+    except (Deadline, HostThrottled):
+        raise
+    except Exception as e:
+        log.info("%s: %s", url, e)
+        status, hdr, body = None, {}, b""
+    if status == 200 and kind == "cv":
+        text = pdf_text(body)
+        status, html = (200, pdf_html(text)) if text and not hdr.get("X-Truncated") else (415, "")
+    else:
+        html = body
+    s["fetched"] += status is not None
+    if status == 304:
+        s["not_modified"] += 1
+
+        def touch(c):
+            c.execute("UPDATE pubsource_web_page SET last_attempt=%s, last_fetched=%s, http_status=304, gone_at=NULL WHERE url=%s",
+                      (now, now, url))
+            inherit(c, url, netid, row["content_hash"], now)
+        write(touch)
+        return 304, None
+    if status != 200:
+        s["errors"] += 1
+        gone = status in (404, 410)
+
+        def err(c):
+            c.execute("""INSERT INTO pubsource_web_page (url, host, kind, parent_url, http_status, first_seen, last_attempt, gone_at)
+                         VALUES (%s,%s,%s,%s,%s,%s,%s,IF(%s,%s,NULL))
+                         ON DUPLICATE KEY UPDATE http_status=VALUES(http_status), last_attempt=VALUES(last_attempt),
+                          gone_at=IF(%s, COALESCE(gone_at, %s), gone_at)""",
+                      (url, host, kind, parent, status, now, now, gone, now, gone, now))
+            if gone:
+                c.execute("UPDATE pubsource_web_page_person SET removed_at=%s WHERE url=%s AND removed_at IS NULL", (now, url))
+        write(err)
+        return status, None
+    sig = page_signals(html)
+    pubs = webPageCitations.has_pub_signal(sig["dois"], sig["years"])
+    changed = not row or row["content_hash"] != sig["hash"]
+    s["changed" if changed else "unchanged"] += 1
+
+    def upsert(c):
+        c.execute("""INSERT INTO pubsource_web_page
+            (url, host, kind, parent_url, etag, last_modified, content_hash, http_status, emails_json, links_json,
+             doi_count, year_count, first_seen, last_attempt, last_fetched, last_changed, gone_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,200,%s,%s,%s,%s,%s,%s,%s,%s,NULL)
+            ON DUPLICATE KEY UPDATE kind=VALUES(kind), parent_url=VALUES(parent_url), etag=VALUES(etag),
+             last_modified=VALUES(last_modified), content_hash=VALUES(content_hash), http_status=200,
+             emails_json=VALUES(emails_json), links_json=VALUES(links_json), doi_count=VALUES(doi_count),
+             year_count=VALUES(year_count), last_attempt=VALUES(last_attempt), last_fetched=VALUES(last_fetched),
+             last_changed=IF(%s, VALUES(last_changed), last_changed), gone_at=NULL""",
+                  (url, host, kind, parent, hdr.get("ETag") or hdr.get("Etag"), hdr.get("Last-Modified"), sig["hash"],
+                   json.dumps(sig["emails"]), json.dumps(sig["links"]), sig["dois"], sig["years"], now, now, now, now, changed))
+        inherit(c, url, netid, sig["hash"], now)
+        if pubs:  # without a snapshot the citation pass never sees the page; idempotent per hash
+            save_snapshot(c, url, sig["hash"], html, main_text(html), now)
+    write(upsert)
+    s["snapshots"] += pubs
+    return 200, (None if kind == "cv" else html)
+
+
+def retire_pages(c, urls, now):
+    """gone_at + soft-remove person links (the citation pass then retracts their seeds)."""
+    for i in range(0, len(urls), 500):
+        part = urls[i:i + 500]
+        ph = ",".join(["%s"] * len(part))
+        c.execute(f"UPDATE pubsource_web_page SET gone_at=%s WHERE url IN ({ph})", (now, *part))
+        c.execute(f"UPDATE pubsource_web_page_person SET removed_at=%s WHERE removed_at IS NULL AND url IN ({ph})", (now, *part))
+
+
+def hop_host(name, pages, hops, skip, deadline, stats, lock):
+    """pages = [(url, kind, parent_url, netid)] on one host; each gets at most one Publications follow.
+    hops = existing hop rows by url (this thread updates its host's pubs rows in place);
+    skip = normalized URLs never to follow (profiles, planned hops).
+    A pubs page reached from two profiles is shared (whose pubs?): it is tombstoned with
+    parent_url NULL + gone_at and never followed again."""
+    s = collections.Counter(host_count=1)
+    conn = {"db": None}
+    try:
+        h = Host(name, deadline)
+        if not h.robots_ok:
+            s["robots_unavailable"] += 1
+            return
+        conn["db"] = db_conn()
+        write = writer(conn)
+        now = utcnow()
+        for url, kind, parent, netid in pages:
+            if expired(deadline):
+                s["stopped_at_deadline"] += 1
+                break
+            if not h.robots.can_fetch(UA, url):
+                s["robots_disallowed"] += 1
+                continue
+            try:
+                status, html = hop_page(h, write, url, kind, parent, netid, hops.get(url), now, s)
+                mine = [r for r in hops.values() if r["kind"] == "pubs" and r["gone_at"] is None
+                        and r["parent_url"] == parent and r["host"] == name]
+                p = pubs_link(html, url) if html else None
+                prow = hops.get(p) if p else None
+                if prow and (prow["parent_url"] is None or (prow["gone_at"] is None and prow["parent_url"] != parent)):
+                    if prow["parent_url"] is not None:
+                        s["pubs_shared"] += 1
+                        write(lambda c, p=p: (c.execute("UPDATE pubsource_web_page SET parent_url=NULL WHERE url=%s", (p,)),
+                                              retire_pages(c, [p], now)))
+                        prow.update(parent_url=None, gone_at=now)
+                    p = None
+                p = p if p and p.rstrip("/") not in skip and h.robots.can_fetch(UA, p) else None
+                if p:
+                    s["pubs_followed"] += 1
+                    hop_page(h, write, p, "pubs", parent, netid, prow, now, s)
+                    hops[p] = dict(prow or {}, url=p, kind="pubs", host=name, parent_url=parent, gone_at=None)
+                if html is not None or status in (404, 410):
+                    # the hop page was read (or is gone): a pubs page it no longer leads to retires
+                    old = [r["url"] for r in mine if r["url"] != p]
+                    if old:
+                        s["pubs_retired"] += len(old)
+                        write(lambda c, old=old: retire_pages(c, old, now))
+                elif status is None or status == 304:  # skipped / 304: known pubs pages keep their own refetch clock
+                    for r in mine:
+                        if h.robots.can_fetch(UA, r["url"]):
+                            hop_page(h, write, r["url"], "pubs", parent, netid, r, now, s)
+            except Exception as e:
+                if isinstance(e, (Deadline, HostThrottled)):
+                    raise
+                s["page_errors"] += 1
+                log.warning("%s: %s", url, e)
+    except Deadline:
+        s["stopped_at_deadline"] += 1
+    except HostThrottled as e:
+        s["throttled_stop"] += 1
+        log.warning("%s", e)
+    except Exception:
+        log.exception("hop host %s failed", name)
+        s["failed"] += 1
+    finally:
+        if conn["db"]:
+            conn["db"].close()
+        with lock:
+            stats.update(s)
+
+
+def hop_pass(deadline, now):
+    """Step 3. DB-only planning (candidates from stored profile links), then a polite fetch per hop
+    host. Candidate set is recomputed every run, so a hop link the profile dropped, or a profile that
+    lost its sole person, retires its hop pages (and with them their seeds) without a fetch.
+    ponytail: only for people with no pub signal on any profile (the M1b pool); widen to everyone
+    if hop pages turn out to add seeds beyond what profiles list."""
+    db = db_conn()
+    try:
+        with db.cursor() as c:
+            c.execute("""SELECT w.url, w.links_json, w.doi_count, w.year_count, pp.netid, pp.is_sole_person, r.name_last
+                         FROM pubsource_web_page w
+                         JOIN pubsource_web_page_person pp ON pp.url = w.url AND pp.removed_at IS NULL
+                         LEFT JOIN identity_cornell_current r ON r.netid = pp.netid COLLATE utf8mb4_unicode_ci
+                         WHERE w.kind = 'profile' AND w.gone_at IS NULL""")
+            prof = c.fetchall()
+            c.execute(f"SELECT * FROM pubsource_web_page WHERE kind IN ({','.join(['%s'] * len(HOP_KINDS))})", HOP_KINDS)
+            hops = {r["url"]: r for r in c.fetchall()}
+            c.execute("SELECT url FROM pubsource_web_page WHERE kind = 'profile'")
+            profiles = {r["url"].rstrip("/") for r in c.fetchall()}
+    finally:
+        db.close()
+    chrome, seen = collections.Counter(), set()
+    for p in prof:
+        if p["url"] not in seen:
+            seen.add(p["url"])
+            chrome.update({l.split("#")[0].rstrip("/") for l in json.loads(p["links_json"] or "[]")})
+    sole = [p for p in prof if p["is_sole_person"] and p["name_last"]]
+    with_pubs = {p["netid"] for p in sole if webPageCitations.has_pub_signal(p["doi_count"], p["year_count"])}
+    parent_netid = {p["url"]: p["netid"] for p in sole}
+    # owners: everyone whose profile (sole or not, pubs or not) links the hop, so a PI's lab site that a
+    # no-pubs colleague also links is dropped as shared instead of seeding the colleague
+    owners = collections.defaultdict(set)
+    for p in prof:
+        if p["name_last"]:
+            for url, _ in hop_candidates(p["url"], json.loads(p["links_json"] or "[]"), p["netid"], p["name_last"], chrome, profiles):
+                owners[url].add(p["netid"])
+    plan, per_person = {}, collections.Counter()
+    for p in sole:
+        if p["netid"] in with_pubs:
+            continue
+        for url, kind in hop_candidates(p["url"], json.loads(p["links_json"] or "[]"), p["netid"], p["name_last"], chrome, profiles):
+            if url not in plan and per_person[p["netid"]] < MAX_HOPS_PER_PERSON:
+                per_person[p["netid"]] += 1
+                plan[url] = (kind, p["url"], p["netid"])
+    shared = [u for u in plan if len(owners[u]) > 1]  # two people's profiles link it: whose pubs? neither
+    for u in shared:
+        del plan[u]
+    stats = collections.Counter(people=len({v[2] for v in plan.values()}), candidates=len(plan), shared_dropped=len(shared))
+    if not plan:  # a degraded read must not retire every hop page
+        return dict(stats, skipped="no_candidates")
+
+    # retire hop rows that lost their reason to exist: a first hop no longer planned, a pubs page whose
+    # profile is no longer a planned parent (ponytail: a stale pubs page otherwise lives until it 404s)
+    planned_parents = {v[1] for v in plan.values()}
+    retire = [u for u, r in hops.items() if r["gone_at"] is None and
+              (u not in plan if r["kind"] != "pubs" else r["parent_url"] not in planned_parents)]
+    live = sum(1 for r in hops.values() if r["gone_at"] is None)
+    if len(retire) > max(10, live // 2):  # a partial degraded read would retract seeds in bulk; same floor as prune
+        log.warning("hop pass: refusing to retire %d of %d live hop pages", len(retire), live)
+        stats["retire_refused"], retire = len(retire), []
+    if retire:
+        db = db_conn()
+        try:
+            with db.cursor() as c:
+                retire_pages(c, retire, now)
+            db.commit()
+        finally:
+            db.close()
+    stats["retired"] = len(retire)
+
+    by_host = collections.defaultdict(list)
+    for url, (kind, parent, netid) in plan.items():
+        by_host[urllib.parse.urlparse(url).hostname.lower()].append((url, kind, parent, netid))
+    skip = profiles | {u.rstrip("/") for u in plan}
+    lock = threading.Lock()
+    with ThreadPoolExecutor(HOST_WORKERS) as ex:
+        list(ex.map(lambda kv: hop_host(kv[0], kv[1], hops, skip, deadline, stats, lock), by_host.items()))
+    return dict(stats)
+
+
 REPORT_SQL = """
 SELECT
   COUNT(*) AS active_professors,
@@ -722,7 +1087,7 @@ def directory_pass(roster, aliases, now):
     db = db_conn()
     try:
         with db.cursor() as c:
-            c.execute("SELECT url, emails_json, content_hash FROM pubsource_web_page WHERE gone_at IS NULL AND emails_json IS NOT NULL")
+            c.execute("SELECT url, emails_json, content_hash FROM pubsource_web_page WHERE gone_at IS NULL AND emails_json IS NOT NULL AND kind = 'profile'")  # hop pages inherit, never email-link
             pages = c.fetchall()
             c.execute("SELECT email FROM pubsource_web_email_alias WHERE resolved_at >= %s", (now - ALIAS_TTL,))
             fresh = {r["email"] for r in c.fetchall()}
@@ -841,6 +1206,10 @@ def main():
             status = "stopped"
             raise SystemExit(143)
         dir_stats = directory_pass(roster, aliases, utcnow()) if not expired(deadline) else {"directory": "skipped_deadline"}
+        if os.environ.get("WEB_SEEDS_HOP", "").lower() == "on" and not expired(deadline):
+            hop = hop_pass(deadline, utcnow())
+            log.info("hop pass: %s", hop)
+            dir_stats.update({"hop_" + k: v for k, v in hop.items()})
         if os.environ.get("WEB_SEEDS_CITATIONS", "").lower() == "on" and not expired(deadline):
             cit = webPageCitations.run_pass(db_conn, lambda: expired(deadline), utcnow())
             log.info("citation pass: %s", cit)
