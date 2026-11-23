@@ -41,6 +41,11 @@ spec:
             env:
             - name: WEB_SEEDS_MAX_SECONDS
               value: "36000"
+            # Step 3: one hop from sole-person profiles with no pubs to the person's lab / personal
+            # site (off-cornell included, Paul 11-22), its "Publications" page, and linked CV PDFs.
+            # Hop pages inherit the profile's sole person; seeds stay gated by name-on-authorship.
+            - name: WEB_SEEDS_HOP
+              value: "on"
             # Step 4: parse citation blocks (Bedrock), resolve DOIs (Crossref), keep author-confirmed
             # seeds in pubsource_web_seed. Incremental: each block is parsed and resolved once.
             - name: WEB_SEEDS_CITATIONS
