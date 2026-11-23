@@ -23,6 +23,16 @@ def test_pub_row_openalex_then_parse():
     assert cp.pub_row("10.1/c", None, {"year": "2007?"})["year"] is None
 
 
+def test_provenance_note_orders_by_kind_and_caps():
+    kind = {"https://a.example.org/cv.pdf": "cv", "https://x.cornell.edu/people/qz": "profile",
+            "https://qzlab.example.org": "lab"}
+    assert cp.provenance_note(list(kind), kind) == ("web_seed: profile https://x.cornell.edu/people/qz; "
+                                                   "lab https://qzlab.example.org; cv https://a.example.org/cv.pdf")
+    many = [f"https://p{i}.example.org" for i in range(5)]
+    note = cp.provenance_note(many, {})
+    assert note.startswith("web_seed: page https://p0.example.org") and note.endswith("; +2 more")
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
