@@ -2,7 +2,7 @@
 """
 Cornell Ithaca web-page seeds, step 6: seeds -> cornell_pub_* (author-asserted pubs).
 
-Every live seed (pubsource_web_seed: a DOI listed on the person's own Cornell page, with
+Every live seed (pubsource_web_seed: a DOI listed on the person's own web page, with
 their name on its author list) becomes a cornell_pub_researcher_publication row with
 retrieval_source='web_seed', review_status='auto_accepted', next to the Feb 2026 retrieval's
 rows (orcid_api, openalex_orcid, europepmc_orcid, scopus_name_search), which it never touches.
@@ -13,6 +13,8 @@ rows (orcid_api, openalex_orcid, europepmc_orcid, scopus_name_search), which it 
     metadata, else from the citation's own parse (title / year / venue / type).
   * This pass owns its source: links whose seed is gone are deleted (the seed row keeps
     its removed_at history), so the table always mirrors the live seeds.
+  * Provenance: review_notes = the pages the seed was listed on, by kind (profile, lab,
+    personal, pubs, cv), e.g. 'web_seed: profile https://...; cv https://...'.
 
 Run by webPageSeeds.py after the ORCID pass when WEB_SEEDS_CORNELL_PUB=on, or alone:
   python3 webPageCornellPub.py [--dry-run]
@@ -32,6 +34,8 @@ log = logging.getLogger("webPageCornellPub")
 
 SOURCE = "web_seed"
 CONFIDENCE = 95.0  # author-asserted: on the person's own page, their name on the work
+KIND_ORDER = {"profile": 0, "lab": 1, "personal": 2, "pubs": 3, "cv": 4}  # page kinds (webPageSeeds step 3)
+NOTE_URLS = 3
 OPENALEX_SELECT = "id,doi,title,publication_year,type,primary_location,ids,cited_by_count"
 
 
@@ -54,6 +58,15 @@ def pub_row(doi, work, parsed):
             "cited_by": None}
 
 
+def provenance_note(urls, kind_of):
+    """review_notes for a web_seed link: where the seed was listed, e.g.
+    'web_seed: profile https://x.cornell.edu/people/a; cv https://a.org/cv.pdf'. Pure."""
+    ranked = sorted(set(urls), key=lambda u: (KIND_ORDER.get(kind_of.get(u), 9), u))
+    parts = [f"{kind_of.get(u) or 'page'} {u}" for u in ranked[:NOTE_URLS]]
+    more = len(ranked) - NOTE_URLS
+    return "web_seed: " + "; ".join(parts) + (f"; +{more} more" if more > 0 else "")
+
+
 def plan_links(seeds, researcher, pubs, existing):
     """seeds {netid: {doi}}, researcher {netid: id}, pubs {doi: publication id},
     existing {(rid, pid): link id} for SOURCE -> (to_insert [(rid, pid)], to_delete [link id],
@@ -71,12 +84,13 @@ def plan_links(seeds, researcher, pubs, existing):
 def run_pass(db, now, dry_run=False):
     s = collections.Counter()
     with db.cursor() as c:
-        c.execute("SELECT netid, doi, citation_hashes_json FROM pubsource_web_seed WHERE removed_at IS NULL")
+        c.execute("SELECT netid, doi, urls_json, citation_hashes_json FROM pubsource_web_seed WHERE removed_at IS NULL")
         rows = c.fetchall()
-    seeds, hash_of = collections.defaultdict(set), {}
+    seeds, hash_of, urls_of = collections.defaultdict(set), {}, collections.defaultdict(set)
     for r in rows:
         d = r["doi"].lower()
         seeds[r["netid"].lower()].add(d)
+        urls_of[(r["netid"].lower(), d)].update(json.loads(r["urls_json"] or "[]"))
         hash_of.setdefault(d, (json.loads(r["citation_hashes_json"]) or [None])[0])
     dois = sorted(hash_of)
     with db.cursor() as c:
@@ -109,14 +123,27 @@ def run_pass(db, now, dry_run=False):
                   (SOURCE,))
         existing = {(r["researcher_id"], r["publication_id"]): r["id"] for r in c.fetchall()}
         ins, dele, skipped = plan_links(seeds, researcher, pubs, existing)
+        # provenance: every live link's note names the pages its seed came from (kept current, so
+        # a seed that moves from the profile to a lab site / CV says so)
+        kind_of = {r["url"]: r["kind"] for r in wc._load(
+            c, "SELECT url, kind FROM pubsource_web_page WHERE url IN ({})", sorted({u for us in urls_of.values() for u in us}))}
+        note = {}
+        for (netid, d), us in urls_of.items():
+            if netid in researcher and d in pubs:
+                note[(researcher[netid], pubs[d])] = provenance_note(us, kind_of)
         c.executemany("""INSERT INTO cornell_pub_researcher_publication
-                             (researcher_id, publication_id, retrieval_source, confidence_score, review_status)
-                         VALUES (%s, %s, %s, %s, 'auto_accepted')""", [(r, p, SOURCE, CONFIDENCE) for r, p in ins])
+                             (researcher_id, publication_id, retrieval_source, confidence_score, review_status, review_notes)
+                         VALUES (%s, %s, %s, %s, 'auto_accepted', %s)""", [(r, p, SOURCE, CONFIDENCE, note.get((r, p))) for r, p in ins])
+        c.execute("SELECT id, researcher_id, publication_id, review_notes FROM cornell_pub_researcher_publication WHERE retrieval_source = %s",
+                  (SOURCE,))
+        upd = [(note[k], r["id"]) for r in c.fetchall()
+               for k in [(r["researcher_id"], r["publication_id"])] if k in note and r["review_notes"] != note[k]]
+        c.executemany("UPDATE cornell_pub_researcher_publication SET review_notes = %s WHERE id = %s", upd)
         if dele:
             c.execute("DELETE FROM cornell_pub_researcher_publication WHERE retrieval_source = %s AND id IN ({})".format(
                 wc._in(len(dele))), [SOURCE, *dele])
     db.commit()
-    s.update(links_inserted=len(ins), links_deleted=len(dele), people_skipped_no_researcher=skipped,
+    s.update(links_inserted=len(ins), links_deleted=len(dele), notes_updated=len(upd), people_skipped_no_researcher=skipped,
              links_total=len(existing) + len(ins) - len(dele))
     return dict(s)
 
