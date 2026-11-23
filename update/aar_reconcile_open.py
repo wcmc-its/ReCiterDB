@@ -313,10 +313,11 @@ for _mod in (aar_db, gate, orch):
         "sys.path fork trap: a stale producer copy is winning. Refusing to trust any "
         "replay result computed against it.")
 
-# CLASS B's extra dependencies (aar_universe_scopus/aar_sweep_stale/
-# aar_report_changed_picks) are NOT imported here -- see _load_class_b_modules() below
-# (T2 / #186). --class-a-only never triggers that loader, so it never imports those
-# three, never constructs identity_index.IdentityIndex.load()'s DB roster query or
+# CLASS B's extra dependencies (aar_sweep_stale/aar_report_changed_picks) are NOT
+# imported here -- see _load_class_b_modules() below (T2 / #186). (aar_universe_scopus
+# is, through aar_orchestrator, which uses its byline-ORCID helpers; importing it does no
+# I/O.) --class-a-only never triggers that loader, so it never imports those two, never
+# constructs identity_index.IdentityIndex.load()'s DB roster query or
 # aar_matcher.IdentityOnlyScorer(), and never runs CLASS B's io-rescore replay (its own
 # S3 reads). These module-level names stay None until then.
 #
@@ -414,9 +415,9 @@ def _load_class_b_modules():
     # here the live table may not have yet: see _drop_absent_optional_cols.
     #
     # top_orcid_match (v3.15) is another, and optional in the same way: 1 when the top
-    # candidate is the person the row's byline ORCID is on file for. The scopus replay
-    # ranks with the row's stored byline_orcid, so the value is the new top candidate's
-    # own; on the pubmed lane it is NULL.
+    # candidate is the person the row's byline ORCID is on file for. Both replays rank
+    # with the row's stored byline_orcid, so the value is the new top candidate's own; on
+    # a pubmed row with no stored ORCID it is NULL.
     _TOP_CANDIDATE_COLS = [
         "top_fg_score", "top_io_score", "top_years_after_wcm", "top_venue_fit",
         "top_orcid_match", "classification"]

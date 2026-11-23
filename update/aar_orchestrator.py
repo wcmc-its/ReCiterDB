@@ -167,30 +167,39 @@ def _compact(cands):
     return [dict({k: c.get(k) for k in keep}, **extra(c)) for c in cands]
 
 
-def _fill_byline_orcids(arts):
-    """AAR_BYLINE_ORCID_PUBMED: give every home-institution author block of `arts` a
-    `byline_orcid` -- PubMed's own (aar_universe._pubmed_orcid), else OpenAlex's for the
-    same DOI by the Scopus lane's rule and fail-neutral lookup
-    (aar_universe_scopus.openalex_authorships / pick_byline_orcid), else None. Only DOIs
-    leave the machine, one call per 50. match_authorship reads the key.
+def byline_orcids(blocks):
+    """Give each (article, author block) pair a `byline_orcid`: PubMed's own
+    (aar_universe._pubmed_orcid), else OpenAlex's for the same DOI by the Scopus lane's
+    rule and fail-neutral lookup (aar_universe_scopus.openalex_authorships /
+    pick_byline_orcid), else None. Only DOIs leave the machine, one call per 50, and
+    only for authors PubMed gives no ORCID. match_authorship reads the key.
 
-    Off, nothing is set and nothing is asked, and the lane is what it was. Returns
-    (author blocks, ORCIDs from PubMed, ORCIDs from OpenAlex), or None when off."""
-    if not byline_orcid_pubmed_enabled():
-        return None
-    blocks = [(a, i, au) for a in arts for i, au in enumerate(a["authors"])
-              if au.get("home_inst")]
-    by_doi = scop.openalex_authorships({a["doi"] for a, _i, au in blocks
+    The OpenAlex pick is positioned by `list_index`, the author's place in the FULL
+    AuthorList: PubMed's parsed list skips collective authors and OpenAlex's does not, so
+    the parsed index would hand one same-initial co-author the other's ORCID ("Yi Wang"
+    behind a consortium taking "Yan Wang"'s). Shared with backfill_byline_orcid --pubmed,
+    so a backfilled row stores what the producer would. Returns (blocks, ORCIDs from
+    PubMed, ORCIDs from OpenAlex)."""
+    by_doi = scop.openalex_authorships({a["doi"] for a, au in blocks
                                         if a.get("doi") and not au.get("orcid")})
     n_pm = n_oa = 0
-    for a, i, au in blocks:
+    for a, au in blocks:
         # "Last, Given": PubMed gives the parts, so a two-word surname stays whole.
         name = f"{au.get('last') or ''}, {au.get('fore') or au.get('initials') or ''}"
         au["byline_orcid"] = au.get("orcid") or scop.pick_byline_orcid(
-            by_doi.get((a.get("doi") or "").lower()), i, name)
+            by_doi.get((a.get("doi") or "").lower()), au.get("list_index", -1), name)
         n_pm += bool(au.get("orcid"))
         n_oa += bool(au["byline_orcid"] and not au.get("orcid"))
     return len(blocks), n_pm, n_oa
+
+
+def _fill_byline_orcids(arts):
+    """AAR_BYLINE_ORCID_PUBMED: `byline_orcids` for every home-institution author block of
+    `arts`. Off, nothing is set and nothing is asked, and the lane is what it was.
+    Returns byline_orcids' counts, or None when off."""
+    if not byline_orcid_pubmed_enabled():
+        return None
+    return byline_orcids([(a, au) for a in arts for au in a["authors"] if au.get("home_inst")])
 
 
 def _trunc(s, n):
@@ -1117,10 +1126,12 @@ def _selftest():
 
     def _arts():
         return [{"pmid": 5, "doi": "10.3168/JDS.2026-28823", "authors": [
-            {"last": "Singh", "fore": "A", "initials": "A", "home_inst": True, "orcid": None},
+            {"last": "Singh", "fore": "A", "initials": "A", "home_inst": True, "orcid": None,
+             "list_index": 0},
             {"last": "Mann", "fore": "S", "initials": "S", "home_inst": True,
-             "orcid": "0000-0003-1806-1154"},
-            {"last": "Wieland", "fore": "M", "initials": "M", "home_inst": False, "orcid": None},
+             "orcid": "0000-0003-1806-1154", "list_index": 1},
+            {"last": "Wieland", "fore": "M", "initials": "M", "home_inst": False, "orcid": None,
+             "list_index": 2},
         ]}]
     asked = []
 
@@ -1156,6 +1167,24 @@ def _selftest():
           on == (2, 1, 1) and _ons[0]["byline_orcid"] == "0000-0002-8762-7097"
           and _ons[1]["byline_orcid"] == "0000-0003-1806-1154"
           and "byline_orcid" not in _ons[2] and asked == [["10.3168/JDS.2026-28823"]])
+    # A consortium sits in OpenAlex's list and not in PubMed's parsed one. Positioned by
+    # list_index, each Wang keeps their own ORCID; by the parsed index Yan took Yi's.
+    _w = {"pmid": 6, "doi": "10.1/w", "authors": [
+        {"last": "Lee", "fore": "Ann", "orcid": None, "list_index": 0},
+        {"last": "Wang", "fore": "Yi", "orcid": None, "list_index": 2},
+        {"last": "Wang", "fore": "Yan", "orcid": None, "list_index": 3}]}
+    _keep_oa = scop.openalex_authorships
+    scop.openalex_authorships = lambda dois: {"10.1/w": [
+        ("Ann Lee", None), ("XYZ Consortium", None), ("Yi Wang", "0000-0001-1111-1111"),
+        ("Yan Wang", "0000-0001-2222-2222")]}
+    try:
+        byline_orcids([(_w, au) for au in _w["authors"]])
+    finally:
+        scop.openalex_authorships = _keep_oa
+    check("a collective author in OpenAlex's list does not shift the pick: each same-initial "
+          "Wang keeps their own ORCID",
+          [au["byline_orcid"] for au in _w["authors"]]
+          == [None, "0000-0001-1111-1111", "0000-0001-2222-2222"])
 
     print("SELFTEST", "PASS" if ok else "FAIL")
     return ok

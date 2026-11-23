@@ -409,11 +409,18 @@ def _row_result(r, new_top, source, cands=None):
         # never matched has no old tier, and _tier_move would call that "unknown", which
         # no apply gate accepts -- so a name the index learns later (#227) could never
         # reach the rows that were opened before it knew the name.
-        # The byline ORCID's person is stronger whatever the name tiers say (owner
-        # decision 2026-11-17: the ORCID outranks the name tier). Live anchor: rows
-        # 84447/84457, byline "A Singh", where the ORCID names as3527 (initial tier) over a
-        # stored WCM full-name homonym, which the name tiers alone call "weaker".
-        rec["tier_move"] = ("stronger" if old_cwid is None or new_top.get("orcid_match")
+        # A PubMed row's ORCID-led move is stronger whatever the name tiers say (owner
+        # decision 2026-11-17: the ORCID outranks the name tier) -- when the byline's name
+        # reaches the person on its own as well: not added by the ORCID alone, and a real
+        # given-name tier. Live anchor: rows 84447/84457, byline "A Singh", where the ORCID
+        # names as3527 (initial tier) over a stored WCM full-name homonym, which the name
+        # tiers alone call "weaker". PubMed only: Scopus and OpenAlex rows were ranked by
+        # their ORCID when written, so an ORCID-led move there is a map change (a new
+        # Scholars confirmation, the nightly inferred list), and keeps the tier rules.
+        orcid_led = (source == "pubmed" and new_top.get("orcid_match")
+                     and not new_top.get("orcid_added")
+                     and new_top.get("given_match") in ("full", "initial"))
+        rec["tier_move"] = ("stronger" if old_cwid is None or orcid_led
                             else _tier_move(r["top_given_match"], new_top["given_match"]))
     return rec
 
@@ -1120,13 +1127,23 @@ def _selftest():
             pm_refused = str(e)
     finally:
         uni.efetch_by_ids, uni.load_home_institution_groups, idxmod.byline_orcid_enabled = saved_pm
-    check("pubmed replay ranks with the ORCID the row stores: Lindqvist, whom the name "
-          "cannot reach, leads, and the move counts as stronger (the ORCID outranks the "
-          "name tier) where the tiers alone say initial -> initial",
+    check("pubmed replay ranks with the ORCID the row stores: Lindqvist, whom only the "
+          "ORCID reaches, leads; that move keeps the name tiers' verdict (initial -> "
+          "initial, sideways), since the 'stronger' rule needs the name to reach them too",
           [(x["new_cwid"], x["classification"], x.get("tier_move"), x["new_given_match"])
-           for x in pm_on] == [("rl_c", "CHANGED", "stronger", "initial")])
+           for x in pm_on] == [("rl_c", "CHANGED", "sideways", "initial")])
     check("...and a row storing no ORCID replays by name alone, as before",
           [x["new_cwid"] for x in pm_off] == ["rh_c"])
+    _led = {"cwid": "rl_c", "name": "R L", "given_match": "initial", "confidence": 0.3,
+            "orcid_match": True}
+    _old = dict(pm_row, top_cwid="rh_c", top_given_match="full")
+    check("an ORCID-led move is 'stronger' only on the PubMed lane, and only when the name "
+          "reaches the person too (not ORCID-added, a real given-name tier)",
+          _row_result(_old, _led, "pubmed")["tier_move"] == "stronger"
+          and _row_result(_old, _led, "scopus")["tier_move"] == "weaker"
+          and _row_result(_old, dict(_led, orcid_added=True), "pubmed")["tier_move"] == "weaker"
+          and _row_result(_old, dict(_led, given_match="unknown"), "pubmed")["tier_move"]
+          == "weaker")
     check("a pubmed row its ORCID ranked is refused on a roster with no ORCID map, and the "
           "message names the lane", "1 open pubmed rows were ranked by a byline ORCID"
           in pm_refused)
