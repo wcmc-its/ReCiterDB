@@ -45,6 +45,11 @@ spec:
             # and a read of backfill_byline_orcid.py's dry run. On, the Scopus lanes ask
             # OpenAlex for the ORCIDs Scopus does not carry, one call per 50 DOIs, using
             # OPENALEX_MAILTO below.
+            # AAR_BYLINE_ORCID_PUBMED (the PubMed lane does the same: PubMed's own byline
+            # ORCID, else OpenAlex's by DOI, and the person it is on file for ranks first) is
+            # NOT listed either: it ships off, needs AAR_BYLINE_ORCID, and is turned on live
+            # with `kubectl set env` after a read of `backfill_byline_orcid.py --pubmed`'s
+            # dry run.
             # AAR Scopus + PubMed lanes (weekly, gated in run_all.py)
             - name: SCOPUS_API_KEY
               valueFrom:
