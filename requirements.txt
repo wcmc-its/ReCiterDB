@@ -13,3 +13,4 @@ sqlalchemy
 joblib
 tensorflow
 xgboost==3.2.0
+pypdf==7.1.1  # CV text for web seeds step 3 (untrusted PDFs: keep current)
