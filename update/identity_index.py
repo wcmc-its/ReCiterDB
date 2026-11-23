@@ -606,13 +606,17 @@ def venue_fit_enabled():
 #                          table without them is simply no Scholars source.
 #   'affiliation_manager'  cornell_pub_orcid_mapping, the v3.15 list. Ithaca fallback.
 #   'inferred'             pubsource_orcid_person (CWID, inferred), the nightly suggestion
-#                          built from accepted articles. WCM fallback.
+#                          built from accepted articles. WCM fallback, and since
+#                          2026-11-23 an Ithaca one too, after Cornell's list, for the
+#                          Ithaca netids that list carries (see (e)).
 # (a) an ORCID Scholars confirms belongs to the Scholars person, whatever a fallback
 #     says; (b) a person with a Scholars-confirmed iD takes no fallback iD at all: Scholars
 #     is the authority for that person; (c) an ORCID Scholars confirms on either campus
 #     leaves the other campus's fallback too, so a cross-campus person holds it on one
 #     roster; (d) an ORCID on file for two people within one list is ignored, as before,
-#     and one Scholars confirms for two people is ignored everywhere and logged.
+#     and one Scholars confirms for two people is ignored everywhere and logged;
+# (e) an inferred iD goes to the roster its person is on (a `cornell-*` person type puts
+#     them on Ithaca), where it ranks below Cornell's own list.
 #
 # THE CANDIDATE SAYS WHICH. The candidate with `orcid_match` true also carries
 # `orcid_source`, one of the three labels. Publication Manager reads it off the first
@@ -686,7 +690,7 @@ ORCID_SCHOLARS, ORCID_AFFILIATION_MANAGER, ORCID_INFERRED = (
 _SCHOLARS_CAMPUS = {"wcm": CAMPUS_WCM, "ithaca": CAMPUS_ITHACA}    # scholar_active.campus
 
 
-def orcid_sources(scholars, ithaca_fallback=(), wcm_fallback=()):
+def orcid_sources(scholars, ithaca_fallback=(), wcm_fallback=(), ithaca_people=frozenset()):
     """The labelled maps behind AAR_BYLINE_ORCID_WCM, one per campus, and the ORCIDs
     Scholars confirms for more than one person:
 
@@ -707,7 +711,16 @@ def orcid_sources(scholars, ithaca_fallback=(), wcm_fallback=()):
         log, mapped on neither campus, and not handed back to a fallback: the authority
         having contradicted itself is no reason to trust a weaker list.
 
-    A Scholars row with a campus other than 'wcm' or 'ithaca' is skipped."""
+    A Scholars row with a campus other than 'wcm' or 'ithaca' is skipped.
+
+    `ithaca_people` (lower-cased ids with a `cornell-*` person type, the test that puts a
+    record on the Ithaca roster, `_campus_person_types`) routes the inferred list: an
+    entry for one of them goes to the Ithaca map, labelled 'inferred', after Cornell's own
+    list (which wins an ORCID both name) and under the same Scholars rules. Owner decision
+    2026-11-23: the nightly inference writes Ithaca netids too (138 on that date, 96 not in
+    Cornell's list; as3527, Ajay Singh, from 5 accepted papers), and a WCM-only map can
+    never match them. The list is still read once by `orcid_map`, so an ORCID it names for
+    two people is dropped whichever rosters they are on. Empty, everything stays on WCM."""
     confirmed, held = {}, set()
     for cwid, orcid, campus in scholars:
         orcid, cwid = bare_orcid(orcid), str(cwid or "").strip().lower()
@@ -716,11 +729,16 @@ def orcid_sources(scholars, ithaca_fallback=(), wcm_fallback=()):
             confirmed.setdefault(orcid, set()).add((cwid, campus))
             held.add((cwid, campus))
     out = {CAMPUS_WCM: {}, CAMPUS_ITHACA: {}}
-    for campus, pairs, source in ((CAMPUS_ITHACA, ithaca_fallback, ORCID_AFFILIATION_MANAGER),
-                                  (CAMPUS_WCM, wcm_fallback, ORCID_INFERRED)):
-        for orcid, cwid in orcid_map(pairs).items():
+    inferred = orcid_map(wcm_fallback)
+    for campus, mapped, source in (
+            (CAMPUS_ITHACA, orcid_map(ithaca_fallback), ORCID_AFFILIATION_MANAGER),
+            (CAMPUS_ITHACA, {o: c for o, c in inferred.items() if c in ithaca_people},
+             ORCID_INFERRED),
+            (CAMPUS_WCM, {o: c for o, c in inferred.items() if c not in ithaca_people},
+             ORCID_INFERRED)):
+        for orcid, cwid in mapped.items():
             if orcid not in confirmed and (cwid, campus) not in held:
-                out[campus][orcid] = (cwid, source)
+                out[campus].setdefault(orcid, (cwid, source))
     for orcid, people in confirmed.items():
         if len(people) == 1:
             (cwid, campus), = people
@@ -1078,14 +1096,15 @@ class IdentityIndex:
             # Last on this connection, so a failed venue query cannot disturb a read the
             # roster depends on.
             dept_venue_fit = cls._load_dept_venue_fit(c, campus)
-            orcid_cwid = cls._load_orcid_map(c, campus)
+            orcid_cwid = cls._load_orcid_map(
+                c, campus, frozenset(str(k).strip().lower() for k in campus_types))
         return cls([cls._record(r, campus_types.get(r["cwid"], ()), r["cwid"] in linked)
                     for r in rows],
                    campus=campus, alternate_names=alternate_names,
                    dept_venue_fit=dept_venue_fit, orcid_cwid=orcid_cwid)
 
     @staticmethod
-    def _load_orcid_map(conn, campus):
+    def _load_orcid_map(conn, campus, ithaca_people=frozenset()):
         """{bare ORCID: netid} from `cornell_pub_orcid_mapping` (`orcid_map`), or {} when
         the ORCID match does not apply: AAR_BYLINE_ORCID is not "on", this is not the
         Ithaca roster, or the table is not there (the dev instance has none).
@@ -1098,7 +1117,7 @@ class IdentityIndex:
         With AAR_BYLINE_ORCID_WCM on as well, the labelled map of `_load_orcid_sources`
         instead, for either campus. Off, this reads exactly what it read in v3.15."""
         if byline_orcid_wcm_enabled():
-            return IdentityIndex._load_orcid_sources(conn, campus)
+            return IdentityIndex._load_orcid_sources(conn, campus, ithaca_people)
         if campus != CAMPUS_ITHACA or not byline_orcid_enabled():
             return {}
         try:
@@ -1119,7 +1138,7 @@ class IdentityIndex:
             return {}
 
     @staticmethod
-    def _load_orcid_sources(conn, campus):
+    def _load_orcid_sources(conn, campus, ithaca_people=frozenset()):
         """{bare ORCID: (cwid, source)} for this campus from Scholars and the two
         fallback lists (`orcid_sources`), or {}. Called only with AAR_BYLINE_ORCID_WCM on.
 
@@ -1157,7 +1176,9 @@ class IdentityIndex:
             wcm = read(has("pubsource_orcid_person"), "pubsource_orcid_person table",
                        "SELECT personIdentifier, orcid FROM pubsource_orcid_person "
                        "WHERE personIdentifierType = 'CWID' AND confidence_type = 'inferred'")
-            maps, twice = orcid_sources(scholars, ithaca, wcm)
+            # `ithaca_people`: the roster's own campus test, read once by `load()` (rule
+            # (e) routes the inferred list by it).
+            maps, twice = orcid_sources(scholars, ithaca, wcm, ithaca_people)
             if twice:
                 log.warning("byline ORCID: %d ORCIDs are confirmed in Scholars for more "
                             "than one person and are ignored: %s", len(twice),
@@ -3422,6 +3443,29 @@ def _selftest():
          "else is in either map",
          set(src[CAMPUS_WCM]) == {S_W, S_X, F_W, F_HELD[:-1] + "7"}
          and set(src[CAMPUS_ITHACA]) == {S_I, F_I}),
+        ("orcid sources (e): with no Ithaca people named, the inferred list stays on WCM "
+         "exactly as before",
+         orcid_sources([], [("rl_c", F_I)], [("bo_w", F_W), ("as_c", F_DUP)])
+         == orcid_sources([], [("rl_c", F_I)], [("bo_w", F_W), ("as_c", F_DUP)], frozenset())
+         and orcid_sources([], [], [("as_c", F_DUP)])[0][CAMPUS_WCM]
+         == {F_DUP: ("as_c", ORCID_INFERRED)}),
+        ("orcid sources (e): an inferred iD for an Ithaca person goes to the Ithaca map, "
+         "labelled 'inferred', and leaves the WCM one",
+         (lambda m: m[CAMPUS_ITHACA] == {F_I: ("rl_c", ORCID_AFFILIATION_MANAGER),
+                                         F_DUP: ("as_c", ORCID_INFERRED)}
+          and m[CAMPUS_WCM] == {F_W: ("bo_w", ORCID_INFERRED)})(
+             orcid_sources([], [("rl_c", F_I)], [("bo_w", F_W), ("AS_C", F_DUP)],
+                           frozenset({"as_c", "rl_c"}))[0])),
+        ("orcid sources (e): Cornell's list wins an ORCID both name; Scholars still wins "
+         "over both and a Scholars-held Ithaca person takes no inferred iD; an inferred "
+         "ORCID for two people is dropped though they are on different rosters",
+         orcid_sources([], [("rl_c", F_I)], [("zz_c", F_I)], frozenset({"rl_c", "zz_c"}))[0]
+         [CAMPUS_ITHACA] == {F_I: ("rl_c", ORCID_AFFILIATION_MANAGER)}
+         and orcid_sources([("rw_c", S_I, "ithaca")], [], [("zz_c", S_I), ("rw_c", F_HELD)],
+                           frozenset({"rw_c", "zz_c"}))[0][CAMPUS_ITHACA]
+         == {S_I: ("rw_c", ORCID_SCHOLARS)}
+         and orcid_sources([], [], [("bo_w", F_DUP), ("as_c", F_DUP)],
+                           frozenset({"as_c"}))[0] == {CAMPUS_WCM: {}, CAMPUS_ITHACA: {}}),
         ("orcid sources: no Scholars rows (v3.16 not applied) is the fallbacks, labelled",
          orcid_sources([], [("rl_c", F_I)], [("bo_w", F_W)])
          == ({CAMPUS_WCM: {F_W: ("bo_w", ORCID_INFERRED)},
@@ -3646,6 +3690,8 @@ def _selftest():
         s_conn = _SrcConn()
         s_on = (byline_orcid_wcm_enabled(), IdentityIndex._load_orcid_map(s_conn, CAMPUS_WCM),
                 IdentityIndex._load_orcid_map(s_conn, CAMPUS_ITHACA))
+        s_routed = (IdentityIndex._load_orcid_map(_SrcConn(), CAMPUS_WCM, frozenset({"bo_w"})),
+                    IdentityIndex._load_orcid_map(_SrcConn(), CAMPUS_ITHACA, frozenset({"bo_w"})))
         s_bare = _SrcConn(absent=("scholar_active", "pubsource_orcid_person"))
         s_no_scholars = (IdentityIndex._load_orcid_map(s_bare, CAMPUS_WCM),
                          IdentityIndex._load_orcid_map(s_bare, CAMPUS_ITHACA))
@@ -3669,6 +3715,11 @@ def _selftest():
         ("orcid wcm load: both on reads the labelled map of each campus, Scholars first",
          s_on == (True, {S_W: ("rh_w", "scholars"), F_W: ("bo_w", "inferred")},
                   {S_I: ("rw_c", "scholars"), F_I: ("rl_c", "affiliation_manager")})),
+        ("orcid wcm load (e): the roster's Ithaca ids route an inferred iD to the Ithaca "
+         "map, after Cornell's list; the WCM map loses it",
+         s_routed == ({S_W: ("rh_w", "scholars")},
+                      {S_I: ("rw_c", "scholars"), F_I: ("rl_c", "affiliation_manager"),
+                       F_W: ("bo_w", "inferred")})),
         ("orcid wcm load: scholar_active without its v3.16 columns and no inferred table "
          "is no error: no WCM map, the Ithaca fallback labelled, the absent lists not queried",
          s_no_scholars == ({}, {F_I: ("rl_c", "affiliation_manager"),
