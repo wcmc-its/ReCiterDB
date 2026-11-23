@@ -318,6 +318,40 @@ _AFFIL_SEP = "|"
 assert not _AFFIL_SEP.isalnum(), "_AFFIL_SEP must be unreachable by _norm's [a-z0-9]"
 
 
+# How the department n-gram in `_affil_match` compares tokens, on BOTH sides (the dept
+# name and the affiliation), after `_affil_tokens` has stripped the institution names:
+#
+#   * the connector "and" is dropped. `_norm("&")` is "", so "&" never survives either
+#     tokenizer, and "A & B" was already the tokens (a, b) while "A and B" was
+#     (a, and, b): the same department, spelled the two ways the roster and the bylines
+#     both use, never matched across. Live anchor: authorship_review 84447 / 84457 / 401,
+#     byline "Department of Population Medicine and Diagnostic Sciences, College of
+#     Veterinary Medicine, Cornell University" against as3527's roster department
+#     "Population Medicine & Diagnostic Science". 72 roster departments carry "&", 96
+#     carry "and".
+#   * a trailing "s" is dropped from every token of `_PLURAL_MIN`+ characters, so
+#     "Sciences" and "Science" are one token -- but ONLY when the department is two or
+#     more words. A one-word department is a bare token-equality test with nothing
+#     around it to keep it honest, and the plural there is the -ic/-ics pair that names
+#     a DIFFERENT thing: folding "Pediatrics" onto "Pediatric" matched "Hospital for
+#     Special Surgery Pediatric Rehabilitation" (26 stored candidates, measured). In a
+#     multi-word department the other words must still stand adjacent and in order,
+#     which is where the specificity is. The length floor keeps short words whole
+#     ("news" is not "new").
+#
+# `_AFFIL_SEP` is one character and not "and", so it passes through untouched and the
+# seam guarantee holds exactly as before. The division test does not use this: it is a
+# single-word equality test and stays the one #203 shipped.
+_DEPT_CONNECTORS = frozenset({"and"})
+_PLURAL_MIN = 5
+
+
+def _dept_key(toks, fold_plural):
+    """Tokens as the department n-gram compares them (see the block above)."""
+    return tuple(t[:-1] if fold_plural and len(t) >= _PLURAL_MIN and t.endswith("s") else t
+                 for t in toks if t not in _DEPT_CONNECTORS)
+
+
 def _affil_tokens(affiliations):
     """Affiliation strings -> one normalised token sequence, `_AFFIL_SEP` between
     strings, with the institution's own name removed. Tokens, not a concatenated blob,
@@ -1584,16 +1618,42 @@ class IdentityIndex:
         1,948 open PubMed and 1,841 open Scopus rows carry more than one affiliation
         string. The sentinel restores the qualifier -- every n-gram window that spans a
         seam contains a token no dept, division or phrase token can equal -- and the
-        selftest below holds that byline at False."""
+        selftest below holds that byline at False.
+
+        The department n-gram compares `_dept_key` tokens, not raw ones: "&" and "and"
+        are the same connector, and in a department of two or more words a trailing
+        plural "s" is folded (see the block above `_dept_key`). That WIDENS the test, so
+        unlike #203 it does create matches, and the measured set is the safety argument.
+        Over all 87,084 authorship_review rows on prod (2026-11-23), stored candidates
+        against today's roster: 545 matches created (203 of 78,149 WCM entries, 342 of
+        67,376 Cornell Ithaca ones), 0 removed. Every one of the 545 is the candidate's
+        own department name with "&" for "and" or back, an "and" left out, or a plural:
+        "Earth & Atmospheric Sciences" 292, "Immunology and Microbial Pathogenesis" 54,
+        "Brain & Mind Research Institute" 51, "Population Medicine and Diagnostic
+        Sciences" 30, and 20 smaller ones. Replaying both rules moves 15 top picks. The
+        8 curator-resolved ones are all fixes (seven "A Singh" rows assigned to as3527,
+        one "Wei Wang" assigned to wew4002) and none is a break; 502 resolved people
+        gain the match, none loses it or drops a rank. One open row moves the wrong
+        way: 5959, byline "Junsung Lee", almost certainly jl3939 "John (Junsung) Lee".
+        The byline reaches him only at the initial tier, so once the rival's "Mechanical
+        & Aerospace Engineering" matches as well as his "Biomedical Engineering" does,
+        the tie goes to confidence, where his alumni flag costs him 0.10.
+        Every guarantee above still holds. Tokens are still whole words, so the
+        "cardiovascular" case stays False; the institution names are stripped before
+        either side is folded; and the seam token is neither "and" nor foldable, so no
+        window can span two affiliation strings."""
         if not affil_toks:
             return False, None
         dept_n = _norm(rec["dept"])
-        dept_toks = name_tokens(rec["dept"])
+        dept_toks = _dept_key(name_tokens(rec["dept"]), False)
+        fold = len(dept_toks) >= 2
+        if fold:
+            dept_toks = _dept_key(dept_toks, True)
         n = len(dept_toks)
-        if dept_n and len(dept_n) >= 4 and n and any(
-                affil_toks[i:i + n] == dept_toks
-                for i in range(len(affil_toks) - n + 1)):
-            return True, "dept"
+        if dept_n and len(dept_n) >= 4 and n:
+            toks = _dept_key(affil_toks, fold)
+            if any(toks[i:i + n] == dept_toks for i in range(len(toks) - n + 1)):
+                return True, "dept"
         # division: any distinctive word (>=5 chars) standing as a whole token
         for word in (rec["division"] or "").replace("&", " ").replace(",", " ").split():
             w = _norm(word)
@@ -2425,6 +2485,64 @@ def _selftest():
          onc.candidates("Roe", "Ann", "A", ["Memorial Sloan Kettering Cancer Center, "
                                             "New York, NY"])[0][0]["affil_dept_match"]
          is False),
+    ]
+
+    # --- "&" vs "and", and plurals, in a department name (_dept_key) ----------
+    # Live rows 84447 / 84457 (byline "A Singh") and 401 (byline "Ajay Singh"): the
+    # roster has as3527 in "Population Medicine & Diagnostic Science", the byline says
+    # "Population Medicine and Diagnostic Sciences". Every Cornell "A. Singh" ties on the
+    # initial tier, so the department is the only thing that can pick Ajay, and before
+    # this it said False and the row went to Aadya Singh (as3295).
+    pmds_affil = ["Department of Population Medicine and Diagnostic Sciences, College of "
+                  "Veterinary Medicine, Cornell University, Ithaca, NY 14853."]
+    pmds = "Population Medicine & Diagnostic Science"
+    singhs = IdentityIndex([dict(rec("Ajay", "", "Singh", cwid="as3527"), dept=pmds),
+                            rec("Aadya", "", "Singh", cwid="as3295")])
+    sing, _ = singhs.candidates("Singh", "A", "A", pmds_affil)
+
+    def am(dept, affils):
+        return IdentityIndex._affil_match(dict(rec("Ann", "", "Roe", cwid="d1"), dept=dept),
+                                          _affil_tokens(affils))[0]
+    checks += [
+        ("rows 84447/84457: 'Medicine & Diagnostic Science' on the roster matches "
+         "'Medicine and Diagnostic Sciences' in the byline, and picks as3527 over the "
+         "initial-tier tie", sing[0]["cwid"] == "as3527"
+         and sing[0]["affil_match_on"] == "dept"
+         and sing[1]["cwid"] == "as3295" and sing[1]["affil_dept_match"] is False),
+        ("...and the other way round: 'and' on the roster, '&' in the byline",
+         am("Earth and Atmospheric Sciences",
+            ["Department of Earth & Atmospheric Sciences, Ithaca"])),
+        ("...and the same department with the 'and' left out ('Brain Mind Research "
+         "Institute', 6 stored candidates)",
+         am("Brain and Mind Research Institute",
+            ["Feil Brain Mind Research Institute, Weill Cornell Medicine, New York, NY"])),
+        ("the words must still be adjacent and in order: an extra word between them is "
+         "not the department",
+         not am(pmds, ["Department of Population Medicine and Clinical Diagnostic "
+                       "Sciences, Ithaca, NY"])),
+        ("dropping 'and' cannot reach across the seam between two affiliation strings",
+         not am(pmds, ["Department of Population Medicine and",
+                       "Diagnostic Sciences, Somewhere Else"])),
+        ("...because _dept_key passes the boundary token through untouched",
+         _dept_key(("population", "medicine", "and", _AFFIL_SEP, "sciences"), True)
+         == ("population", "medicine", _AFFIL_SEP, "science")),
+        ("a ONE-word department is not plural-folded: 'Pediatrics' does not match "
+         "'Pediatric Rehabilitation' (26 stored candidates would have, measured)",
+         not am("Pediatrics", ["Hospital for Special Surgery Pediatric Rehabilitation "
+                               "& Young Athlete Center, New York, NY"])),
+        ("...while a one-word department still matches itself exactly",
+         am("Pediatrics", ["Department of Pediatrics, Weill Cornell Medicine"])),
+        ("a short word keeps its 's' ('news' is not 'new')",
+         not am("News Media", ["Department of New Media, Somewhere, NY"])
+         and am("News Media", ["Department of News Media, Somewhere, NY"])),
+        ("folding is per WHOLE token, so #203's 'cardiovascular' case stays out: "
+         "'Vascular Sciences' does not match 'Cardiovascular Sciences'",
+         not am("Vascular Sciences", ["Division of Cardiovascular Sciences, University "
+                                      "of Manchester, UK."])),
+        ("...and the institution strip still runs first: 'Weill Cornell Graduate School "
+         "of Medical Sciences' does not name a 'Medical Science' department",
+         not am("Medical Science", ["Weill Cornell Graduate School of Medical Sciences, "
+                                    "New York, NY"])),
     ]
 
     # --- campus scope: R1, the rarity term Cornell Ithaca would take from WCM -----
