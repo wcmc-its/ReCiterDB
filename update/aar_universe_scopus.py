@@ -1355,7 +1355,7 @@ def _selftest():
     _maps, _ = _osrc([("jo_w", _O_W, "wcm")], [("jo_c", "0000-0001-0000-0002")],
                      [("JB_W", _O_ADD)])
     _wcm_l = IdentityIndex([_p("John", "Doe", "jd_w"), _p("Jordan", "Doe", "jo_w"),
-                            _p("Jordan", "Buck", "jb_w")], orcid_cwid=_maps[CAMPUS_WCM])
+                            _p("Jordan", "Dowe", "jb_w")], orcid_cwid=_maps[CAMPUS_WCM])
     _roster_l = CampusRoster(_wcm_l, ithaca=IdentityIndex(_cu, campus=CAMPUS_ITHACA,
                                                           orcid_cwid=_maps[CAMPUS_ITHACA]))
     _au_w = dict(_au_o, affiliations=["Weill Cornell Medicine, New York, NY"])
@@ -1373,7 +1373,8 @@ def _selftest():
           and [(c["cwid"], c["orcid_match"]) for c in _w1c] == [("jo_w", True), ("jd_w", False)]
           and list(_w1c[0])[-1] == "orcid_source" and _w1c[0]["orcid_source"] == "scholars"
           and "orcid_source" not in _w1c[1] and "campus" not in _w1c[0])
-    check("...a WCM person only the ORCID reaches is top_cwid with top_orcid_match=2 and "
+    check("...a WCM person only the ORCID reaches (a close surname, Dowe for Doe: an "
+          "inferred iD adds no unrelated one) is top_cwid with top_orcid_match=2 and "
           "orcid_source 'inferred'",
           _w2["top_cwid"] == "jb_w" and _w2["top_orcid_match"] == 2
           and _w2c[0]["orcid_source"] == "inferred" and _w2c[0]["orcid_added"] is True
@@ -1389,7 +1390,7 @@ def _selftest():
           json.dumps(wcm_lane_candidates(_roster_l, _au_w, None, _ith_fam))
           == json.dumps(wcm_lane_candidates(
               CampusRoster(IdentityIndex([_p("John", "Doe", "jd_w"), _p("Jordan", "Doe", "jo_w"),
-                                          _p("Jordan", "Buck", "jb_w")])), _au_w, None, _ith_fam))
+                                          _p("Jordan", "Dowe", "jb_w")])), _au_w, None, _ith_fam))
           and "orcid" not in json.dumps(wcm_lane_candidates(_roster_l, _au_o, None, _ith_fam)))
     check("the row's byline name for the lookup is the stored wcm_author",
           _byline_name(_au2) == _on_row["wcm_author"] == "Jane Smith"
