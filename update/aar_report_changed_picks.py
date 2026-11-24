@@ -826,6 +826,19 @@ def _selftest():
           _drift_cols(stored, [base[0], base[1]][::1]) == []
           and _drift_cols(row([base[0], base[1]]), [base[0], base[1]]) == [])
 
+    # A candidate `title` is display text, not a drift field: its arrival on the
+    # replayed list (stored rows predate it) must not mark every open row stale.
+    check("a candidate title APPEARING, or changing, is not drift",
+          "title" not in _DRIFT_CAND_FIELDS
+          and _drift_cols(stored, [dict(c, title="Graduate Research Assistant")
+                                   for c in base]) == []
+          and _drift_cols(row([dict(c, title="Professor") for c in base]),
+                          [dict(c, title="Lecturer") for c in base]) == [])
+    tech = [dict(base[0], dept="Cornell Tech"), base[1]]
+    check("...while a department renamed to 'Cornell Tech' on the top pick is drift",
+          _drift_cols(row([dict(base[0], dept="Faculty and Research"), base[1]]), tech)
+          == ["candidate_cwids_json", "top_dept"])
+
     # ---- every candidate field in the list, changed ALONE, drifts -------------
     # Perturbed on the NON-top candidate, so only candidate_cwids_json can move: that
     # isolates _cands_drifted from _drift_cols' own top_* comparisons. Before #205 the

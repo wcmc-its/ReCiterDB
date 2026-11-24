@@ -1198,7 +1198,10 @@ def _cornell_record(row):
         "givenName": first,
         "middleName": _cornell_middle_name(row["name"], first, last),
         "primaryTitle": row["primary_business_title"] or row["primary_job_title"] or "",
-        "primaryAcademicDepartment": row["primary_department"] or "",
+        # Folded through the one shared map: Cornell Tech's generic HR units
+        # ("Faculty and Research", ...) become "Cornell Tech" (cornell_hr_feed).
+        "primaryAcademicDepartment": cornell_hr_feed.canonical_dept(
+            row["primary_department"] or ""),
         CORNELL_MARK: "yes",
     }
 
@@ -2249,6 +2252,14 @@ def demo():
                    "primaryAcademicDepartment": "Statistics and Data Science",
                    CORNELL_MARK: "yes"}, rec
     assert not (set(rec) & FLAG_COLUMNS), "no WCM appointment flag on a Cornell person"
+    # Cornell Tech's generic HR units are written as the campus, not the unit name.
+    for unit in ("Faculty and Research", "Tech Instruction", "JTC Instruction"):
+        tech = _cornell_record(dict(cornell_row, primary_department=unit,
+                                    primary_business_title="Graduate Research Assistant"))
+        assert tech["primaryAcademicDepartment"] == "Cornell Tech", tech
+        assert tech["primaryTitle"] == "Graduate Research Assistant", tech
+    assert _cornell_record(dict(cornell_row, primary_department=None))[
+        "primaryAcademicDepartment"] == "", "no department stays empty"
     assert set(rec) - {CORNELL_MARK} <= set(UPSERT_COLUMNS), "no invented columns"
     # Compound surname: "De" is not a middle name.
     assert _cornell_middle_name("Iwijn De Vlaminck", "Iwijn", "De Vlaminck") == ""

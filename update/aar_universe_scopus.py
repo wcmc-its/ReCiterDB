@@ -332,6 +332,23 @@ def _trunc(s, n):
     return s[:n] if isinstance(s, str) and len(s) > n else s
 
 
+# A candidate's `title` (identity.primaryTitle) is published for the card to show beside
+# the department ("Cornell Tech · Graduate Research Assistant"): whitespace collapsed, cut
+# to CANDIDATE_TITLE_MAX, and present only when the record has one. It is display text,
+# NOT a drift field (aar_report_changed_picks._DRIFT_CAND_FIELDS leaves it out on
+# purpose): a stored row without the key is not stale, so its arrival rewrites nothing by
+# itself and an open row picks it up the next time a lane or a reconcile writes it.
+CANDIDATE_TITLE_MAX = 80
+
+
+def candidate_title(c):
+    """The candidate's title as `_compact` stores it, or None when there is none."""
+    t = c.get("title")
+    if not isinstance(t, str) or not t.strip():
+        return None
+    return " ".join(t.split())[:CANDIDATE_TITLE_MAX]
+
+
 def _compact(cands):
     keep = ("cwid", "name", "name_source", "name_n", "person_type", "dept", "given_match",
             "affil_dept_match", "cohort_size", "confidence", "years_after_wcm")
@@ -352,6 +369,9 @@ def _compact(cands):
             out["orcid_added"] = True       # only the ORCID put them here: top_orcid_match 2
         if c.get("orcid_source"):
             out["orcid_source"] = c["orcid_source"]
+        title = candidate_title(c)
+        if title:
+            out["title"] = title
         return out
     return [dict({k: c.get(k) for k in keep}, **extra(c)) for c in cands]
 
@@ -1632,6 +1652,16 @@ def _selftest():
           and _compact([dict(top, venue_fit=0.0)])[0]["venue_fit"] == 0.0
           and _compact([dict(top, venue_fit=1.586)])[0]
           == dict(_compact([top])[0], venue_fit=1.586))
+
+    check("_compact stores a candidate's title only when it has one, whitespace "
+          "collapsed and cut to CANDIDATE_TITLE_MAX; everything else is untouched",
+          "title" not in _compact([dict(top, title="")])[0]
+          and "title" not in _compact([dict(top, title="   ")])[0]
+          and "title" not in _compact([dict(top, title=None)])[0]
+          and _compact([dict(top, title=" Graduate  Research\tAssistant ")])[0]
+          == dict(_compact([dict(top, title="")])[0], title="Graduate Research Assistant")
+          and len(_compact([dict(top, title="x" * 300)])[0]["title"])
+          == CANDIDATE_TITLE_MAX == 80)
 
     _lookup = build_venue_lookup([(100001, "0146-9592", None, "Optics")], [("cleo", "Optics")])
     check("stored_venue_subfield reads what the row stores: Scopus's unhyphenated ISSN, else the "
