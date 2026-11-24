@@ -55,17 +55,17 @@ The --apply run is a prod write, handed to the owner; not alongside the nightly
 (14:30 UTC). Env: DB_USERNAME/DB_PASSWORD/DB_HOST/DB_NAME (reciterdb). AAR_VENUE_FIT is
 not read: the term is computed as the CronJob computes it with the switch on (it is on).
 
-WHICH RUN. --only-folded-depts is the #311 (Cornell Tech) refresh: 745 rows on the
-2026-11-23 dry run, 20 pick changes. The unscoped run re-derives every candidate from
-today's roster, and that roster carries Cornell HR's Workday renames ("Cornell Lab for
-Accelerator-based ScienceS & Ed", "Pop Medicine & Diagnstc Sci", ...) that the venue-fit
-training rows, stored under the old names, do not know: those candidates lose their
-venue term. The same dry run moved 216 picks, most of them for that reason. Fold the
-renames (cornell_hr_feed.DEPT_ALIASES) before running it unscoped.
+PICKS. The list is re-sorted, but a different person takes the row only on positive
+evidence (see positive_evidence); otherwise the stored order stands and the row still gets
+its new labels and evidence.
+
+WHICH RUN. The unscoped run. --only-folded-depts limits it to rows with a stored candidate
+whose department cornell_hr_feed.canonical_dept changes; since #315 that is every aliased
+Cornell department, not only the Cornell Tech units.
 
 Usage:
   python3 backfill_rederive_candidates.py --selftest
-  python3 backfill_rederive_candidates.py --only-folded-depts  # dry run, Cornell Tech only
+  python3 backfill_rederive_candidates.py --only-folded-depts  # dry run, aliased depts only
   python3 backfill_rederive_candidates.py                      # dry run
   python3 backfill_rederive_candidates.py --apply
   python3 backfill_rederive_candidates.py --rollback LEDGER    # dry run of the undo
@@ -94,6 +94,7 @@ _SELECT_SQL = bvf._SELECT_SQL
 _CONF_TOL = 5e-4          # half the 0.001 quantum, above FLOAT noise (as everywhere else)
 # The per-candidate fields this pass re-derives and compares; anything else a stored
 # candidate carries is kept as it is.
+_KEPT = "pick kept (rival only penalized)"
 _DERIVED = ("dept", "title", "person_type", "affil_dept_match", "venue_fit", "confidence")
 
 
@@ -133,15 +134,26 @@ def load_roster():
 
 
 def has_folded_dept(row):
-    """Does any stored candidate carry a department `canonical_dept` folds (the Cornell
-    Tech units)? The --only-folded-depts row filter: the change #311 made, and nothing else
-    the roster has done since."""
+    """Does any stored candidate carry a department `canonical_dept` changes (a
+    Cornell Tech unit or any other alias)? The --only-folded-depts row filter."""
     try:
         cands = json.loads(row.get("candidate_cwids_json") or "[]")
     except ValueError:
         return False
     return any(isinstance(c, dict) and isinstance(c.get("dept"), str)
                and canonical_dept(c["dept"]) != c["dept"] for c in cands or [])
+
+
+def positive_evidence(c):
+    """May this candidate take a row from the stored pick? Only on something that points AT
+    the person: their byline ORCID, their department on the byline, or a good venue fit (a
+    positive venue term). A person who leads only because the stored pick was penalized does
+    not: on rows curators had decided (2026-11-24), such a new lead was right 30 times,
+    displaced the right person 10 times, and both were wrong 186 times, against 81 right and
+    6 displaced for the byline and the fit. The stored order then stands."""
+    fit = c.get("venue_fit")
+    return bool(c.get("orcid_match") or c.get("affil_dept_match")
+                or (fit is not None and venue_fit.venue_term(fit) > 0))
 
 
 def rederive_row(row, roster, lookup, table, run_ts, folded_only=False):
@@ -159,11 +171,7 @@ def rederive_row(row, roster, lookup, table, run_ts, folded_only=False):
 
     `folded_only` (--only-folded-depts) re-derives only the candidates whose STORED
     department folds; every other candidate keeps its stored evidence and gains only
-    its title. That is #311's change and nothing else the roster has done since --
-    on 2026-11-23 Cornell's HR feed had renamed dozens of departments to Workday short
-    forms ("Cornell Lab for Accelerator-based ScienceS & Ed"), which the venue-fit
-    training rows (stored under the old names) do not know, so re-deriving those
-    candidates moves fits for a reason that has nothing to do with Cornell Tech.
+    its title.
 
     `flags` counts the individual effects (non-exclusive) for the report."""
     try:
@@ -212,7 +220,12 @@ def rederive_row(row, roster, lookup, table, run_ts, folded_only=False):
                 else:
                     flags.add(f"{f} changed")
         out.append(n)
+    in_stored_order = list(out)
     out.sort(key=bvf._key, reverse=True)       # stable: ties keep the stored order
+    if not bvf._cwid_eq(cands[0].get("cwid"), out[0].get("cwid")) \
+            and not positive_evidence(out[0]):
+        out = in_stored_order                  # re-derived evidence, stored order
+        flags.add(_KEPT)
     stored = _compact(out)
     top = stored[0]
     after = {
@@ -243,7 +256,8 @@ def rederive_row(row, roster, lookup, table, run_ts, folded_only=False):
           or bool(row.get("top_affil_match")) != bool(after["top_affil_match"])
           or _fit_ne(row.get("top_venue_fit"), after["top_venue_fit"])):
         verdict = "TOP_RELABEL"
-    elif order_moved or flags - {"title changed", "candidate not on roster (kept as stored)"}:
+    elif order_moved or flags - {"title changed", "candidate not on roster (kept as stored)",
+                                 _KEPT}:
         verdict = "CANDIDATE_CHANGE"
     elif "title changed" in flags:
         verdict = "TITLE_ONLY"
@@ -354,7 +368,7 @@ def main():
                          "titles); they pick the title up on their next rewrite")
     ap.add_argument("--only-folded-depts", action="store_true",
                     help="only rows with a stored candidate whose department "
-                         "cornell_hr_feed.canonical_dept folds (the Cornell Tech units), "
+                         "cornell_hr_feed.canonical_dept changes (an alias), "
                          "and on them re-derive only those candidates (the rest keep "
                          "their stored evidence and gain their title)")
     ap.add_argument("--limit", type=int, default=None, help="consider only the first N rows")
@@ -539,6 +553,29 @@ def _selftest():
     check("--only-folded-depts: a row is in scope when a stored candidate's department "
           "folds", has_folded_dept(row(stored)) and not has_folded_dept(written)
           and not has_folded_dept({"candidate_cwids_json": "{bad"}))
+
+    # A pick moves only on positive evidence. cs2 (stored pick) never publishes in Human
+    # Factors: -0.20. em3 has no training rows there either way; a rival with no venue
+    # score leads on the penalty alone, and the stored pick stands with its new evidence.
+    roster["no4"] = rec("no4", "Mann Library")
+    pen = [cand("cs2", "Computer Science", 0.383), cand("no4", "Mann Library", 0.383)]
+    v9, f9, e9 = rederive_row(row(pen, affil="X"), roster, lookup, table, "T9")
+    c9 = json.loads(e9["after"]["candidate_cwids_json"])
+    check("a rival who leads only because the stored pick was penalized does not take the "
+          "row; the penalized evidence is still stored",
+          v9 == "CONFIDENCE_CHANGE" and e9["after"]["top_cwid"] == "cs2"
+          and [c["cwid"] for c in c9] == ["cs2", "no4"]
+          and c9[0]["confidence"] < c9[1]["confidence"]
+          and _KEPT in f9)
+    w9 = dict(row(pen, affil="X"), **e9["after"])
+    check("...and that row re-derives to itself (resume-safe)",
+          rederive_row(w9, roster, lookup, table, "T9")[0] == "UNCHANGED")
+    check("positive evidence: byline ORCID, byline department or a good fit; not a neutral, "
+          "poor or absent fit",
+          all(positive_evidence(c) for c in ({"orcid_match": True}, {"affil_dept_match": True},
+                                             {"venue_fit": 1.0}))
+          and not any(positive_evidence(c) for c in ({}, {"venue_fit": 0.9}, {"venue_fit": -2.0},
+                                                     {"venue_fit": None})))
 
     # Title only: everything else already current.
     cur = json.loads(a["candidate_cwids_json"])
