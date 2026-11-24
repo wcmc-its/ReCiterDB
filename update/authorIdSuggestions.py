@@ -341,7 +341,7 @@ def http_json(url, params=None, headers=None, tries=5):
             time.sleep(2 * (attempt + 1))
             continue
         r.raise_for_status()
-    raise RuntimeError(f"GET {url} failed after retries")
+    raise RuntimeError(f"GET {url} failed after retries (last: HTTP {r.status_code})")
 
 
 def openalex_params(p):
@@ -349,15 +349,19 @@ def openalex_params(p):
     mailto = (os.environ.get("OPENALEX_MAILTO") or "").strip()
     if mailto:
         p["mailto"] = mailto
-    key = (os.environ.get("OPENALEX_API_KEY") or "").strip()
-    if key:
-        p["api_key"] = key
     return p
+
+
+def openalex_headers():
+    """The key goes in a header, so no URL in an error or a log carries it."""
+    key = (os.environ.get("OPENALEX_API_KEY") or "").strip()
+    return {"Accept": "application/json", **({"Authorization": "Bearer " + key} if key else {})}
 
 
 def openalex_works_by_pmid(pmids):
     j = http_json(f"{OPENALEX}/works", openalex_params(
-        {"filter": "pmid:" + "|".join(str(p) for p in pmids), "per_page": 50, "select": "ids,authorships"}))
+        {"filter": "pmid:" + "|".join(str(p) for p in pmids), "per_page": 50, "select": "ids,authorships"}),
+        openalex_headers())
     time.sleep(OPENALEX_SLEEP)
     out = {}
     for w in (j or {}).get("results") or []:
@@ -368,7 +372,8 @@ def openalex_works_by_pmid(pmids):
 
 
 def openalex_author_by_orcid(orcid):
-    j = http_json(f"{OPENALEX}/authors/orcid:{orcid}", openalex_params({"select": "id"}))
+    j = http_json(f"{OPENALEX}/authors/orcid:{orcid}", openalex_params({"select": "id"}),
+                  openalex_headers())
     time.sleep(OPENALEX_SLEEP)
     return ((j or {}).get("id") or "").rsplit("/", 1)[-1] or None
 

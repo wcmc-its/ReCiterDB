@@ -107,23 +107,28 @@ def rows_for_batch(work_ids, results, now):
 
 
 def _get(params):
+    headers = {"Accept": "application/json"}
     mailto = (os.environ.get("OPENALEX_MAILTO") or "").strip()
     if mailto:
         params = {**params, "mailto": mailto}
+    key = (os.environ.get("OPENALEX_API_KEY") or "").strip()
+    if key:   # in a header, so no URL in an error or a log carries it
+        headers["Authorization"] = "Bearer " + key
     for attempt in range(5):
         try:
-            r = requests.get(OPENALEX_WORKS, params=params, timeout=60,
-                             headers={"Accept": "application/json"})
-        except (requests.ConnectionError, requests.Timeout):
+            r = requests.get(OPENALEX_WORKS, params=params, timeout=60, headers=headers)
+        except (requests.ConnectionError, requests.Timeout) as e:
+            last = type(e).__name__
             time.sleep(2 * (attempt + 1))
             continue
         if r.status_code == 200:
             return r.json()
         if r.status_code in (429, 500, 502, 503, 504):
+            last = f"HTTP {r.status_code}"
             time.sleep(2 * (attempt + 1))
             continue
         r.raise_for_status()
-    raise RuntimeError("OpenAlex fetch failed after retries")
+    raise RuntimeError(f"OpenAlex fetch failed after retries (last: {last})")
 
 
 def pending_ids(conn, text):

@@ -234,7 +234,8 @@ def _http_get(url, params, headers, stats, tries=5):
         t0 = time.time()
         try:
             r = requests.get(url, params=params, headers=headers, timeout=60)
-        except (requests.ConnectionError, requests.Timeout):
+        except (requests.ConnectionError, requests.Timeout) as e:
+            last = type(e).__name__
             stats.seconds += time.time() - t0
             time.sleep(2 * (attempt + 1))
             continue
@@ -245,20 +246,22 @@ def _http_get(url, params, headers, stats, tries=5):
         if r.status_code == 400:
             raise BadBatch(r.text[:200])
         if r.status_code in (429, 500, 502, 503, 504):
+            last = f"HTTP {r.status_code}"
             time.sleep(2 * (attempt + 1))
             continue
         r.raise_for_status()
-    raise RuntimeError(f"{url} failed after {tries} tries")
+    raise RuntimeError(f"{url} failed after {tries} tries (last: {last})")
 
 
 def openalex_get(params, stats):
+    headers = {"Accept": "application/json"}
     mailto = (os.environ.get("OPENALEX_MAILTO") or "").strip()
     key = (os.environ.get("OPENALEX_API_KEY") or "").strip()
     if mailto:
         params = {**params, "mailto": mailto}
-    if key:
-        params = {**params, "api_key": key}
-    return _http_get(OPENALEX_WORKS, params, {"Accept": "application/json"}, stats)
+    if key:   # in a header, so no URL in an error or a log carries it
+        headers["Authorization"] = "Bearer " + key
+    return _http_get(OPENALEX_WORKS, params, headers, stats)
 
 
 def fetch_openalex(kind, values, stats):

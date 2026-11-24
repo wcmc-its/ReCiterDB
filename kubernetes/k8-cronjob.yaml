@@ -136,6 +136,14 @@ spec:
                   name: reciterdb-configmap
                   key: OPENALEX_MAILTO
                   optional: true
+            # Its own daily OpenAlex budget instead of the one keyless calls share per egress
+            # IP (the same secret as reciterdb-web-seeds). Optional: absent, calls go keyless.
+            - name: OPENALEX_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: openalex-api
+                  key: OPENALEX_API_KEY
+                  optional: true
             # Contact address sent with every NCBI E-utilities call. Unset, the AAR lanes
             # and collectAffiliations.py fall back to the default in aar_universe.py, which
             # is a personal address: add an institutional NCBI_EMAIL to reciterdb-configmap.
