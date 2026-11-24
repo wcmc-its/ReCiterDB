@@ -2249,7 +2249,7 @@ def demo():
     rec = _cornell_record(cornell_row)
     assert rec == {"surname": "Wells", "givenName": "Martin", "middleName": "Timothy",
                    "primaryTitle": "Professor",
-                   "primaryAcademicDepartment": "Statistics and Data Science",
+                   "primaryAcademicDepartment": "Statistics & Data Science",
                    CORNELL_MARK: "yes"}, rec
     assert not (set(rec) & FLAG_COLUMNS), "no WCM appointment flag on a Cornell person"
     # Cornell Tech's generic HR units are written as the campus, not the unit name.
