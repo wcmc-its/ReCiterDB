@@ -210,6 +210,67 @@ def test_pdf_html_one_block_per_entry():
     assert w.pdf_html("a < b and c > d") == "<p>a &lt; b and c &gt; d"
 
 
+def _run_hop_host(pages, html, hops, parent_netid):
+    """hop_host with the network and DB stubbed. Returns (stats, retired urls, fetched urls)."""
+    import collections
+    import threading
+    from unittest import mock
+    retired, fetched, stats = [], [], collections.Counter()
+    host = mock.Mock(robots_ok=True)
+    host.robots.can_fetch.return_value = True
+
+    def hop_page(h, write, url, kind, parent, netid, row, now, s):
+        w.needs_fetch(row, None, now)  # reads the row as the real one does
+        fetched.append(url)
+        if html.get(url) is None:
+            return None, None
+        return 200, (None if kind == "cv" else html[url])  # a CV has no html, as in the real one
+    with mock.patch.multiple(w, Host=lambda *a: host, db_conn=mock.Mock(), hop_page=hop_page, expired=lambda d: False,
+                             writer=lambda conn: (lambda fn: fn(mock.Mock())),
+                             retire_pages=lambda c, urls, now: retired.extend(urls)):
+        w.hop_host("zlab.org", pages, hops, set(), parent_netid, None, stats, threading.Lock())
+    return stats, retired, fetched
+
+
+PUBS = "https://zlab.org/pubs"
+LINK = f'<a href="{PUBS}">Publications</a>'
+
+
+def _pubs_row(parent):
+    return {"url": PUBS, "kind": "pubs", "host": "zlab.org", "parent_url": parent, "gone_at": None, "http_status": 200,
+            "last_fetched": NOW, "content_hash": "x", "etag": None, "last_modified": None}
+
+
+def test_hop_host_two_pages_lead_to_one_pubs_page():
+    pages = [("https://zlab.org/a", "lab", "P1", "qbz11"), ("https://zlab.org/b", "lab", "P1", "qbz11")]
+    s, retired, fetched = _run_hop_host(pages, {u: LINK for u, *_ in pages}, {}, {"P1": "qbz11"})
+    assert s["page_errors"] == 0 and retired == [] and fetched.count(PUBS) == 1
+
+
+def test_hop_host_sibling_without_link_does_not_retire():
+    pages = [("https://zlab.org/a", "lab", "P1", "qbz11"), ("https://zlab.org/b", "cv", "P1", "qbz11")]
+    html = {"https://zlab.org/a": LINK, "https://zlab.org/b": "<p>hi</p>"}
+    for order in (pages, pages[::-1]):
+        for hops in ({}, {PUBS: _pubs_row("P1")}):
+            s, retired, _ = _run_hop_host(order, html, hops, {"P1": "qbz11"})
+            assert retired == [] and s["page_errors"] == 0
+    # one sibling unread (skipped / failed): it may be the one that links the pubs page
+    assert _run_hop_host(pages, {"https://zlab.org/b": "<p>hi</p>"}, {PUBS: _pubs_row("P1")}, {"P1": "qbz11"})[1] == []
+    # every page read and none links it: retired
+    s, retired, _ = _run_hop_host(pages, {u: "<p>hi</p>" for u, *_ in pages}, {PUBS: _pubs_row("P1")}, {"P1": "qbz11"})
+    assert retired == [PUBS] and s["pubs_retired"] == 1
+
+
+def test_hop_host_shared_means_two_people():
+    pages = [("https://zlab.org/a", "lab", "P1", "qbz11"), ("https://zlab.org/b", "lab", "P2", "qbz11")]
+    html = {u: LINK for u, *_ in pages}
+    s, retired, _ = _run_hop_host(pages, html, {}, {"P1": "qbz11", "P2": "qbz11"})
+    assert s["pubs_shared"] == 0 and retired == []
+    pages[1] = ("https://zlab.org/b", "lab", "P2", "ov22")
+    s, retired, _ = _run_hop_host(pages, html, {}, {"P1": "qbz11", "P2": "ov22"})
+    assert s["pubs_shared"] == 1 and retired == [PUBS]
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

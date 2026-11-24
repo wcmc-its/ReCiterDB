@@ -906,12 +906,14 @@ def retire_pages(c, urls, now):
         c.execute(f"UPDATE pubsource_web_page_person SET removed_at=%s WHERE removed_at IS NULL AND url IN ({ph})", (now, *part))
 
 
-def hop_host(name, pages, hops, skip, deadline, stats, lock):
+def hop_host(name, pages, hops, skip, parent_netid, deadline, stats, lock):
     """pages = [(url, kind, parent_url, netid)] on one host; each gets at most one Publications follow.
     hops = existing hop rows by url (this thread updates its host's pubs rows in place);
     skip = normalized URLs never to follow (profiles, planned hops).
-    A pubs page reached from two profiles is shared (whose pubs?): it is tombstoned with
-    parent_url NULL + gone_at and never followed again."""
+    A pubs page reached from two people's profiles is shared (whose pubs?): it is tombstoned with
+    parent_url NULL + gone_at and never followed again. Two profiles of one person are not shared.
+    parent_netid = profile URL -> its sole person.
+    A pubs page retires only once every hop page of its person on this host was read and none leads to it."""
     s = collections.Counter(host_count=1)
     conn = {"db": None}
     try:
@@ -922,6 +924,13 @@ def hop_host(name, pages, hops, skip, deadline, stats, lock):
         conn["db"] = db_conn()
         write = writer(conn)
         now = utcnow()
+        known = collections.defaultdict(list)  # netid -> live pubs rows on this host before this run
+        for r in list(hops.values()):  # snapshot: other host threads add rows
+            if r["kind"] == "pubs" and r["gone_at"] is None and r["host"] == name:
+                known[parent_netid.get(r["parent_url"])].append(r)
+        found = collections.defaultdict(set)  # netid -> pubs pages this run's hop pages lead to
+        left = collections.Counter(netid for _, _, _, netid in pages)  # netid -> hop pages not yet read
+        done = set()  # pubs pages already handled this run
         for url, kind, parent, netid in pages:
             if expired(deadline):
                 s["stopped_at_deadline"] += 1
@@ -931,11 +940,10 @@ def hop_host(name, pages, hops, skip, deadline, stats, lock):
                 continue
             try:
                 status, html = hop_page(h, write, url, kind, parent, netid, hops.get(url), now, s)
-                mine = [r for r in hops.values() if r["kind"] == "pubs" and r["gone_at"] is None
-                        and r["parent_url"] == parent and r["host"] == name]
                 p = pubs_link(html, url) if html else None
                 prow = hops.get(p) if p else None
-                if prow and (prow["parent_url"] is None or (prow["gone_at"] is None and prow["parent_url"] != parent)):
+                if prow and (prow["parent_url"] is None
+                             or (prow["gone_at"] is None and parent_netid.get(prow["parent_url"]) != netid)):
                     if prow["parent_url"] is not None:
                         s["pubs_shared"] += 1
                         write(lambda c, p=p: (c.execute("UPDATE pubsource_web_page SET parent_url=NULL WHERE url=%s", (p,)),
@@ -944,24 +952,30 @@ def hop_host(name, pages, hops, skip, deadline, stats, lock):
                     p = None
                 p = p if p and p.rstrip("/") not in skip and h.robots.can_fetch(UA, p) else None
                 if p:
-                    s["pubs_followed"] += 1
-                    hop_page(h, write, p, "pubs", parent, netid, prow, now, s)
-                    hops[p] = dict(prow or {}, url=p, kind="pubs", host=name, parent_url=parent, gone_at=None)
-                if html is not None or status in (404, 410):
-                    # the hop page was read (or is gone): a pubs page it no longer leads to retires
-                    old = [r["url"] for r in mine if r["url"] != p]
-                    if old:
-                        s["pubs_retired"] += len(old)
-                        write(lambda c, old=old: retire_pages(c, old, now))
+                    found[netid].add(p)
+                    if p not in done:  # a second page of the same person may lead to it again
+                        done.add(p)
+                        s["pubs_followed"] += 1
+                        hop_page(h, write, p, "pubs", parent, netid, prow, now, s)
+                        hops[p] = dict(prow or {}, url=p, kind="pubs", host=name, parent_url=parent, gone_at=None)
+                if status in (200, 404, 410):  # read, or gone (a CV is 200 with no html)
+                    left[netid] -= 1
                 elif status is None or status == 304:  # skipped / 304: known pubs pages keep their own refetch clock
-                    for r in mine:
-                        if h.robots.can_fetch(UA, r["url"]):
-                            hop_page(h, write, r["url"], "pubs", parent, netid, r, now, s)
+                    for r in known[netid]:
+                        if r["url"] not in done and r["parent_url"] and h.robots.can_fetch(UA, r["url"]):
+                            done.add(r["url"])
+                            hop_page(h, write, r["url"], "pubs", r["parent_url"], netid, r, now, s)
             except Exception as e:
                 if isinstance(e, (Deadline, HostThrottled)):
                     raise
                 s["page_errors"] += 1
                 log.warning("%s: %s", url, e)
+        # ponytail: skipped / 304 siblings block retirement; record which hop page led to it if stale ones pile up
+        for netid in [n for n, k in left.items() if not k]:
+            old = [r["url"] for r in known[netid] if r["url"] not in found[netid] and r["gone_at"] is None]
+            if old:
+                s["pubs_retired"] += len(old)
+                write(lambda c, old=old: retire_pages(c, old, now))
     except Deadline:
         s["stopped_at_deadline"] += 1
     except HostThrottled as e:
@@ -1053,7 +1067,7 @@ def hop_pass(deadline, now):
     skip = profiles | {u.rstrip("/") for u in plan}
     lock = threading.Lock()
     with ThreadPoolExecutor(HOST_WORKERS) as ex:
-        list(ex.map(lambda kv: hop_host(kv[0], kv[1], hops, skip, deadline, stats, lock), by_host.items()))
+        list(ex.map(lambda kv: hop_host(kv[0], kv[1], hops, skip, parent_netid, deadline, stats, lock), by_host.items()))
     return dict(stats)
 
 
