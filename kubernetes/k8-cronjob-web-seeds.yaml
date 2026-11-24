@@ -51,7 +51,7 @@ spec:
             - name: WEB_SEEDS_CITATIONS
               value: "on"
             # Step 5: seeds -> ORCID inference (webPageOrcid.py) in pubsource_web_orcid_inference.
-            # OpenAlex (keyless) + the cached Crossref authors; no Bedrock.
+            # OpenAlex (OPENALEX_API_KEY if set, else keyless) + the cached Crossref authors; no Bedrock.
             - name: WEB_SEEDS_ORCID
               value: "on"
             # Step 6: live seeds -> cornell_pub_researcher_publication (retrieval_source web_seed,
@@ -74,6 +74,11 @@ spec:
             # directory pass logs "skipped" and linking uses roster addresses only.
             - secretRef:
                 name: cornell-ithaca-ed
+                optional: true
+            # OPENALEX_API_KEY: its own daily OpenAlex budget instead of the one keyless calls share
+            # per egress IP. Optional: absent, calls go keyless.
+            - secretRef:
+                name: openalex-api
                 optional: true
             resources:
               requests:
