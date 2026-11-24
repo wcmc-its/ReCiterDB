@@ -1188,7 +1188,8 @@ def _cornell_middle_name(full, first, last):
     # "Jo Smith-"; "Jo" prefixes "Joanna". The surname boundary is whitespace and
     # NOT a hyphen, because a hyphen is inside a compound surname rather than
     # before it -- "De Vlaminck" still brackets, "Smith-Jones" still does not.
-    if not (re.match(rf"{re.escape(first)}\b", full, re.I)
+    # Whitespace after the first name, not \b: no boundary follows the "." of "A. Brad Anton".
+    if not (re.match(rf"{re.escape(first)}(?=\s)", full, re.I)
             and re.search(rf"(?:^|\s){re.escape(last)}$", full, re.I)):
         return ""
     return full[len(first):len(full) - len(last)].strip()
@@ -2306,6 +2307,7 @@ def demo():
     assert _cornell_middle_name("Mary Jo Smith-Jones", "Mary", "Smith-Jones") == "Jo"
     # ... and neither is a given name that merely prefixes it
     assert _cornell_middle_name("Joanna Lee", "Jo", "Lee") == ""
+    assert _cornell_middle_name("A. Brad Anton", "A.", "Anton") == "Brad"
 
     # finalize() keeps it. Without the CORNELL_MARK branch the has_role filter
     # drops it -- primaryAcademicDepartment satisfies the isnotnull filter but

@@ -1,0 +1,66 @@
+# Monthly Cornell people -> ReCiter Identity (syncCornellIdentities.py).
+#
+# APPLY THIS BY HAND, ONCE. The ReCiterDB CodeBuild pipeline auto-deploys the IMAGE only --
+# it does not apply manifests (same as k8-cronjob-identity.yaml). Replace CONTAINER_IMAGE
+# with the tag reciterdb-identity is on; later deploys move it.
+#
+# 13:00 UTC on the 8th: Cornell's HR file lands on the 7th and reciterdb-identity loads it
+# at 12:00. The 14:30 reciterdb job then lands the person types, and the next 12:00
+# identity run admits the new people.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: reciterdb-cornell-sync
+  namespace: reciter
+  labels:
+    app: reciterdb-cornell-sync
+    tier: backend
+spec:
+  schedule: "0 13 8 * *"
+  concurrencyPolicy: Forbid
+  # A start missed by more than a day waits for the next month.
+  startingDeadlineSeconds: 86400
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Safe to retry: only records that still differ are written.
+      backoffLimit: 1
+      activeDeadlineSeconds: 3600
+      template:
+        spec:
+          # IRSA role: BatchGetItem on Identity, and S3 for the previous-version copies.
+          serviceAccountName: reciterdb-cronjob-sa
+          containers:
+          - name: reciterdb-cornell-sync
+            image: CONTAINER_IMAGE
+            # Drop "--apply" for a dry run.
+            command: ["python3", "syncCornellIdentities.py", "--apply"]
+            env:
+            - name: RECITER_BASE_URL
+              value: "http://reciter-prod"
+            # Named keys, not envFrom of these secrets: reciterdb-secrets also holds static
+            # AWS keys, which would take precedence over the IRSA role.
+            - name: RECITER_API_KEY
+              valueFrom: {secretKeyRef: {name: reciter-secrets, key: ADMIN_API_KEY}}
+            - name: DB_USERNAME
+              valueFrom: {secretKeyRef: {name: reciterdb-secrets, key: DB_USERNAME}}
+            - name: DB_PASSWORD
+              valueFrom: {secretKeyRef: {name: reciterdb-secrets, key: DB_PASSWORD}}
+            - name: LDAP_BIND_PASSWORD
+              valueFrom: {secretKeyRef: {name: reciter-inst-secrets, key: LDAP_BIND_PASSWORD}}
+            envFrom:
+            # DB_HOST / DB_NAME / S3_BUCKET / AWS_DEFAULT_REGION.
+            - configMapRef:
+                name: reciterdb-configmap
+            # CORNELL_ITHACA_ED_DN / CORNELL_ITHACA_ED_PASS, the Cornell directory bind.
+            - secretRef:
+                name: cornell-ithaca-ed
+            resources:
+              requests:
+                memory: 1G
+                cpu: 500m
+              limits:
+                memory: 2G
+                cpu: 1
+          restartPolicy: Never
