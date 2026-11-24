@@ -26,7 +26,8 @@ spells out a different given name, 0.914 on multi-candidate initial-tier rows; a
 time-split replay held at 0.879 / 0.865 / 0.907. Re-ranking stored candidates with
 +0.15 / -0.20 fixed 88 top picks and broke 17; larger weights changed nothing further.
 
-Imports only sqlalchemy, so the lanes that load it stay free of the PubMed-lane modules.
+Imports only sqlalchemy and cornell_hr_feed (stdlib only, for `canonical_dept`), so the
+lanes that load it stay free of the PubMed-lane modules.
 
 Usage:
   python3 venue_fit.py --selftest      # offline checks, no DB
@@ -35,6 +36,8 @@ import math, re, sys, unicodedata
 from collections import Counter
 
 from sqlalchemy import text
+
+from cornell_hr_feed import canonical_dept
 
 ALPHA = 5.0          # pseudo-count pulling a department's share toward the campus share
 MIN_DEPT = 20        # a department with fewer training rows returns no fit
@@ -216,7 +219,13 @@ class DeptVenueFit:
     The rows are (dept, subfield, n) or (dept, subfield, n, cwid). Department is matched
     as an exact string, the `top_dept` the producer stored against the `dept` the roster
     carries today, so a renamed department starts again from no rows; a person's own rows
-    are found by cwid, case-folded, under the department they were accepted in."""
+    are found by cwid, case-folded, under the department they were accepted in.
+
+    The one exception is a rename this table is told about: both sides go through
+    `cornell_hr_feed.canonical_dept`, so rows stored under Cornell Tech's generic HR
+    units ("Faculty and Research", "Tech Instruction", "JTC Instruction") pool with rows
+    stored under "Cornell Tech", and a person is looked up under whichever of those names
+    the roster gives them. Own rows fold the same way, so they still come off."""
 
     def __init__(self, rows):
         self.n_ds, self.n_d, self.n_s = Counter(), Counter(), Counter()
@@ -224,6 +233,7 @@ class DeptVenueFit:
         for dept, subfield, n, *who in rows:
             if not dept or not subfield or not n:
                 continue
+            dept = canonical_dept(dept)
             self.n_ds[(dept, subfield)] += n
             self.n_d[dept] += n
             self.n_s[subfield] += n
@@ -239,6 +249,7 @@ class DeptVenueFit:
         (156 of 255 Ithaca departments on 2026-11-16) once `cwid`'s own are left out."""
         if not dept or not subfield:
             return None
+        dept = canonical_dept(dept)
         who = _cwid_key(cwid)
         n_d = self.n_d.get(dept, 0) - self.own_d.get((who, dept), 0)
         if n_d < MIN_DEPT:
@@ -518,6 +529,32 @@ def _selftest():
           "and the bonus to a namesake beside them",
           solo.fit("Optics Lab", "Optics", "one1") is None
           and venue_term(solo.fit("Optics Lab", "Optics", "two2")) == 0.15)
+
+    # --- Cornell Tech's generic HR units pool under "Cornell Tech"
+    # 12 + 6 + 4 rows under three stored names: no name reaches MIN_DEPT alone, the
+    # pooled department (22) does, and it is the same table whichever name is asked.
+    #   N = 122, 2 subfields -> p_optics = 23/125
+    tech = DeptVenueFit([("Faculty and Research", "Optics", 12, "ra1"),
+                         ("Tech Instruction", "Optics", 6, "ti2"),
+                         ("Cornell Tech", "Optics", 4, "ct3"),
+                         ("Law School", "Law", 100)])
+    check("the three Cornell Tech unit names and 'Cornell Tech' are one department",
+          tech.n_d == {"Cornell Tech": 22, "Law School": 100}
+          and tech.n_ds[("Cornell Tech", "Optics")] == 22)
+    check("...looked up under any of its names, with the same answer (by hand)",
+          tech.fit("Cornell Tech", "Optics") is not None
+          and tech.fit("Cornell Tech", "Optics") == tech.fit("Faculty and Research", "Optics")
+          == tech.fit("JTC Instruction", "Optics")
+          == round(math.log((22 + 5 * 23 / 125) / 27 / (23 / 125)), 3))
+    check("...and a person's own rows stored under an old name still come off "
+          "(ra1's 12 leave 10 < 20: no fit; ct3's 4 leave 18: no fit)",
+          tech.fit("Cornell Tech", "Optics", "ra1") is None
+          and tech.fit("Faculty and Research", "Optics", "ra1") is None
+          and tech.fit("Cornell Tech", "Optics", "ct3") is None
+          and tech.own_d == {("ra1", "Cornell Tech"): 12, ("ti2", "Cornell Tech"): 6,
+                             ("ct3", "Cornell Tech"): 4})
+    check("...and no other department is folded",
+          DeptVenueFit([("Research", "Optics", 30)]).n_d == {"Research": 30})
 
     # --- the under-20 rule and missing inputs
     small = DeptVenueFit([("Tiny", "Optics", 19), ("Big", "Optics", 20), ("Big", "Law", 1)])

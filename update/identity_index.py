@@ -37,6 +37,8 @@ from collections import Counter
 
 from sqlalchemy import create_engine, text
 
+from cornell_hr_feed import canonical_dept
+
 # person-type flags in reporting precedence order (mirrors the pubs skill CASE,
 # extended with the columns that table actually carries). label + historical flag.
 PERSON_TYPES = [
@@ -1315,7 +1317,12 @@ class IdentityIndex:
             "pref_full": " ".join(x for x in (
                 (r.get(k) or "").strip()
                 for k in ("prefFirstName", "prefMiddleName", "prefLastName")) if x),
-            "dept": r["primaryAcademicDepartment"] or "",
+            # A Cornell record's department goes through the shared fold, so Cornell
+            # Tech's generic HR units read as "Cornell Tech" here even before
+            # buildIdentity has rewritten `identity` (cornell_hr_feed.canonical_dept).
+            # The WCM branch keeps the column exactly as stored.
+            "dept": (canonical_dept(r["primaryAcademicDepartment"] or "")
+                     if campus == CAMPUS_ITHACA else r["primaryAcademicDepartment"] or ""),
             "division": r["primaryAcademicDivision"] or "",
             "program": r["primaryProgram"] or "",
             "title": r["primaryTitle"] or "",
@@ -2626,6 +2633,52 @@ def _selftest():
         label, hist = cornell_person_type(types)
         return dict(rec(given, "", surname, cwid=cwid),
                     campus=CAMPUS_ITHACA, person_type=label, historical=hist)
+
+    # --- Cornell Tech: the department is the campus, and the byline names it ---------
+    # Cornell HR files Cornell Tech people under "Faculty and Research" / "Tech
+    # Instruction" / "JTC Instruction"; the record reads them as "Cornell Tech"
+    # (cornell_hr_feed.canonical_dept). The department n-gram then needs BOTH words,
+    # adjacent: "Cornell University" is stripped as an institution phrase before the
+    # test, and a bare "Cornell" is one token against a two-token department.
+    _ct_row = dict({c: None for c in _PTYPE_COLS}, cwid="ct42", givenName="Ana",
+                   middleName="", surname="Quill",
+                   primaryAcademicDepartment="Faculty and Research",
+                   primaryAcademicDivision=None,
+                   primaryTitle="Graduate Research Assistant", primaryProgram=None,
+                   endDateWCMFaculty=None, endDateWCMStudent=None, prefFirstName=None,
+                   prefMiddleName=None, prefLastName=None)
+    ct_rec = IdentityIndex._record(_ct_row, campus_types=("cornell-ithaca",))
+    ct_idx = IdentityIndex([ct_rec], campus=CAMPUS_ITHACA)
+
+    def ct_on(*affils):
+        return ct_idx.candidates("Quill", "Ana", "A", list(affils))[0][0]
+
+    checks += [
+        ("cornell tech: a Cornell record filed under 'Faculty and Research' reads as "
+         "'Cornell Tech', and keeps its title",
+         ct_rec["dept"] == "Cornell Tech"
+         and ct_rec["title"] == "Graduate Research Assistant"),
+        ("...a WCM record is never folded, whatever its department says",
+         IdentityIndex._record(dict(_ct_row, cwid="wcm9"))["dept"] == "Faculty and Research"),
+        ("...'Cornell Tech, New York, NY' is a department match",
+         ct_on("Cornell Tech, New York, NY 10044, USA")["affil_match_on"] == "dept"),
+        ("...so is 'Cornell University, Cornell Tech' (the phrase strip leaves the pair)",
+         ct_on("Department of Computer Science, Cornell University, Cornell Tech, "
+               "New York, NY")["affil_match_on"] == "dept"),
+        ("...a bare Cornell is NOT: 'Cornell University, Ithaca', 'Cornell University, "
+         "New York', 'Cornell, NY' and 'Weill Cornell Medicine' all fail",
+         all(ct_on(a)["affil_dept_match"] is False for a in (
+             "Department of Computer Science, Cornell University, Ithaca, NY",
+             "Cornell University, New York, NY, USA",
+             "Cornell, New York, NY",
+             "Weill Cornell Medicine, New York, NY"))),
+        ("...nor 'Cornell' and 'Tech' apart, or across two affiliation strings",
+         ct_on("Cornell University, Department of Tech Policy")["affil_dept_match"] is False
+         and ct_on("Dept of Medicine, Weill Cornell", "Tech University of Munich"
+                   )["affil_dept_match"] is False),
+        ("...and the candidate publishes the record's title",
+         ct_on("Cornell Tech, New York, NY")["title"] == "Graduate Research Assistant"),
+    ]
 
     # A WCM person who is today the UNIQUE holder of their surname+initial, and an
     # Ithaca homonym who would join that cohort.

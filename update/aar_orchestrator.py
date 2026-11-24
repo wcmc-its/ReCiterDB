@@ -154,7 +154,8 @@ def _compact(cands):
     # aar_universe_scopus._compact: WCM entries keep their exact pre-campus bytes. The
     # byline-ORCID keys by that function's rule too: `orcid_match` only on a row whose
     # ORCID found somebody, `orcid_added` / `orcid_source` only on the matched person.
-    # Every row without an ORCID match stores exactly the bytes it did before.
+    # `title` by that function's rule too (scop.candidate_title): only when the record
+    # has one, and never a drift field.
     def extra(c):
         out = {"campus": c["campus"]} if c.get("campus") else {}
         if "orcid_match" in c:
@@ -163,6 +164,9 @@ def _compact(cands):
             out["orcid_added"] = True
         if c.get("orcid_source"):
             out["orcid_source"] = c["orcid_source"]
+        title = scop.candidate_title(c)
+        if title:
+            out["title"] = title
         return out
     return [dict({k: c.get(k) for k in keep}, **extra(c)) for c in cands]
 
@@ -877,6 +881,11 @@ def _selftest():
           sorted(r["classification"] for r in rows) == ["absent", "buried"])
     _cu = dict(auth(None)[5], cwid="cu1", campus="cornell-ithaca", io_score=None)
     _mixed = _compact([auth(None)[5], _cu])
+    check("_compact (pubmed lane) stores a candidate's title only when it has one, by "
+          "the Scopus lane's rule",
+          "title" not in _compact([dict(auth(None)[5], title="")])[0]
+          and _compact([dict(auth(None)[5], title="Professor of Medicine")])[0]["title"]
+          == "Professor of Medicine")
     check("_compact tags a Cornell candidate with its campus and leaves the WCM entry "
           "exactly as before (no campus key)",
           "campus" not in _mixed[0] and _mixed[1]["campus"] == "cornell-ithaca"

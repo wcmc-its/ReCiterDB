@@ -60,6 +60,32 @@ TYPE_RANK = {"Primary": 0, "Joint": 1, "Dual": 2, "Administrative": 3}
 # offices (Provost, a Dean's office), not places a byline names.
 EXTRA_UNIT_TYPES = ("Primary", "Joint", "Dual")
 
+# Cornell HR files Cornell Tech people under three generic unit names that exist only
+# at Cornell Tech (identity_cornell.primary_college = 'TECH', measured on prod
+# 2026-11-23: "Faculty and Research" 286, "Tech Instruction" 41, "JTC Instruction" 3,
+# none at any other college). As a department they mean nothing to a curator, and a
+# byline names the campus instead: 1,322 authorship_review affiliations say "Cornell
+# Tech". The department string is also a matcher key (venue_fit.DeptVenueFit, the
+# identity_index department n-gram), so it is folded in ONE place, here, and every
+# consumer calls canonical_dept: buildIdentity writes it, IdentityIndex reads it, and
+# the venue-fit table folds the historical top_dept rows stored under the old names.
+# The tables this module loads keep the raw HR value; only consumers fold it.
+CORNELL_TECH = "Cornell Tech"
+DEPT_ALIASES = {
+    "faculty and research": CORNELL_TECH,
+    "tech instruction": CORNELL_TECH,
+    "jtc instruction": CORNELL_TECH,
+}
+
+
+def canonical_dept(dept):
+    """The department a consumer should use: a DEPT_ALIASES name -> its canonical
+    department (case and runs of whitespace ignored), anything else unchanged, byte for
+    byte. Non-strings (None) pass through."""
+    if not isinstance(dept, str):
+        return dept
+    return DEPT_ALIASES.get(" ".join(dept.split()).lower(), dept)
+
 # Collation pinned to identity_cornell's (utf8mb4_unicode_ci); a schema default
 # that differs (MySQL 8: utf8mb4_0900_ai_ci) breaks the view's join and UNION.
 APPOINTMENT_DDL = f"""CREATE TABLE IF NOT EXISTS {APPOINTMENT_TABLE} (

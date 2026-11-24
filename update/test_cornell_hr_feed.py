@@ -91,7 +91,18 @@ def real(path):
           f"{sum(1 for x in p.values() if not x['primary_department'])} without a department")
 
 
+def test_canonical_dept():
+    for unit in ("Faculty and Research", "Tech Instruction", "JTC Instruction",
+                 " faculty  AND research ", "Cornell Tech"):
+        assert f.canonical_dept(unit) == "Cornell Tech", unit
+    # everything else is returned untouched, whitespace included
+    for dept in ("Computer Science", "Faculty Affairs", "Research", " Physics ", ""):
+        assert f.canonical_dept(dept) == dept, dept
+    assert f.canonical_dept(None) is None
+
+
 if __name__ == "__main__":
+    test_canonical_dept()
     test_parse_and_derive()
     test_refusals()
     test_latest_key_skips_summary()
