@@ -424,10 +424,12 @@ def rerank_row(row, orcid, idx, venue_lookup, run_ts):
                   None, _pub_year(row),
                   scop.stored_venue_subfield(venue_lookup, row.get("issn"), row.get("journal"))
                   if group == "Ithaca" else None)
-        person = next((c for c in home.candidates(*byline, orcid)[0] if c["orcid_match"]),
+        person = next((c for c in home.candidates(*byline, orcid)[0] if c.get("orcid_match")),
                       None)
-        if person is None:                         # a byline with no usable surname
-            return "pick skipped: no stored candidates", None
+        if person is None:
+            # A byline with no usable surname, or an inferred iD the matcher ignores: one
+            # naming an unrelated surname (identity_index.SURNAME_CLOSE).
+            return "pick skipped: the matcher does not add the ORCID's person", None
         named = any(_cwid_eq(c["cwid"], rec["cwid"]) for c in home.candidates(*byline)[0])
         cohort = (cohort or len(cands)) + (0 if named else 1)
         out = [dict(c, cohort_size=cohort) for c in scop._compact([person]) + out]
@@ -1025,16 +1027,19 @@ def _selftest():
 
     # ---- AAR_BYLINE_ORCID_WCM: WCM and mixed rows, labelled maps -----------------
     from identity_index import orcid_sources, CAMPUS_WCM
-    S_RUTH, S_ROBERT, F_BEA, F_LIND, F_CLASH = (f"0000-0003-0000-000{k}" for k in range(1, 6))
+    S_RUTH, S_ROBERT, F_BEA, F_LIND, F_CLASH, F_FAR = (f"0000-0003-0000-000{k}"
+                                                     for k in range(1, 7))
 
     def wperson(given, surname, cwid):
         return {k: v for k, v in dict(person(given, surname, cwid),
                                       person_type="Full-Time Faculty").items() if k != "campus"}
     maps, _ = orcid_sources([("ru_w", S_RUTH, "wcm"), ("rw_c", S_ROBERT, "ithaca")],
                             [("rl_c", F_LIND), ("rx_c", F_CLASH)],
-                            [("BO_W", F_BEA), ("rh_w", F_CLASH)])
+                            [("BO_W", F_BEA), ("rh_w", F_CLASH), ("ao_w", F_FAR)])
+    # Bea Weisz: a surname close to the byline's, which an inferred iD may still add
+    # (identity_index.SURNAME_CLOSE); Ann Other's is unrelated, and it may not.
     w_people = [wperson("Rhea", "Weiss", "rh_w"), wperson("Ruth", "Weiss", "ru_w"),
-                wperson("Bea", "Other", "bo_w")]
+                wperson("Bea", "Weisz", "bo_w"), wperson("Ann", "Other", "ao_w")]
     roster = CampusRoster(IdentityIndex(w_people, orcid_cwid=maps[CAMPUS_WCM]),
                           ithaca=IdentityIndex(people, campus=CAMPUS_ITHACA,
                                                orcid_cwid=maps[CAMPUS_ITHACA]))
@@ -1065,6 +1070,10 @@ def _selftest():
           and after["top_orcid_match"] == 2 and after["top_cohort_size"] == 3
           and after["candidate_cwids_json"] == made(F_BEA, w_affil)
           and group_and_source(w_row, after) == ("WCM", "inferred"))
+    check("WCM switch: an inferred iD for a person with an unrelated surname adds nobody: "
+          "the matcher ignores it, and the row is left alone",
+          rerank_row(w_row, F_FAR, roster, None, ts)
+          == ("pick skipped: the matcher does not add the ORCID's person", None))
     m_row = stored(index=roster, affil=two)
     verdict, after = rerank_row(m_row, S_ROBERT, roster, None, ts)
     check("WCM switch: a mixed row is re-ranked: the Cornell person the ORCID is on file "

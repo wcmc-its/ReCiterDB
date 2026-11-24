@@ -32,7 +32,7 @@ AAR_BYLINE_ORCID=on. See `byline_orcid_enabled`.
 Env: DB_USERNAME/DB_PASSWORD/DB_HOST/DB_NAME (reciterdb, read-only); AAR_VENUE_FIT;
 AAR_BYLINE_ORCID; AAR_BYLINE_ORCID_WCM.
 """
-import logging, os, re, unicodedata
+import difflib, logging, os, re, unicodedata
 from collections import Counter
 
 from sqlalchemy import create_engine, text
@@ -703,6 +703,29 @@ def orcid_map(pairs):
     return {o: next(iter(n)) for o, n in by_orcid.items() if len(n) == 1}
 
 
+# An iD from the INFERRED list may add a person the byline's surname does not reach only
+# when one of their surname words is close to one of the byline's (owner decision
+# 2026-11-23). The inferred list is learned from accepted papers and misfiles a co-author's
+# iD: the PubMed reconcile dry run that day proposed Daniel Green for "Ariana I
+# Matarangas" (5 rows) and Alexander Drilon for "Antoine Desilets" (their own iDs, each
+# inferred onto someone else from one accepted paper), and Ronan Chaligne for "Travis J
+# Hollmann" (whose byline carries Chaligne's iD). Close keeps the name changes the add
+# exists for: Dorr/Doerr 0.89, Sarkar/Sarker 0.83, Ahmad/Ahmed 0.80; those three scored
+# under 0.5. Scholars-confirmed and Cornell-list iDs keep their unrestricted reach (a
+# married name, the Lindqvist case).
+SURNAME_CLOSE = 0.75
+
+
+def surnames_close(byline_last, rec):
+    """Is a surname word of the byline within SURNAME_CLOSE (difflib ratio, `name_tokens`
+    folding) of a surname word of roster record `rec`, its directory surname or the last
+    word of its publishing name?"""
+    mine = name_tokens(byline_last)
+    theirs = set(name_tokens(rec.get("surname"))) | set(name_tokens(rec.get("pref_full"))[-1:])
+    return any(difflib.SequenceMatcher(None, a, b).ratio() >= SURNAME_CLOSE
+               for a in mine for b in theirs)
+
+
 def byline_orcid_wcm_enabled():
     """AAR_BYLINE_ORCID_WCM=on AND AAR_BYLINE_ORCID=on. Anything else, a typo in either
     included, is off, and the ORCID match is the Ithaca-only one of v3.15."""
@@ -1346,6 +1369,13 @@ class IdentityIndex:
         # The roster record the byline's ORCID is on file for, or None (always None on
         # an index with no map, and for a caller that passed no ORCID).
         orcid_rec = self.orcid_rec.get(byline_orcid) if byline_orcid else None
+        if (orcid_rec is not None and self.orcid_source.get(byline_orcid) == ORCID_INFERRED
+                and not any(r["cwid"] == orcid_rec["cwid"] for r in pool)
+                and not surnames_close(last, orcid_rec) and not surnames_close(fore, orcid_rec)):
+            # An inferred iD naming someone the surname does not reach and whose surname
+            # is unrelated: the row is ranked as if it carried no ORCID (SURNAME_CLOSE).
+            # `fore` too: on an inverted byline (see the retry below) it holds the surname.
+            orcid_rec = None
         if not pool and orcid_rec is not None and self.orcid_source and fore and not _swapped:
             # AAR_BYLINE_ORCID_WCM only (a labelled map): the ORCID found somebody, and
             # that must not cost the row the people the inverted-name retry below
@@ -3603,6 +3633,12 @@ def _selftest():
     w_today = IdentityIndex(wcm_people).candidates("Weiss", "Ruth", "R", wcm_affil)
     w_promoted, _ = on_roster.candidates("Weiss", "Ruth", "R", wcm_affil, byline_orcid=S_W)
     w_added, w_added_n = on_roster.candidates("Weiss", "Ruth", "R", wcm_affil, byline_orcid=F_W)
+    near_maps, _ = orcid_sources([], [], [("bz_w", F_W), ("ru_w", F_HELD)])
+    near_idx = IdentityIndex([rec("Ruth", "", "Weiss", cwid="ru_w"),
+                              rec("Bea", "", "Weisz", cwid="bz_w")],
+                             orcid_cwid=near_maps[CAMPUS_WCM])
+    near_added, _ = near_idx.candidates("Weiss", "Ruth", "R", wcm_affil, byline_orcid=F_W)
+    near_confirm, _ = near_idx.candidates("Weiss", "R", "R", wcm_affil, byline_orcid=F_HELD)
     m_today = on_roster.candidates("Weiss", "Rhea", "R", two_campus)
     m_ith, m_ith_n = on_roster.candidates("Weiss", "Rhea", "R", two_campus, byline_orcid=F_I)
     m_wcm, _ = on_roster.candidates("Weiss", "Robert", "R", two_campus, byline_orcid=S_W)
@@ -3625,7 +3661,7 @@ def _selftest():
     # name reaches Ruth Weiss only through the swapped retry.
     inv = ("Ruth J", "Weiss", "W", wcm_affil)
     inv_today = IdentityIndex(wcm_people).candidates(*inv)
-    inv_other, inv_other_n = lw_idx.candidates(*inv, byline_orcid=F_W)
+    inv_other, inv_other_n = lw_idx.candidates(*inv, byline_orcid=S_W)
     inv_homonym, _ = lw_idx.candidates(*inv, byline_orcid=S_W)
     inv_self, inv_self_n = IdentityIndex(
         wcm_people, orcid_cwid={S_W: ("ru_w", ORCID_SCHOLARS)}).candidates(*inv, byline_orcid=S_W)
@@ -3642,11 +3678,30 @@ def _selftest():
         ("orcid wcm: ...ranking evidence only: the same people, confidences and fields",
          sorted(_plain(w_promoted), key=lambda c: c["cwid"])
          == sorted(w_today[0], key=lambda c: c["cwid"])),
-        ("orcid wcm: a fallback iD adds a WCM person the name did not reach, labelled "
-         "'inferred' and marked orcid_added (top_orcid_match 2)",
-         [(c["cwid"], c["orcid_match"]) for c in w_added]
-         == [("bo_w", True), ("ru_w", False), ("rh_w", False)] and w_added_n == 3
-         and w_added[0]["orcid_source"] == "inferred" and w_added[0]["orcid_added"] is True),
+        ("orcid wcm (guard): an inferred iD naming a person the surname does not reach and "
+         "whose surname is unrelated (Other, on a Weiss byline) is ignored: the row is the "
+         "WCM list as it was, with no orcid key",
+         _json.dumps([w_added, w_added_n]) == _json.dumps(w_today)
+         and not any(k.startswith("orcid") for c in w_added for k in c)),
+        ("orcid wcm (guard): ...an inferred iD still adds a person whose surname is close "
+         "(Weisz, on a Weiss byline), labelled 'inferred' and marked orcid_added "
+         "(top_orcid_match 2), and still confirms a person the name reaches",
+         [(c["cwid"], c["orcid_match"], c.get("orcid_added")) for c in near_added]
+         == [("bz_w", True, True), ("ru_w", False, None)]
+         and near_added[0]["orcid_source"] == "inferred"
+         and [(c["cwid"], c["orcid_match"]) for c in near_confirm][0] == ("ru_w", True)),
+        ("orcid (guard): surnames_close keeps spelling variants and compound surnames, and "
+         "rejects the unrelated surnames the 2026-11-23 dry run proposed",
+         all(surnames_close(a, {"surname": b}) for a, b in (
+             ("Dörr", "Doerr"), ("Sarkar", "Sarker"), ("Ahmad", "Ahmed"),
+             ("Jackvony Infurna", "Jackvony"), ("Arevalo-Perez", "Arevalo Perez")))
+         and surnames_close("Landau", {"surname": "Smith", "pref_full": "Heather Landau"})
+         and not any(surnames_close(a, {"surname": b}) for a, b in (
+             ("Matarangas", "Green"), ("Desilets", "Drilon"), ("Hollmann", "Chaligne"),
+             ("Kalra", "Ngo")))),
+        ("orcid (guard): Scholars-confirmed and Cornell-list iDs keep their reach: the "
+         "Lindqvist add on a Weiss byline is unchanged",
+         [(c["cwid"], c["orcid_match"]) for c in m_ith][:1] == [("rl_c", True)]),
         ("orcid wcm: no ORCID, or one on file for nobody, is the WCM list as it was, byte "
          "for byte, labelled map or not",
          _json.dumps(on_roster.candidates("Weiss", "Ruth", "R", wcm_affil))
@@ -3700,9 +3755,12 @@ def _selftest():
          "the cohort, which counts both",
          [c["cwid"] for c in inv_today[0]] == ["ru_w"] and inv_today[1] == 1
          and [(c["cwid"], c["orcid_match"], c.get("orcid_added"), c.get("orcid_source"))
-              for c in inv_other] == [("bo_w", True, True, "inferred"), ("ru_w", False, None, None)]
+              for c in inv_other] == [("rh_w", True, True, "scholars"), ("ru_w", False, None, None)]
          and inv_other_n == 2 and all(c["cohort_size"] == 2 for c in inv_other)
          and _plain(inv_other[1:]) == [dict(inv_today[0][0], cohort_size=2)]),
+        ("orcid wcm, inverted byline (guard): an inferred iD for an unrelated surname is "
+         "ignored there too: the retry's answer, byte for byte",
+         _json.dumps(lw_idx.candidates(*inv, byline_orcid=F_W)) == _json.dumps(inv_today)),
         ("orcid wcm, inverted byline: an ORCID on file for the person the retry reaches "
          "confirms her full name match (not orcid_added, so top_orcid_match 1), at the "
          "confidence she had",
@@ -3718,7 +3776,7 @@ def _selftest():
          "with nobody for the retry to reach the ORCID's person stands alone, as before",
          _json.dumps(lw_idx.candidates(*inv)) == _json.dumps(inv_today)
          and [(c["cwid"], c["cohort_size"]) for c in lw_idx.candidates(
-             "Zed Q", "Nomatch", "N", wcm_affil, byline_orcid=F_W)[0]] == [("bo_w", 1)]),
+             "Zed Q", "Nomatch", "N", wcm_affil, byline_orcid=S_W)[0]] == [("rh_w", 1)]),
         ("orcid, inverted byline on the v3.15 map (second switch off): unchanged, the "
          "ORCID's person alone",
          [c["cwid"] for c in o_idx.candidates("Rhea J", "Weiss", "W", byline[3],
