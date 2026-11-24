@@ -85,17 +85,18 @@ import backfill_venue_fit as bvf                                 # noqa: E402
 from aar_universe_scopus import _compact                         # noqa: E402
 from cornell_hr_feed import canonical_dept                       # noqa: E402
 from identity_index import (IdentityIndex, CAMPUS_ITHACA,        # noqa: E402
-                            _affil_tokens, temporal_penalty)
+                            _affil_tokens, netid_gap, netid_penalty, temporal_penalty)
 
 WRITE_COLS = bvf.WRITE_COLS
 _READ_COLS = ["id", "source", "author_key", "wcm_author", "issn", "journal",
-              "author_affiliation"] + [c for c in WRITE_COLS if c != "top_venue_fit"]
+              "author_affiliation", "entrez_date"] + [c for c in WRITE_COLS if c != "top_venue_fit"]
 _SELECT_SQL = bvf._SELECT_SQL
 _CONF_TOL = 5e-4          # half the 0.001 quantum, above FLOAT noise (as everywhere else)
 # The per-candidate fields this pass re-derives and compares; anything else a stored
 # candidate carries is kept as it is.
 _KEPT = "pick kept (rival only penalized)"
-_DERIVED = ("dept", "title", "person_type", "affil_dept_match", "venue_fit", "confidence")
+_DERIVED = ("dept", "title", "person_type", "affil_dept_match", "venue_fit", "confidence",
+            "netid_years_after")
 
 
 def _ne(field, a, b):
@@ -105,6 +106,8 @@ def _ne(field, a, b):
         return bool(a) != bool(b)
     if field in ("dept", "title", "person_type"):
         return (a or "") != (b or "")
+    if field == "netid_years_after":
+        return (a or 0) != (b or 0)
     return _fit_ne(a, b)
 
 
@@ -150,7 +153,12 @@ def positive_evidence(c):
     positive venue term). A person who leads only because the stored pick was penalized does
     not: on rows curators had decided (2026-11-24), such a new lead was right 30 times,
     displaced the right person 10 times, and both were wrong 186 times, against 81 right and
-    6 displaced for the byline and the fit. The stored order then stands."""
+    6 displaced for the byline and the fit. The stored order then stands.
+
+    A NetID newer than the paper cancels the byline and the fit: 19 of the 39 picks moved on
+    2026-11-24 went to such a person."""
+    if c.get("netid_years_after") and c.get("given_match") != "full" and not c.get("orcid_match"):
+        return False
     fit = c.get("venue_fit")
     return bool(c.get("orcid_match") or c.get("affil_dept_match")
                 or (fit is not None and venue_fit.venue_term(fit) > 0))
@@ -189,6 +197,9 @@ def rederive_row(row, roster, lookup, table, run_ts, folded_only=False):
     # only the byline ORCID added against the cohort including them; the stored
     # cohort_size is the latter.
     added = sum(1 for c in cands if c.get("orcid_added"))
+    # A Scopus/OpenAlex row's entrez_date is the paper's own date, the lanes' pub_year.
+    paper = str(row.get("entrez_date") or "")[:4]
+    pub_year = int(paper) if paper.isdigit() else None
     flags, out = set(), []
     for c in cands:
         rec = roster.get(str(c.get("cwid") or "").lower())
@@ -205,14 +216,20 @@ def rederive_row(row, roster, lookup, table, run_ts, folded_only=False):
         affil, _where = IdentityIndex._affil_match(rec, toks)
         fit = table.fit(rec["dept"], subfield, rec["cwid"]) if subfield else None
         cohort = int(c.get("cohort_size") or 1) - (0 if c.get("orcid_added") else added)
+        gap = netid_gap(rec.get("netid_year"), pub_year)
         conf = IdentityIndex._confidence(
             c.get("given_match"), max(cohort, 1), affil, rec["historical"],
-            temporal_penalty(c.get("years_after_wcm")), venue_fit.venue_term(fit))
+            temporal_penalty(c.get("years_after_wcm"))
+            + netid_penalty(gap, c.get("given_match"), c.get("orcid_match")),
+            venue_fit.venue_term(fit))
         n = dict(c, dept=rec["dept"], title=rec["title"], person_type=rec["person_type"],
                  affil_dept_match=affil, confidence=conf)
         n.pop("venue_fit", None)
         if fit is not None:
             n["venue_fit"] = fit
+        n.pop("netid_years_after", None)
+        if gap:
+            n["netid_years_after"] = gap
         for f in _DERIVED:
             if _ne(f, c.get(f), n.get(f)):
                 if f == "affil_dept_match":
@@ -508,6 +525,21 @@ def _selftest():
           and a["top_confidence"] == exp_ct1 and a["top_venue_fit"] is not None
           and {"affiliation match gained", "dept changed", "top_dept relabelled",
                "candidate order changed"} <= flags)
+    # NetID age: cs2's NetID is 3 years newer than the paper, so its confidence drops 0.20.
+    young = dict(roster, cs2=dict(roster["cs2"], netid_year=2023))
+    _v, _f, e_age = rederive_row(row(stored, entrez_date="2020-01-01"), young, lookup, table, "T")
+    age = {c["cwid"]: c for c in json.loads(e_age["after"]["candidate_cwids_json"])}
+    check("a NetID 3 years newer than the paper costs 0.20 and is stored; others carry no key",
+          age["cs2"]["netid_years_after"] == 3 and "netid_years_after" not in age["ct1"]
+          and age["cs2"]["confidence"] == max(0.0, round(new[1]["confidence"] - 0.20, 3))
+          and age["ct1"]["confidence"] == new[0]["confidence"])
+    again = dict(row(stored, entrez_date="2020-01-01"), **{k: x for k, x in e_age["after"].items()})
+    late = dict(roster, ct1=dict(roster["ct1"], netid_year=2021))
+    v_late, f_late, _e = rederive_row(row(stored, entrez_date="2020-01-01"), late, lookup, table, "T")
+    check("a person whose NetID is newer than the paper does not take the row, byline or not",
+          v_late != "PICK_CHANGE" and _KEPT in f_late)
+    check("...and a second run changes nothing",
+          rederive_row(again, young, lookup, table, "T2")[0] == "UNCHANGED")
     check("...the stored list goes through _compact: titles published, both fits scored "
           "(Computer Science never publishes in Human Factors: -0.20)",
           new[0]["title"] == "Graduate Research Assistant" and new[1]["title"] == "Professor"

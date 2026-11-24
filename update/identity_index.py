@@ -533,6 +533,43 @@ def temporal_penalty(years_after_wcm):
                      TEMPORAL_PENALTY_CAP), 3)
 
 
+# ---- NetID age (Cornell Ithaca) -------------------------------------------------
+# Cornell issues a NetID when a person arrives, so one created well after a paper came out
+# belongs to somebody who was probably not at Cornell when it was written.
+# `identity_cornell_directory.netid_created` is the directory record's createTimestamp.
+#
+# Measured on curator-decided Ithaca Scopus/OpenAlex rows (2026-11-24), candidates whose
+# NetID is from a later calendar year than the paper, leaving out
+# full-given-name matches and ORCID matches: the top pick was wrong 574 times and right 4.
+# A FULL given-name match that new, when it led, was right 51 times and wrong 7, so that
+# tier carries the gap for the curator to see and no penalty.
+#
+# IT LOWERS CONFIDENCE AND NOTHING ELSE, like the temporal and venue terms. It says who did
+# not write the paper, not who did: demoting the pick outright fixed 13 decided rows,
+# broke 1 and moved 210 from one wrong person to another (the real author is usually off
+# the roster). In confidence, at 0.20, it fixed 4, broke 0, and moved 134 wrong to wrong.
+#
+# 2001 is when Cornell loaded everyone it already had, so that year says nothing.
+NETID_NEW_YEARS = 1
+NETID_PENALTY = 0.20
+NETID_BULK_YEAR = 2001
+
+
+def netid_gap(netid_year, pub_year):
+    """Calendar years from the paper to the NetID, when that is NETID_NEW_YEARS or more;
+    None otherwise, and when either year is unknown."""
+    if not netid_year or not pub_year or netid_year <= NETID_BULK_YEAR:
+        return None
+    gap = netid_year - pub_year
+    return gap if gap >= NETID_NEW_YEARS else None
+
+
+def netid_penalty(gap, given_match, orcid_match=False):
+    """What a `netid_gap` costs in confidence: nothing for a full given-name match or the
+    person the byline ORCID is on file for."""
+    return NETID_PENALTY if gap and given_match != "full" and not orcid_match else 0.0
+
+
 # ---- venue fit ---------------------------------------------------------------
 # The Scopus and OpenAlex lanes have no identity-only score: name and affiliation text
 # are all a candidate is ranked on, and an initials-only byline leaves the name saying
@@ -1157,10 +1194,38 @@ class IdentityIndex:
             dept_venue_fit = cls._load_dept_venue_fit(c, campus)
             orcid_cwid = cls._load_orcid_map(
                 c, campus, frozenset(str(k).strip().lower() for k in campus_types))
-        return cls([cls._record(r, campus_types.get(r["cwid"], ()), r["cwid"] in linked)
-                    for r in rows],
+            netid_year = cls._load_netid_years(c, campus)
+        records = [cls._record(r, campus_types.get(r["cwid"], ()), r["cwid"] in linked)
+                   for r in rows]
+        for rec in records:
+            if rec["campus"] == CAMPUS_ITHACA:
+                rec["netid_year"] = netid_year.get(str(rec["cwid"]).lower())
+        return cls(records,
                    campus=campus, alternate_names=alternate_names,
                    dept_venue_fit=dept_venue_fit, orcid_cwid=orcid_cwid)
+
+    @staticmethod
+    def _load_netid_years(conn, campus):
+        """{netid: year its directory record was created} for the Ithaca roster, or {} on
+        the WCM one, before buildIdentity has added the column, or on ANY failure
+        (`_load_orcid_map`'s rule): no term, the ranking of the day before."""
+        if campus != CAMPUS_ITHACA:
+            return {}
+        try:
+            if not conn.execute(text(
+                    "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = "
+                    "DATABASE() AND table_name = 'identity_cornell_directory' "
+                    "AND column_name = 'netid_created'")).scalar():
+                logging.getLogger(__name__).warning(
+                    "no identity_cornell_directory.netid_created; matching without NetID age")
+                return {}
+            return {str(n).lower(): y for n, y in conn.execute(text(
+                "SELECT netid, YEAR(netid_created) FROM identity_cornell_directory "
+                "WHERE netid_created IS NOT NULL")).all()}
+        except Exception as e:                                       # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "NetID dates unavailable (%r); matching without NetID age", e)
+            return {}
 
     @staticmethod
     def _load_orcid_map(conn, campus, ithaca_people=frozenset()):
@@ -1582,7 +1647,10 @@ class IdentityIndex:
         for k, (rec, given_match, via) in enumerate(cohort):
             affil_match, where = self._affil_match(rec, affil_toks)
             gap = (pub_year - rec["end_year"]) if (pub_year and rec["end_year"]) else None
-            penalty = temporal_penalty(gap)
+            new_netid = netid_gap(rec.get("netid_year"), pub_year)
+            penalty = temporal_penalty(gap) + netid_penalty(
+                new_netid, given_match,
+                orcid_rec is not None and rec["cwid"] == orcid_rec["cwid"])
             fit = (fit_table.fit(rec["dept"], venue_subfield, rec["cwid"])
                    if fit_table else None)
             out.append({
@@ -1613,6 +1681,9 @@ class IdentityIndex:
                 # Same rule, same reason: the key exists only where there is a number.
                 # A candidate the table cannot score carries no key and no term.
                 out[-1]["venue_fit"] = fit
+            if new_netid:
+                # Same rule again: only on a candidate whose NetID is that much newer.
+                out[-1]["netid_years_after"] = new_netid
             if orcid_rec is not None:
                 # And again: the key exists only on a row whose ORCID found somebody.
                 out[-1]["orcid_match"] = rec["cwid"] == orcid_rec["cwid"]
@@ -1750,8 +1821,9 @@ class IdentityIndex:
                     venue=0.0):
         """Explainable ordering aid, NOT a probability. `historical` is the flat
         person-type flag (alumni/inactive/emeritus); `penalty` is the already-capped
-        temporal term from `temporal_penalty`, applied exactly once and ONLY here —
-        this is the single route by which staleness reaches either sort key. `venue` is
+        temporal term from `temporal_penalty` (plus `netid_penalty` on an Ithaca record),
+        applied exactly once and ONLY here — this is the single route by which staleness
+        or NetID age reaches either sort key. `venue` is
         the signed, already-bounded term from `venue_fit.venue_term` (+0.15 / -0.20 / 0),
         added before the clip and likewise the venue's only route to either key."""
         base = 0.50 if given_match == "full" else 0.25 if given_match == "initial" else 0.15
@@ -3275,6 +3347,14 @@ def _selftest():
          with_table.candidates(*call, "Optics")[0][0]["confidence"] == 1.0
          and IdentityIndex._confidence("full", 1, True, False, 0.0, -0.20) == 0.95
          and IdentityIndex._confidence("unknown", 266, False, True, 0.0, -0.20) == 0.0),
+        ("netid age: a later calendar year than the paper, never 2001, never unknown",
+         [netid_gap(*a) for a in ((2023, 2020), (2021, 2020), (2020, 2020), (2001, 1990),
+                                  (None, 2020), (2023, None))]
+         == [3, 1, None, None, None, None]),
+        ("netid age: costs an initial-tier candidate 0.20, a full match or ORCID nothing",
+         [netid_penalty(3, "initial"), netid_penalty(3, "unknown"), netid_penalty(3, "full"),
+          netid_penalty(3, "initial", True), netid_penalty(None, "initial")]
+         == [0.20, 0.20, 0.0, 0.0, 0.0]),
         ("venue (2): the default term is zero, so every existing _confidence call is unchanged",
          IdentityIndex._confidence("initial", 2, False, False)
          == IdentityIndex._confidence("initial", 2, False, False, 0.0, 0.0) == 0.45),

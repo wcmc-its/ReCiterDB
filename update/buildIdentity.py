@@ -1898,12 +1898,14 @@ def cornell_hr_appointments(dry_run=False):
 
 CORNELL_DIRECTORY_TABLE = "identity_cornell_directory"
 # cornellEduCWID is the attribute the 2026-09-03 bridge CSV was built from.
-CORNELL_DIRECTORY_ATTRS = ("uid", "cn", "givenName", "sn", "cornellEduCWID")
+CORNELL_DIRECTORY_ATTRS = ("uid", "cn", "givenName", "sn", "cornellEduCWID",
+                            "createTimestamp")
 CORNELL_DIRECTORY_DDL = f"""CREATE TABLE IF NOT EXISTS {CORNELL_DIRECTORY_TABLE} (
   netid VARCHAR(100) NOT NULL PRIMARY KEY,
   display_name VARCHAR(200), given_name VARCHAR(100), surname VARCHAR(100),
   cwid VARCHAR(20),
   loaded_at DATETIME NOT NULL,
+  netid_created DATE NULL,
   KEY idx_cwid (cwid)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"""
 
@@ -1913,7 +1915,10 @@ def _directory_row(netid, attrs):
     def v(attr, size):
         return str(attrs.get(attr) or "").strip()[:size] or None
     cwid = v("cornellEduCWID", 20)
-    return (netid, v("cn", 200), v("givenName", 100), v("sn", 100), cwid and cwid.lower())
+    # "20150708211359Z" off the wire, a datetime when ldap3 has the schema.
+    made = re.match(r"(\d{4})-?(\d{2})-?(\d{2})", str(attrs.get("createTimestamp") or ""))
+    return (netid, v("cn", 200), v("givenName", 100), v("sn", 100), cwid and cwid.lower(),
+            "-".join(made.groups()) if made else None)
 
 
 def cornell_directory(dry_run=False):
@@ -1961,13 +1966,16 @@ def cornell_directory(dry_run=False):
     try:
         cur = db.cursor()
         cur.execute(CORNELL_DIRECTORY_DDL)
+        # The table predates the column (2026-11-14); the matcher reads it for NetID age.
+        cur.execute(f"ALTER TABLE {CORNELL_DIRECTORY_TABLE} "
+                    "ADD COLUMN IF NOT EXISTS netid_created DATE NULL")
         db.commit()
         # DELETE, not TRUNCATE, so a failed INSERT rolls back to the previous rows.
         cur.execute(f"DELETE FROM {CORNELL_DIRECTORY_TABLE}")
         cur.executemany(
             f"INSERT INTO {CORNELL_DIRECTORY_TABLE} "
-            "(netid, display_name, given_name, surname, cwid, loaded_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s)",
+            "(netid, display_name, given_name, surname, cwid, netid_created, loaded_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
             [r + (now,) for r in rows])
         db.commit()
     finally:
@@ -2310,10 +2318,13 @@ def demo():
     assert _cornell_filter(["a1", "b2"]) == "(|(uid=a1)(uid=b2))"
     assert _cornell_filter(["a*b"]) == r"(|(uid=a\2ab))", "filter metachars escaped"
     assert _directory_row("ab12", {"cn": " Ann B. ", "givenName": "Ann", "sn": "B",
-                                   "cornellEduCWID": "ABC1001"}) == \
-        ("ab12", "Ann B.", "Ann", "B", "abc1001"), "trimmed, cwid lowercased"
+                                   "cornellEduCWID": "ABC1001",
+                                   "createTimestamp": "20150708211359Z"}) == \
+        ("ab12", "Ann B.", "Ann", "B", "abc1001", "2015-07-08"), "trimmed, cwid lowercased"
+    assert _directory_row("ab12", {"createTimestamp": datetime.datetime(
+        2015, 7, 8, 21, 13, tzinfo=datetime.timezone.utc)})[5] == "2015-07-08"
     assert _directory_row("ab12", {"cn": "", "cornellEduCWID": None}) == \
-        ("ab12", None, None, None, None), "blanks become NULL"
+        ("ab12", None, None, None, None, None), "blanks become NULL"
 
     # -- optional-source isolation -----------------------------------------
     # With the gate on, every Cornell abort site used to take the nightly WCM
