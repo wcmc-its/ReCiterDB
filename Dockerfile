@@ -75,6 +75,9 @@ COPY update/infer_venue_subfield.py ./
 # Manual one-off, not run by run_all.py: brings OPEN Cornell rows already in the queue
 # to what the matcher writes once AAR_VENUE_FIT is on (dry run by default).
 COPY update/backfill_venue_fit.py ./
+# Manual, not run by run_all.py: re-derives OPEN Cornell rows' stored candidates from
+# today's roster (dept fold, title, affiliation match, venue term); dry run by default.
+COPY update/backfill_rederive_candidates.py ./
 # Manual one-off, not run by run_all.py: fills authorship_review.byline_orcid (v3.15) on
 # rows already in the queue, from OpenAlex by DOI (dry run by default).
 COPY update/backfill_byline_orcid.py ./
