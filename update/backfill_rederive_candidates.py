@@ -55,8 +55,17 @@ The --apply run is a prod write, handed to the owner; not alongside the nightly
 (14:30 UTC). Env: DB_USERNAME/DB_PASSWORD/DB_HOST/DB_NAME (reciterdb). AAR_VENUE_FIT is
 not read: the term is computed as the CronJob computes it with the switch on (it is on).
 
+WHICH RUN. --only-folded-depts is the #311 (Cornell Tech) refresh: 745 rows on the
+2026-11-23 dry run, 20 pick changes. The unscoped run re-derives every candidate from
+today's roster, and that roster carries Cornell HR's Workday renames ("Cornell Lab for
+Accelerator-based ScienceS & Ed", "Pop Medicine & Diagnstc Sci", ...) that the venue-fit
+training rows, stored under the old names, do not know: those candidates lose their
+venue term. The same dry run moved 216 picks, most of them for that reason. Fold the
+renames (cornell_hr_feed.DEPT_ALIASES) before running it unscoped.
+
 Usage:
   python3 backfill_rederive_candidates.py --selftest
+  python3 backfill_rederive_candidates.py --only-folded-depts  # dry run, Cornell Tech only
   python3 backfill_rederive_candidates.py                      # dry run
   python3 backfill_rederive_candidates.py --apply
   python3 backfill_rederive_candidates.py --rollback LEDGER    # dry run of the undo
