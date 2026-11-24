@@ -54,8 +54,17 @@ A namesake co-author sets it; an initials-only byline never does.
 A paper that puts one "A is with X. B is with Y." blob on every author is reduced to each
 author's own clause (aar_universe.own_segment) before it is stored.
 
+Funders from OpenAlex are its `awards` plus any entry of its `funders` list that no award
+names: OpenAlex drops awards over time (28 of 35 China Scholarship Council papers between
+2026-10-29 and 2026-11-24) and keeps the funder.
+
   RESEARCH_SECURITY_MODE=dry-run python3 collectAffiliations.py
   RESEARCH_SECURITY_MODE=apply python3 collectAffiliations.py --max-seconds 3000
+
+--refetch-funders, run by hand: asks OpenAlex again for every in-scope article stored from
+it and ADDS funders not stored yet (it never deletes one), then stops. The next normal run
+rebuilds the flags. In dry-run it makes the OpenAlex calls, reports the flags that would
+be added, and writes nothing.
 
 Env: DB_HOST/DB_NAME/DB_USERNAME/DB_PASSWORD; AWS credentials and region (DynamoDB);
 PUBMED_API_KEY, NCBI_EMAIL (set it: efetch goes through aar_universe, whose fallback
@@ -94,6 +103,7 @@ DDB_UNPROCESSED_RETRIES = 8
 EFETCH_BATCH = 200
 OA_BATCH = 50                 # OpenAlex caps an OR-filter at 50 values
 OA_SLEEP = 0.2
+OA_MAX_FAILS = 5              # --refetch-funders stops after this many failed batches in a row
 WRITE_BATCH = 1000
 NAME_MAX, AFF_MAX = 255, 15000
 ID_MAX = 96                   # article_id VARCHAR(96) in all five tables
@@ -295,6 +305,13 @@ def parse_openalex_work(article_id, w):
         agency, gid = _s(g.get("funder_display_name")), _s(g.get("funder_award_id"))
         if agency or gid:
             funders.append((agency, gid, ""))
+    # a funder OpenAlex names without an award (see the module docstring)
+    named = {f[0].casefold() for f in funders}
+    for f in w.get("funders") or []:
+        agency = _s((f or {}).get("display_name"))
+        if agency and agency.casefold() not in named:
+            named.add(agency.casefold())
+            funders.append((agency, "", ""))
     return _record(article_id, "openalex", _unblob(authors), funders, len(ships))
 
 
@@ -414,7 +431,7 @@ def openalex_works(kind, values):
     field = "openalex" if kind == "id" else "doi"
     try:
         body = openalex_get({"filter": f"{field}:" + "|".join(values), "per-page": 100,
-                             "select": "id,doi,authorships,awards"}, Stats())
+                             "select": "id,doi,authorships,awards,funders"}, Stats())
     except BadBatch:
         if len(values) == 1:
             return {}
@@ -462,6 +479,10 @@ INS_FLAG = (f"INSERT IGNORE INTO {T_FLAG}_new (article_id, program, agency, gran
             "VALUES (:article_id, :program, :agency, :grant_id)")
 SEL_AFF = f"SELECT article_id, `rank`, author_name, affiliation FROM {T_AFF} ORDER BY article_id, `rank`, seq"
 SEL_FUNDER = f"SELECT article_id, agency, grant_id FROM {T_FUNDER} ORDER BY article_id, seq"
+SEL_OA_FUNDER = (f"SELECT s.article_id, f.seq, f.agency, f.grant_id FROM {T_STATE} s "
+                 f"LEFT JOIN {T_FUNDER} f ON f.article_id = s.article_id "
+                 "WHERE s.source = 'openalex' ORDER BY s.article_id, f.seq")
+UPD_N_FUNDERS = f"UPDATE {T_STATE} SET n_funders = :n WHERE article_id = :article_id"
 SEL_STATE = f"SELECT article_id, source, attempts, fetched_at FROM {T_STATE}"
 SQL_PERSON = "SELECT personIdentifier AS cwid, firstName, lastName FROM person"
 SQL_IDENTITY = "SELECT cwid, givenName, surname FROM identity"
@@ -785,6 +806,99 @@ def run(mode, eng, text, ddb_fetch=None, efetch=efetch_records, openalex=openale
             "retried_misses": n_retry, "swapped": swapped}
 
 
+def new_funders(stored, fetched):
+    """The (agency, grant_id, country) in fetched that stored [(agency, grant_id)] lacks. A
+    funder without a grant id adds nothing when its agency is already stored."""
+    have = {((a or "").casefold(), (g or "").casefold()) for a, g in stored}
+    agencies = {a for a, _ in have}
+    out = []
+    for agency, gid, country in fetched:
+        a, g = agency[:500].casefold(), gid[:255].casefold()
+        if (a, g) in have or (not g and a in agencies):
+            continue
+        have.add((a, g))
+        agencies.add(a)
+        out.append((agency, gid, country))
+    return out
+
+
+def refetch_funders(mode, eng, text, openalex=openalex_works, max_http_calls=500):
+    """Add funders OpenAlex now reports for articles already collected from it. Never
+    deletes. Returns {"articles", "fetched", "new_funders", "new_flags": {article_id:
+    [program]}, "failed", "truncated"}, or None when the tables are absent."""
+    write = mode == "apply"
+    with eng.connect() as conn:
+        if not all(table_exists(conn, text, t) for t in TABLES):
+            print("research-security tables are absent — skipped")
+            return None
+        has_review = table_exists(conn, text, "authorship_review")
+        ext = {"ext": EXT_COHORTS}
+        articles, _, _ = build_scope(
+            _stream(conn, text, SQL_ACCEPTED, ext), _stream(conn, text, SQL_PENDING, ext),
+            _stream(conn, text, SQL_REVIEW, ext) if has_review else ())
+        stored, last = {}, {}
+        for r in _stream(conn, text, SEL_OA_FUNDER):
+            rows = stored.setdefault(r["article_id"], [])
+            if r["seq"] is not None:
+                rows.append((r["agency"], r["grant_id"]))
+                last[r["article_id"]] = int(r["seq"])
+    doi_of = {_ci(a): doi for a, doi in articles.items()}
+    by_kind = {"id": {}, "doi": {}}
+    for aid in stored:                   # the stored spelling, so the update hits its row
+        key = openalex_key(aid, doi_of[_ci(aid)]) if _ci(aid) in doi_of else None
+        if key:
+            by_kind[key[0]].setdefault(key[1], []).append(aid)
+    n_articles = sum(len(v) for values in by_kind.values() for v in values.values())
+    print(f"refetch funders ({mode}): {n_articles} in-scope articles stored from OpenAlex", flush=True)
+
+    calls = failed = in_a_row = cut = fetched = n_new = 0
+    flags = {}
+    for kind, by_value in by_kind.items():
+        for values in chunks(sorted(by_value), OA_BATCH):
+            # several in a row = a spent daily quota or an outage, at ~30s of retries each
+            if calls >= max_http_calls or in_a_row >= OA_MAX_FAILS or out_of_time("openalex"):
+                cut += sum(len(by_value[v]) for v in values)
+                continue
+            calls += 1
+            try:
+                found = openalex(kind, values)
+            except Exception as e:  # noqa: BLE001 — nothing written for this batch; run it again
+                failed += 1
+                in_a_row += 1
+                print(f"  openalex batch failed: {e}", flush=True)
+                continue
+            in_a_row = 0
+            ins, upd = [], []
+            for v in values:
+                for aid in by_value[v] if v in found else ():
+                    fetched += 1
+                    old = stored[aid]
+                    add = new_funders(old, parse_openalex_work(aid, found[v])["funders"])
+                    if not add:
+                        continue
+                    n_new += len(add)
+                    was = {f["program"] for f in flag_article(aid, old)}
+                    now = {f["program"] for f in flag_article(aid, [(a, g) for a, g, _ in add])}
+                    if now - was:
+                        flags[aid] = sorted(now - was)
+                    for seq, (agency, gid, country) in enumerate(add, last.get(aid, -1) + 1):
+                        ins.append({"article_id": aid, "seq": seq, "agency": agency[:500] or None,
+                                    "grant_id": gid[:255] or None, "country": country[:100] or None,
+                                    "source": "openalex"})
+                    upd.append({"article_id": aid, "n": len(old) + len(add)})
+            if write and ins:
+                with eng.begin() as conn:
+                    conn.execute(text(INS_FUNDER), ins)
+                    conn.execute(text(UPD_N_FUNDERS), upd)
+    by_program = Counter(p for ps in flags.values() for p in ps)
+    print(f"  {fetched} returned by OpenAlex; {n_new} funders {'added' if write else 'would be added'}; "
+          f"{len(flags)} articles newly flagged {dict(by_program)}; {calls} HTTP batches, {failed} failed"
+          f"{f'; TRUNCATED: {cut} articles not asked' if cut else ''}"
+          f"{'' if write else ' (nothing written)'}", flush=True)
+    return {"articles": n_articles, "fetched": fetched, "new_funders": n_new, "new_flags": flags,
+            "failed": failed, "truncated": cut}
+
+
 def make_engine():
     """Its own engine, not aar_db.engine(): that one has no read or write timeout, so a
     statement stuck on the server would hang the nightly pod with no line of output for
@@ -802,6 +916,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--max-seconds", type=int, default=0,
                     help="stop starting collection batches after this many seconds (0 = no limit)")
+    ap.add_argument("--refetch-funders", action="store_true",
+                    help="add funders OpenAlex now reports for articles already collected, then stop")
     args = ap.parse_args(argv)
     mode = resolve_mode(os.environ.get("RESEARCH_SECURITY_MODE"))
     if mode == "off":
@@ -812,8 +928,11 @@ def main(argv=None):
     if args.max_seconds > 0:
         DEADLINE = time.time() + args.max_seconds
     from sqlalchemy import text
-    stats = run(mode, make_engine(), text,
-                max_http_calls=int(os.environ.get("RESEARCH_SECURITY_MAX_HTTP_CALLS") or "500"))
+    max_http_calls = int(os.environ.get("RESEARCH_SECURITY_MAX_HTTP_CALLS") or "500")
+    if args.refetch_funders:
+        res = refetch_funders(mode, make_engine(), text, max_http_calls=max_http_calls)
+        return 1 if res is None or res["failed"] or res["truncated"] else 0
+    stats = run(mode, make_engine(), text, max_http_calls=max_http_calls)
     return 0 if stats is None or stats["swapped"] else 1
 
 

@@ -126,6 +126,8 @@ class FakeEngine:
                     for a in self.done] + self.state
         if sql == ca.SEL_AFF:
             return self.stored_aff
+        if sql == ca.SEL_OA_FUNDER:
+            return self.stored_funders
         if sql == ca.SEL_FUNDER:
             return self.stored_funders
         return []
@@ -404,6 +406,91 @@ def test_parse_openalex_work():
                             (3, "Li Zhang", ["Xidian University"])]
     assert r["funders"] == [("China Scholarship Council", "", "")]
     assert ca.parse_openalex_work("X", {})["n_authors"] == 0
+
+
+def test_openalex_funder_without_an_award_is_kept_once():
+    w = {"awards": [{"funder_display_name": "NSF", "funder_award_id": "1"}],
+         "funders": [{"display_name": "nsf"}, {"display_name": "China Scholarship Council"},
+                     {"display_name": "China Scholarship Council"}, None, {"display_name": None}]}
+    assert ca.parse_openalex_work("SCOPUS:1", w)["funders"] == [("NSF", "1", ""), ("China Scholarship Council", "", "")]
+
+
+def test_openalex_select_asks_for_what_the_parser_reads(monkeypatch):
+    import enrichArticles
+    asked = []
+    monkeypatch.setattr(enrichArticles, "openalex_get", lambda params, stats: asked.append(params) or {"results": []})
+    monkeypatch.setattr(ca, "OA_SLEEP", 0)
+    ca.openalex_works("doi", ["10.1000/ext"])
+    assert {"authorships", "awards", "funders"} <= set(asked[0]["select"].split(","))
+
+
+# ---- --refetch-funders ----------------------------------------------------------------------
+CSC = "China Scholarship Council"
+OA_STORED = [{"article_id": "SCOPUS:85100000001", "seq": 0, "agency": "NSF", "grant_id": "1"},
+             {"article_id": "SCOPUS:85100000001", "seq": 4, "agency": "NIH", "grant_id": "2"},
+             {"article_id": "SCOPUS:85100000003", "seq": None, "agency": None, "grant_id": None},
+             {"article_id": "SCOPUS:99999999999", "seq": 0, "agency": "NSF", "grant_id": "9"}]   # out of scope
+
+
+def oa_found(**works):
+    def fetch(kind, values):
+        assert kind == "doi" and sorted(values) == ["10.1000/ext", "10.1000/review"]
+        return {"10.1000/ext": works["ext"]} if "ext" in works else {}
+    return fetch
+
+
+def test_refetch_funders_adds_after_the_last_seq_and_never_deletes(capsys):
+    eng = FakeEngine(stored_funders=OA_STORED)
+    res = ca.refetch_funders("apply", eng, text, openalex=oa_found(ext={"funders": [{"display_name": "nsf"}, {"display_name": CSC}]}))
+    assert res["new_flags"] == {"SCOPUS:85100000001": [wp.match_funder(CSC)[0]]}
+    assert eng.writes() == [ca.INS_FUNDER, ca.UPD_N_FUNDERS]
+    params = {sql: p for sql, p in eng.log}
+    assert params[ca.INS_FUNDER] == [{"article_id": "SCOPUS:85100000001", "seq": 5, "agency": CSC,
+                                      "grant_id": None, "country": None, "source": "openalex"}]
+    assert params[ca.UPD_N_FUNDERS] == [{"article_id": "SCOPUS:85100000001", "n": 3}]
+    assert "1 articles newly flagged" in capsys.readouterr().out
+
+
+def test_refetch_funders_dry_run_writes_nothing():
+    eng = FakeEngine(stored_funders=OA_STORED)
+    res = ca.refetch_funders("dry-run", eng, text, openalex=oa_found(ext={"funders": [{"display_name": CSC}]}))
+    assert res["new_funders"] == 1 and eng.writes() == [] and eng.begins == 0
+
+
+def test_refetch_funders_is_idempotent_and_ignores_a_work_with_no_funders():
+    stored = OA_STORED + [{"article_id": "SCOPUS:85100000001", "seq": 5, "agency": CSC, "grant_id": None}]
+    for work in ({"funders": [{"display_name": CSC}]}, {}):
+        eng = FakeEngine(stored_funders=stored)
+        res = ca.refetch_funders("apply", eng, text, openalex=oa_found(ext=work))
+        assert res["new_funders"] == 0 and res["new_flags"] == {} and eng.writes() == []
+
+
+def test_refetch_funders_stops_after_several_failures_in_a_row(monkeypatch):
+    monkeypatch.setattr(ca, "OA_BATCH", 1)
+    monkeypatch.setattr(ca, "OA_MAX_FAILS", 1)
+    asked = []
+
+    def boom(kind, values):
+        asked.append(values)
+        raise RuntimeError("429")
+    res = ca.refetch_funders("apply", FakeEngine(stored_funders=OA_STORED), text, openalex=boom)
+    assert len(asked) == 1 and res["failed"] == 1 and res["truncated"] == 1
+
+
+def test_refetch_funders_failed_or_capped_batch_exits_1(monkeypatch):
+    def boom(kind, values):
+        raise RuntimeError("503")
+    eng = FakeEngine(stored_funders=OA_STORED)
+    assert ca.refetch_funders("apply", eng, text, openalex=boom)["failed"] == 1 and eng.writes() == []
+    assert ca.refetch_funders("apply", eng, text, openalex=no_call, max_http_calls=0)["truncated"] == 2
+    monkeypatch.setenv("RESEARCH_SECURITY_MODE", "apply")
+    monkeypatch.setattr(ca, "make_engine", lambda: eng)
+    monkeypatch.setattr(ca, "run", no_call)
+    monkeypatch.setitem(sys.modules, "sqlalchemy", types.SimpleNamespace(text=text))
+    monkeypatch.setattr(ca, "refetch_funders", lambda *a, **k: {"failed": 1, "truncated": 0})
+    assert ca.main(["--refetch-funders"]) == 1
+    monkeypatch.setattr(ca, "refetch_funders", lambda *a, **k: {"failed": 0, "truncated": 0})
+    assert ca.main(["--refetch-funders"]) == 0
 
 
 # ---- scope and matching -------------------------------------------------------------------------
