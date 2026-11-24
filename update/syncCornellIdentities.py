@@ -10,8 +10,8 @@ Moved from scripts/sync_cornell_ithaca_identities.py (ReCiter Research), which w
 hand. Dry run unless --apply. Own CronJob: kubernetes/k8-cronjob-cornell-sync.yaml.
 
 Nobody reads the output of a scheduled run, so it stops instead of guessing when
-  - ED's netid <-> CWID list is unreadable or short (a missing pair mints a second person),
-  - Cornell's directory answers partially,
+  - Cornell's directory answers partially, or with few CWIDs (a missing netid <-> CWID pair
+    mints a second person),
   - a netid already names somebody else in Identity (the PUT replaces the whole item),
   - it would create more than MAX_NEW people.
 Only records that would change are written, each batch is re-read just before its PUT,
@@ -24,9 +24,10 @@ previous run's types survived the Institutional Client, which overwrites personT
 the people it manages. A marker it wiped would leave the CWID in the WCM pool.
 
   python3 syncCornellIdentities.py [--apply] [--netids a1,b2] | --demo
+  (--netids takes the ids to write: a dual person's is their CWID)
 
-Environment: DB_*, CORNELL_ITHACA_ED_DN/_PASS, LDAP_BIND_PASSWORD (LDAP_BIND_DN optional),
-AWS read on Identity; for --apply also RECITER_API_KEY, RECITER_BASE_URL, S3_BUCKET.
+Environment: DB_*, CORNELL_ITHACA_ED_DN/_PASS, AWS read on Identity; for --apply also
+RECITER_API_KEY, RECITER_BASE_URL, S3_BUCKET.
 """
 import argparse
 import datetime
@@ -45,9 +46,7 @@ INSTITUTION = "Cornell University"
 CAMPUS = bi.CORNELL_CAMPUS_TYPE
 BATCH = 100
 MAX_NEW = 1000                      # the first HR file (2026-11) added 353
-MIN_SOR_PAIRS = 3000                # 3,834 on 2026-11-24
-SOR = "ed-cornell-sor"
-bi.BASE_DN.setdefault(SOR, "ou=cornell-ithaca,ou=sors,dc=weill,dc=cornell,dc=edu")
+MIN_PAIRS = 200                     # 271 of the roster on 2026-11-24
 
 # role flag -> person type: Cornell's vocabulary. `cornell-` is a prefix other code tests
 # for, so WCM's own `affiliate-cornell` is not caught by it.
@@ -224,18 +223,23 @@ def fetch_live(uids):
     return out
 
 
-def sor_pairs():
-    """netid -> {cwid} from ED's cornell-ithaca SOR. Errors raise; short is refused."""
+def cwid_pairs(entries, bridge):
+    """netid -> {cwid}: what Cornell's directory says today, plus the dated bridge CSV.
+
+    ED's cornell-ithaca SOR has the same list, but the cluster's ED bind cannot read it.
+    On 2026-11-24 these two held 62 of its 63 pairs whose CWID has an identity; the other
+    (erg54) has left the directory, so it is never created here."""
     pairs = {}
-    for r in bi.ldap_search(SOR, "(&(weillCornellEduNetID=*)(weillCornellEduCWID=*))",
-                            ["weillCornellEduNetID", "weillCornellEduCWID"]):
-        n, c = (r["weillCornellEduNetID"].strip().lower(),
-                r["weillCornellEduCWID"].strip().lower())
-        if n and c:
+    for n, e in entries.items():
+        c = str(e.get("cornellEduCWID") or "").strip().lower()
+        if c:
             pairs.setdefault(n, set()).add(c)
-    if len(pairs) < MIN_SOR_PAIRS:
-        raise SystemExit(f"ED's cornell-ithaca list returned {len(pairs)} netids, under "
-                         f"{MIN_SOR_PAIRS}. A short list creates duplicate people.")
+    if len(pairs) < MIN_PAIRS:
+        raise SystemExit(f"Cornell's directory gave a CWID for {len(pairs)} netids, under "
+                         f"{MIN_PAIRS}. A short list creates duplicate people.")
+    for n, (c, _) in bridge.items():
+        if c:
+            pairs.setdefault(n.strip().lower(), set()).add(c.strip().lower())
     return pairs
 
 
@@ -263,7 +267,9 @@ def load_roster():
 
 def plan(rows, wcm_roster):
     """(uid -> identity to write, before merging; uid -> live record)."""
-    pairs = sor_pairs()
+    entries = bi.cornell_directory_entries([r["netid"] for r in rows],
+                                           ("uid", "cornellEduCWID"))
+    pairs = cwid_pairs(entries, bi.load_cwid_bridge())
     cwids = {r["netid"]: pairs[r["netid"]] for r in rows if r["netid"] in pairs}
     live_cwids = fetch_live({c for cs in cwids.values() for c in cs})
     dual = {}
@@ -274,9 +280,7 @@ def plan(rows, wcm_roster):
                          netid, ", ".join(held))
         if held:
             dual[netid] = held
-    present = bi.cornell_directory_lookup(
-        [r["netid"] for r in rows if r["netid"] not in dual])
-    mine = [r for r in rows if r["netid"] not in dual and r["netid"] in present]
+    mine = [r for r in rows if r["netid"] not in dual and r["netid"] in entries]
     live = fetch_live([r["netid"] for r in mine] + list(dual))
     logger.info("%d rostered, %d dual, %d absent from the live directory, %d to check",
                 len(rows), len(dual), len(rows) - len(dual) - len(mine), len(mine))
@@ -337,9 +341,9 @@ def main(apply, netids=None):
         if missing:
             raise SystemExit(f"--apply needs {', '.join(missing)}")
     rows, wcm_roster = load_roster()
-    if netids:
-        rows = [r for r in rows if r["netid"] in netids]
     todo, live = plan(rows, wcm_roster)
+    if netids:
+        todo = {u: t for u, t in todo.items() if u in netids}
     new = [u for u in todo if u not in live]
     if len(new) > MAX_NEW:
         raise SystemExit(f"{len(new)} new people, over {MAX_NEW}: check the roster first.")
@@ -451,6 +455,15 @@ def demo():
     assert collisions(["a", "b", "c", "d"], {
         "a": {"personTypes": [CAMPUS]}, "b": {"personTypes": ["affiliate-cornell"]},
         "c": {}, "mtw1": {}}, {"c"}) == ["b"]
+    e = {f"n{i}": {"cornellEduCWID": f"C{i}"} for i in range(MIN_PAIRS)}
+    p = cwid_pairs(dict(e, x1={"cornellEduCWID": None}), {"N1": ("c1", True), "y1": ("z9", False)})
+    assert p["n1"] == {"c1"} and p["y1"] == {"z9"} and "x1" not in p
+    try:
+        cwid_pairs({"n1": e["n1"]}, {})
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("a directory without CWIDs must stop the run")
     print("demo ok")
 
 

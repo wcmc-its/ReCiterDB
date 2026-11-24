@@ -47,8 +47,6 @@ spec:
               valueFrom: {secretKeyRef: {name: reciterdb-secrets, key: DB_USERNAME}}
             - name: DB_PASSWORD
               valueFrom: {secretKeyRef: {name: reciterdb-secrets, key: DB_PASSWORD}}
-            - name: LDAP_BIND_PASSWORD
-              valueFrom: {secretKeyRef: {name: reciter-inst-secrets, key: LDAP_BIND_PASSWORD}}
             envFrom:
             # DB_HOST / DB_NAME / S3_BUCKET / AWS_DEFAULT_REGION.
             - configMapRef:
