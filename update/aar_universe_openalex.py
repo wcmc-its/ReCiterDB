@@ -68,6 +68,7 @@ Overlapping runs are idempotent via the author_key upsert, as on the Scopus lane
 
 Env (never printed): PUBMED_API_KEY (DOI resolution), DB_* (identity roster + sink),
 OPENALEX_MAILTO (optional polite-pool address, same env name as Scholars-Profile-System),
+OPENALEX_API_KEY (optional: its own daily budget instead of the one keyless calls share per IP),
 CROSSREF_MAILTO (optional Crossref polite-pool address; falls back to OPENALEX_MAILTO),
 OPENALEX_PREPRINT_LINK_SECONDS (wall-clock cap on step 3b, default 600).
 
@@ -118,13 +119,16 @@ RXIV_SLEEP = 0.2
 # ---- OpenAlex fetch ---------------------------------------------------------
 def _openalex_get(params):
     params = dict(params)
+    headers = {"Accept": "application/json"}
     mailto = (os.environ.get("OPENALEX_MAILTO") or "").strip()
     if mailto:
         params["mailto"] = mailto
+    key = (os.environ.get("OPENALEX_API_KEY") or "").strip()
+    if key:   # in a header, so no URL in an error or a log carries it
+        headers["Authorization"] = "Bearer " + key
     for attempt in range(5):
         try:
-            r = requests.get(OPENALEX_WORKS, params=params, timeout=60,
-                             headers={"Accept": "application/json"})
+            r = requests.get(OPENALEX_WORKS, params=params, timeout=60, headers=headers)
         except (requests.ConnectionError, requests.Timeout):
             if attempt == 4:
                 raise
@@ -136,7 +140,7 @@ def _openalex_get(params):
             time.sleep(2 * (attempt + 1))
             continue
         r.raise_for_status()   # any other 4xx/5xx is not transient: raise now, no retry
-    raise RuntimeError("OpenAlex works fetch failed after retries")
+    raise RuntimeError(f"OpenAlex works fetch failed after retries (last: HTTP {r.status_code})")
 
 
 def build_filter(since, until):
