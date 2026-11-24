@@ -417,6 +417,35 @@ def run_orcid_suggestions():
         logger.exception(f"ORCID suggestions failed (ignored — yesterday's rows stand): {e}")
 
 
+def article_orcid_cmd(mode, max_seconds=0):
+    """The command for ARTICLE_ORCID=off|dry-run|apply, or None when off. Anything
+    unrecognised is off: a typo in a CronJob env patch must not start writing."""
+    mode = (mode or "off").strip().lower()
+    if mode not in ("apply", "dry-run"):
+        return None
+    cmd = f"python3 collectArticleOrcids.py --{mode}"
+    return f"{cmd} --max-seconds {int(max_seconds)}" if max_seconds > 0 else cmd
+
+
+def run_article_orcids():
+    """Crossref byline iDs per paper -> pubsource_article_orcid (v3.18), for Scholars' ORCID
+    queue. SHIPS OFF: ARTICLE_ORCID unset (or anything but dry-run/apply) skips it. Before
+    setting it: apply setup/table_article_orcid_v3.18.sql and run the backfill once by hand
+    (collectArticleOrcids.py --apply --max-batches 10000, about two hours). Set the env with
+    `kubectl set env`, never `kubectl apply`. Isolated: a failure is logged and the slots are
+    asked again the next night."""
+    try:
+        timeout = int(os.getenv("ARTICLE_ORCID_TIMEOUT_SECONDS", "1800"))
+        # The script stops starting batches a minute before the hard timeout.
+        cmd = article_orcid_cmd(os.getenv("ARTICLE_ORCID"), max(timeout - 60, 60))
+        if not cmd:
+            logger.info("Article ORCIDs: ARTICLE_ORCID=%s — skipped", os.getenv("ARTICLE_ORCID") or "off")
+            return
+        run_script("articleOrcids", cmd, timeout_seconds=timeout)
+    except Exception as e:
+        logger.exception(f"Article ORCIDs failed (ignored — asked again tomorrow): {e}")
+
+
 def author_id_suggestions_cmd(mode):
     """The command for AUTHOR_ID_SUGGESTIONS=off|dry-run|apply, or None when off. Anything
     unrecognised is off: a typo in a CronJob env patch must not start writing."""
@@ -817,6 +846,8 @@ def main():
                                               # WCM conference abstracts + preprints from OpenAlex
         run_pubmed_lane_if_due()              # DAILY by default (AAR_PUBMED_LANE_CADENCE)
         run_conflicts_refresh_if_due()        # weekly (Sun): refill empty COI rows (#130)
+        run_article_orcids()                  # OFF unless ARTICLE_ORCID=dry-run|apply: Crossref
+                                              # byline iDs per paper (v3.18)
         run_orcid_suggestions()               # nightly: pubsource_orcid_person from accepted articles
         run_author_id_suggestions()           # OFF unless AUTHOR_ID_SUGGESTIONS=dry-run|apply:
                                               # person_author_id (Scopus AU-ID / OpenAlex author)
