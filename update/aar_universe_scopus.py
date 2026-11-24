@@ -363,6 +363,8 @@ def _compact(cands):
         out = {"campus": c["campus"]} if c.get("campus") else {}
         if c.get("venue_fit") is not None:
             out["venue_fit"] = c["venue_fit"]
+        if c.get("netid_years_after"):
+            out["netid_years_after"] = c["netid_years_after"]
         if "orcid_match" in c:
             out["orcid_match"] = bool(c["orcid_match"])
         if c.get("orcid_added"):

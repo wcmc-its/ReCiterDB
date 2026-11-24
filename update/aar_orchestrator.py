@@ -158,6 +158,8 @@ def _compact(cands):
     # has one, and never a drift field.
     def extra(c):
         out = {"campus": c["campus"]} if c.get("campus") else {}
+        if c.get("netid_years_after"):
+            out["netid_years_after"] = c["netid_years_after"]
         if "orcid_match" in c:
             out["orcid_match"] = bool(c["orcid_match"])
         if c.get("orcid_added"):
