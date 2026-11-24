@@ -1024,6 +1024,20 @@ def _cornell_bridge_skips(bridge, live_cwids):
             if in_reciter or (cwid or "").strip().lower() in live_cwids}
 
 
+def _cornell_under_cwid(pairs, rostered, ours):
+    """netid -> cwid for rostered people whose ReCiter identity is their CWID and
+    carries the Cornell marker, so that is the id they are written under.
+
+    The bridge drops their netid, rightly, but a CWID outside the WCM roster has no row
+    here either, so neither id could be matched (24 people, 2026-11-24: Avery August,
+    John Cawley, Nicki Dell). The marker decides: the sync puts it on a CWID only when
+    that person holds no WCM person type, so no WCM researcher's row is written here.
+    A netid that already has an identity of its own (`ours`) keeps it.
+    """
+    return {n: c for n, c in pairs.items()
+            if n in rostered and c in ours and c not in rostered and n not in ours}
+
+
 CORNELL_DIRECTORY_HOST = "query.directory.cornell.edu"
 CORNELL_DIRECTORY_PORT = 636
 CORNELL_DIRECTORY_BASE = "ou=People,o=Cornell University,c=us"
@@ -1272,6 +1286,15 @@ def cornell_ithaca():
             cur.execute("SELECT LOWER(personIdentifier) FROM person_person_type "
                         "WHERE personType = %s", (CORNELL_CAMPUS_TYPE,))
             ours = {c for (c,) in cur.fetchall()}
+            # Cornell's own netid -> CWID list, reloaded every run; the CSV is dated.
+            try:
+                cur.execute(f"SELECT LOWER(netid), LOWER(cwid) FROM {CORNELL_DIRECTORY_TABLE} "
+                            "WHERE cwid IS NOT NULL")
+                pairs = dict(cur.fetchall())
+            except Exception as exc:                # noqa: BLE001 - not loaded yet
+                logger.warning("cornell: %s unavailable (%s) - using the bridge CSV alone",
+                               CORNELL_DIRECTORY_TABLE, type(exc).__name__)
+                pairs = {}
     finally:
         conn.close()
 
@@ -1285,15 +1308,21 @@ def cornell_ithaca():
                     len(roster), extract, (datetime.date.today() - extract).days)
 
     rostered = {r["netid"] for r in roster}
-    bridged = _cornell_bridge_skips(load_cwid_bridge(), live_cwids) & rostered
+    bridge = load_cwid_bridge()
+    pairs.update((n.lower(), c.strip().lower()) for n, (c, _) in bridge.items() if c)
+    under_cwid = _cornell_under_cwid(pairs, {n.lower() for n in rostered}, ours)
+    bridged = (_cornell_bridge_skips(bridge, live_cwids) & rostered) - set(under_cwid)
     roster = [r for r in roster if r["netid"] not in bridged]
 
     present = cornell_directory_lookup([r["netid"] for r in roster])
     absent = [r for r in roster if r["netid"].strip().lower() not in present]
     roster = [r for r in roster if r["netid"].strip().lower() in present]
-    logger.info("cornell: %d rostered, %d skipped by the CWID bridge, %d absent "
-                "from the live directory, %d admitted",
-                len(rostered), len(bridged), len(absent), len(roster))
+    # The directory knows them by netid; from here on they are their CWID.
+    for r in roster:
+        r["netid"] = under_cwid.get(r["netid"].lower(), r["netid"])
+    logger.info("cornell: %d rostered, %d skipped by the CWID bridge, %d under their "
+                "CWID, %d absent from the live directory, %d admitted",
+                len(rostered), len(bridged), len(under_cwid), len(absent), len(roster))
 
     collisions = _cornell_collisions([r["netid"] for r in roster], live_cwids, ours)
     if collisions:
@@ -2295,6 +2324,14 @@ def demo():
               "aam346": ("alm4018", False)}
     assert _cornell_bridge_skips(bridge, {"joe2011"}) == {"aa749", "jje1"}
     assert _cornell_bridge_skips(bridge, set()) == {"aa749"}, "CSV verdict alone"
+
+    # ... unless the CWID itself carries the Cornell marker: then they are written under it.
+    _p = {"aa749": "ava4001", "jje1": "joe2011"}
+    assert _cornell_under_cwid(_p, {"aa749", "jje1"}, {"ava4001"}) == {"aa749": "ava4001"}
+    assert not _cornell_under_cwid(_p, {"jje1"}, {"ava4001"}), "off the roster"
+    assert not _cornell_under_cwid(_p, {"aa749"}, {"ava4001", "aa749"}), "netid has its own identity"
+    assert not _cornell_under_cwid(_p, {"aa749", "ava4001"}, {"ava4001"}), \
+        "the cwid is somebody else's netid"
 
     # Namespace collision: a netid already naming somebody else in `identity`
     # aborts. Case-folded, because identity.cwid is utf8mb4_unicode_ci and the

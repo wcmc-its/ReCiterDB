@@ -262,9 +262,17 @@ HR_DDL = f"""CREATE TABLE IF NOT EXISTS {HR_TABLE} (
 # because the file is academic appointments only and says nothing about staff,
 # students or emeriti. Being in the file means a current appointment, hence
 # is_active_employee and is_academic.
+# The spreadsheet also carries netids with no name at all (they arrived with only an ORCID
+# iD). The HR name is all or nothing, so the two sources' halves are never mixed.
+BLANK_NAME = ("h.netid IS NOT NULL AND COALESCE(c.name_first, '') = '' "
+              "AND COALESCE(c.name_last, '') = ''")
 VIEW_DDL = f"""CREATE OR REPLACE VIEW {VIEW} AS
-SELECT c.netid, c.name, c.name_first, c.name_last,
-       c.email, c.email_netid, c.email_alt_cu,
+SELECT c.netid,
+       IF({BLANK_NAME}, h.name, c.name) AS name,
+       IF({BLANK_NAME}, h.name_first, c.name_first) AS name_first,
+       IF({BLANK_NAME}, h.name_last, c.name_last) AS name_last,
+       c.email, COALESCE(c.email_netid, CONCAT(h.netid, '@cornell.edu')) AS email_netid,
+       c.email_alt_cu,
        COALESCE(h.primary_department, c.primary_department) AS primary_department,
        c.primary_job_title,
        COALESCE(h.primary_title, c.primary_business_title) AS primary_business_title,
