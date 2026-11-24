@@ -37,7 +37,7 @@ from collections import Counter
 
 from sqlalchemy import create_engine, text
 
-from cornell_hr_feed import canonical_dept
+from cornell_hr_feed import canonical_dept, dept_names
 
 # person-type flags in reporting precedence order (mirrors the pubs skill CASE,
 # extended with the columns that table actually carries). label + historical flag.
@@ -1323,6 +1323,9 @@ class IdentityIndex:
             # The WCM branch keeps the column exactly as stored.
             "dept": (canonical_dept(r["primaryAcademicDepartment"] or "")
                      if campus == CAMPUS_ITHACA else r["primaryAcademicDepartment"] or ""),
+            # Every name a byline may call it, for `_affil_match` (Cornell only).
+            "dept_names": (dept_names(r["primaryAcademicDepartment"])
+                           if campus == CAMPUS_ITHACA else ()),
             "division": r["primaryAcademicDivision"] or "",
             "program": r["primaryProgram"] or "",
             "title": r["primaryTitle"] or "",
@@ -1717,19 +1720,24 @@ class IdentityIndex:
         Every guarantee above still holds. Tokens are still whole words, so the
         "cardiovascular" case stays False; the institution names are stripped before
         either side is folded; and the seam token is neither "and" nor foldable, so no
-        window can span two affiliation strings."""
+        window can span two affiliation strings.
+
+        A Cornell record carries `dept_names` (cornell_hr_feed.dept_names), every name a
+        byline may use for its department, and any one of them matches. A WCM record
+        carries none and tests `dept` alone, as before."""
         if not affil_toks:
             return False, None
-        dept_n = _norm(rec["dept"])
-        dept_toks = _dept_key(name_tokens(rec["dept"]), False)
-        fold = len(dept_toks) >= 2
-        if fold:
-            dept_toks = _dept_key(dept_toks, True)
-        n = len(dept_toks)
-        if dept_n and len(dept_n) >= 4 and n:
-            toks = _dept_key(affil_toks, fold)
-            if any(toks[i:i + n] == dept_toks for i in range(len(toks) - n + 1)):
-                return True, "dept"
+        for dept in rec.get("dept_names") or (rec["dept"],):
+            dept_n = _norm(dept)
+            dept_toks = _dept_key(name_tokens(dept), False)
+            fold = len(dept_toks) >= 2
+            if fold:
+                dept_toks = _dept_key(dept_toks, True)
+            n = len(dept_toks)
+            if dept_n and len(dept_n) >= 4 and n:
+                toks = _dept_key(affil_toks, fold)
+                if any(toks[i:i + n] == dept_toks for i in range(len(toks) - n + 1)):
+                    return True, "dept"
         # division: any distinctive word (>=5 chars) standing as a whole token
         for word in (rec["division"] or "").replace("&", " ").replace(",", " ").split():
             w = _norm(word)
@@ -2678,6 +2686,30 @@ def _selftest():
                    )["affil_dept_match"] is False),
         ("...and the candidate publishes the record's title",
          ct_on("Cornell Tech, New York, NY")["title"] == "Graduate Research Assistant"),
+
+        ("dept names: any name a byline uses for the department matches (HR short form on "
+         "the roster, the merged department's old name, a section's parent)",
+         all(IdentityIndex._affil_match(
+             IdentityIndex._record(dict(_ct_row, primaryAcademicDepartment=d),
+                                   campus_types=("cornell-ithaca",)),
+             _affil_tokens([a])) == (True, "dept") for d, a in (
+                 ("Pop Medicine & Diagnstc Sci", "Department of Population Medicine and "
+                  "Diagnostic Sciences, Cornell University, Ithaca, NY"),
+                 ("Bio and Environmental Engineer",
+                  "Department of Biological and Environmental Engineering, Ithaca"),
+                 ("Biomedical and Translational Sciences",
+                  "Department of Biomedical Sciences, Cornell University, Ithaca, NY"),
+                 ("Plant Biology (Ag)", "School of Integrative Plant Science, Ithaca")))),
+        ("...and another department's name still does not, nor does the same record on WCM",
+         IdentityIndex._affil_match(
+             IdentityIndex._record(dict(_ct_row, primaryAcademicDepartment="Animal Science"),
+                                   campus_types=("cornell-ithaca",)),
+             _affil_tokens(["Department of Food Science, Ithaca"])) == (False, None)
+         and IdentityIndex._affil_match(
+             IdentityIndex._record(dict(_ct_row, primaryAcademicDepartment=
+                                        "Bio and Environmental Engineer")),
+             _affil_tokens(["Department of Biological and Environmental Engineering"]))
+         == (False, None)),
     ]
 
     # A WCM person who is today the UNIQUE holder of their surname+initial, and an

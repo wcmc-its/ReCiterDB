@@ -55,6 +55,42 @@ def test_am_status():
     assert o.am_status(A, set()) == "none" and o.am_status(A, {A}) == "agrees" and o.am_status(A, {B}) == "conflicts"
 
 
+def _http_429(remaining, reset):
+    import urllib.error
+    return urllib.error.HTTPError("u", 429, "Too Many Requests", {"x-ratelimit-remaining": remaining, "x-ratelimit-reset": reset}, None)
+
+
+def test_openalex_budget_spent_stops_at_once():
+    from unittest import mock
+    import webPageExpand
+    with mock.patch.object(o, "_budget_blocked_until", 0.0), mock.patch("time.sleep"), \
+            mock.patch("urllib.request.urlopen", side_effect=_http_429("0", "3600")) as u:
+        assert o.fetch_openalex([f"10.1/{i}" for i in range(120)]) == ({}, set())
+        assert u.call_count == 1
+        try:
+            webPageExpand.works_by_orcid("0000-0000-0000-0000")
+            assert False, "must raise so the person is skipped, not written as having no works"
+        except o.OpenAlexBudgetSpent:
+            pass
+        assert u.call_count == 1
+    with mock.patch.object(o, "_budget_blocked_until", 0.0), mock.patch("time.sleep"), \
+            mock.patch("urllib.request.urlopen", side_effect=_http_429("900", "3600")) as u:
+        o.fetch_openalex(["10.1/a"])
+        assert u.call_count == 4  # a burst 429 is still retried
+
+
+def test_openalex_key_goes_in_a_header_only():
+    import io
+    import os
+    from unittest import mock
+    for env, want in (({"OPENALEX_API_KEY": "fake-key"}, "Bearer fake-key"), ({"OPENALEX_API_KEY": ""}, None)):
+        with mock.patch.dict(os.environ, env), mock.patch.object(o, "_budget_blocked_until", 0.0), \
+                mock.patch("urllib.request.urlopen", return_value=io.BytesIO(b'{"results": []}')) as u:
+            o.openalex_get("filter=x")
+            req = u.call_args[0][0]
+            assert req.get_header("Authorization") == want and "fake-key" not in req.full_url
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

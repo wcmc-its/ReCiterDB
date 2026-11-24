@@ -60,31 +60,178 @@ TYPE_RANK = {"Primary": 0, "Joint": 1, "Dual": 2, "Administrative": 3}
 # offices (Provost, a Dean's office), not places a byline names.
 EXTRA_UNIT_TYPES = ("Primary", "Joint", "Dual")
 
-# Cornell HR files Cornell Tech people under three generic unit names that exist only
-# at Cornell Tech (identity_cornell.primary_college = 'TECH', measured on prod
-# 2026-11-23: "Faculty and Research" 286, "Tech Instruction" 41, "JTC Instruction" 3,
-# none at any other college). As a department they mean nothing to a curator, and a
-# byline names the campus instead: 1,322 authorship_review affiliations say "Cornell
-# Tech". The department string is also a matcher key (venue_fit.DeptVenueFit, the
-# identity_index department n-gram), so it is folded in ONE place, here, and every
-# consumer calls canonical_dept: buildIdentity writes it, IdentityIndex reads it, and
-# the venue-fit table folds the historical top_dept rows stored under the old names.
-# The tables this module loads keep the raw HR value; only consumers fold it.
-CORNELL_TECH = "Cornell Tech"
-DEPT_ALIASES = {
-    "faculty and research": CORNELL_TECH,
-    "tech instruction": CORNELL_TECH,
-    "jtc instruction": CORNELL_TECH,
+# --- department names -------------------------------------------------------------
+# One Cornell department reaches us under several names, at the same time: the 2026-11
+# Workday extract shortened most of them ("Electrical and Computer Eng") while everyone
+# it does not cover keeps the directory's ("Electrical & Computer Engineering"), and
+# papers use a third. The string is a matcher key (venue_fit.DeptVenueFit, the
+# identity_index department n-gram), so the spellings are grouped here and nowhere else.
+# Three questions, three functions:
+#
+#   canonical_dept   what to show and store: one name per group (buildIdentity writes it,
+#                    IdentityIndex reads it).
+#   venue_dept       whose papers teach the venue-fit table: the group's, POOLED, and for
+#                    a section too small to score, its parent unit's. A partition, so no
+#                    paper is counted under two departments and a department with many
+#                    spellings gets no extra tries at a high score.
+#   dept_names       what a byline may call it: the canonical name plus other names papers
+#                    use. ANY of them matches, as in ReCiter's OrganizationalUnitSynonyms.
+#
+# Groups come from prod (2026-11-23): the stored top_dept of accepted authorships beside
+# the same person's department today. A name that covers several departments ("College
+# Academic Activity - Endowed": Johnson and Hotel) is a PARENT, never a synonym. The
+# tables this module loads keep the raw HR value; only consumers fold it.
+#
+# canonical name: other names HR / the directory / stored rows use for the same unit.
+DEPT_GROUPS = {
+    # Generic HR units that exist only at Cornell Tech (primary_college = 'TECH').
+    "Cornell Tech": ("Faculty and Research", "Tech Instruction", "JTC Instruction"),
+    # Engineering
+    "Applied & Engineering Physics": ("Applied and Engineering Physics",),
+    "Biological & Environmental Engineering": (
+        "CALS Biological & Environmental Engr", "Bio and Environmental Engineer"),
+    "Chemical & Biomolecular Engineering": ("Chemical and Biomolecular Eng",),
+    "Civil & Environmental Engineering": ("Civil and Environmental Eng",),
+    "Earth & Atmospheric Sciences": (
+        "Earth and Atmospheric Sciences", "Earth and Atmospheric Sci (Ag)",
+        "CALS Earth and Atmospheric Science"),
+    "Electrical & Computer Engineering": ("Electrical and Computer Eng",),
+    "Materials Science & Engineering": (
+        "Materials Science Engineering", "Materials Science and Eng"),
+    "Mechanical & Aerospace Engineering": ("Mechanical and Aerospace Eng",),
+    "Operations Research & Information Engineering": (
+        "Operations Research & Information Engr", "Oper Research and Info Eng"),
+    # Agriculture & Life Sciences, Arts & Sciences
+    "Animal Science": ("CALS Animal Science",),
+    "Communication": ("CALS Communication",),
+    "Computational Biology": ("CALS Computational Biology",),
+    "Cornell Cooperative Extension": (
+        "CALS Cornell Cooperative Extension", "Coop Ext Area Spec (Ag)"),
+    "Ecology & Evolutionary Biology": (
+        "Ecology and Evolutionary Biology", "CALS Ecology & Evolutionary Biology",
+        "Ecology and Evolutionary Biology (Ag)", "Ecology and Evolutionary Biology (As)"),
+    "Entomology": ("CALS Entomology", "Entomology (Geneva)"),
+    "Food Science": ("CALS Food Science", "Food Science (Geneva)"),
+    "Global Development": ("CALS Global Development",),
+    "Horticulture": ("Horticultural Sci (Geneva)",),
+    "Integrated Pest Management": (
+        "CALS Integrated Pest Management", "Coop Ext Pest Mgmt (Ag)"),
+    "Lab of Ornithology": ("CALS Lab of O - Administration",),
+    "Landscape Architecture": ("CALS Landscape Architecture", "Landscape Architecture (Ag)"),
+    "Microbiology": ("CALS Microbiology", "Microbiology (Ag)"),
+    "Molecular Biology & Genetics": (
+        "Molecular Biology and Genetics", "CALS Molecular Biology & Genetics",
+        "Molecular Biology and Genetics (Ag)", "Molecular Biology and Genetics (As)"),
+    "Natural Resources": ("CALS Natural Resources",),
+    "Neurobiology & Behavior": (
+        "Neurobiology and Behavior", "CALS Neurobiology & Behavior",
+        "Neurobiology and Behavior (Ag)"),
+    "Nutritional Sciences": (
+        "CALS Nutritional Sciences", "Nutritional Sciences (Ag)", "Nutritional Sciences (He)"),
+    "Plant Biology": ("Plant Biology (Ag)",),
+    "Plant Pathology & Plant-Microbe Biology": (
+        "Plant Pathology and Plant-Micro", "Plant Pathology (Geneva)"),
+    "School of Integrative Plant Science": ("CALS School of Integrative Plant Science",),
+    "Africana Studies and Research Center": ("Africana Studies and Research",),
+    "History of Art and Visual Studies": ("History of Art",),
+    "Performing and Media Arts": ("Theatre Arts",),
+    "Knight Institute for Writing": ("John S. Knight Writing Institute", "Writing Program"),
+    "Statistics & Data Science": (
+        "Statistics and Data Science", "Department of Statistics & Data Science",
+        "Statistical Science"),
+    # Veterinary Medicine
+    "Baker Institute": ("Jame Baker Institute for Animal Medicine",),
+    "Biomedical & Translational Sciences": (
+        "Biomedical and Translational Sciences", "Biomedical Sciences", "Molecular Medicine"),
+    "Population Medicine & Diagnostic Sciences": (
+        "Population Medicine & Diagnostic Science", "Pop Medicine & Diagnstc Sci"),
+    # Human Ecology, Policy, ILR, Business, Law
+    "Bronfenbrenner Center for Translational Research": (
+        "Bronfenbrenner Ctr forTranslational Rsch",),
+    "Design & Environmental Analysis": ("Design and Environment Analysis",),
+    "Fiber Science & Apparel Design": ("Fiber Sci and Apparel Design",),
+    "Psychology (Human Ecology)": ("CHE-Psychology", "CHE - Psychology"),
+    "Public Policy": ("Policy Analysis and Management",),
+    "Yang-Tan Institute": ("Yang Tan Institute", "Employment and Disability Inst"),
+    "Applied Economics & Management": (
+        "Applied Economics and Management", "CALS AEM", "Dyson - Teaching",
+        "Dyson - Research", "Dyson - Extension", "College Academic Activity \u2013 Contract"),
+    "Hotel Administration": ("SHA Teaching",),
+    "Johnson Graduate School of Management": ("Johnson Grad School Mgmt", "Johnson Instruction"),
+    "Law School": ("Law School Dean's Office", "Law Instruction"),
+    # Laboratories and centers
+    "Cornell Center for Materials Research": ("Ctr Materials Research",),
+    "Cornell Laboratory for Accelerator-based Sciences & Education": (
+        "Cornell Lab Accelerator Sciences & Ed",
+        "Cornell Lab for Accelerator-based ScienceS & Ed"),
+    "Cornell NanoScale Science & Technology Facility": (
+        "NanoScale Science & Technology Facility", "Cornell Nanofab Facility"),
+    "Institute of Biotechnology": (
+        "Institute Biotechnology & Life Science", "Biotechnology Center"),
+    "Laboratory of Atomic & Solid State Physics": (
+        "Lab. of Atomic & Solid State Physics", "Lab Atomic and Solid State Phys"),
+    "Radiophysics & Space Research": (
+        "Radiophysics and Space Research", "Center Radiophysics and Space Research"),
+    "Weill Institute for Cell & Molecular Biology": (
+        "Weill Institute", "Inst Cell and Molecular Biology"),
+}
+
+# canonical name -> the unit whose papers stand in for it. Before the Workday names these
+# people were stored under the parent, so this keeps the training they already had.
+DEPT_PARENTS = {
+    **dict.fromkeys(("Horticulture", "Plant Biology", "Plant Breeding and Genetics",
+                     "Plant Pathology & Plant-Microbe Biology", "Soil and Crop Sciences"),
+                    "School of Integrative Plant Science"),
+    **dict.fromkeys(("Design & Environmental Analysis", "Fiber Science & Apparel Design"),
+                    "Human Centered Design"),
+    **dict.fromkeys(("Hotel Administration", "Johnson Graduate School of Management"),
+                    "College Academic Activity \u2013 Endowed"),
+}
+
+# canonical name -> further names papers use. HR abbreviations are not listed: no byline
+# says "Pop Medicine & Diagnstc Sci". "&"/"and" and a plural "s" are the matcher's job.
+# A parent that a byline can name ("School of Integrative Plant Science") is added by
+# dept_names itself.
+BYLINE_NAMES = {
+    "Biomedical & Translational Sciences": ("Biomedical Sciences", "Molecular Medicine"),
+    "Laboratory of Atomic & Solid State Physics": ("LASSP",),
+    "Psychology (Human Ecology)": ("Psychology",),
+    "Public Policy": ("Policy Analysis and Management",),
+    "Weill Institute for Cell & Molecular Biology": ("Weill Institute",),
+    "Yang-Tan Institute": ("Employment and Disability Institute",),
 }
 
 
+def _dept_norm(dept):
+    return " ".join(dept.split()).lower()
+
+
+_CANONICAL = {_dept_norm(m): c for c, members in DEPT_GROUPS.items() for m in members}
+
+
 def canonical_dept(dept):
-    """The department a consumer should use: a DEPT_ALIASES name -> its canonical
-    department (case and runs of whitespace ignored), anything else unchanged, byte for
-    byte. Non-strings (None) pass through."""
+    """The department to show and store: a DEPT_GROUPS member -> its canonical name (case
+    and runs of whitespace ignored), anything else unchanged, byte for byte. Non-strings
+    (None) pass through."""
     if not isinstance(dept, str):
         return dept
-    return DEPT_ALIASES.get(" ".join(dept.split()).lower(), dept)
+    return _CANONICAL.get(_dept_norm(dept), dept)
+
+
+def venue_dept(dept):
+    """The department whose papers score `dept` in the venue-fit table: its canonical
+    name, or that name's parent unit."""
+    dept = canonical_dept(dept)
+    return DEPT_PARENTS.get(dept, dept)
+
+
+def dept_names(dept):
+    """Every name a byline may use for `dept`, canonical first; () for an empty one."""
+    name = canonical_dept(dept)
+    if not name:
+        return ()
+    return tuple(dict.fromkeys((name, *BYLINE_NAMES.get(name, ()), venue_dept(name))))
+
 
 # Collation pinned to identity_cornell's (utf8mb4_unicode_ci); a schema default
 # that differs (MySQL 8: utf8mb4_0900_ai_ci) breaks the view's join and UNION.
