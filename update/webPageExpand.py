@@ -38,7 +38,6 @@ import sys
 import time
 import unicodedata
 import urllib.parse
-import urllib.request
 
 import webPageCitations as wc
 import webPageCornellPub as cp
@@ -178,16 +177,16 @@ def plan_person(works, seed_dois, orcid, first, last, seed_extra=()):
 # ---------------------------------------------------------------- I/O
 
 def works_by_orcid(orcid):
-    """Every OpenAlex work under the ORCID. Keyless: page= paging only (cursor= 401s)."""
+    """Every OpenAlex work under the ORCID. page= paging only (keyless cursor= 401s)."""
     out, page = [], 1
     while True:
         q = urllib.parse.urlencode({"filter": f"author.orcid:{orcid}", "select": SELECT, "per-page": 200, "page": page})
         for attempt in range(4):
             try:
-                req = urllib.request.Request("https://api.openalex.org/works?" + q, headers={"User-Agent": wo.UA})
-                with urllib.request.urlopen(req, timeout=60) as r:
-                    d = json.load(r)
+                d = wo.openalex_get(q)
                 break
+            except wo.OpenAlexBudgetSpent:
+                raise
             except Exception as e:
                 if attempt == 3:
                     raise
