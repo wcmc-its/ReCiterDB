@@ -26,7 +26,7 @@ spells out a different given name, 0.914 on multi-candidate initial-tier rows; a
 time-split replay held at 0.879 / 0.865 / 0.907. Re-ranking stored candidates with
 +0.15 / -0.20 fixed 88 top picks and broke 17; larger weights changed nothing further.
 
-Imports only sqlalchemy and cornell_hr_feed (stdlib only, for `canonical_dept`), so the
+Imports only sqlalchemy and cornell_hr_feed (stdlib only, for `venue_dept`), so the
 lanes that load it stay free of the PubMed-lane modules.
 
 Usage:
@@ -37,7 +37,7 @@ from collections import Counter
 
 from sqlalchemy import text
 
-from cornell_hr_feed import canonical_dept
+from cornell_hr_feed import venue_dept
 
 ALPHA = 5.0          # pseudo-count pulling a department's share toward the campus share
 MIN_DEPT = 20        # a department with fewer training rows returns no fit
@@ -216,16 +216,13 @@ class DeptVenueFit:
     gives that author no fit at all. p_s is the campus share and is not adjusted, as in
     that script. With no cwid nothing is subtracted.
 
-    The rows are (dept, subfield, n) or (dept, subfield, n, cwid). Department is matched
-    as an exact string, the `top_dept` the producer stored against the `dept` the roster
-    carries today, so a renamed department starts again from no rows; a person's own rows
-    are found by cwid, case-folded, under the department they were accepted in.
-
-    The one exception is a rename this table is told about: both sides go through
-    `cornell_hr_feed.canonical_dept`, so rows stored under Cornell Tech's generic HR
-    units ("Faculty and Research", "Tech Instruction", "JTC Instruction") pool with rows
-    stored under "Cornell Tech", and a person is looked up under whichever of those names
-    the roster gives them. Own rows fold the same way, so they still come off."""
+    The rows are (dept, subfield, n) or (dept, subfield, n, cwid). Both sides go through
+    `cornell_hr_feed.venue_dept`: the `top_dept` the producer stored and the `dept` the
+    roster carries today are folded to one name per department, so rows stored under any
+    of a department's spellings pool, and a section too small to score borrows its parent
+    unit's rows. A renamed department that the table there does not know starts again
+    from no rows. A person's own rows are found by cwid, case-folded, under the folded
+    department they were accepted in, so they still come off."""
 
     def __init__(self, rows):
         self.n_ds, self.n_d, self.n_s = Counter(), Counter(), Counter()
@@ -233,7 +230,7 @@ class DeptVenueFit:
         for dept, subfield, n, *who in rows:
             if not dept or not subfield or not n:
                 continue
-            dept = canonical_dept(dept)
+            dept = venue_dept(dept)
             self.n_ds[(dept, subfield)] += n
             self.n_d[dept] += n
             self.n_s[subfield] += n
@@ -249,7 +246,7 @@ class DeptVenueFit:
         (156 of 255 Ithaca departments on 2026-11-16) once `cwid`'s own are left out."""
         if not dept or not subfield:
             return None
-        dept = canonical_dept(dept)
+        dept = venue_dept(dept)
         who = _cwid_key(cwid)
         n_d = self.n_d.get(dept, 0) - self.own_d.get((who, dept), 0)
         if n_d < MIN_DEPT:

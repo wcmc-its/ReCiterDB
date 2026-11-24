@@ -101,8 +101,45 @@ def test_canonical_dept():
     assert f.canonical_dept(None) is None
 
 
+def test_dept_groups():
+    """Structure first: the table is edited by hand and an overlap would silently pool two
+    departments."""
+    members = [f._dept_norm(m) for ms in f.DEPT_GROUPS.values() for m in ms]
+    assert len(members) == len(set(members)), "a name is in two groups"
+    canon = {f._dept_norm(c) for c in f.DEPT_GROUPS}
+    assert not canon & set(members), "a canonical name is a member of another group"
+    for table in (f.DEPT_PARENTS, f.BYLINE_NAMES):
+        for name in table:
+            assert f.canonical_dept(name) == name, name     # keyed by canonical name
+    for parent in f.DEPT_PARENTS.values():
+        assert f.canonical_dept(parent) == parent and parent not in f.DEPT_PARENTS, parent
+    for name in members + list(canon):
+        assert f.canonical_dept(f.canonical_dept(name)) == f.canonical_dept(name), name
+
+    # both HR spellings and the canonical name are one department, for venues and display
+    for d in ("Electrical & Computer Engineering", "Electrical and Computer Eng"):
+        assert f.canonical_dept(d) == f.venue_dept(d) == "Electrical & Computer Engineering"
+    assert f.canonical_dept("CALS Food Science") == f.canonical_dept("Food Science") == "Food Science"
+    # a section keeps its own name, borrows its parent's papers, and answers to both names
+    assert f.canonical_dept("Plant Biology (Ag)") == "Plant Biology"
+    assert f.venue_dept("Plant Biology (Ag)") == "School of Integrative Plant Science"
+    assert f.dept_names("Plant Biology (Ag)") == (
+        "Plant Biology", "School of Integrative Plant Science")
+    # a unit covering several departments is a parent, never a synonym
+    endowed = "College Academic Activity \u2013 Endowed"
+    assert f.canonical_dept(endowed) == endowed
+    assert f.canonical_dept("Johnson Grad School Mgmt") != f.canonical_dept("Hotel Administration")
+    assert f.venue_dept("Johnson Grad School Mgmt") == f.venue_dept("SHA Teaching") == endowed
+    # the two Psychology departments stay apart
+    assert f.canonical_dept("CHE-Psychology") != f.canonical_dept("Psychology")
+    assert f.dept_names("CHE-Psychology") == ("Psychology (Human Ecology)", "Psychology")
+    assert f.dept_names("Physics") == ("Physics",)
+    assert f.dept_names("") == f.dept_names(None) == ()
+
+
 if __name__ == "__main__":
     test_canonical_dept()
+    test_dept_groups()
     test_parse_and_derive()
     test_refusals()
     test_latest_key_skips_summary()
