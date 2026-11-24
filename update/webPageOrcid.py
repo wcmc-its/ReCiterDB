@@ -34,6 +34,7 @@ import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -121,10 +122,46 @@ def am_status(orcid, am):
     return "agrees" if orcid in am else "conflicts"
 
 
+class OpenAlexBudgetSpent(Exception):
+    """The daily OpenAlex budget is gone until its reset (00:00 UTC); retrying sooner is pointless."""
+
+
+_budget_blocked_until = 0.0  # time.time() value
+
+
+def openalex_get(query):
+    """GET /works. Uses OPENALEX_API_KEY when set (its own daily budget; keyless shares one per IP).
+    The key goes in a header so no logged URL carries it."""
+    global _budget_blocked_until
+    if time.time() < _budget_blocked_until:
+        raise OpenAlexBudgetSpent("daily budget spent")
+    headers = {"User-Agent": UA}
+    key = (os.environ.get("OPENALEX_API_KEY") or "").strip()
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    req = urllib.request.Request("https://api.openalex.org/works?" + query, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        if e.code == 429:  # a burst 429 (short wait, budget left) is worth a retry; a spent budget is not
+            try:
+                wait = float(e.headers.get("Retry-After") or 0)
+                if float(e.headers.get("x-ratelimit-remaining") or 1) <= 0:
+                    wait = max(wait, float(e.headers.get("x-ratelimit-reset") or 0))
+            except ValueError:
+                raise e
+            if wait > 60:
+                _budget_blocked_until = time.time() + wait
+                log.warning("openalex: daily budget spent, resets in %d min", wait // 60)
+                raise OpenAlexBudgetSpent("daily budget spent") from e
+        raise
+
+
 def fetch_openalex(dois, select="doi,authorships"):
     """({doi: work} for the DOIs OpenAlex knows, set of DOIs whose batch answered).
     A DOI in an unanswered batch is neither found nor a miss: it is asked again next run.
-    Keyless, page= only."""
+    page= paging only (works with or without a key)."""
     out, answered = {}, set()
     for i in range(0, len(dois), OPENALEX_BATCH):
         part = dois[i:i + OPENALEX_BATCH]
@@ -132,14 +169,14 @@ def fetch_openalex(dois, select="doi,authorships"):
                                     "per-page": OPENALEX_BATCH, "page": 1})
         for attempt in range(4):
             try:
-                req = urllib.request.Request("https://api.openalex.org/works?" + q, headers={"User-Agent": UA})
-                with urllib.request.urlopen(req, timeout=60) as r:
-                    for w in json.load(r).get("results", []):
-                        d = (w.get("doi") or "").lower().removeprefix("https://doi.org/")
-                        if d:
-                            out[d] = w
+                for w in openalex_get(q).get("results", []):
+                    d = (w.get("doi") or "").lower().removeprefix("https://doi.org/")
+                    if d:
+                        out[d] = w
                 answered.update(part)
                 break
+            except OpenAlexBudgetSpent:
+                return out, answered
             except Exception as e:  # transient: back off; a batch that never answers is retried next run
                 log.info("openalex batch %d: %s", i, e)
                 time.sleep(2 ** attempt)
