@@ -7,9 +7,11 @@ paper that carries an iD contests it, so it matters as much as an accepted one.
 Asks Crossref for author lists in batches (filter=doi:a,doi:b) and takes the iD of the
 author aar_universe_scopus.pick_byline_orcid matches to the byline name. One row per slot
 asked, orcid NULL when Crossref prints none; a failed batch writes nothing and is asked
-again next run. A slot is asked again only when its DOI or its byline position changes.
-ponytail: an iD Crossref adds after we asked is not picked up; re-ask old NULL rows if
-that turns out to matter.
+again next run. A slot is asked again when its DOI or its byline position changes, and
+every run while Crossref has no record of the DOI (found = 0): the record can be newer
+than the question, and Crossref sometimes leaves DOIs it has out of an answer.
+ponytail: an iD Crossref adds to a record it already gave us is not picked up; re-ask old
+NULL rows if that turns out to matter.
 
 Reader: Scholars Profile System etl/orcid-evidence (see the read rules in the setup file).
 
@@ -46,22 +48,23 @@ def due_slots(rows):
     for r in rows:
         dup.add(r[:2]) if r[:2] in by_slot else by_slot.__setitem__(r[:2], r)
     out, bad = {}, 0
-    for key, (uid, pmid, rank, first, last, raw, had_doi, had_rank) in by_slot.items():
+    for key, (uid, pmid, rank, first, last, raw, had_doi, had_rank, had_found) in by_slot.items():
         doi = norm_doi(raw)                 # None for a DOI with a comma: it would split the filter
         if not doi or key in dup:
             bad += 1
-        elif (had_doi, had_rank) != (doi, rank):
+        elif (had_doi, had_rank) != (doi, rank) or not had_found:
             out.setdefault(doi, []).append((uid, pmid, rank, first, last))
     return out, bad
 
 
 def crossref_authors(dois, get, pause=0.0):
     """{doi: Crossref author list} for the DOIs Crossref has a record for. Raises when the
-    request fails, the answer is not a result list, or a full batch has no record at all. One
-    DOI Crossref calls invalid would fail its whole batch every night, so that batch is split
-    until the DOI is alone; alone, it is a DOI with no record. Any other HTTP 400 (a renamed
-    parameter, a gateway) is a failure: 'asked, no record' is never asked again."""
-    from aar_universe_openalex import CROSSREF_BATCH, CROSSREF_WORKS
+    request fails or the answer is not a result list. An answer with no record at all is not a
+    failure: re-asked DOIs come in batches Crossref has none of. One DOI Crossref calls invalid
+    would fail its whole batch every night, so that batch is split until the DOI is alone;
+    alone, it is a DOI with no record. Any other HTTP 400 (a renamed parameter, a gateway) is a
+    failure."""
+    from aar_universe_openalex import CROSSREF_WORKS
     try:
         j = get(CROSSREF_WORKS, {"filter": ",".join(f"doi:{d}" for d in dois),
                                  "select": "DOI,author", "rows": len(dois)})
@@ -77,10 +80,7 @@ def crossref_authors(dois, get, pause=0.0):
     items = (j.get("message") or {}).get("items")
     if not isinstance(items, list):
         raise ValueError("Crossref answered without a result list")
-    out = {i["DOI"].lower(): i.get("author") or [] for i in items if i.get("DOI")}
-    if len(dois) >= CROSSREF_BATCH and not out.keys() & set(dois):
-        raise ValueError(f"Crossref has none of {len(dois)} DOIs")
-    return out
+    return {i["DOI"].lower(): i.get("author") or [] for i in items if i.get("DOI")}
 
 
 def match(authors, n_pubmed, rank, first, last):
@@ -166,7 +166,7 @@ def main():
         print(f"{TABLE} does not exist: apply setup/table_article_orcid_v3.18.sql first")
         return 1
     cur.execute(SLOTS_SQL.format(
-        have=", c.doi, c.author_rank" if have else ", NULL, NULL",
+        have=", c.doi, c.author_rank, c.found" if have else ", NULL, NULL, NULL",
         join=f"LEFT JOIN {TABLE} c ON c.personIdentifier = a.personIdentifier AND c.pmid = a.pmid "
              "AND c.source = 'crossref'" if have else ""), ())
     rows = cur.fetchall()
@@ -235,16 +235,17 @@ def _selftest():
     check("a malformed iD is not an iD", match([au("Doe", "Jane", "0000-0002-1825")], 1, 1, "Jane", "Doe"), None)
 
     # ---- what is due
-    s = lambda uid, pmid, doi, hd=None, hr=None, rank=1: (uid, pmid, rank, "Jane", "Doe", doi, hd, hr)
+    s = lambda uid, pmid, doi, hd=None, hr=None, rank=1, found=1: (
+        uid, pmid, rank, "Jane", "Doe", doi, hd, hr, found if hd else None)
     due, bad = due_slots([
         s("a", 1, "10.1000/New"), s("a", 2, "10.1000/asked", "10.1000/asked", 1),
         s("a", 3, "10.1000/moved", "10.1000/old", 1), s("a", 4, "10.1000/rank", "10.1000/rank", 2),
         s("a", 5, "10.1000/a,b"), s("a", 6, "10.1000/dup"), s("a", 6, "10.1000/dup", rank=3),
-        s("b", 2, "10.1000/asked")])
-    check("due: new, DOI changed, position changed, and a new person on a DOI already asked",
+        s("b", 2, "10.1000/asked"), s("a", 7, "10.1000/norecord", "10.1000/norecord", 1, found=0)])
+    check("due: new, DOI changed, position changed, a new person on a DOI already asked, no record yet",
           {d: [x[:2] for x in v] for d, v in due.items()},
           {"10.1000/new": [("a", 1)], "10.1000/moved": [("a", 3)], "10.1000/rank": [("a", 4)],
-           "10.1000/asked": [("b", 2)]})
+           "10.1000/asked": [("b", 2)], "10.1000/norecord": [("a", 7)]})
     check("left out: a comma DOI, two target entries", bad, 2)
 
     # ---- batches
@@ -307,9 +308,11 @@ def _selftest():
     st, stopped, wrote = go(every_other, range(400))
     check("failures that are not in a row do not stop it", (stopped, st["failed"], len(wrote)), (False, 5, 200))
     st, stopped, wrote = go(lambda u, p: (_ for _ in ()).throw(Refused(503)), range(400))
-    check("a full batch with no record at all is a failure", go(
-        lambda u, p: {"message": {"items": []}}, range(40))[2], [])
     check("failures in a row stop the run", (stopped, st["batches"], wrote), (True, MAX_FAILED, []))
+    # 160 DOIs = four full batches: as failures they would stop the run.
+    st, stopped, wrote = go(lambda u, p: {"message": {"items": []}}, range(160))
+    check("batches Crossref has no record of are written as no record, and the run goes on",
+          (stopped, st["failed"], len(wrote), {w[5:] for w in wrote}), (False, 0, 160, {(None, None, 0)}))
     print("selftest ok" if ok else "selftest FAILED")
     return ok
 

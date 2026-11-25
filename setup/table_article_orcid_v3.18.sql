@@ -6,14 +6,16 @@
 -- PubMed prints no iD. Reader: Scholars Profile System etl/orcid-evidence.
 --
 -- One row per (person, paper, source) ASKED. `orcid` NULL = asked, and that source prints
--- no iD for that author. No row = not asked yet, or the request failed. So the table is
+-- no iD for that author. found = 0 = it has no record of the DOI yet: asked again every run,
+-- so NOT an answer. No row = not asked yet, or the request failed. So the table is
 -- its own ledger, per person-slot rather than per DOI: a person who becomes the target of
 -- a paper already fetched for a coauthor is asked for too.
 --
 -- READERS: rows are never deleted. Count a row only while person_article_author still marks
 -- the same person and rank as the target (targetAuthor LIKE '1%', rank = author_rank) and
 -- person_article.targetAuthorCount <= 1; take the assertion from person_article. A reader
--- that lets an iD RAISE a match must also check that the backfill is complete (row count):
+-- that lets an iD RAISE a match must also check that the table is complete and current (few
+-- eligible slots without a found = 1 row for their doi and rank, and a recent MAX(fetched_at)):
 -- a missing row can be the rejected paper that contests the iD.
 --
 -- Not in updateReciterDB.py's truncate/swap list and must never be added: truncating it
