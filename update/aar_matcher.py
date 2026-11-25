@@ -140,7 +140,7 @@ class IdentityOnlyScorer:
 # 5,913 were accepted or assigned (2026-11-25). But such a byline gives a first initial
 # nothing to lean on, and for these person types an initial-only pick there was almost
 # never right. This function replayed on the stored list of every decided row (2026-11-25):
-# 661 rejected rows and 118 given to somebody else would have had no such pick, against 24
+# 661 rejected rows and 118 given to somebody else would have had no such pick, against 7
 # rows that lose the right person from the list.
 # ponytail: PubMed lane only (it alone has MSK-only bylines: 0 open on the other lanes).
 _MSK_RE = re.compile(r"sloan.*kettering", re.I | re.S)
@@ -168,7 +168,9 @@ def withhold_msk_initial(cands, affiliations, grad_faculty):
     = the rule is off) and not backed by an ORCID or a score. Then the whole list goes, not
     just the pick: the next person in line was right 19 times in 661. Anyone matched by
     full name, by ORCID or on a score, the graduate school faculty, and PhD and MD-PhD
-    students and alumni stay. The authorship is still queued, with no suggestion if nobody
+    students and alumni stay. So does the "Faculty" type: 83% right when it is the pick,
+    and which of it and a weak type leads is often a tie between scores near zero (a replay
+    of the open rows reversed it on dozens), so it must not be lost on that. The authorship is still queued, with no suggestion if nobody
     is left, as any unmatched byline is.
 
     Never on a pick production already suggests (>= 30): with no pick `_already_curated`
@@ -184,7 +186,8 @@ def withhold_msk_initial(cands, affiliations, grad_faculty):
     top = cands[0]
     if backed(top) or top["person_type"] not in MSK_WEAK_TYPES:
         return cands
-    return [c for c in cands if backed(c) or c["person_type"].startswith(_MSK_PROGRAM)]
+    return [c for c in cands if backed(c) or c["person_type"] == "Faculty"
+            or c["person_type"].startswith(_MSK_PROGRAM)]
 
 
 def match_authorship(author, pmid, idx, io_scorer, top_k=5, pub_year=None, withhold=True):
@@ -516,6 +519,8 @@ def _msk_selftest():
         ("the next person in line goes with the pick", left([ft, inact]) == []),
         ("grad faculty and PhD students further down stay",
          left([ft, inact, phd, grad]) == ["ph1", "GRD1"]),
+        ("so does the Faculty type, and only that exact type",
+         left([ft, c("fc", "Faculty"), c("em", "Emeritus Faculty")]) == ["fc"]),
         ("a full-name match further down stays", left([ft, c("f", "Postdoc", "full")]) == ["f"]),
         ("a full-name pick is left alone", left([c("f", "Postdoc", "full"), ft]) == ["f", "ft1"]),
         ("a grad faculty pick is left alone (cwid case ignored)", left([grad, ft]) == ["GRD1", "ft1"]),
