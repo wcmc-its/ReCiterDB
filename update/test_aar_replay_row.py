@@ -202,4 +202,48 @@ check("OpenAlex: DOI, then the work id", asked, ["doi:10.1/x", "ids.openalex:W1"
 check("...every candidate", (o["lane"], o["n_candidates_all"], len(o["producer_cwids_today"])),
       ("openalex", 8, 5))
 
+# ---- the io scorer's swallowed failures ----
+import io                                   # noqa: E402
+import numpy                                # noqa: E402
+import aar_matcher as matcher               # noqa: E402
+
+
+class NoSuchKey(Exception):
+    pass
+
+
+class S3:
+    exceptions = type("X", (), {"NoSuchKey": NoSuchKey})
+    answer = None
+
+    def get_object(self, **kw):
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return {"Body": io.BytesIO(self.answer)}
+
+
+def broken(*a, **kw):
+    raise ValueError("no such column")
+
+
+det = matcher.det
+kept = det._s3, det.score_user, det._score
+for label, answer, score, warned in (
+        ("no input", NoSuchKey(), None, 0),
+        ("archived input", RuntimeError("InvalidObjectState"), None, 0),
+        ("throttled", RuntimeError("SlowDown"), None, 1),
+        ("cut off", b'[{"id": 1', None, 1),
+        ("empty", b"[]", None, 0),
+        ("cannot be scored", b'[{"id": 1}]', broken, 1),
+        ("scored", b'[{"id": 1}]', lambda *a, **kw: numpy.array([0.5]), 0)):
+    det._s3, det.score_user = S3(), lambda uid: ("missing", uid, [])
+    det._s3.answer = answer
+    det._score = score or kept[2]
+    seen = []
+    got = rr._io_scorer(seen).scores("abc1001")
+    seen = [w for w in seen if "abc1001" in w]
+    check(f"identity-only input {label}: warnings", len(seen), warned)
+    check(f"...{label}: what the producer gets", got, {1: (50.0, 50.0)} if label == "scored" else {})
+det._s3, det.score_user, det._score = kept
+
 print(f"\n{n}/{n} passed\n")

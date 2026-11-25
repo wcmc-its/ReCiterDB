@@ -48,7 +48,7 @@ Usage:
   python3 aar_replay_row.py --cronjob-env FILE AUTHOR_KEY
   python3 aar_replay_row.py --cronjob-env FILE AUTHOR_KEY --person CWID
 """
-import argparse, contextlib, json, logging, os, sys
+import argparse, contextlib, io, json, logging, os, sys, threading
 from concurrent.futures import ThreadPoolExecutor
 
 from sqlalchemy import event, text
@@ -335,13 +335,16 @@ class _Warnings(logging.Handler):
 
 def _io_scorer(warnings):
     """The producer's scorer. It reads a failed S3 fetch as "never scored", so failures
-    are collected. An archived input is not one: the producer cannot read it either."""
+    are collected, on both of its inputs. A missing or archived input is not one: the
+    producer cannot read it either."""
     import xgboost
     import aar_matcher as matcher
+    det = matcher.det
     if xgboost.__version__ != PINNED_XGBOOST:
         warnings.append(f"xgboost {xgboost.__version__} here, {PINNED_XGBOOST} in production: "
                         "io scores can differ")
-    score_user = matcher.det.score_user
+    score_user, get_object, score = det.score_user, det._s3.get_object, det._score
+    here = threading.local()       # the cwid whose identity-only input this thread is on
 
     def recorded(uid):
         res = score_user(uid)
@@ -349,8 +352,45 @@ def _io_scorer(warnings):
             warnings.append(f"identity-only score unavailable for {uid}: "
                             f"{str(res[2][:1])[:120]}")
         return res
-    matcher.det.score_user = recorded
-    return matcher.IdentityOnlyScorer()
+
+    def failed(stage, e):
+        warnings.append(f"identity-only score unavailable for {here.cwid}: "
+                        f"{stage}: {type(e).__name__}: {str(e)[:90]}")
+
+    # _identity_only_input swallows every exception, so each step is watched from inside.
+    def fetched(**kw):
+        if not getattr(here, "cwid", None):
+            return get_object(**kw)
+        try:
+            obj = get_object(**kw)
+            body = obj["Body"].read()
+            json.loads(body)
+            return dict(obj, Body=io.BytesIO(body))
+        except det._s3.exceptions.NoSuchKey:
+            raise
+        except Exception as e:      # noqa: BLE001  (re-raised)
+            if "InvalidObjectState" not in str(e):
+                failed("fetch", e)
+            raise
+
+    def scored(*a, **kw):
+        try:
+            return score(*a, **kw)
+        except Exception as e:      # noqa: BLE001  (re-raised)
+            if getattr(here, "cwid", None):
+                failed("score", e)
+            raise
+
+    class Scorer(matcher.IdentityOnlyScorer):
+        def _identity_only_input(self, cwid):
+            here.cwid = cwid
+            try:
+                return super()._identity_only_input(cwid)
+            finally:
+                here.cwid = None
+
+    det.score_user, det._s3.get_object, det._score = recorded, fetched, scored
+    return Scorer()
 
 
 def main():
@@ -382,8 +422,8 @@ def main():
                     raise Refused("DynamoDB alternate names could not be read: people known by "
                                   "another name would look excluded")
                 roster = CampusRoster.load(alternate_names=names)
-                io = _io_scorer(seen.seen) if row["source"] == "pubmed" else None
-                out = replay(row, roster, io, args.person)
+                scorer = _io_scorer(seen.seen) if row["source"] == "pubmed" else None
+                out = replay(row, roster, scorer, args.person)
             except Unresolvable as e:
                 out = {"status": "unresolvable", "author_key": args.author_key, "reason": str(e)}
             except requests.RequestException as e:
