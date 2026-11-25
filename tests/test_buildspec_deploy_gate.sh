@@ -71,6 +71,33 @@ do
   fi
 done
 
+# post_build runs even after a failed build. Run the real script from the buildspec with stub
+# docker/aws/kubectl: a failed build or a failed push must never reach `kubectl set image`.
+post_build=$(awk '/^  post_build:/{p=1} p && /^      - \|$/{f=1;next} p && f{sub(/^        /,"");print}' k8-buildspec.yml)
+post() {  # post <CODEBUILD_BUILD_SUCCEEDING> <docker exit code> -> commands that ran
+  local bin; bin=$(mktemp -d)
+  printf '#!/bin/sh\necho "docker $*" >&3\nexit %s\n' "$2" > "$bin/docker"
+  printf '#!/bin/sh\necho "kubectl $*" >&3\n' > "$bin/kubectl"
+  printf '#!/bin/sh\nexit 0\n' > "$bin/aws"
+  chmod +x "$bin"/*
+  PATH="$bin:$PATH" DEPLOY=yes CODEBUILD_BUILD_SUCCEEDING="$1" REPOSITORY_URI=repo TAG=t \
+    CRON_JOB_NAME=reciterdb EKS_CLUSTER_NAME=c EKS_KUBECTL_ROLE_ARN=r \
+    sh -c "$post_build" 3>&1 >/dev/null 2>&1
+}
+repoints() { post "$1" "$2" | grep -c 'kubectl set image'; }
+post_check() {  # post_check <expected cronjobs repointed> <succeeding> <docker exit> <description>
+  local got; got=$(repoints "$2" "$3")
+  if [ "$got" = "$1" ]; then
+    echo "[OK]   repointed=$got  $4"
+  else
+    echo "[FAIL] repointed=$got want=$1  $4"
+    fails=$((fails + 1))
+  fi
+}
+post_check 4 1 0 "good build and push repoint all four cronjobs"
+post_check 0 0 0 "failed build repoints nothing"
+post_check 0 1 1 "failed push repoints nothing"
+
 # The old unguarded conditions must be gone from the build/deploy steps.
 if grep -qE '^\s+if expr "\$\{BRANCH\}"' k8-buildspec.yml; then
   echo "[FAIL] a bare BRANCH-only deploy condition is still present"
