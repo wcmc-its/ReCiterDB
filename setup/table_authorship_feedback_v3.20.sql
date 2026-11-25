@@ -1,5 +1,5 @@
 -- =============================================================================
--- Migration: authorship_feedback (v3.19)
+-- Migration: authorship_feedback (v3.20)
 -- =============================================================================
 -- "Report a problem" reports from Publication Manager's /authorships page: what the
 -- curator typed, plus a snapshot of the card and of the rows behind it. A report must
@@ -9,7 +9,7 @@
 -- WRITERS: Publication Manager inserts the report and fills the snapshot once
 -- (`client_snapshot` at insert; `server_snapshot`, `snapshot_state` and the row keys in
 -- one UPDATE after it). Only the feedback skill writes `status` and the columns after it,
--- through the column-limited login in grants_authorship_feedback_reader_v3.19.sql.template.
+-- through the column-limited login in grants_authorship_feedback_reader_v3.20.sql.template.
 -- No producer, nightly job or stored procedure reads or writes this table.
 --
 -- READERS: no SQL join to authorship_review or the admin_* tables without an explicit
@@ -28,7 +28,7 @@
 --   the PR first is harmless: without the table the endpoint answers 503 and nothing else
 --   uses it. Idempotent, CREATE only. Merging the PR does NOT run DDL; apply to BOTH
 --   reciterdb instances by hand.
---   mysql -h "$DB_HOST" -u "$DB_USERNAME" -p "$DB_NAME" < setup/table_authorship_feedback_v3.19.sql
+--   mysql -h "$DB_HOST" -u "$DB_USERNAME" -p "$DB_NAME" < setup/table_authorship_feedback_v3.20.sql
 -- Rollback: unset AUTHORSHIP_FEEDBACK_CWIDS, then DROP TABLE authorship_feedback;
 -- =============================================================================
 CREATE TABLE IF NOT EXISTS `authorship_feedback` (

@@ -33,7 +33,7 @@ NO WRITES. Every database connection this process opens, through any module's en
 put in a read-only session transaction and checked before use (`_read_only`), so a write
 is refused by the server whatever the code does. DynamoDB, S3 and the three APIs are only
 read; that half is by inspection, not enforced. Run it with the read-only login of
-setup/grants_authorship_feedback_reader_v3.19.sql.template.
+setup/grants_authorship_feedback_reader_v3.20.sql.template.
 
 Output: one JSON object on stdout; progress goes to stderr. `status` is
   ok                  replayed

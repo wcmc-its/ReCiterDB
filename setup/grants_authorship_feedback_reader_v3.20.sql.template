@@ -1,5 +1,5 @@
 -- =============================================================================
--- Grants: authorship_feedback_reader (v3.19)  --  TEMPLATE, run by hand by an admin
+-- Grants: authorship_feedback_reader (v3.20)  --  TEMPLATE, run by hand by an admin
 -- =============================================================================
 -- The login of the authorship-feedback skill and of update/aar_replay_row.py. It can read
 -- reciterdb and write only the skill's own columns of authorship_feedback: no INSERT, no
@@ -10,7 +10,7 @@
 -- replay needs, so treat the password like any other reciterdb one.
 --
 -- TO RUN (MariaDB 11.4; an account with CREATE USER and GRANT OPTION):
---   1. Apply table_authorship_feedback_v3.19.sql first: a column grant needs its table.
+--   1. Apply table_authorship_feedback_v3.20.sql first: a column grant needs its table.
 --   2. Copy this file OUTSIDE the repo. In the copy replace __PASSWORD__ with a generated
 --      password, different for dev and prod, and __SCHEMA__ with the database name. Never
 --      commit the copy and never put the password on a command line.
