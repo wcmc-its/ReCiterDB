@@ -56,7 +56,15 @@ phases:
       - docker build --tag $REPOSITORY_URI:$TAG .
   post_build:
     commands:
+      # CodeBuild runs post_build even when the build phase failed, so stop here rather than
+      # repoint the live cronjobs at an image that was never pushed (build 456, 2026-11-25).
+      # set -e does the same for a failed push.
       - |
+        set -e
+        if [ "$CODEBUILD_BUILD_SUCCEEDING" != 1 ]; then
+          echo "Build failed; nothing pushed, cronjobs untouched."
+          exit 1
+        fi
         if [ "$DEPLOY" = yes ]; then
           docker push $REPOSITORY_URI:$TAG
           # Log out from the Docker registry to clear credentials
