@@ -53,7 +53,7 @@ Usage:
   python aar_matcher.py --surname Worgall --given Stefan --pmid 42220538 \
       --affil "Department of Pediatrics, Weill Cornell Medicine, New York, NY"
 """
-import argparse, json, os, sys
+import argparse, json, os, re, sys
 
 import pandas as pd
 
@@ -134,10 +134,64 @@ class IdentityOnlyScorer:
 
 
 # ---- public entry point ----------------------------------------------------
-def match_authorship(author, pmid, idx, io_scorer, top_k=5, pub_year=None):
+# ---- MSK-only bylines, initial-only picks -------------------------------------------
+# Sloan Kettering is a home institution (aar_universe.DEFAULT_HOME_INSTITUTION_KEYWORDS) and
+# should stay one: of the decided PubMed rows whose byline names it and nothing of ours,
+# 5,913 were accepted or assigned (2026-11-25). But such a byline gives a first initial
+# nothing to lean on, and for these person types an initial-only pick there was almost
+# never right. This function replayed on the stored list of every decided row (2026-11-25):
+# 661 rejected rows and 118 given to somebody else would have had no such pick, against 24
+# rows that lose the right person from the list.
+# ponytail: PubMed lane only (it alone has MSK-only bylines: 0 open on the other lanes).
+_MSK_RE = re.compile(r"sloan.*kettering", re.I | re.S)
+_OURS_RE = re.compile(r"weill|cornell|presbyterian", re.I)
+MSK_WEAK_TYPES = frozenset((
+    "Full-Time Faculty", "Part-Time Faculty", "Adjunct Faculty", "Voluntary Faculty",
+    "Postdoc", "Non-Faculty"))
+# The PhD and MD-PhD programs are shared with MSK, so their people are expected there.
+_MSK_PROGRAM = ("Student PhD", "Student MD-PhD", "Alumni PhD", "Alumni MD-PhD")
+MSK_IO_FLOOR = 20.0          # at or above it the weak picks were right about half the time
+_SUGGESTED = 30.0            # aar_gate.STORAGE_THRESHOLD (checked in the self-test)
+
+
+def msk_only(affiliations):
+    """The byline names Sloan Kettering and nothing of WCM, Cornell or NewYork-Presbyterian."""
+    text = " | ".join(a or "" for a in affiliations or [])
+    return bool(_MSK_RE.search(text)) and not _OURS_RE.search(text)
+
+
+def withhold_msk_initial(cands, affiliations, grad_faculty):
+    """`cands` (ranked), less the initial-only guesses an MSK-only byline cannot support.
+
+    Fires only when the PICK is initial-only, of a weak person type, not on the graduate
+    school faculty list (`grad_faculty`, a set of lowercase cwids; None = list unavailable
+    = the rule is off) and not backed by an ORCID or a score. Then the whole list goes, not
+    just the pick: the next person in line was right 19 times in 661. Anyone matched by
+    full name, by ORCID or on a score, the graduate school faculty, and PhD and MD-PhD
+    students and alumni stay. The authorship is still queued, with no suggestion if nobody
+    is left, as any unmatched byline is.
+
+    Never on a pick production already suggests (>= 30): with no pick `_already_curated`
+    could not see that, and the authorship would come back as an orphan it is not."""
+    if not cands or grad_faculty is None or not msk_only(affiliations):
+        return cands
+
+    def backed(c):
+        return (c["given_match"] != "initial" or bool(c.get("orcid_match"))
+                or str(c["cwid"]).lower() in grad_faculty
+                or (c.get("io_score") or 0) >= MSK_IO_FLOOR
+                or (c.get("final_score") or 0) >= _SUGGESTED)
+    top = cands[0]
+    if backed(top) or top["person_type"] not in MSK_WEAK_TYPES:
+        return cands
+    return [c for c in cands if backed(c) or c["person_type"].startswith(_MSK_PROGRAM)]
+
+
+def match_authorship(author, pmid, idx, io_scorer, top_k=5, pub_year=None, withhold=True):
     """Rank candidate CWIDs for one WCM authorship on an orphan article.
 
     author = {"last","fore","initials","affiliations"} (a universe author block).
+    withhold = False leaves out `withhold_msk_initial`, for aar_replay_row.py only.
     pub_year = the paper's publication year (None -> no temporal penalty, pre-#159
     ranking). Returns the ranked candidate list; each candidate gains:
       io_score  (float 0-100 | None)   ReCiter identity-only score for this pmid
@@ -198,6 +252,9 @@ def match_authorship(author, pmid, idx, io_scorer, top_k=5, pub_year=None):
         d["given_match"] == "full",
         d["io_score"] if d["io_score"] is not None else -1.0,
         d["confidence"]), reverse=True)
+    if withhold:
+        cands = withhold_msk_initial(cands, author.get("affiliations"),
+                                     getattr(getattr(idx, "wcm", idx), "grad_faculty", None))
     return cands
 
 
@@ -424,11 +481,77 @@ def _rank_selftest():
     return ok
 
 
+def _msk_selftest():
+    """Offline. The MSK-only rule: what it withholds, and everything it must leave alone."""
+    from aar_gate import STORAGE_THRESHOLD
+    MSK = ["Department of Medical Physics, Memorial Sloan-Kettering Cancer Center, New York"]
+    BOTH = MSK + ["Weill Cornell Medicine, New York, NY"]
+    G = {"grd1"}
+
+    def c(cwid, ptype, given="initial", **kw):
+        return dict({"cwid": cwid, "person_type": ptype, "given_match": given,
+                     "io_score": None, "final_score": None}, **kw)
+    ft = c("ft1", "Full-Time Faculty")
+
+    def left(cands, aff=MSK, g=G):
+        return [x["cwid"] for x in withhold_msk_initial(cands, aff, g)]
+    inact, phd, grad = (c("in1", "Inactive Faculty"), c("ph1", "Student PhD (Tri-I)"),
+                        c("GRD1", "Full-Time Faculty"))
+
+    class _IO:
+        def scores(self, cwid):
+            return {}
+    rec = {"cwid": "ft1", "given": "Ann", "middle": "", "surname": "Roe", "given_norm": "ann",
+           "surname_norm": "roe", "dept": "", "division": "", "program": "", "title": "",
+           "person_type": "Full-Time Faculty", "historical": False, "end_year": None}
+    idx = IdentityIndex([rec])
+    au = {"last": "Roe", "fore": "Abe", "initials": "A", "affiliations": MSK}
+
+    def wired(roster, **kw):
+        return [x["cwid"] for x in match_authorship(au, 99, roster, _IO(), **kw)]
+    off = wired(idx)
+    idx.grad_faculty = G
+    checks = [
+        ("each weak type is withheld", all(left([c("x", t)]) == [] for t in MSK_WEAK_TYPES)),
+        ("the next person in line goes with the pick", left([ft, inact]) == []),
+        ("grad faculty and PhD students further down stay",
+         left([ft, inact, phd, grad]) == ["ph1", "GRD1"]),
+        ("a full-name match further down stays", left([ft, c("f", "Postdoc", "full")]) == ["f"]),
+        ("a full-name pick is left alone", left([c("f", "Postdoc", "full"), ft]) == ["f", "ft1"]),
+        ("a grad faculty pick is left alone (cwid case ignored)", left([grad, ft]) == ["GRD1", "ft1"]),
+        ("other person types are left alone", all(
+            left([c("x", t), ft]) == ["x", "ft1"] for t in
+            ("Faculty", "Inactive Faculty", "Resident (NYP)", "Student MD-PhD", "Emeritus Faculty"))),
+        ("an ORCID pick is left alone", left([dict(ft, orcid_match=True)]) == ["ft1"]),
+        ("a score at the floor is left alone, below it is not",
+         left([dict(ft, io_score=MSK_IO_FLOOR)]) == ["ft1"]
+         and left([dict(ft, io_score=MSK_IO_FLOOR - 0.01)]) == []),
+        ("a pick production already suggests is left alone", left([dict(ft, final_score=30.0)]) == ["ft1"]),
+        ("a byline that also names us is left alone", left([ft], BOTH) == ["ft1"]),
+        ("New York-Presbyterian counts as us", left([ft], [MSK[0] + "; NewYork-Presbyterian"]) == ["ft1"]),
+        ("a byline without MSK is left alone", left([ft], ["Rockefeller University"]) == ["ft1"]),
+        ("both spellings and a split affiliation", msk_only(["Memorial Sloan Kettering"])
+         and msk_only(["Memorial Sloan-Kettering"]) and not msk_only([]) and not msk_only(None)),
+        ("no grad faculty list: the rule is off", left([ft], MSK, None) == ["ft1"]),
+        ("no candidates", left([]) == []),
+        ("match_authorship: off without the list, on with it, off for the replay",
+         off == ["ft1"] and wired(idx) == [] and wired(idx, withhold=False) == ["ft1"]),
+        ("match_authorship: a CampusRoster takes the list from its WCM roster",
+         wired(CampusRoster(idx)) == []),
+        ("_SUGGESTED is the gate's threshold", _SUGGESTED == STORAGE_THRESHOLD),
+    ]
+    for name, ok in checks:
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def _selftest(live=False):
     """Offline unless `live`. Every sibling's --selftest is offline, so this one going
     to reciterdb, DynamoDB and S3 by default surprised a run that expected no I/O."""
     print("=== Temporal-penalty ranking (offline) ===")
     rank_ok = _rank_selftest()
+    print("\n=== MSK-only bylines (offline) ===")
+    rank_ok = _msk_selftest() and rank_ok
     if not live:
         print("\nSELFTEST", "PASS" if rank_ok else "FAIL",
               "(offline only; add --live for the Worgall and homonym checks)")

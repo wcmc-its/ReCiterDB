@@ -233,6 +233,8 @@ def _orcid_guard(rows, idx, lane):
 
 def _classify_pubmed(rows, idx, limit=None):
     """-> (stale, matched, unresolvable). `stale` entries are {row, before}."""
+    import aar_matcher as matcher      # here: it loads the scoring engine, which nothing else needs
+    io = None
     rows = rows[:limit] if limit else rows
     _orcid_guard(rows, idx, "pubmed")
     pmids = sorted({r["pmid"] for r in rows if r["pmid"]})
@@ -257,6 +259,12 @@ def _classify_pubmed(rows, idx, limit=None):
                                         pub_year=art.get("pub_year"),
                                         **({"byline_orcid": r["byline_orcid"]}
                                            if r.get("byline_orcid") else {}))
+        if cands and matcher.msk_only(au.get("affiliations")):
+            # The one rule that empties a list AFTER scoring (withhold_msk_initial).
+            io = io or matcher.IdentityOnlyScorer()
+            cands = matcher.match_authorship(
+                dict(au, byline_orcid=r.get("byline_orcid")), r["pmid"], idx, io, top_k=5,
+                pub_year=art.get("pub_year"))
         if cands:
             matched.append(r)
         else:

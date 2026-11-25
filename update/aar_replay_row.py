@@ -216,10 +216,15 @@ def rank(row, lane, au, pub_year, roster, io_scorer=None):
                 list(ex.map(io_scorer.scores,
                             sorted({c["cwid"] for c in everyone if not c.get("campus")})))
 
-        def call(top_k):
+        def call(top_k, **kw):
             return matcher.match_authorship(au, row["pmid"], roster, io_scorer, top_k=top_k,
-                                            pub_year=pub_year)
-        campuses = byline_campuses(au["affiliations"])
+                                            pub_year=pub_year, **kw)
+        # The one rule that takes people off a ranked list: shown, with its name, not hidden.
+        everyone, five = call(None, withhold=False), call(5)
+        for c in call(5, withhold=False):
+            if _position(five, c["cwid"]) is None:
+                everyone[_position(everyone, c["cwid"]) - 1]["withheld"] = "msk_initial_only"
+        return everyone, five, byline_campuses(au["affiliations"])
     else:
         # frozenset(): the OpenAlex lane has no Scopus afids (aar_universe_openalex.run).
         family = (frozenset() if lane == "openalex"
@@ -250,8 +255,12 @@ def explain(person, au, pub_year, roster, lane, campuses, everyone, five):
         kept = _position(five, person)
         return {"cwid": person, "candidate": True, "position_in_all": pos,
                 "position_in_producer_list": kept,
-                "rules": [] if kept else [{"rule": "top_5_cut", "detail":
-                          "matched, but outside the five the producer keeps"}]}
+                "rules": [] if kept else [
+                    {"rule": "msk_initial_only", "detail": "matched, and withheld: an initial "
+                     "alone, on a byline naming only MSK (aar_matcher.withhold_msk_initial)"}
+                    if everyone[pos - 1].get("withheld") else
+                    {"rule": "top_5_cut", "detail":
+                     "matched, but outside the five the producer keeps"}]}
     last, fore = au.get("last"), au.get("fore")
     rules, found = [], False
     for campus, idx in ((CAMPUS_WCM, roster.wcm), (CAMPUS_ITHACA, roster.ithaca)):
