@@ -845,7 +845,7 @@ def openalex_authorships(dois, get=None):
 
 
 def wcm_lane_candidates(idx, au, pub_year, ithaca_family=None, venue_subfield=None,
-                        byline_orcid=None):
+                        byline_orcid=None, top_k=5):
     """`idx.candidates` for one WCM-lane author -- the producer's call, and the one the
     replay tools (aar_sweep_stale / aar_report_changed_picks) make on a live re-fetch, so
     a replay reaches the same roster(s) the producer did. A `CampusRoster` gets the
@@ -860,7 +860,8 @@ def wcm_lane_candidates(idx, au, pub_year, ithaca_family=None, venue_subfield=No
     does with it is the roster's rule: with AAR_BYLINE_ORCID alone, the venue term's;
     with AAR_BYLINE_ORCID_WCM as well, WCM and two-campus lists are matched too. Either
     way this lane takes the first candidate as top_cwid and nothing re-sorts the list
-    after the matcher, so the person the ORCID is on file for is the row's pick."""
+    after the matcher, so the person the ORCID is on file for is the row's pick. `top_k` is for
+    aar_replay_row.py, which passes None for the whole list; the lanes leave it alone."""
     kw = {}
     if isinstance(idx, CampusRoster):
         if ithaca_family is None:
@@ -871,7 +872,7 @@ def wcm_lane_candidates(idx, au, pub_year, ithaca_family=None, venue_subfield=No
     if byline_orcid:
         kw["byline_orcid"] = byline_orcid
     return idx.candidates(au["last"], au["fore"], au["initials"], au["affiliations"],
-                          top_k=5, pub_year=pub_year, **kw)
+                          top_k=top_k, pub_year=pub_year, **kw)
 
 
 def run(aft, bef, apply_writes=False, afid_list=DEFAULT_AFID_LIST, recheck=True, idx=None,

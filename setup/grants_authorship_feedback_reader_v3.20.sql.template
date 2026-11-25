@@ -1,0 +1,39 @@
+-- =============================================================================
+-- Grants: authorship_feedback_reader (v3.20)  --  TEMPLATE, run by hand by an admin
+-- =============================================================================
+-- The login of the authorship-feedback skill and of update/aar_replay_row.py. It can read
+-- reciterdb and write only the skill's own columns of authorship_feedback: no INSERT, no
+-- DELETE, no DDL, no EXECUTE, and no other column or table. This grant, not the skill's
+-- instructions, is what stops those scripts from writing anything else.
+--
+-- It reads every table in the schema, the admin_* and HR ones included. That is what the
+-- replay needs, so treat the password like any other reciterdb one.
+--
+-- TO RUN (MariaDB 11.4; an account with CREATE USER and GRANT OPTION):
+--   1. Apply table_authorship_feedback_v3.20.sql first: a column grant needs its table.
+--   2. Copy this file OUTSIDE the repo. In the copy replace __PASSWORD__ with a generated
+--      password, different for dev and prod, and __SCHEMA__ with the database name. Never
+--      commit the copy and never put the password on a command line.
+--   3. mysql -h "$DB_HOST" -u "$DB_USERNAME" -p "$DB_NAME" < the-copy.sql, then delete it.
+--   4. Read the SHOW GRANTS output: exactly the three lines described below.
+-- Nothing in this repo runs this file.
+--
+-- IDEMPOTENT, with two limits: on an existing account CREATE USER IF NOT EXISTS leaves the
+-- password as it is (use ALTER USER to rotate), and GRANT never narrows what the account
+-- already holds. If SHOW GRANTS lists anything more, DROP USER and run this again.
+-- Rollback: DROP USER 'authorship_feedback_reader'@'%';
+-- =============================================================================
+CREATE USER IF NOT EXISTS 'authorship_feedback_reader'@'%' IDENTIFIED BY '__PASSWORD__';
+
+GRANT SELECT ON `__SCHEMA__`.* TO 'authorship_feedback_reader'@'%';
+
+GRANT UPDATE (`status`, `claimed_by`, `claimed_at`, `duplicate_of`, `diagnosis`,
+              `resolution_ref`, `handled_at`)
+   ON `__SCHEMA__`.`authorship_feedback` TO 'authorship_feedback_reader'@'%';
+
+-- The dev instance allows 30 connections in all. A replay opens up to four.
+GRANT USAGE ON *.* TO 'authorship_feedback_reader'@'%' WITH MAX_USER_CONNECTIONS 10;
+
+-- Verification: USAGE (with MAX_USER_CONNECTIONS 10), SELECT on the schema, and UPDATE on
+-- the seven columns. Nothing else.
+SHOW GRANTS FOR 'authorship_feedback_reader'@'%';
