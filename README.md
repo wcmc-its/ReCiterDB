@@ -53,7 +53,7 @@ In conjunction with data from [ReCiter](https://github.com/wcmc-its/reciter), Re
 - Which faculty publish the most frequently on cancer, overall and by proportion of their total scholarly output?
 - What percent of papers published by a given faculty are in collaboration with existing members of the Cancer Center?
 - What are the most influential cancer-related papers by members of the Cancer Center?
-- Finally, a variety of person-level bibliometric statistics are available through a bibliometric report that can be generated on demand (see [sample](https://github.com/wcmc-its/ReCiterDB/blob/master/files/sampleBibliometricReport.rtf))
+- Finally, a variety of person-level bibliometric statistics are available through a bibliometric report that can be generated on demand
 
 
 
@@ -257,7 +257,6 @@ All defined in `setup/createEventsProceduresReciterDb.sql`.
 
 | Procedure | Purpose |
 |-----------|---------|
-| `generateBibliometricReport(personID)` | Full bibliometric report for one person |
 | `generatePubsRTF()` | RTF publication list |
 | `generateEmailNotifications()` | New publication email alerts |
 
