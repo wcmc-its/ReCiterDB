@@ -147,6 +147,17 @@ pubmed([ITH])
 check("Ithaca byline: Cornell people, and the WCM person with a Cornell appointment",
       {c["cwid"] for c in rr.replay(pm, roster)["candidates_all"]}, {"ith1001", "lnk1001"})
 check("...others of WCM: campus", rules("abc1000"), ["campus_not_consulted"])
+pubmed(["Memorial Sloan Kettering Cancer Center, New York, NY"])
+roster.wcm.grad_faculty = {"abc1003"}
+o = rr.replay(pm, roster)
+five = rr.replay(pm, roster)["producer_cwids_today"]
+gone = [c["cwid"] for c in o["candidates_all"] if c.get("withheld") == "msk_initial_only"]
+check("MSK-only byline: everyone is shown, the producer's list is what the rule leaves",
+      (o["n_candidates_all"], set(five) <= {"abc1003"}, len(gone) + len(five)), (8, True, 5))
+check("...and a withheld person is told why", rules(gone[0]), ["msk_initial_only"])
+check("...while one below the fifth still is below the fifth", rules(
+    next(c["cwid"] for c in o["candidates_all"] if c["cwid"] not in gone + five)), ["top_5_cut"])
+roster.wcm.grad_faculty = None
 pubmed([WCM], fore="B")
 try:
     rr.replay(pm, roster)

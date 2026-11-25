@@ -1008,6 +1008,8 @@ class IdentityIndex:
     def __init__(self, records, campus=CAMPUS_WCM, alternate_names=None, dept_venue_fit=None,
                  orcid_cwid=None):
         self.campus = campus
+        # Set by `load()` on the WCM roster; None = MSK initial-only rule off.
+        self.grad_faculty = None
         # The department x subfield table behind the venue term (see the venue-fit block
         # above), or None: no term, no `venue_fit` key, today's output. Kept only on an
         # Ithaca index -- the scope decision is enforced here, not left to each caller.
@@ -1195,14 +1197,35 @@ class IdentityIndex:
             orcid_cwid = cls._load_orcid_map(
                 c, campus, frozenset(str(k).strip().lower() for k in campus_types))
             netid_year = cls._load_netid_years(c, campus)
+            grad_faculty = cls._load_grad_faculty(c, campus)
         records = [cls._record(r, campus_types.get(r["cwid"], ()), r["cwid"] in linked)
                    for r in rows]
         for rec in records:
             if rec["campus"] == CAMPUS_ITHACA:
                 rec["netid_year"] = netid_year.get(str(rec["cwid"]).lower())
-        return cls(records,
-                   campus=campus, alternate_names=alternate_names,
-                   dept_venue_fit=dept_venue_fit, orcid_cwid=orcid_cwid)
+        idx = cls(records,
+                  campus=campus, alternate_names=alternate_names,
+                  dept_venue_fit=dept_venue_fit, orcid_cwid=orcid_cwid)
+        idx.grad_faculty = grad_faculty
+        return idx
+
+    @staticmethod
+    def _load_grad_faculty(conn, campus):
+        """Lowercase cwids of everyone on the graduate school faculty list, current or
+        former, for `aar_matcher.withhold_msk_initial`. None on the Ithaca roster, when the
+        table is absent or empty, or on ANY failure (`_load_orcid_map`'s rule): the rule is
+        off and the lane runs as it did before it."""
+        if campus != CAMPUS_WCM:
+            return None
+        try:
+            cwids = {str(c).strip().lower() for (c,) in conn.execute(text(
+                "SELECT DISTINCT cwid FROM identity_grad_school_faculty "
+                "WHERE cwid IS NOT NULL AND cwid <> ''")).all()}
+        except Exception as e:                                       # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "graduate school faculty unavailable (%r); MSK initial-only rule off", e)
+            return None
+        return cwids or None
 
     @staticmethod
     def _load_netid_years(conn, campus):
